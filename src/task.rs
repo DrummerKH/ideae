@@ -2069,6 +2069,8 @@ pub struct TaskView {
     /// them as they are was asked for a second time.
     conflict_marked: Vec<(String, u32)>,
     markers_accepted: bool,
+    /// Work put away in the repository, the latest first.
+    stashes: Vec<git::Stash>,
     branch_hunks: Rc<Vec<git::Hunk>>,
     /// The Changes tab shows an older diff than the one read last.
     diff_stale: bool,
@@ -2226,7 +2228,7 @@ impl TaskView {
                         (read, patch, branch, shared, staged, changed_on_disk(open_known), seen, known)
                     })
                     .await;
-                let git::Refreshed { files, watch, info, states, base, .. } = read;
+                let git::Refreshed { files, watch, info, states, base, stashes, .. } = read;
                 known = now_known;
                 seen = now_seen;
                 let applied = this.update_in(cx, |this, window, cx| {
@@ -2237,6 +2239,10 @@ impl TaskView {
                     }
                     if this.file_states != states {
                         this.file_states = states;
+                        cx.notify();
+                    }
+                    if this.stashes != stashes {
+                        this.stashes = stashes;
                         cx.notify();
                     }
                     if let Some(patch) = patch {
@@ -2318,6 +2324,7 @@ impl TaskView {
             uncommitted_hunks: Rc::default(),
             conflict_marked: Vec::new(),
             markers_accepted: false,
+            stashes: Vec::new(),
             branch_hunks: Rc::default(),
             diff_stale: false,
             branch_info: git::BranchInfo::default(),
@@ -4836,6 +4843,18 @@ impl TaskView {
                             .on_click(cx.listener(|this, _, window, cx| this.commit(window, cx))),
                     )
                     .child(
+                        Button::new("stash")
+                            .small()
+                            .ghost()
+                            .disabled(busy || self.files.is_empty())
+                            .label("Stash")
+                            .tooltip("Put everything not committed away, to bring back later; the message box names it")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let message = this.commit_input.read(cx).value().trim().to_string();
+                                this.run_action("Stash", move |root| git::stash(&root, &message), false, window, cx)
+                            })),
+                    )
+                    .child(
                         Button::new("push")
                             .small()
                             .ghost()
@@ -4914,7 +4933,87 @@ impl TaskView {
             list = list.child(section("stage-all", title, "stage all", true, cx));
             list = self.render_change_tree(list, &unstaged, false, cx);
         }
+        if !self.stashes.is_empty() {
+            let muted = cx.theme().muted_foreground;
+            list = list.child(
+                div().px_3().pt_3().pb_1().text_xs().text_color(muted).child(format!("STASHES ({})", self.stashes.len())),
+            );
+            for (i, stash) in self.stashes.iter().enumerate() {
+                let group = SharedString::from(format!("stash-{i}"));
+                let act = |id: &'static str, label: &'static str, tip: &'static str, name: String, cx: &mut Context<Self>| {
+                    Button::new((id, i)).xsmall().ghost().label(label).tooltip(tip).on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        let name = name.clone();
+                        match id {
+                            "stash-apply" => this.run_action("Stash", move |root| git::stash_apply(&root, &name, false), false, window, cx),
+                            "stash-pop" => this.run_action("Stash", move |root| git::stash_apply(&root, &name, true), false, window, cx),
+                            _ => this.drop_stash_dialog(name, window, cx),
+                        }
+                    }))
+                };
+                let name = stash.name.clone();
+                list = list.child(
+                    h_flex()
+                        .id(group.clone())
+                        .group(group.clone())
+                        .relative()
+                        .px_3()
+                        .py_0p5()
+                        .gap_2()
+                        .text_sm()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(cx.theme().accent))
+                        .child(div().flex_1().min_w_0().truncate().child(stash.what.clone()))
+                        .child(div().flex_none().text_xs().text_color(muted).child(stash.when.clone()))
+                        // Over the row's end while the pointer is on it: the name keeps its room.
+                        .child(
+                            h_flex()
+                                .absolute()
+                                .right_1()
+                                .top_0()
+                                .bottom_0()
+                                .bg(cx.theme().accent)
+                                .opacity(0.)
+                                .group_hover(group, |s| s.opacity(1.))
+                                .child(act("stash-apply", "apply", "Bring it back and keep it in the list", stash.name.clone(), cx))
+                                .child(act("stash-pop", "pop", "Bring it back and take it off the list", stash.name.clone(), cx))
+                                .child(act("stash-drop", "drop", "Throw it away", stash.name.clone(), cx)),
+                        )
+                        .on_click(cx.listener(move |this, _, window, cx| this.show_stash(name.clone(), window, cx))),
+                );
+            }
+        }
         list.overflow_y_scrollbar()
+    }
+
+    /// What a stash holds, as a diff in a dialog.
+    fn show_stash(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let root = self.root.clone();
+        let what = self.stashes.iter().find(|s| s.name == name).map(|s| s.what.clone()).unwrap_or_default();
+        cx.spawn_in(window, async move |_, cx| {
+            let title = format!("{name} · {what}");
+            let files = cx.background_spawn(async move { DiffFile::parse(&git::stash_patch(&root, &name)).map(with_languages).unwrap_or_default() }).await;
+            let _ = cx.update(|window, cx| show_diff_dialog(title, files, window, cx));
+        })
+        .detach();
+    }
+
+    fn drop_stash_dialog(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let what = self.stashes.iter().find(|s| s.name == name).map(|s| s.what.clone()).unwrap_or_default();
+        let this = cx.weak_entity();
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            let (this, name) = (this.clone(), name.clone());
+            dialog
+                .confirm()
+                .title(format!("Drop {name}?"))
+                .description(format!("{what}\n\nWhat it holds is gone for good."))
+                .ok_text("Drop")
+                .on_ok(move |_, window, cx| {
+                    let name = name.clone();
+                    let _ = this.update(cx, |this, cx| this.run_action("Stash", move |root| git::stash_drop(&root, &name), false, window, cx));
+                    true
+                })
+        });
     }
 
     /// The files as a folder tree; a folded folder hides what is under it.
@@ -5497,6 +5596,22 @@ pub fn status_glyph(status: &crate::agent::AgentStatus) -> Option<(&'static str,
 
 /// Highlights diffs with the editor's language table, which knows more
 /// (Kotlin aliases, XML, Gradle, properties) than the diff's own detection.
+/// A diff of its own in a dialog: a stash, two variants against each other.
+pub fn show_diff_dialog(title: String, files: Vec<DiffFile>, window: &mut Window, cx: &mut App) {
+    if files.is_empty() {
+        return window.push_notification(Notification::info(format!("{title}: nothing differs.")), cx);
+    }
+    let diff = cx.new(|cx| DiffState::new(files, cx).with_mode(DiffMode::Split));
+    let room = window.viewport_size();
+    let (width, height) = (room.width * 0.92, room.height * 0.72);
+    window.open_dialog(cx, move |dialog, _, _| {
+        let diff = diff.clone();
+        dialog.title(title.clone()).w(width).content(move |content, _, cx| {
+            content.child(div().h(height).child(Diff::new(&diff).line_number(true).code_font_size(crate::zoom::size(crate::zoom::Kind::Changes, cx))))
+        })
+    });
+}
+
 pub fn with_languages(files: Vec<DiffFile>) -> Vec<DiffFile> {
     files
         .into_iter()

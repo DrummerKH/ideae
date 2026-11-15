@@ -1416,7 +1416,7 @@ impl Workspace {
     /// What one variant has that another has not, in the files either
     /// changed: the two worktrees as they are, in a diff of its own.
     pub fn compare_variants(&mut self, ours: &Path, theirs: &Path, window: &mut Window, cx: &mut Context<Self>) {
-        use gpui_kit::component::diff::{Diff, DiffFile, DiffMode, DiffState};
+        use gpui_kit::component::diff::DiffFile;
         let name = |path: &Path| self.find(path).map(|(pi, ti)| letter(self.projects[pi].tasks[ti].variant)).unwrap_or_default();
         let (a, b) = (name(ours), name(theirs));
         let files: Vec<String> = [ours, theirs].iter().filter_map(|path| self.touched.get(*path)).flatten().cloned().collect::<std::collections::BTreeSet<_>>().into_iter().collect();
@@ -1428,29 +1428,14 @@ impl Workspace {
                     DiffFile::parse(&patch).map(task::with_languages).map_err(|error| error.to_string())
                 })
                 .await;
-            let _ = cx.update(|window, cx| {
-                let files = match found {
-                    Ok(files) if !files.is_empty() => files,
-                    Ok(_) => return window.push_notification(Notification::info(format!("{a} and {b} have the same in every file they changed.")), cx),
-                    Err(error) => return window.push_notification(Notification::error(error).title("Compare"), cx),
-                };
-                let count = files.len();
-                let diff = cx.new(|cx| DiffState::new(files, cx).with_mode(DiffMode::Split));
-                let room = window.viewport_size();
-                let (width, height) = (room.width * 0.92, room.height * 0.72);
-                window.open_dialog(cx, move |dialog, _, _| {
-                    let diff = diff.clone();
-                    dialog
-                        .title(format!("{a} ↔ {b}: {a} on the left, {b} on the right · {count} file{}", if count == 1 { "" } else { "s" }))
-                        .w(width)
-                        .content(move |content, _, cx| {
-                            content.child(
-                                div()
-                                    .h(height)
-                                    .child(Diff::new(&diff).line_number(true).code_font_size(crate::zoom::size(crate::zoom::Kind::Changes, cx))),
-                            )
-                        })
-                });
+            let _ = cx.update(|window, cx| match found {
+                Ok(files) if files.is_empty() => window.push_notification(Notification::info(format!("{a} and {b} have the same in every file they changed.")), cx),
+                Ok(files) => {
+                    let count = files.len();
+                    let title = format!("{a} ↔ {b}: {a} on the left, {b} on the right · {count} file{}", if count == 1 { "" } else { "s" });
+                    task::show_diff_dialog(title, files, window, cx)
+                }
+                Err(error) => window.push_notification(Notification::error(error).title("Compare"), cx),
             });
         })
         .detach();

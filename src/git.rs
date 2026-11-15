@@ -479,6 +479,8 @@ pub struct Known {
     history: Option<(HistoryKey, History)>,
     /// What the patches last given were made of.
     patches: Option<u64>,
+    /// The stashes, by the log they were listed from.
+    stashes: (Stamp, Vec<Stash>),
 }
 
 /// HEAD, the branch compared with, and the files its ref can be in.
@@ -549,6 +551,8 @@ pub struct Refreshed {
     pub base: Option<String>,
     /// None when they are the ones of the refresh before.
     pub patches: Option<Patches>,
+    /// Work put away, the latest first.
+    pub stashes: Vec<Stash>,
 }
 
 pub struct Patches {
@@ -558,6 +562,63 @@ pub struct Patches {
     pub branch: String,
     /// What is staged; asked for only when something is.
     pub staged: String,
+}
+
+/// Work put away with `git stash`. The repository has one list of it,
+/// whichever worktree it was put away in.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Stash {
+    /// `stash@{0}`.
+    pub name: String,
+    /// "On main: before the pull".
+    pub what: String,
+    /// "2 hours ago".
+    pub when: String,
+}
+
+pub fn stashes(root: &Path) -> Vec<Stash> {
+    let list = git(root, &["stash", "list", "--format=%gd%x1f%gs%x1f%cr"]).unwrap_or_default();
+    list.lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\x1f');
+            Some(Stash { name: parts.next()?.to_string(), what: parts.next()?.to_string(), when: parts.next()?.to_string() })
+        })
+        .collect()
+}
+
+/// Puts away everything not committed, files git does not know of too.
+pub fn stash(root: &Path, message: &str) -> Result<String, String> {
+    let mut args = vec!["stash", "push", "--include-untracked"];
+    if !message.is_empty() {
+        args.extend(["-m", message]);
+    }
+    run(root, "git", &args).map(|_| "Put away: it is under Stashes".to_string())
+}
+
+/// Brings a stash back into the worktree; with `drop` it leaves the list
+/// when that went without a conflict. On a conflict it stays.
+pub fn stash_apply(root: &Path, name: &str, drop: bool) -> Result<String, String> {
+    // Not tried when it would not go in: a stash applied halfway leaves its conflict in the files.
+    if let Some(files) = merge_conflicts(root, Some(&format!("{name}^1")), name).filter(|files| !files.is_empty()) {
+        return Err(format!("would conflict in {} (the stash is kept)", files.join(", ")));
+    }
+    run(root, "git", &["stash", "apply", name]).map_err(|error| {
+        let first = error.lines().find(|line| line.starts_with("error") || line.contains("CONFLICT")).unwrap_or(error.lines().next().unwrap_or_default());
+        format!("{first} (the stash is kept)")
+    })?;
+    if drop {
+        run(root, "git", &["stash", "drop", name])?;
+    }
+    Ok(format!("Brought back {name}"))
+}
+
+pub fn stash_drop(root: &Path, name: &str) -> Result<String, String> {
+    run(root, "git", &["stash", "drop", name]).map(|_| format!("Dropped {name}"))
+}
+
+/// What a stash holds, as a patch against the commit it was made on.
+pub fn stash_patch(root: &Path, name: &str) -> String {
+    git(root, &["stash", "show", "-p", "--include-untracked", name]).unwrap_or_default()
 }
 
 /// `picked`: the branch to compare with when not the one work starts from.
@@ -630,8 +691,15 @@ pub fn refresh(root: &Path, picked: Option<String>, light: bool, known: &mut Kno
     }
     let made_of = made_of.finish();
     let base = compared.filter(|_| history.fork.is_some());
+    // The log of the stash is there as long as something is stashed, and
+    // is written to whenever the list changes.
+    let log = stamp(&known.refs.as_ref().and_then(|refs| refs.parent()).map(|common| common.join("logs/refs/stash")).unwrap_or_default());
+    if known.stashes.0 != log {
+        known.stashes = (log, if log.is_some() { stashes(root) } else { Vec::new() });
+    }
+    let stashes = known.stashes.1.clone();
     if known.patches == Some(made_of) {
-        return Refreshed { files, watch, info, states, base, patches: None };
+        return Refreshed { files, watch, info, states, base, patches: None, stashes };
     }
     known.patches = Some(made_of);
 
@@ -654,7 +722,7 @@ pub fn refresh(root: &Path, picked: Option<String>, light: bool, known: &mut Kno
         info.pull_conflicts = known.pull.1.clone();
     }
     let staged = if states.values().any(|state| state.staged) { git(root, &["diff", "--cached"]).unwrap_or_default() } else { String::new() };
-    Refreshed { files, watch, info, states, base, patches: Some(Patches { working, branch, staged }) }
+    Refreshed { files, watch, info, states, base, patches: Some(Patches { working, branch, staged }), stashes }
 }
 
 /// The most changed files `git diff` is told by name. More, and naming
@@ -1075,16 +1143,23 @@ pub fn between(ours: &Path, theirs: &Path, files: &[String]) -> String {
 /// moves. What is not committed counts as it is on disk. None when git is
 /// too old to tell (before 2.38) or there is no upstream.
 pub fn pull_conflicts(root: &Path) -> Option<Vec<String>> {
+    merge_conflicts(root, None, "@{u}")
+}
+
+/// The same for any commit taken into the worktree; `base` is what both
+/// sides are compared with when it is not their common ancestor.
+fn merge_conflicts(root: &Path, base: Option<&str>, theirs: &str) -> Option<Vec<String>> {
     // A commit of the worktree as it is, kept nowhere; nothing when it is clean.
     // Git refuses to make one of some states of the index: then it is not known.
     let made = crate::procs::command("git").current_dir(root).args(["stash", "create"]).output().ok().filter(|made| made.status.success())?;
     let written = String::from_utf8_lossy(&made.stdout).trim().to_string();
     let mine = if written.is_empty() { "HEAD" } else { written.as_str() };
-    let merged = crate::procs::command("git")
-        .current_dir(root)
-        .args(["merge-tree", "--write-tree", "--name-only", "--no-messages", mine, "@{u}"])
-        .output()
-        .ok()?;
+    let mut merge = crate::procs::command("git");
+    merge.current_dir(root).args(["merge-tree", "--write-tree", "--name-only", "--no-messages"]);
+    if let Some(base) = base {
+        merge.args(["--merge-base", base]);
+    }
+    let merged = merge.args([mine, theirs]).output().ok()?;
     match merged.status.code() {
         Some(0) => Some(Vec::new()),
         // The tree it made, then the files it could not merge.
@@ -1200,7 +1275,7 @@ mod lock_tests {
 // They script repositories with bash, which Windows lacks or has as WSL's.
 #[cfg(all(test, unix))]
 mod pull_tests {
-    use super::{between, conflict_marked, hunks, pull_conflicts, pull_safe, working_patch};
+    use super::{between, conflict_marked, hunks, pull_conflicts, pull_safe, refresh, stash, stash_apply, stash_drop, stash_patch, working_patch, Known};
     use std::{path::Path, process::Command};
 
     fn sh(dir: &Path, script: &str) {
@@ -1274,6 +1349,38 @@ mod pull_tests {
         sh(&a, "git apply ../ab.patch");
         assert_eq!(std::fs::read_to_string(a.join("f.txt")).unwrap(), "one\ntwo\nthree\n");
         assert!(!a.join("gone.txt").exists() && std::fs::read_to_string(a.join("made.txt")).unwrap() == "new\n");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Work is put away, seen in the list and as a patch, and brought back;
+    /// one that would not go back in without a conflict stays in the list.
+    #[test]
+    fn work_is_put_away_and_brought_back() {
+        let base = setup("stash");
+        let b = base.join("b");
+        assert!(refresh(&b, None, false, &mut Known::default()).stashes.is_empty());
+        sh(&b, "printf 'one\\nTWO\\nthree\\n' > f.txt; echo note > new.txt");
+        stash(&b, "before lunch").unwrap();
+        assert_eq!(std::fs::read_to_string(b.join("f.txt")).unwrap(), "one\ntwo\nthree\n");
+        assert!(!b.join("new.txt").exists(), "the file git did not know of went with it");
+        let listed = refresh(&b, None, false, &mut Known::default()).stashes;
+        assert_eq!(listed.iter().map(|s| (s.name.as_str(), s.what.as_str())).collect::<Vec<_>>(), [("stash@{0}", "On main: before lunch")]);
+        let patch = stash_patch(&b, "stash@{0}");
+        assert!(patch.contains("+TWO") && patch.contains("new.txt"), "{patch}");
+        // The line it changed is changed again and committed: it cannot simply go back.
+        sh(&b, "printf 'one\\n2\\nthree\\n' > f.txt; git commit -qam two");
+        let refused = stash_apply(&b, "stash@{0}", true).unwrap_err();
+        assert!(refused.ends_with("(the stash is kept)"), "{refused}");
+        assert_eq!(refresh(&b, None, false, &mut Known::default()).stashes.len(), 1);
+        assert!(refused.starts_with("would conflict in f.txt"), "{refused}");
+        assert_eq!(std::fs::read_to_string(b.join("f.txt")).unwrap(), "one\n2\nthree\n", "and nothing was touched");
+        sh(&b, "git reset -q --hard HEAD~1");
+        stash_apply(&b, "stash@{0}", true).unwrap();
+        assert_eq!(std::fs::read_to_string(b.join("f.txt")).unwrap(), "one\nTWO\nthree\n");
+        assert!(b.join("new.txt").exists() && refresh(&b, None, false, &mut Known::default()).stashes.is_empty(), "back, and off the list");
+        stash(&b, "").unwrap();
+        stash_drop(&b, "stash@{0}").unwrap();
+        assert!(refresh(&b, None, false, &mut Known::default()).stashes.is_empty());
         let _ = std::fs::remove_dir_all(&base);
     }
 
