@@ -214,8 +214,12 @@ impl Finder {
                 let query_owner = finder.clone();
                 let confirm_owner = finder.clone();
                 if kind == FinderKind::Grep {
+                    // A height, not just a minimum: with an empty list the
+                    // minimum let the options row hang below the dialog, where
+                    // a click went to the backdrop and closed it.
+                    palette = palette.h(px(488.));
                     let options = finder.clone();
-                    palette = palette.header(move |_, _, cx| {
+                    palette = palette.footer(move |_, _, cx| {
                         let f = options.read(cx);
                         let (regex, mask) = (f.regex, f.mask.clone());
                         let toggle = options.clone();
@@ -223,7 +227,7 @@ impl Finder {
                             .gap_2()
                             .px_3()
                             .py_1p5()
-                            .border_b_1()
+                            .border_t_1()
                             .border_color(cx.theme().border)
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
