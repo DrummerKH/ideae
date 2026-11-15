@@ -18,6 +18,8 @@ pub enum Kind {
     Editor,
     Daemon,
     Agent,
+    /// What an agent started that analyzes code: Claude Code's LSP plugins.
+    AgentLanguageServer,
     Terminal,
     LanguageServer,
     Browser,
@@ -30,6 +32,7 @@ impl Kind {
             Kind::Editor => "editor",
             Kind::Daemon => "daemon",
             Kind::Agent => "agents",
+            Kind::AgentLanguageServer => "agents' language servers",
             Kind::Terminal => "terminals",
             Kind::LanguageServer => "language servers",
             Kind::Browser => "browser",
@@ -43,8 +46,11 @@ pub struct Proc {
     pub pid: i32,
     pub depth: usize,
     pub name: String,
-    /// The task a terminal session belongs to (its worktree's name).
+    /// The task a terminal session belongs to (its worktree's name), on the
+    /// session's first row.
     pub task: Option<String>,
+    /// The task it runs for, on every row of the session.
+    owner: Option<String>,
     pub kind: Kind,
     /// The app's child this process descends from (itself for those).
     top: i32,
@@ -60,8 +66,12 @@ pub struct Snapshot {
     /// The app's tree, parents before children.
     pub procs: Vec<Proc>,
     pub by_kind: Vec<(Kind, usize, f32, u64)>,
+    /// Per task: its terminals, agent and what they started.
+    pub by_task: Vec<(String, f32, u64)>,
     pub app_cpu: f32,
     pub app_mem: u64,
+    /// The app itself: the window, its daemon, its language servers, Chrome.
+    pub own_mem: u64,
 }
 
 #[cfg(target_os = "linux")]
@@ -176,12 +186,27 @@ impl Sampler {
             roots.push((d, 0));
         }
         if let Some(socket) = &socket {
-            let mut sessions: Vec<i32> = all
+            let candidates: std::collections::HashSet<i32> = all
                 .iter()
                 .filter(|(pid, raw)| raw.sid == **pid && raw.ppid != me && Some(**pid) != daemon)
                 .filter(|(pid, _)| session_env(**pid).2.as_deref() == Some(socket.as_str()))
                 .map(|(pid, _)| *pid)
                 .collect();
+            // A session of its own only when nothing of ours is above it: an
+            // agent's background shell (setsid) inherits the socket too, and
+            // the daemon's sessions show under the daemon.
+            let ours_above = |pid: i32| {
+                let mut at = all.get(&pid).map(|r| r.ppid);
+                for _ in 0..64 {
+                    match at {
+                        Some(p) if p == me || Some(p) == daemon || candidates.contains(&p) => return true,
+                        Some(p) if p > 1 => at = all.get(&p).map(|r| r.ppid),
+                        _ => return false,
+                    }
+                }
+                false
+            };
+            let mut sessions: Vec<i32> = candidates.iter().copied().filter(|&pid| !ours_above(pid)).collect();
             sessions.sort();
             roots.extend(sessions.into_iter().map(|pid| (pid, 1)));
         }
@@ -191,7 +216,10 @@ impl Sampler {
         while let Some((pid, depth, inherited, task, top)) = stack.pop() {
             let top = if depth == 1 { pid } else { top };
             let Some(raw) = all.get(&pid) else { continue };
-            let session_root = root_pids.contains(&pid) && pid != me && Some(pid) != daemon;
+            // A terminal session: one we found on its own, or a session the
+            // app or its daemon started.
+            let session_root = (root_pids.contains(&pid) && pid != me && Some(pid) != daemon)
+                || (raw.sid == pid && daemon.is_some_and(|d| raw.ppid == d));
             let kind = if pid == me {
                 Kind::Editor
             } else if Some(pid) == daemon {
@@ -200,6 +228,8 @@ impl Sampler {
                 Kind::Terminal
             } else if raw.name == "claude" {
                 Kind::Agent
+            } else if matches!(inherited, Kind::Agent | Kind::AgentLanguageServer) && is_language_server(&raw.name) {
+                Kind::AgentLanguageServer
             } else if raw.ppid == me {
                 // The app's own children: terminal shells lead a session,
                 // language servers and Chrome do not.
@@ -234,6 +264,7 @@ impl Sampler {
                 depth,
                 name: raw.name.clone(),
                 task: if leader { task.clone() } else { None },
+                owner: task.clone(),
                 kind,
                 top,
                 cpu,
@@ -241,7 +272,7 @@ impl Sampler {
             });
             if let Some(kids) = children.get(&pid) {
                 // Reversed, so the stack pops them in pid order. Sessions
-                // are roots of their own, under the daemon's row.
+                // found on their own are roots, under the daemon's row.
                 for &kid in kids.iter().rev().filter(|k| !root_pids.contains(k)) {
                     stack.push((kid, depth + 1, kind, task.clone(), top));
                 }
@@ -249,12 +280,27 @@ impl Sampler {
         }
         self.ticks = ticks;
 
+        let mut tasks: HashMap<String, (f32, u64)> = HashMap::new();
+        for p in &snap.procs {
+            if let Some(task) = &p.owner {
+                let e = tasks.entry(task.clone()).or_default();
+                e.0 += p.cpu;
+                e.1 += p.mem;
+            }
+            if matches!(p.kind, Kind::Editor | Kind::Daemon | Kind::LanguageServer | Kind::Browser) && p.owner.is_none() {
+                snap.own_mem += p.mem;
+            }
+        }
+        let mut by_task: Vec<_> = tasks.into_iter().map(|(t, (c, m))| (t, c, m)).collect();
+        by_task.sort_by(|a, b| b.2.cmp(&a.2));
+        snap.by_task = by_task;
+
         let mut kinds: HashMap<Kind, (usize, f32, u64)> = HashMap::new();
-        // Agents count once per terminal session, not per process they run.
-        let mut agent_sessions = std::collections::HashSet::new();
+        // Agents count once per task, not per process or session they run.
+        let mut agent_tasks = std::collections::HashSet::new();
         for p in &snap.procs {
             let e = kinds.entry(p.kind).or_default();
-            if p.kind != Kind::Agent || agent_sessions.insert(p.top) {
+            if p.kind != Kind::Agent || agent_tasks.insert(p.owner.clone().unwrap_or_else(|| p.top.to_string())) {
                 e.0 += 1;
             }
             e.1 += p.cpu;
@@ -267,6 +313,16 @@ impl Sampler {
         snap.by_kind = by_kind;
         snap
     }
+}
+
+/// Language servers by their process names, as Claude Code's LSP plugins
+/// start them.
+fn is_language_server(name: &str) -> bool {
+    const NAMES: [&str; 12] = [
+        "rust-analyzer", "gopls", "clangd", "pyright", "jdtls", "intellij-server",
+        "kotlin-lsp", "typescript-lan", "tsserver", "vtsls", "lua-language-se", "solargraph",
+    ];
+    NAMES.iter().any(|n| name.starts_with(n)) || name.contains("language-server") || name.ends_with("-lsp")
 }
 
 #[cfg(target_os = "linux")]
@@ -377,7 +433,11 @@ impl SysMon {
             .child("RAM")
             .child(bar(mem_pct, cx))
             .child(div().w(px(26.)).child(format!("{mem_pct:.0}%")))
-            .child(div().pl_1().child(format!("ideae {} · {:.0}%", bytes(s.app_mem), s.app_cpu)))
+            .child(div().pl_1().child(format!(
+                "ideae {} · tasks {}",
+                bytes(s.own_mem),
+                bytes(s.app_mem.saturating_sub(s.own_mem))
+            )))
             .tooltip(move |_, cx| {
                 let mon = tip.clone();
                 cx.new(|cx| SysTooltip::new(mon, cx)).into()
@@ -429,13 +489,18 @@ impl Render for SysTooltip {
                 v_flex()
                     .child(format!("CPU {:.0}% of {} cores", s.cpu, std::thread::available_parallelism().map_or(1, |n| n.get())))
                     .child(format!("RAM {} of {} ({mem_pct:.0}%)", bytes(s.mem_used), bytes(s.mem_total)))
-                    .child(format!("ideae with everything it started: {} · {:.1}% CPU", bytes(s.app_mem), s.app_cpu)),
+                    .child(format!("ideae with everything it started: {} · {:.1}% CPU", bytes(s.app_mem), s.app_cpu))
+                    .child(format!("ideae itself (window, daemon, its language servers, browser): {}", bytes(s.own_mem))),
             )
             .child(div().text_color(muted).child("BY TYPE"))
             .child(v_flex().children(s.by_kind.iter().map(|&(kind, n, cpu, mem)| {
                 let label = if kind == Kind::Agent { format!("{} ({n})", kind.label()) } else { kind.label().to_string() };
                 row(div().child(label).into_any_element(), mem, cpu)
             })))
+            .when(!s.by_task.is_empty(), |el| {
+                el.child(div().text_color(muted).child("BY TASK"))
+                    .child(v_flex().children(s.by_task.iter().map(|(task, cpu, mem)| row(div().child(task.clone()).into_any_element(), *mem, *cpu))))
+            })
             .child(div().text_color(muted).child("PROCESSES"))
             .child(
                 v_flex().font_family(cx.theme().mono_font_family.clone()).children(s.procs.iter().take(TREE_ROWS).map(|p| {
