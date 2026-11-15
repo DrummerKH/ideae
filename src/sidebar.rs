@@ -305,9 +305,16 @@ impl Workspace {
         // Second line: when it was last busy, and where (the project in the
         // inbox, the branch when the title is not it).
         let mut details: Vec<String> = Vec::new();
+        // A working agent's latest step says more than when it last moved.
+        let activity = t.view.as_ref().and_then(|v| {
+            let v = v.read(cx);
+            (v.agent_status == AgentStatus::Working).then(|| v.agent_activity.clone()).flatten()
+        });
         let when = ago(t.last_active);
-        if !when.is_empty() {
-            details.push(when);
+        match activity {
+            Some(activity) => details.push(activity),
+            None if !when.is_empty() => details.push(when),
+            None => {}
         }
         if in_active {
             details.push(project.name.clone());

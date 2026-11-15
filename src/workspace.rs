@@ -1027,7 +1027,14 @@ impl Workspace {
         let label = format!("{} · {}", self.projects[pi].name, entry.label());
         let seen = self.active.as_deref() == Some(event.task.as_path()) && window.is_window_active();
         let was = view.read(cx).agent_status.clone();
-        view.update(cx, |t, cx| t.set_agent_status(status.clone(), seen, cx));
+        view.update(cx, |t, cx| {
+            t.set_agent_status(status.clone(), seen, cx);
+            match event.event.as_str() {
+                "PreToolUse" => t.agent_activity = event.message.clone(),
+                "UserPromptSubmit" => t.agent_activity = Some("Thinking".into()),
+                _ => {}
+            }
+        });
         self.projects[pi].tasks[ti].last_active = state::now();
         if status.is_attention() && !seen && status != was && !event.replayed && state::settings().notifications {
             let body = match &status {

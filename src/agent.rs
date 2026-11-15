@@ -278,6 +278,34 @@ fn shell_quote(s: &str) -> String {
     if cfg!(windows) { format!("'{}'", s.replace('\'', "''")) } else { format!("'{}'", s.replace('\'', r"'\''")) }
 }
 
+/// "Editing task.rs", "Running cargo test": a tool call in a few words.
+pub fn activity(payload: &Value) -> Option<String> {
+    let tool = payload["tool_name"].as_str()?;
+    let input = &payload["tool_input"];
+    let file = |key: &str| {
+        input[key].as_str().map(|p| Path::new(p).file_name().map_or(p.to_string(), |n| n.to_string_lossy().into_owned()))
+    };
+    let short = |s: &str, n: usize| {
+        let s = s.lines().next().unwrap_or_default().trim();
+        if s.chars().count() > n { format!("{}…", s.chars().take(n).collect::<String>()) } else { s.to_string() }
+    };
+    Some(match tool {
+        "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => format!("Editing {}", file("file_path").or_else(|| file("notebook_path"))?),
+        "Read" => format!("Reading {}", file("file_path")?),
+        "Bash" => match input["description"].as_str().filter(|d| !d.is_empty()) {
+            Some(description) => short(description, 60),
+            None => format!("Running {}", short(input["command"].as_str()?, 50)),
+        },
+        "Grep" => format!("Searching \"{}\"", short(input["pattern"].as_str()?, 40)),
+        "Glob" => format!("Finding {}", short(input["pattern"].as_str()?, 40)),
+        "WebFetch" | "WebSearch" => "Browsing the web".into(),
+        "Task" | "Agent" => format!("Delegating: {}", short(input["description"].as_str().unwrap_or("a subtask"), 50)),
+        "TodoWrite" => "Planning".into(),
+        other if other.starts_with("mcp__") => format!("Using {}", other.trim_start_matches("mcp__").replace("__", " ")),
+        other => format!("Using {other}"),
+    })
+}
+
 /// `ideae --hook <Event>`: run by Claude Code, forwards the event and exits.
 /// It must never block or fail the agent, so every error is swallowed.
 pub fn run_hook(event: &str) {
@@ -287,10 +315,15 @@ pub fn run_hook(event: &str) {
     let (Some(socket), Some(task)) = (std::env::var(SOCK_ENV).ok(), std::env::var(TASK_ENV).ok()) else {
         return;
     };
+    // Before a tool runs the message says what the agent is doing.
+    let message = match event {
+        "PreToolUse" => activity(&payload),
+        _ => payload["message"].as_str().map(str::to_string),
+    };
     let line = json!({
         "task": task,
         "event": event,
-        "message": payload["message"].as_str(),
+        "message": message,
         "kind": payload["notification_type"].as_str(),
     });
     #[cfg(unix)]
@@ -331,6 +364,16 @@ mod tests {
             send(&format!("{addr}/{}", "0".repeat(32)), r#"{"task":"/w/t","event":"Stop"}"#);
             assert!(rx.recv_timeout(Duration::from_millis(500)).is_err(), "a wrong token got through");
         }
+    }
+
+    #[test]
+    fn activities() {
+        let a = |v: Value| activity(&v);
+        assert_eq!(a(json!({"tool_name":"Edit","tool_input":{"file_path":"/x/src/task.rs"}})).as_deref(), Some("Editing task.rs"));
+        assert_eq!(a(json!({"tool_name":"Bash","tool_input":{"command":"cargo test --all","description":""}})).as_deref(), Some("Running cargo test --all"));
+        assert_eq!(a(json!({"tool_name":"Bash","tool_input":{"command":"x","description":"Build the app"}})).as_deref(), Some("Build the app"));
+        assert_eq!(a(json!({"tool_name":"Grep","tool_input":{"pattern":"fn main"}})).as_deref(), Some("Searching \"fn main\""));
+        assert_eq!(a(json!({"tool_name":"mcp__github__get_issue","tool_input":{}})).as_deref(), Some("Using github get_issue"));
     }
 
     #[test]

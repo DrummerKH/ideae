@@ -1150,6 +1150,8 @@ pub struct TaskView {
     pub root: PathBuf,
     pub branch: SharedString,
     pub agent_status: crate::agent::AgentStatus,
+    /// What the working agent does now: its latest tool call, in words.
+    pub agent_activity: Option<String>,
     hook_socket: Option<String>,
     /// Numbers terminals so each has a unique element id and default title.
     terminal_seq: usize,
@@ -1325,6 +1327,7 @@ impl TaskView {
             root,
             branch: branch.into(),
             agent_status: crate::agent::AgentStatus::Unknown,
+            agent_activity: None,
             hook_socket,
             terminal_seq: 1,
             unseen: false,
@@ -2014,6 +2017,9 @@ impl TaskView {
 
     pub fn set_agent_status(&mut self, status: crate::agent::AgentStatus, seen: bool, cx: &mut Context<Self>) {
         self.unseen = status.is_attention() && !seen;
+        if status != crate::agent::AgentStatus::Working {
+            self.agent_activity = None;
+        }
         self.agent_status = status;
         cx.emit(TaskEvent::Changed);
         cx.notify();
