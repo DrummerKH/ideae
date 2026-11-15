@@ -30,7 +30,8 @@ Windows build exists and is being tried out (see [Windows](#windows)).
   implementations (LSP when the language server is installed, else a
   search-based fallback; a missing server can be installed from the editor
   header into `~/.local/share/ideae/lsp`), file structure, blame of the cursor
-  line, syntax-aware selection, autosave when you leave a file.
+  line, syntax-aware selection, autosave when you leave a file. Markdown
+  has a Preview in its header.
 - **Git.** Changes with stage/unstage/discard, commit, push, PR (`gh`), the
   branch against its base, history, safe pull.
 - **Terminals.** Built on libghostty-vt. Ctrl+click on paths, `file:line`,

@@ -341,6 +341,8 @@ pub struct FileView {
     lsp_program: String,
     /// The server this file would have if it were installed.
     lsp_missing: Option<&'static str>,
+    /// Markdown shown as it reads instead of its source.
+    preview: bool,
     _poll: Task<()>,
 }
 
@@ -551,6 +553,34 @@ impl FileView {
         self.lsp_client.as_ref().is_some_and(|c| c.busy().is_some())
     }
 
+    fn is_markdown(&self) -> bool {
+        self.path.extension().and_then(|e| e.to_str()).is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "md" | "markdown" | "mdx"))
+    }
+
+    /// The text as it is in the editor, unsaved edits too, drawn as
+    /// Markdown. A link to another file of the worktree opens it here.
+    fn render_preview(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use gpui_kit::component::text::TextView;
+        let (task, dir) = (self.task.clone(), self.path.parent().map(PathBuf::from).unwrap_or_default());
+        div().id("markdown-preview").flex_1().min_h_0().bg(cx.theme().background).child(
+            TextView::markdown("markdown", self.editor.read(cx).value())
+                .scrollable(true)
+                .selectable(true)
+                .on_link_click(move |link, _, window, cx| {
+                    let (target, _) = link.split_once('#').unwrap_or((link.as_ref(), ""));
+                    let file = dir.join(target);
+                    if !target.is_empty() && !target.contains("://") && file.is_file() {
+                        let _ = task.update(cx, |t, cx| t.open_file(file, 0, window, cx));
+                    } else if link.contains("://") {
+                        cx.open_url(link);
+                    }
+                })
+                .size_full()
+                .px_6()
+                .py_4(),
+        )
+    }
+
     fn status_text(&self) -> String {
         let busy = self.lsp_client.as_ref().and_then(|c| c.busy());
         match (self.lsp_program.is_empty(), self.lsp_ok, busy) {
@@ -588,6 +618,23 @@ impl Render for FileView {
                             .child(self.path.strip_prefix(&self.root).unwrap_or(&self.path).display().to_string()),
                     )
                     .children(self.render_blame(cx))
+                    .when(self.is_markdown(), |header| {
+                        header.child(
+                            Button::new("preview")
+                                .xsmall()
+                                .ghost()
+                                .label("Preview")
+                                .selected(self.preview)
+                                .tooltip("The Markdown as it reads, or its source")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.preview = !this.preview;
+                                    if !this.preview {
+                                        this.editor.read(cx).focus_handle(cx).focus(window, cx);
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    })
                     .when(!crate::ide::installed().is_empty(), |header| {
                         let path = self.path.clone();
                         let line = self.cursor_line + 1;
@@ -663,7 +710,8 @@ impl Render for FileView {
             .when_some(self.error.clone(), |this, error| {
                 this.child(div().px_3().py_1().text_xs().text_color(gpui_kit::red()).child(error))
             })
-            .child(
+            .when(self.preview, |this| this.child(self.render_preview(cx)))
+            .when(!self.preview, |this| this.child(
                 div().relative().flex_1().min_h_0().child(crate::zoom::wheel(crate::zoom::Kind::Editor)).child(
                     Editor::new(&self.editor)
                         // Replaces the built-in menu, so its items are listed again.
@@ -689,7 +737,7 @@ impl Render for FileView {
                         .font_family(cx.theme().mono_font_family.clone())
                         .text_size(crate::zoom::size(crate::zoom::Kind::Editor, cx)),
                 ),
-            )
+            ))
     }
 }
 
@@ -3248,6 +3296,7 @@ impl TaskView {
             lsp_client: None,
             lsp_program: String::new(),
             lsp_missing: None,
+            preview: false,
             // Re-render while the server reports progress, so the header can
             // say "indexing" instead of a misleading "ready".
             _poll: cx.spawn(async move |this: WeakEntity<FileView>, cx| {
