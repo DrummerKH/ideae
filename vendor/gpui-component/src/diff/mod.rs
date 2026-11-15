@@ -573,7 +573,12 @@ fn render_diff(
             props.header_visible
                 && !(matches!(row, DisplayRow::File(_)) && top.offset_in_item <= px(0.))
         })
-        .map(|row| render_file_header(row.file(), true, &code, window, cx));
+        .map(|row| {
+            // This runs inside the state's own update, where the header
+            // cannot read the state for itself.
+            let collapsed = state.is_file_collapsed(state.files()[row.file()].path());
+            render_file_header(row.file(), Some(collapsed), &code, window, cx)
+        });
     let label = match state.files() {
         [file] => t!("Diff.Viewer", name = file.path().as_str()).to_string(),
         files => t!("Diff.ViewerFiles", count = files.len()).to_string(),
@@ -916,7 +921,7 @@ fn render_row(
     cx: &mut App,
 ) -> AnyElement {
     match row {
-        DisplayRow::File(file) => render_file_header(*file, false, &code, window, cx),
+        DisplayRow::File(file) => render_file_header(*file, None, &code, window, cx),
         DisplayRow::Notice(file) => render_notice(&code.files[*file], cx),
         DisplayRow::Hunk { file, hunk } => render_hunk_separator(*file, *hunk, &code, cx),
         DisplayRow::Fold { file, pairs } => render_fold(*file, pairs.clone(), &code, cx),
@@ -1160,7 +1165,9 @@ fn conflict_tint(part: Option<ConflictPart>, cx: &App) -> Hsla {
 
 fn render_file_header(
     file: usize,
-    sticky: bool,
+    // ideae patch: for the header that sticks to the top, whether its file
+    // is collapsed.
+    sticky: Option<bool>,
     code: &CodePresentation,
     window: &mut Window,
     cx: &mut App,
@@ -1173,7 +1180,10 @@ fn render_file_header(
     let document = &code.files[file];
     let foreground = cx.theme().muted_foreground;
     let border = cx.theme().border;
-    let collapsed = code.state.read(cx).is_file_collapsed(document.path());
+    let (sticky, collapsed) = match sticky {
+        Some(collapsed) => (true, collapsed),
+        None => (false, code.state.read(cx).is_file_collapsed(document.path())),
+    };
     let content = if let Some(render) = &code.header.content {
         render(document, window, cx)
     } else {
