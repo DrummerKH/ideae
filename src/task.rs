@@ -1357,6 +1357,8 @@ pub struct ChangesView {
     /// The single changes of the diff shown: each can be taken back or
     /// staged without the rest of its file.
     hunks: Rc<Vec<git::Hunk>>,
+    /// Those of them that are staged, by file and lines.
+    staged: Rc<HashSet<(String, String)>>,
     selection: Option<DiffLineRange>,
     task: WeakEntity<TaskView>,
     /// The branches to compare with, for the menu: listed off the UI thread.
@@ -1407,6 +1409,7 @@ impl ChangesView {
             selected_code: String::new(),
             branches,
             hunks: Rc::default(),
+            staged: Rc::default(),
         }
     }
 
@@ -1735,6 +1738,7 @@ impl Render for ChangesView {
                     let add_view = cx.weak_entity();
                     // Under each change, what can be done with it alone.
                     let (hunks, task, staging) = (self.hunks.clone(), self.task.clone(), self.scope == DiffScope::Uncommitted);
+                    let in_index = self.staged.clone();
                     let hunk_notes = hunks.iter().enumerate().map(|(i, h)| {
                         let side = if h.modified { DiffSide::Modified } else { DiffSide::Original };
                         DiffAnnotation::line(("hunk", i), DiffLinePosition::new(h.path.clone(), side, h.line as usize))
@@ -1775,9 +1779,11 @@ impl Render for ChangesView {
                                                 }),
                                         )
                                         .when(staging, |row| {
-                                            row.child(Button::new(("hunk-stage", i)).xsmall().ghost().label("+ stage").tooltip("Stage this change alone").on_click(
+                                            let is_staged = in_index.contains(&(staged.path.clone(), staged.changes.clone()));
+                                            let (label, tip) = if is_staged { ("− unstage", "Take this change out of what is staged") } else { ("+ stage", "Stage this change alone") };
+                                            row.child(Button::new(("hunk-stage", i)).xsmall().ghost().label(label).tooltip(tip).on_click(
                                                 move |_, window, cx| {
-                                                    let _ = stage.update(cx, |t, cx| t.stage_hunk(staged.clone(), window, cx));
+                                                    let _ = stage.update(cx, |t, cx| t.stage_hunk(staged.clone(), !is_staged, window, cx));
                                                 },
                                             ))
                                         })
@@ -2188,7 +2194,7 @@ impl TaskView {
                 let root = poll_root.clone();
                 let picked = poll_base.lock().unwrap().clone();
                 let Ok((open, open_known)) = this.update(cx, |this, cx| this.open_files_known(cx)) else { break };
-                let (read, patch, branch, on_disk, now_seen, now_known) = cx
+                let (read, patch, branch, staged, on_disk, now_seen, now_known) = cx
                     .background_spawn(async move {
                         let read = git::refresh(&root, picked, &mut known);
                         // Nothing committed on the branch yet: one patch, parsed once.
@@ -2201,7 +2207,8 @@ impl TaskView {
                             }
                             _ => parse_patch(read.branch.clone(), &mut seen.1),
                         };
-                        (read, patch, branch, changed_on_disk(open_known), seen, known)
+                        let staged: HashSet<(String, String)> = git::hunks(&read.staged).into_iter().map(|hunk| (hunk.path, hunk.changes)).collect();
+                        (read, patch, branch, staged, changed_on_disk(open_known), seen, known)
                     })
                     .await;
                 let git::Refreshed { files, watch, info, states, base, .. } = read;
@@ -2219,6 +2226,12 @@ impl TaskView {
                     }
                     if let Some(patch) = patch {
                         this.apply_patch(patch, cx);
+                    }
+                    if this.changes.read(cx).staged.as_ref() != &staged {
+                        this.changes.update(cx, |changes, cx| {
+                            changes.staged = Rc::new(staged);
+                            cx.notify();
+                        });
                     }
                     this.apply_branch_patch(base, branch, cx);
                     this.apply_files(files, cx);
@@ -5006,10 +5019,13 @@ impl TaskView {
         self.discard_undo = Some(kept);
     }
 
-    fn stage_hunk(&mut self, hunk: git::Hunk, window: &mut Window, cx: &mut Context<Self>) {
+    fn stage_hunk(&mut self, hunk: git::Hunk, stage: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.run_action(
-            "Stage",
-            move |root| git::apply_hunk(&root, &hunk.stage, false, true).map(|_| format!("Staged a change of {}", hunk.path)),
+            if stage { "Stage" } else { "Unstage" },
+            move |root| {
+                let done = if stage { "Staged" } else { "Unstaged" };
+                git::stage_change(&root, &hunk, stage).map(|_| format!("{done} a change of {}", hunk.path))
+            },
             false,
             window,
             cx,
