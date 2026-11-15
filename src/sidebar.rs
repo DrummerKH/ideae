@@ -11,10 +11,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::{prelude::FluentBuilder as _, *};
 
-use crate::{agent::AgentStatus, state, task, workspace::Workspace};
-
-/// How long a task stays under Active after it was last in view.
-const ACTIVE_WINDOW: u64 = 24 * 3600;
+use crate::{agent::AgentStatus, task, workspace::Workspace};
 
 #[derive(Clone)]
 pub enum DraggedRow {
@@ -59,11 +56,11 @@ impl Workspace {
             .border_r_1()
             .border_color(cx.theme().border);
 
-        let active = self.active_rows();
+        let active = self.active_rows(cx);
         if !active.is_empty() {
             let collapsed = self.active_collapsed;
             list = list.child(
-                section_header(if collapsed { "▸ ACTIVE" } else { "▾ ACTIVE" }, cx)
+                section_header(if collapsed { "▸ NEEDS YOU" } else { "▾ NEEDS YOU" }, cx)
                     .id("active-header")
                     .cursor_pointer()
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -126,22 +123,22 @@ impl Workspace {
         )
     }
 
-    /// Starred tasks, running ones and those in view within the last day;
-    /// starred first, then the most recent.
-    fn active_rows(&self) -> Vec<(usize, usize)> {
-        let since = state::now().saturating_sub(ACTIVE_WINDOW);
+    /// Tasks whose agent waits for an answer or finished while out of view:
+    /// an inbox, empty most of the time, most recent first.
+    fn active_rows(&self, cx: &App) -> Vec<(usize, usize)> {
         let mut rows: Vec<(usize, usize)> = Vec::new();
         for (pi, p) in self.projects.iter().enumerate() {
             for (ti, t) in p.tasks.iter().enumerate() {
-                if t.starred || t.view.is_some() || t.last_active >= since {
+                let waiting = t.view.as_ref().is_some_and(|v| {
+                    let v = v.read(cx);
+                    v.unseen || matches!(v.agent_status, AgentStatus::NeedsInput(_))
+                });
+                if waiting && self.active.as_deref() != Some(t.path.as_path()) {
                     rows.push((pi, ti));
                 }
             }
         }
-        rows.sort_by_key(|&(pi, ti)| {
-            let t = &self.projects[pi].tasks[ti];
-            (!t.starred, std::cmp::Reverse(t.last_active))
-        });
+        rows.sort_by_key(|&(pi, ti)| std::cmp::Reverse(self.projects[pi].tasks[ti].last_active));
         rows
     }
 
@@ -235,12 +232,10 @@ impl Workspace {
         };
         let agent_title = agent_title.filter(|s| !s.is_empty());
         let muted = cx.theme().muted_foreground;
-        let subtitle = match (in_active, t.main || t.title.is_empty()) {
-            (true, true) => Some(project.name.clone()),
-            (true, false) => Some(format!("{} · {}", project.name, t.branch)),
-            (false, true) => None,
-            (false, false) => Some(t.branch.clone()),
-        };
+        // Inbox rows are one line, with the project in place of the details.
+        let subtitle = (!in_active && !t.main && !t.title.is_empty()).then(|| t.branch.clone());
+        let project_name = in_active.then(|| project.name.clone());
+        let (needs, agent_title) = if in_active { (None, None) } else { (needs, agent_title) };
 
         let this = cx.weak_entity();
         let (starred, main) = (t.starred, t.main);
@@ -298,6 +293,9 @@ impl Workspace {
                             .when(!running, |s| s.text_color(muted))
                             .child(label.clone()),
                     )
+                    .when_some(project_name, |s, name| {
+                        s.child(div().flex_none().max_w(px(90.)).truncate().text_xs().text_color(muted).child(name))
+                    })
                     .when(t.starred, |s| s.child(div().flex_none().text_xs().text_color(muted).child("★")))
                     .when(t.locked.is_some(), |s| s.child(div().flex_none().text_xs().text_color(muted).child("locked")))
                     .when(changes > 0, |s| s.child(div().flex_none().text_xs().text_color(muted).child(changes.to_string())))
