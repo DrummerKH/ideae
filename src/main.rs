@@ -8,6 +8,7 @@ mod history;
 mod ide;
 mod lsp;
 mod naming;
+mod procs;
 mod search;
 mod sidebar;
 mod state;
@@ -346,6 +347,7 @@ fn main() {
         }
     }
     desktop::refresh_entry();
+    procs::catch_quit_signals();
 
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
@@ -398,5 +400,16 @@ fn main() {
             })
             .expect("failed to open window");
             cx.activate(true);
+            // A quit signal (logout, kill) goes the same way as Exit.
+            cx.spawn(async move |cx| {
+                loop {
+                    cx.background_executor().timer(std::time::Duration::from_millis(200)).await;
+                    if procs::quit_requested() {
+                        let _ = cx.update(|cx| cx.quit());
+                        break;
+                    }
+                }
+            })
+            .detach();
         });
 }

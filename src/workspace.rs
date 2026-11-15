@@ -136,8 +136,14 @@ impl Workspace {
                     view.update(cx, |t, cx| t.set_terminal_colors(&colors, cx));
                 }
             }),
+            // Terminals end their whole session (the agent and whatever it
+            // started in the background); nothing of a task outlives the app.
             cx.on_app_quit(|this: &mut Self, cx| {
                 this.save(cx);
+                for view in this.views() {
+                    view.update(cx, |t, cx| t.shut_down(cx));
+                }
+                crate::procs::end_child_sessions();
                 async {}
             }),
         ];
@@ -210,7 +216,6 @@ impl Workspace {
                 }
             });
         }
-        this.last_saved = this.serialize(cx);
         this
     }
 

@@ -202,12 +202,18 @@ impl LspClient {
     /// Starts the server; initialization runs on its own thread, and every
     /// call waits for it.
     pub fn spawn(program: &str, args: &[&str], root: &Path) -> Result<Arc<Self>> {
-        let mut child = Command::new(program)
-            .args(args)
-            .current_dir(root)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+        let mut command = Command::new(program);
+        command.args(args).current_dir(root).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+        // Dies with the app even when it exits without running destructors.
+        // SAFETY: prctl only sets a flag of the child.
+        unsafe {
+            use std::os::unix::process::CommandExt as _;
+            command.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                Ok(())
+            });
+        }
+        let mut child = command
             .spawn()
             .with_context(|| format!("starting {program}"))?;
         let stdin = Arc::new(Mutex::new(child.stdin.take().expect("piped stdin")));
@@ -363,7 +369,9 @@ impl LspClient {
 
 impl Drop for LspClient {
     fn drop(&mut self) {
-        let _ = self.child.lock().unwrap().kill();
+        let mut child = self.child.lock().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
