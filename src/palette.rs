@@ -12,7 +12,7 @@ use gpui_kit::*;
 
 use crate::{task, workspace::Workspace};
 
-actions!(ideae, [CommandPalette, RecentPlaces]);
+actions!(ideae, [CommandPalette, RecentPlaces, NextWaiting]);
 
 type Run = Rc<dyn Fn(&mut Window, &mut App)>;
 
@@ -173,6 +173,7 @@ impl Workspace {
             Entry::action("Go to file…", "Ctrl+Shift+N", GoToFile),
             Entry::action("Find in files…", "Ctrl+Shift+F", FindInFiles),
             Entry::action("Find in terminal…", "Ctrl+F", task::FindInTerminal).detail("the scrollback"),
+            Entry::action("Next waiting task", "Alt+Down", NextWaiting).detail("an agent that asks or is done"),
             Entry::new("Recent tasks", move |window, cx| {
                 let _ = w.update(cx, |w, cx| w.recent_tasks(window, cx));
             })

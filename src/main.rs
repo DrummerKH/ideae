@@ -208,6 +208,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)))
             .on_action(cx.listener(|this, _: &palette::CommandPalette, window, cx| this.command_palette(window, cx)))
             .on_action(cx.listener(|this, _: &palette::RecentPlaces, window, cx| this.recent_tasks(window, cx)))
+            .on_action(cx.listener(|this, _: &palette::NextWaiting, window, cx| this.next_waiting(window, cx)))
             .on_action(cx.listener(|this, _: &NewTask, window, cx| {
                 if let Some(project) = this.active_project().or((!this.projects.is_empty()).then_some(0)) {
                     this.new_task_dialog(project, window, cx);
@@ -508,6 +509,7 @@ fn main() {
                     KeyBinding::new(keys::bind("ctrl-,"), OpenSettings, context),
                     // In a terminal it was Select All, which the mouse and Copy still do.
                     KeyBinding::new(keys::bind("ctrl-shift-a"), palette::CommandPalette, context),
+                    KeyBinding::new(keys::bind("alt-down"), palette::NextWaiting, context),
                 ]);
             }
             // Not in a terminal: Ctrl+E is the end of the line there, in the shell

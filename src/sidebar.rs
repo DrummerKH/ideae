@@ -209,6 +209,29 @@ impl Workspace {
         rows
     }
 
+    /// Alt+Down: the task that waits for you, the questions first, then the
+    /// finished ones, the longest waiting first; into its agent.
+    pub fn next_waiting(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut rows = self.active_rows(cx);
+        let asks = |&(pi, ti): &(usize, usize), cx: &App| {
+            self.projects[pi].tasks[ti]
+                .view
+                .as_ref()
+                .is_some_and(|v| matches!(v.read(cx).agent_status, AgentStatus::NeedsInput(_)))
+        };
+        rows.reverse();
+        rows.sort_by_key(|row| !asks(row, cx));
+        let Some(&(pi, ti)) = rows.first() else {
+            gpui_kit::component::WindowExt::push_notification(window, gpui_kit::component::notification::Notification::info("No task waits for you."), cx);
+            return;
+        };
+        let path = self.projects[pi].tasks[ti].path.clone();
+        self.switch(&path, window, cx);
+        if let Some(view) = self.active_view() {
+            view.update(cx, |t, cx| t.show_view(0, window, cx));
+        }
+    }
+
     fn render_project(&self, pi: usize, first: bool, cx: &mut Context<Self>) -> AnyElement {
         let p = &self.projects[pi];
         let name: SharedString = p.name.clone().into();
