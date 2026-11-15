@@ -5113,13 +5113,18 @@ impl TaskView {
         self.agent_status == crate::agent::AgentStatus::Working
     }
 
-    /// Stops every terminal and browser of the task before it is dropped.
+    /// Stops every terminal and browser of the task before it is dropped,
+    /// and what they started that left their sessions.
     pub fn shut_down(&mut self, cx: &mut Context<Self>) {
         self.autosave_all(cx);
         for tab in &self.tabs {
             if let TabKind::Terminal(view) = &tab.kind {
                 TermView::end(&view, cx);
             }
+        }
+        if let Some(socket) = self.hook_socket.clone() {
+            let task = self.root.display().to_string();
+            std::thread::spawn(move || crate::procs::end_task_strays(Some(&task), &socket));
         }
     }
 }

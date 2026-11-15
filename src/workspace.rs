@@ -213,6 +213,10 @@ impl Workspace {
                     if let Some(daemon) = crate::daemon::client::get() {
                         daemon.shutdown();
                     }
+                    // Here, not on the tasks' threads: the app exits next.
+                    if let Some(socket) = this.hook_socket.clone() {
+                        crate::procs::end_task_strays(None, &socket);
+                    }
                 }
                 crate::procs::end_child_sessions();
                 async {}

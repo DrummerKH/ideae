@@ -294,6 +294,60 @@ pub fn end_child_sessions() {
     }
 }
 
+/// Ends what a task started that left its terminals' sessions, such as a
+/// shell an agent runs in the background with a session of its own: every
+/// process with this app's `socket` and, if given, the task's root in its
+/// environment. Another ideae started from a task's terminal inherits the
+/// same, so the trees of ideae processes are left alone.
+#[cfg(target_os = "linux")]
+pub fn end_task_strays(task: Option<&str>, socket: &str) {
+    let me = std::process::id() as i32;
+    let daemon = crate::daemon::client::get().and_then(|d| d.pid()).map(|p| p as i32);
+    let sock = format!("{}={socket}", crate::agent::SOCK_ENV);
+    let task = task.map(|t| format!("{}={t}", crate::agent::TASK_ENV));
+    let tagged = |pid: i32| {
+        let Ok(env) = std::fs::read(format!("/proc/{pid}/environ")) else { return false };
+        let vars: Vec<&[u8]> = env.split(|&b| b == 0).collect();
+        vars.contains(&sock.as_bytes()) && task.as_ref().is_none_or(|t| vars.contains(&t.as_bytes()))
+    };
+    let ideae = |pid: i32| name(pid as u32).is_some_and(|n| n.starts_with("ideae"));
+    // Under another ideae (or itself one): not ours to end.
+    let in_other_app = |pid: i32| {
+        let mut at = Some(pid);
+        for _ in 0..64 {
+            match at {
+                Some(p) if p == me || Some(p) == daemon || p <= 1 => return false,
+                Some(p) if ideae(p) => return true,
+                Some(p) => at = ppid(p),
+                None => return false,
+            }
+        }
+        false
+    };
+    let strays = || -> Vec<i32> {
+        pids().into_iter().filter(|&p| p != me && Some(p) != daemon && running(p) && tagged(p) && !in_other_app(p)).collect()
+    };
+    for (signal, grace) in [(libc::SIGTERM, 500), (libc::SIGKILL, 0)] {
+        let alive = strays();
+        if alive.is_empty() {
+            return;
+        }
+        for pid in alive {
+            // SAFETY: kill only sends a signal.
+            unsafe { libc::kill(pid, signal) };
+        }
+        let deadline = Instant::now() + Duration::from_millis(grace);
+        while Instant::now() < deadline && !strays().is_empty() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+/// Reading another process's environment needs /proc; elsewhere a stray
+/// lives on.
+#[cfg(not(target_os = "linux"))]
+pub fn end_task_strays(_: Option<&str>, _: &str) {}
+
 #[cfg_attr(not(unix), allow(dead_code))]
 static QUIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -314,4 +368,32 @@ pub fn catch_quit_signals() {
 
 pub fn quit_requested() -> bool {
     QUIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod stray_tests {
+    use std::os::unix::process::CommandExt as _;
+    use std::process::{Child, Command};
+
+    fn tagged_sleep(task: &str, socket: &str) -> Child {
+        let mut command = Command::new("sleep");
+        command.arg("30").env(crate::agent::TASK_ENV, task).env(crate::agent::SOCK_ENV, socket);
+        // SAFETY: setsid in the child before exec, as a background shell does.
+        unsafe { command.pre_exec(|| { libc::setsid(); Ok(()) }) };
+        command.spawn().unwrap()
+    }
+
+    #[test]
+    fn ends_the_tasks_strays_and_only_them() {
+        let socket = format!("/tmp/ideae-test-{}.sock", std::process::id());
+        let (mut ours, mut other_task, mut other_app) =
+            (tagged_sleep("/t/a", &socket), tagged_sleep("/t/b", &socket), tagged_sleep("/t/a", "elsewhere"));
+        super::end_task_strays(Some("/t/a"), &socket);
+        assert!(ours.try_wait().unwrap().is_some(), "the task's stray is ended");
+        assert!(other_task.try_wait().unwrap().is_none(), "another task's process lives on");
+        assert!(other_app.try_wait().unwrap().is_none(), "another app's process lives on");
+        let _ = other_task.kill();
+        let _ = other_app.kill();
+        let _ = (other_task.wait(), other_app.wait());
+    }
 }
