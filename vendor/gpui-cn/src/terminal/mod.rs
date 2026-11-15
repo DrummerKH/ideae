@@ -216,7 +216,8 @@ pub use engine::{
     TerminalSnapshot, TerminalStatus,
 };
 pub use frame::{
-    ImageLayer, ImagePlacement, RowId, TerminalColors, TerminalFrame, TerminalImage, Viewport,
+    FindHighlight, FindState, ImageLayer, ImagePlacement, RowId, TerminalColors, TerminalFrame, TerminalImage,
+    Viewport,
 };
 pub use geometry::Geometry;
 pub use input::TerminalInput;

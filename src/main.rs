@@ -485,6 +485,8 @@ fn main() {
             cx.bind_keys([
                 KeyBinding::new("ctrl-e", palette::RecentPlaces, None),
                 KeyBinding::new("ctrl-e", NoAction, Some(gpui_cn::terminal::KEY_CONTEXT)),
+                // Readline's forward-char, which the arrow key does as well.
+                KeyBinding::new("ctrl-f", task::FindInTerminal, Some(gpui_cn::terminal::KEY_CONTEXT)),
             ]);
             // Ctrl+Alt+Left/Right switch GNOME workspaces. In a terminal Alt+Left
             // stays the shell's word move.

@@ -578,6 +578,32 @@ pub struct TerminalFrame {
     pub scroll: ScrollMetrics,
     /// The input modes.
     pub modes: InputModes,
+    /// ideae patch: the search, while there is one.
+    pub find: Option<FindState>,
+}
+
+/// ideae patch: where a search stands, and its matches on screen.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FindState {
+    /// Matches in the whole scrollback.
+    pub total: usize,
+    /// The selected match, 0 the newest.
+    pub selected: Option<usize>,
+    /// The parts of matches on screen.
+    pub highlights: Arc<[FindHighlight]>,
+}
+
+/// ideae patch: one row's part of a match on screen, columns `start..end`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FindHighlight {
+    /// Viewport row.
+    pub row: u16,
+    /// First column.
+    pub start: u16,
+    /// Column after the last.
+    pub end: u16,
+    /// Part of the selected match.
+    pub selected: bool,
 }
 
 impl TerminalFrame {
@@ -598,6 +624,7 @@ impl TerminalFrame {
             cursor: Cursor::default(),
             colors: TerminalColors::default(),
             scroll: ScrollMetrics::new(count, 0, count),
+            find: None,
             modes: InputModes::default(),
         }
     }

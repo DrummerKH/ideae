@@ -647,6 +647,29 @@ impl TerminalState {
         cx.notify();
     }
 
+    /// ideae patch: search the scrollback; an empty `needle` ends the search.
+    /// The viewport scrolls to the newest match.
+    pub fn find(&mut self, needle: impl Into<String>, cx: &mut Context<Self>) {
+        if let Some(handle) = &self.handle {
+            let _ = handle.input(TerminalInput::Find(needle.into()));
+        }
+        cx.notify();
+    }
+
+    /// ideae patch: the next match, toward older output when `older`.
+    pub fn find_next(&mut self, older: bool, cx: &mut Context<Self>) {
+        if let Some(handle) = &self.handle {
+            let _ = handle.input(TerminalInput::FindNext(older));
+        }
+        cx.notify();
+    }
+
+    /// ideae patch: how the search stands, as of the last frame.
+    #[must_use]
+    pub fn find_state(&self) -> Option<&crate::terminal::FindState> {
+        self.frame.find.as_ref()
+    }
+
     /// Scroll by whole pages; negative is toward older output.
     pub fn scroll_pages(&mut self, pages: isize, cx: &mut Context<Self>) {
         let rows = isize::try_from(self.frame.viewport.rows()).unwrap_or(24);

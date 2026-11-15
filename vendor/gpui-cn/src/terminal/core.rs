@@ -24,7 +24,7 @@ use ghostty_vt::terminal::{Event, Mode, Point, PointCoordinate, ScrollViewport};
 use ghostty_vt::{key, mouse};
 
 use crate::terminal::frame::{
-    CellSelection, CellSpan, Color, Cursor, CursorShape, ImageLayer, ImagePlacement, InputModes,
+    CellSelection, FindHighlight, FindState, CellSpan, Color, Cursor, CursorShape, ImageLayer, ImagePlacement, InputModes,
     Rgb, ScrollMetrics, Style, StyleRun, TerminalColors, TerminalFrame, TerminalImage, TerminalRow,
     Underline, Viewport,
 };
@@ -83,6 +83,9 @@ pub(crate) struct Core {
     title: String,
     cwd: Option<PathBuf>,
     scratch: String,
+    /// ideae patch: the scrollback search, while there is one. Parking
+    /// drops it.
+    search: Option<vt::search::Search>,
 }
 
 /// The Kitty graphics Unicode placeholder, U+10EEEE.
@@ -282,6 +285,7 @@ impl Core {
             title: String::new(),
             cwd: None,
             scratch: String::new(),
+            search: None,
         })
     }
 
@@ -548,6 +552,21 @@ impl Core {
                     Vec::new()
                 }
             }
+            TerminalInput::Find(needle) => {
+                self.find(&needle).map_err(fault)?;
+                return Ok(Vec::new());
+            }
+            TerminalInput::FindNext(older) => {
+                if let Some(search) = &mut self.search {
+                    search.run(&self.terminal).map_err(fault)?;
+                    if older {
+                        search.select_next(&self.terminal).map_err(fault)?;
+                    } else {
+                        search.select_prev(&self.terminal).map_err(fault)?;
+                    }
+                }
+                return Ok(Vec::new());
+            }
             TerminalInput::Scroll(request) => {
                 self.terminal.scroll_viewport(match request {
                     ScrollRequest::Lines(n) => ScrollViewport::Delta(n),
@@ -625,6 +644,68 @@ impl Core {
         Ok(bytes)
     }
 
+    /// ideae patch: starts, changes or (empty) ends the search, and selects
+    /// its newest match.
+    fn find(&mut self, needle: &str) -> Result<(), vt::Error> {
+        if needle.is_empty() {
+            self.search = None;
+            return Ok(());
+        }
+        if self.search.is_none() {
+            self.search = Some(vt::search::Search::new(&self.terminal)?);
+        }
+        let Some(search) = &mut self.search else { return Ok(()) };
+        search.set_needle(&self.terminal, Some(needle))?;
+        search.run(&self.terminal)?;
+        search.select_next(&self.terminal)?;
+        Ok(())
+    }
+
+    /// ideae patch: the search's count and its matches in the viewport.
+    fn find_state(&mut self) -> Result<Option<FindState>, vt::Error> {
+        let Some(search) = &mut self.search else { return Ok(None) };
+        search.feed(&self.terminal)?;
+        for _ in 0..64 {
+            if search.tick()? != vt::search::Status::Running {
+                break;
+            }
+        }
+        let terminal = &self.terminal;
+        let point = |r: &vt::screen::GridRef<'_>| -> Result<Option<(u16, u16)>, vt::Error> {
+            Ok(terminal
+                .point_from_grid_ref(r, vt::terminal::PointSpace::Viewport)?
+                .and_then(|p| Some((p.x, u16::try_from(p.y).ok()?))))
+        };
+        let selected_at = match search.selected_match(terminal)? {
+            Some(m) => point(&m.start())?,
+            None => None,
+        };
+        let columns = self.viewport.columns();
+        let rows = self.viewport.rows();
+        let mut highlights = Vec::new();
+        for m in search.viewport_matches(terminal)? {
+            let (start, end) = (point(&m.start())?, point(&m.end())?);
+            // Partly off screen: the part that is on it.
+            let (start, end) = match (start, end) {
+                (Some(s), Some(e)) => (s, e),
+                (None, Some(e)) => ((0, 0), e),
+                (Some(s), None) => (s, (columns.saturating_sub(1), rows.saturating_sub(1))),
+                (None, None) => continue,
+            };
+            let selected = selected_at.is_some_and(|at| at == start);
+            for row in start.1..=end.1 {
+                let from = if row == start.1 { start.0 } else { 0 };
+                let to = if row == end.1 { end.0 + 1 } else { columns };
+                highlights.push(FindHighlight { row, start: from, end: to, selected });
+            }
+        }
+        Ok(Some(FindState {
+            total: search.total_matches()?,
+            selected: search.selected_index()?,
+            highlights: highlights.into(),
+        }))
+    }
+
     /// The selected text, with trailing whitespace trimmed per line.
     pub(crate) fn copy(&self, selection: CellSelection) -> io::Result<String> {
         let point = |(x, y): (u16, u16)| {
@@ -700,6 +781,7 @@ impl Core {
         let bracketed_paste = self.mode(Mode::BRACKETED_PASTE);
         let focus_reporting = self.mode(Mode::FOCUS_EVENT);
         let alternate_scroll = self.mode(Mode::ALT_SCROLL);
+        let find = self.find_state().map_err(fault)?;
         let snapshot = self.render.update(&self.terminal).map_err(fault)?;
         let dirty = snapshot.dirty().map_err(fault)?;
         let raw_cursor = snapshot.cursor().map_err(fault)?;
@@ -751,6 +833,7 @@ impl Core {
                 && f.scroll == scroll
                 && f.modes == modes
                 && f.images == images
+                && f.find == find
         });
         if !force && dirty == Dirty::Clean && unchanged_state {
             return Ok(None);
@@ -897,6 +980,7 @@ impl Core {
             colors,
             scroll,
             modes,
+            find,
         });
         self.last = Some(frame.clone());
         Ok(Some(frame))
@@ -1448,6 +1532,24 @@ mod tests {
             })
             .unwrap();
         assert_eq!(text, "world\nsec");
+    }
+
+    #[test]
+    fn find_selects_the_newest_match_and_steps_to_older_ones() {
+        let mut core = core();
+        let mut effects = Effects::default();
+        core.write(b"one two\r\nthree\r\nTWO four", &mut effects);
+        core.input(TerminalInput::Find("two".into())).unwrap();
+        let find = core.frame(true).unwrap().unwrap().find.clone().unwrap();
+        assert_eq!((find.total, find.selected), (2, Some(0)));
+        let selected: Vec<_> = find.highlights.iter().filter(|h| h.selected).map(|h| (h.row, h.start, h.end)).collect();
+        assert_eq!(selected, [(2, 0, 3)]);
+        core.input(TerminalInput::FindNext(true)).unwrap();
+        let find = core.frame(true).unwrap().unwrap().find.clone().unwrap();
+        let selected: Vec<_> = find.highlights.iter().filter(|h| h.selected).map(|h| (h.row, h.start, h.end)).collect();
+        assert_eq!(selected, [(0, 4, 7)]);
+        core.input(TerminalInput::Find(String::new())).unwrap();
+        assert!(core.frame(true).unwrap().unwrap().find.is_none());
     }
 
     #[test]

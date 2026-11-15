@@ -217,6 +217,8 @@ impl RenderOnce for Terminal {
 struct Painting {
     backgrounds: Vec<(Bounds<Pixels>, Hsla)>,
     selections: Vec<Bounds<Pixels>>,
+    /// ideae patch: search matches, the selected one in its own color.
+    found: Vec<(Bounds<Pixels>, bool)>,
     blocks: Vec<(Bounds<Pixels>, Hsla)>,
     decorations: Vec<(Bounds<Pixels>, Hsla)>,
     lines: Vec<(Point<Pixels>, ShapedLine)>,
@@ -494,6 +496,12 @@ fn prepare(
         origin: point(px(0.0), px(0.0)),
         ..geometry
     };
+    if let Some(find) = &frame.find {
+        for h in find.highlights.iter().filter(|h| h.row < geometry.rows && h.start < h.end) {
+            let end = h.end.min(geometry.columns);
+            painting.found.push((geometry.span_bounds(h.start..end, h.row), h.selected));
+        }
+    }
     let mut drawn = HashMap::with_capacity(usize::from(geometry.rows));
     let visible = usize::from(geometry.rows).min(frame.rows.len());
     for (index, row) in frame.rows.iter().take(visible).enumerate() {
@@ -829,6 +837,10 @@ fn paint(painting: Painting, window: &mut Window, cx: &mut App) {
     };
     images(ImageLayer::BelowBackground, window);
     for (bounds, color) in painting.backgrounds {
+        window.paint_quad(fill(bounds, color));
+    }
+    for (bounds, selected) in painting.found {
+        let color = if selected { gpui_kit::hsla(0.08, 0.95, 0.55, 0.65) } else { gpui_kit::hsla(0.14, 0.95, 0.55, 0.35) };
         window.paint_quad(fill(bounds, color));
     }
     for bounds in painting.selections {

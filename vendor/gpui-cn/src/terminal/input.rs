@@ -174,6 +174,11 @@ pub enum TerminalInput {
     Scroll(ScrollRequest),
     /// Focus gained or lost.
     Focus(bool),
+    /// ideae patch: search the scrollback for this text, case-insensitive
+    /// for ASCII letters, and select the newest match; empty ends the search.
+    Find(String),
+    /// ideae patch: select the next match, toward older output when true.
+    FindNext(bool),
 }
 
 impl TerminalInput {

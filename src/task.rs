@@ -43,6 +43,8 @@ pub struct TermView {
     agent: bool,
     ran: bool,
     task: Option<WeakEntity<TaskView>>,
+    /// The search bar (Ctrl+F), while open.
+    find: Option<Entity<gpui_kit::component::input::InputState>>,
 }
 
 impl TermView {
@@ -75,7 +77,99 @@ impl TermView {
         .detach();
         let agent = task.is_some();
         let ran = state.read(cx).foreground().is_some_and(|p| !p.is_shell());
-        Self { id, state, session, seq, agent, ran, task }
+        Self { id, state, session, seq, agent, ran, task, find: None }
+    }
+
+    fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui_kit::component::input::InputState;
+        let input = match &self.find {
+            Some(input) => input.clone(),
+            None => {
+                let input = cx.new(|cx| InputState::new(window, cx).placeholder("Find in the terminal"));
+                // What is selected is what you would look for.
+                if let Some(text) = self.state.read(cx).selected_text().filter(|t| !t.contains('\n')) {
+                    input.update(cx, |i, cx| i.set_value(text.clone(), window, cx));
+                    self.state.update(cx, |s, cx| s.find(text, cx));
+                }
+                cx.subscribe_in(&input, window, |this, input, event: &InputEvent, _, cx| match event {
+                    InputEvent::Change => {
+                        let needle = input.read(cx).value().to_string();
+                        this.state.update(cx, |s, cx| s.find(needle, cx));
+                    }
+                    InputEvent::PressEnter { shift, .. } => {
+                        let older = !*shift;
+                        this.state.update(cx, |s, cx| s.find_next(older, cx));
+                    }
+                    _ => {}
+                })
+                .detach();
+                self.find = Some(input.clone());
+                input
+            }
+        };
+        input.update(cx, |i, cx| i.select_all(window, cx));
+        input.read(cx).focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.find = None;
+        self.state.update(cx, |s, cx| s.find("", cx));
+        self.state.read(cx).focus_handle().clone().focus(window, cx);
+        cx.notify();
+    }
+
+    fn render_find(&self, input: Entity<gpui_kit::component::input::InputState>, cx: &mut Context<Self>) -> AnyElement {
+        let state = self.state.read(cx).find_state().cloned();
+        let empty = input.read(cx).value().is_empty();
+        let count = match state {
+            _ if empty => String::new(),
+            Some(f) if f.total > 0 => match f.selected {
+                // Numbered from the oldest, as they read top to bottom.
+                Some(ix) => format!("{} of {}", f.total - ix, f.total),
+                None => format!("{} matches", f.total),
+            },
+            _ => "No matches".into(),
+        };
+        h_flex()
+            .flex_none()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .capture_action(cx.listener(|this, _: &gpui_kit::component::input::Escape, window, cx| {
+                cx.stop_propagation();
+                this.close_find(window, cx);
+            }))
+            .child(div().w(px(260.)).child(gpui_kit::component::input::Input::new(&input).small()))
+            .child(div().min_w(px(80.)).text_xs().text_color(cx.theme().muted_foreground).child(count))
+            .child(
+                Button::new("find-newer")
+                    .xsmall()
+                    .ghost()
+                    .icon(IconName::ArrowUp)
+                    .tooltip("Newer match (Shift+Enter)")
+                    .on_click(cx.listener(|this, _, _, cx| this.state.update(cx, |s, cx| s.find_next(false, cx)))),
+            )
+            .child(
+                Button::new("find-older")
+                    .xsmall()
+                    .ghost()
+                    .icon(IconName::ArrowDown)
+                    .tooltip("Older match (Enter)")
+                    .on_click(cx.listener(|this, _, _, cx| this.state.update(cx, |s, cx| s.find_next(true, cx)))),
+            )
+            .child(div().flex_1())
+            .child(
+                Button::new("find-close")
+                    .xsmall()
+                    .ghost()
+                    .label("×")
+                    .tooltip("Close (Esc)")
+                    .on_click(cx.listener(|this, _, window, cx| this.close_find(window, cx))),
+            )
+            .into_any_element()
     }
 
     /// The agent's program is gone: its shell is back at the prompt, or the
@@ -94,7 +188,7 @@ impl TermView {
         state.is_closed() || matches!(state.status(), TerminalStatus::Exited(_) | TerminalStatus::Failed(_))
     }
 
-    fn render_agent_ended(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_agent_ended(&self, cx: &mut Context<Self>) -> AnyElement {
         let task = self.task.clone();
         h_flex()
             .flex_none()
@@ -117,7 +211,7 @@ impl TermView {
                             task.update(cx, |t, cx| t.restart_agent(window, cx));
                         }
                     }),
-            )
+            )            .into_any_element()
     }
 
     /// Stops the terminal's program, and with it everything in its session.
@@ -152,8 +246,17 @@ impl TermView {
 impl Render for TermView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let highlight = cx.theme().primary.opacity(0.15);
-        let ended = self.agent_ended(cx).then(|| self.render_agent_ended(cx));
-        v_flex().size_full().children(ended).child(
+        let ended = if self.agent_ended(cx) { Some(self.render_agent_ended(cx)) } else { None };
+        let find = match self.find.clone() {
+            Some(input) => Some(self.render_find(input, cx)),
+            None => None,
+        };
+        v_flex()
+            .size_full()
+            .on_action(cx.listener(|this, _: &FindInTerminal, window, cx| this.open_find(window, cx)))
+            .children(ended)
+            .children(find)
+            .child(
         div()
             .id("terminal-drop")
             .relative()
@@ -186,7 +289,7 @@ fn shell_quote(s: &str) -> String {
 // ---------------------------------------------------------------- file
 
 actions!(ideae_file, [SaveFile, ExpandSelection, ShrinkSelection, ToggleComment, ShowOutline, ShowUsages, SendToAgent]);
-actions!(ideae_task, [ToggleZoom, SendDiffToAgent, CommentOnDiff]);
+actions!(ideae_task, [ToggleZoom, SendDiffToAgent, CommentOnDiff, FindInTerminal]);
 
 actions!(ideae_task, [NextTab, PrevTab, NavigateBack, NavigateForward]);
 
