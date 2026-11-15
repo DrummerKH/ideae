@@ -10,6 +10,13 @@ fn git(args: &[&str]) -> Option<String> {
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    // Twig has no grammar crate: its generated parser is vendored.
+    println!("cargo:rerun-if-changed=vendor/tree-sitter-twig/src/parser.c");
+    cc::Build::new()
+        .include("vendor/tree-sitter-twig/src")
+        .file("vendor/tree-sitter-twig/src/parser.c")
+        .warnings(false)
+        .compile("tree-sitter-twig");
     let commit = git(&["rev-parse", "--short", "HEAD"]).unwrap_or_default();
     println!("cargo:rustc-env=IDEAE_COMMIT={commit}");
     // A new commit or checkout changes these.

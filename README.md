@@ -111,3 +111,10 @@ a release build needs a Windows host for `fxc.exe`.
 `vendor/` holds patched copies of `gpui-component`, `gpui-base` and
 `gpui-cn` (Apache-2.0, licenses kept in each directory). Changed places are
 marked `ideae patch`.
+
+`vendor/tree-sitter-twig` is the generated parser of
+[tree-sitter-twig](https://github.com/gbprod/tree-sitter-twig) (MIT, license
+kept beside it). `queries/julia-highlights.scm` and
+`queries/solidity-highlights.scm` come from tree-sitter-julia and
+tree-sitter-solidity (MIT); the Solidity one has a pattern rewritten for this
+tree-sitter version.

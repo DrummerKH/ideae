@@ -509,13 +509,21 @@ fn main() {
                     }
                 })
                 .unwrap_or_else(|| WindowBounds::centered(size(px(1500.), px(920.)), cx));
+            let requested = match window_bounds {
+                WindowBounds::Windowed(b) => Some(b.origin),
+                _ => None,
+            };
             let options = WindowOptions {
                 window_bounds: Some(window_bounds),
                 app_id: Some(state::APP_ID.into()),
                 ..TitleBar::window_options()
             };
             gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| Workspace::new(repos, agent, appearance, window, cx))
+                cx.new(|cx| {
+                    let mut workspace = Workspace::new(repos, agent, appearance, window, cx);
+                    workspace.placed_at(requested);
+                    workspace
+                })
             })
             .expect("failed to open window");
             cx.activate(true);

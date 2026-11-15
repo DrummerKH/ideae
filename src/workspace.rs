@@ -89,6 +89,11 @@ pub struct Workspace {
     pub build: crate::build_watch::BuildWatch,
     /// Where the window is, to open there next time.
     window_place: Option<state::WindowPlace>,
+    /// Where the window was asked to open, and when: some window managers
+    /// place it a fixed offset away (frame or shadow insets), which would
+    /// otherwise add up with every restart.
+    requested_origin: Option<(Point<Pixels>, std::time::Instant)>,
+    origin_offset: Point<Pixels>,
     /// Quitting while the agents go on: a restart, or the window's ×.
     keep_terminals: bool,
 }
@@ -208,9 +213,17 @@ impl Workspace {
                 WindowBounds::Maximized(b) => (b, true, false),
                 WindowBounds::Fullscreen(b) => (b, false, true),
             };
+            if let Some((asked, at)) = this.requested_origin {
+                let offset = bounds.origin - asked;
+                let small = offset.x.abs() < px(150.) && offset.y.abs() < px(150.);
+                if at.elapsed() < std::time::Duration::from_secs(3) && !maximized && small {
+                    this.origin_offset = offset;
+                }
+            }
+            let origin = bounds.origin - this.origin_offset;
             this.window_place = Some(state::WindowPlace {
-                x: f32::from(bounds.origin.x),
-                y: f32::from(bounds.origin.y),
+                x: f32::from(origin.x),
+                y: f32::from(origin.y),
                 width: f32::from(bounds.size.width),
                 height: f32::from(bounds.size.height),
                 maximized,
@@ -271,6 +284,8 @@ impl Workspace {
             last_saved: String::new(),
             _subscriptions: subscriptions,
             _tick: tick,
+            requested_origin: None,
+            origin_offset: Point::default(),
             window_place: saved.window.clone(),
             keep_terminals: false,
             build: crate::build_watch::BuildWatch::new(),
@@ -1078,6 +1093,10 @@ impl Workspace {
         }
         self.save(cx);
         cx.notify();
+    }
+
+    pub fn placed_at(&mut self, origin: Option<Point<Pixels>>) {
+        self.requested_origin = origin.map(|o| (o, std::time::Instant::now()));
     }
 
     /// The window's ×: the window goes, the daemon's agents and terminals
