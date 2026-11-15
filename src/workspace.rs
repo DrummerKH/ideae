@@ -40,6 +40,8 @@ pub struct TaskEntry {
     /// Its pull request, and when `gh` was last asked.
     pub pr: Option<crate::pr::Pr>,
     pub pr_checked: Option<std::time::Instant>,
+    /// Ports of `.ideae.toml` services: base + 100 × this; 0 for main.
+    pub port_slot: u32,
     /// Locked worktree (`git worktree lock`) whose locker is gone.
     pub locked: Option<String>,
 }
@@ -356,6 +358,7 @@ impl Workspace {
                     left_view: None,
                     pr: None,
                     pr_checked: None,
+                    port_slot: t.port_slot,
                 })
                 .collect();
             self.projects.push(project);
@@ -432,6 +435,7 @@ impl Workspace {
                             starred: t.starred,
                             last_active: t.last_active,
                             open: t.view.is_some(),
+                            port_slot: t.port_slot,
                             session: match &t.view {
                                 Some(view) => view.read(cx).session(cx),
                                 None => t.session.clone(),
@@ -469,9 +473,11 @@ impl Workspace {
         if entry.busy.is_some() {
             return None;
         }
+        let slot = self.port_slot_for(path);
+        let entry = self.entry_mut(path)?;
         let (root, branch, session) = (entry.path.clone(), entry.branch.clone(), entry.session.clone());
         let view = cx.new(|cx| {
-            let mut t = TaskView::new(root, branch, agent, socket, window, cx);
+            let mut t = TaskView::new(root, branch, agent, socket, slot, window, cx);
             // Servers start when the task comes into view (switch).
             t.lsp_asleep = true;
             t.restore(&session, window, cx);
@@ -480,6 +486,20 @@ impl Workspace {
         cx.subscribe(&view, |_, _, _: &TaskEvent, cx| cx.notify()).detach();
         self.entry_mut(path)?.view = Some(view.clone());
         Some(view)
+    }
+
+    /// The task's port slot, given now if it has none: 0 for the main
+    /// checkout, else the lowest one no other task of the project holds.
+    fn port_slot_for(&mut self, path: &Path) -> u32 {
+        let Some((pi, ti)) = self.find(path) else { return 0 };
+        let tasks = &self.projects[pi].tasks;
+        if tasks[ti].main || tasks[ti].port_slot > 0 {
+            return tasks[ti].port_slot;
+        }
+        let taken: std::collections::HashSet<u32> = tasks.iter().map(|t| t.port_slot).collect();
+        let slot = (1..).find(|s| !taken.contains(s)).unwrap_or(1);
+        self.projects[pi].tasks[ti].port_slot = slot;
+        slot
     }
 
     pub fn switch(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
@@ -760,6 +780,7 @@ impl Workspace {
                     left_view: None,
                     pr: None,
                     pr_checked: None,
+                    port_slot: 0,
                 },
             );
         }
@@ -875,6 +896,7 @@ impl Workspace {
             left_view: None,
             pr: None,
             pr_checked: None,
+            port_slot: 0,
         });
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
@@ -1005,6 +1027,7 @@ impl Workspace {
                                 left_view: None,
                                 pr: None,
                                 pr_checked: None,
+                                port_slot: 0,
                             }),
                         }
                     }

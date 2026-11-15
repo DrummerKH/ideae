@@ -102,6 +102,8 @@ pub struct TaskState {
     pub last_active: u64,
     /// Running when the app quit, so started again with it.
     pub open: bool,
+    /// Its share of the services' ports: 0 for the main checkout.
+    pub port_slot: u32,
     pub session: TaskSession,
 }
 

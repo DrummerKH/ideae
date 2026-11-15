@@ -38,6 +38,7 @@ pub struct TermView {
     session: Option<String>,
     /// Numbers shells within the task, for their session after a restart.
     seq: usize,
+<<<<<<< Updated upstream
     /// The agent's terminal: a program other than the shell has run in it,
     /// so the shell at its prompt means the agent ended.
     agent: bool,
@@ -45,6 +46,10 @@ pub struct TermView {
     task: Option<WeakEntity<TaskView>>,
     /// The search bar (Ctrl+F), while open.
     find: Option<Entity<gpui_kit::component::input::InputState>>,
+=======
+    /// The `.ideae.toml` service it runs, if any.
+    pub service: Option<String>,
+>>>>>>> Stashed changes
 }
 
 impl TermView {
@@ -53,7 +58,11 @@ impl TermView {
         state: Entity<TerminalState>,
         session: Option<String>,
         seq: usize,
+<<<<<<< Updated upstream
         task: Option<WeakEntity<TaskView>>,
+=======
+        service: Option<String>,
+>>>>>>> Stashed changes
         cx: &mut Context<Self>,
     ) -> Self {
         cx.observe(&state, |_, _, cx| cx.notify()).detach();
@@ -75,6 +84,7 @@ impl TermView {
             _ => {}
         })
         .detach();
+<<<<<<< Updated upstream
         let agent = task.is_some();
         let ran = state.read(cx).foreground().is_some_and(|p| !p.is_shell());
         Self { id, state, session, seq, agent, ran, task, find: None }
@@ -212,6 +222,9 @@ impl TermView {
                         }
                     }),
             )            .into_any_element()
+=======
+        Self { id, state, session, seq, service }
+>>>>>>> Stashed changes
     }
 
     /// Stops the terminal's program, and with it everything in its session.
@@ -1323,12 +1336,18 @@ pub struct TaskView {
     pub agent_status: crate::agent::AgentStatus,
     /// What the working agent does now: its latest tool call, in words.
     pub agent_activity: Option<String>,
+<<<<<<< Updated upstream
     /// The command that starts the agent, for Restart.
     agent: Option<String>,
     /// Text for the agent's prompt once it is ready to take it.
     pending_prompt: Option<String>,
     /// Files you were in, the latest first, with where the cursor was.
     recent: Vec<(PathBuf, u32, u32)>,
+=======
+    /// Its share of the ports of `.ideae.toml`'s services, and those services.
+    pub port_slot: u32,
+    services: Vec<crate::services::Service>,
+>>>>>>> Stashed changes
     hook_socket: Option<String>,
     /// Numbers terminals so each has a unique element id and default title.
     terminal_seq: usize,
@@ -1404,9 +1423,12 @@ impl TaskView {
         branch: String,
         agent: Option<String>,
         hook_socket: Option<String>,
+        port_slot: u32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let services = crate::services::load(&root).unwrap_or_default();
+        let task_env = crate::services::task_env(&services, port_slot);
         let weak = cx.weak_entity();
         let changes = cx.new(|cx| ChangesView::new(root.clone(), weak.clone(), cx));
         let history = cx.new(|cx| HistoryView::new(root.clone(), weak, cx));
@@ -1424,9 +1446,15 @@ impl TaskView {
         let mut tabs = Vec::new();
         // The agent's terminal, or a shell when there is no agent; more shells
         // are a "+" away.
+<<<<<<< Updated upstream
         match &agent {
             Some(agent) => tabs.push(Self::make_terminal(&root, hook_socket.as_ref(), "agent", 0, Some(agent.clone()), window, cx)),
             None => tabs.push(Self::make_terminal(&root, hook_socket.as_ref(), "shell", 1, None, window, cx)),
+=======
+        match agent {
+            Some(agent) => tabs.push(Self::make_terminal(&root, hook_socket.as_ref(), "agent", 0, Some(agent), task_env.clone(), None, window, cx)),
+            None => tabs.push(Self::make_terminal(&root, hook_socket.as_ref(), "shell", 1, None, task_env.clone(), None, window, cx)),
+>>>>>>> Stashed changes
         }
         // Changes and History open on demand: the Log button, a changed file,
         // Ctrl+2/3.
@@ -1505,9 +1533,14 @@ impl TaskView {
             branch: branch.into(),
             agent_status: crate::agent::AgentStatus::Unknown,
             agent_activity: None,
+<<<<<<< Updated upstream
             agent: agent.clone(),
             pending_prompt: None,
             recent: Vec::new(),
+=======
+            port_slot,
+            services,
+>>>>>>> Stashed changes
             hook_socket,
             terminal_seq: 1,
             unseen: false,
@@ -1566,10 +1599,12 @@ impl TaskView {
         title: &str,
         seq: usize,
         input: Option<String>,
+        extra_env: Vec<(String, String)>,
+        service: Option<(String, PathBuf)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> TabItem {
-        let mut env: Vec<(String, String)> = Vec::new();
+        let mut env: Vec<(String, String)> = extra_env;
         // Every terminal of the task can reach the hook socket, so a claude
         // started by hand reports too once given the settings file.
         if let Some(socket) = hook_socket {
@@ -1577,7 +1612,14 @@ impl TaskView {
             env.push((crate::agent::TASK_ENV.into(), root.display().to_string()));
         }
         // Set either way: an ideae started from an agent's terminal inherits "agent".
-        let role = if input.is_some() { "agent" } else { "terminal" };
+        let role = if service.is_some() {
+            "service"
+        } else if input.is_some() {
+            "agent"
+        } else {
+            "terminal"
+        };
+        let cwd = service.as_ref().map_or_else(|| root.clone(), |(_, cwd)| cwd.clone());
         env.push((crate::agent::ROLE_ENV.into(), role.into()));
         // Enter is a carriage return; PowerShell's line editor takes a bare
         // newline for a line break inside the command and waits for more.
@@ -1586,7 +1628,15 @@ impl TaskView {
         let config = TerminalConfig::default().with_colors(crate::theme::terminal_colors(cx));
         // In the daemon the program outlives the window; a restart attaches
         // to it again under the same session name.
-        let session = format!("{}#{}", root.display(), if role == "agent" { "agent".to_string() } else { format!("shell-{seq}") });
+        let session = format!(
+            "{}#{}",
+            root.display(),
+            match (&service, role) {
+                (Some((name, _)), _) => format!("service-{name}"),
+                (None, "agent") => "agent".to_string(),
+                _ => format!("shell-{seq}"),
+            }
+        );
         #[cfg(unix)]
         let daemon = crate::daemon::client::get();
         #[cfg(not(unix))]
@@ -1596,12 +1646,12 @@ impl TaskView {
         let (state, session) = match daemon {
             #[cfg(unix)]
             Some(daemon) => {
-                let spec = crate::daemon::proto::Spec { cwd: root.clone(), env, input };
+                let spec = crate::daemon::proto::Spec { cwd: cwd.clone(), env, input };
                 let id = session.clone();
                 (cx.new(|cx| daemon.terminal(id, spec, config, window, cx)), Some(session))
             }
             _ => {
-                let mut options = LocalTerminalOptions::default().with_cwd(WorkingDirectory::Path(root.clone()));
+                let mut options = LocalTerminalOptions::default().with_cwd(WorkingDirectory::Path(cwd.clone()));
                 for (name, value) in env {
                     options = options.with_env(name, value);
                 }
@@ -1651,8 +1701,13 @@ impl TaskView {
         })
         .detach();
         let id = SharedString::from(format!("{}-term-{seq}", root.display()));
+<<<<<<< Updated upstream
         let task = (role == "agent").then(|| cx.weak_entity());
         let view = cx.new(|cx| TermView::new(id, state, session, seq, task, cx));
+=======
+        let service_name = service.map(|(name, _)| name);
+        let view = cx.new(|cx| TermView::new(id, state, session, seq, service_name, cx));
+>>>>>>> Stashed changes
         TabItem::new(title.to_string(), TabKind::Terminal(view))
     }
 
@@ -2236,7 +2291,8 @@ impl TaskView {
     /// A shell tab numbered `seq`: a restored one gets its old session back.
     fn terminal_tab(&mut self, seq: usize, window: &mut Window, cx: &mut Context<Self>) -> usize {
         self.terminal_seq = self.terminal_seq.max(seq);
-        let tab = Self::make_terminal(&self.root, self.hook_socket.as_ref(), &format!("shell {seq}"), seq, None, window, cx);
+        let env = crate::services::task_env(&self.services, self.port_slot);
+        let tab = Self::make_terminal(&self.root, self.hook_socket.as_ref(), &format!("shell {seq}"), seq, None, env, None, window, cx);
         // After the last terminal, so terminals stay together left of the views.
         let at = self.tabs.iter().rposition(|t| matches!(t.kind, TabKind::Terminal(_))).map_or(0, |ix| ix + 1);
         self.tabs.insert(at, tab);
@@ -2933,6 +2989,7 @@ impl TaskView {
                     .cursor_pointer()
                     .child(format!("· {} {}", b.last_hash, b.last_subject)),
             )
+            .child(self.render_run(cx))
             .child(
                 Button::new("log")
                     .xsmall()
@@ -4782,6 +4839,10 @@ impl TaskView {
                 match &tab.kind {
                     // The task's first terminal: the agent, or the shell without one.
                     TabKind::Terminal(_) if tab.title == "agent" || tab.title == "shell" => s.kind = "agent".into(),
+                    TabKind::Terminal(view) if view.read(cx).service.is_some() => {
+                        s.kind = "service".into();
+                        s.path = view.read(cx).service.clone();
+                    }
                     TabKind::Terminal(view) => {
                         s.kind = "shell".into();
                         s.line = view.read(cx).seq as u32;
@@ -4838,6 +4899,12 @@ impl TaskView {
                 }
                 "shell" => {
                     self.new_terminal_tab(window, cx);
+                }
+                // Attaches to it in the daemon, or starts it again.
+                "service" => {
+                    if let Some(name) = &saved.path {
+                        self.service_tab(name, window, cx);
+                    }
                 }
                 "changes" => self.tabs.push(TabItem::new("Changes", TabKind::Changes)),
                 "history" => self.tabs.push(TabItem::new("History", TabKind::History)),
@@ -5088,5 +5155,160 @@ fn location_of(range: &DiffLineRange) -> String {
         format!("{}:{}", range.path(), range.start())
     } else {
         format!("{}:{}-{}", range.path(), range.start(), range.end())
+    }
+}
+
+// ---------------------------------------------------------------- services
+
+use gpui_kit::component::notification::Notification;
+
+impl TaskView {
+    fn service_ix(&self, name: &str, cx: &App) -> Option<usize> {
+        self.tabs.iter().position(|t| match &t.kind {
+            TabKind::Terminal(v) => v.read(cx).service.as_deref() == Some(name),
+            _ => false,
+        })
+    }
+
+    /// The services running now, with their ports, for the task's row.
+    pub fn running_services(&self, cx: &App) -> Vec<(String, Option<u16>)> {
+        self.services
+            .iter()
+            .filter(|s| self.service_ix(&s.name, cx).is_some())
+            .map(|s| (s.name.clone(), s.port(self.port_slot)))
+            .collect()
+    }
+
+    /// The service's terminal tab, created when missing; returns its index.
+    fn service_tab(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) -> Option<usize> {
+        if let Some(ix) = self.service_ix(name, cx) {
+            return Some(ix);
+        }
+        let service = self.services.iter().find(|s| s.name == name)?.clone();
+        let slot = self.port_slot;
+        let mut env = crate::services::task_env(&self.services, slot);
+        env.extend(service.env(&self.services, slot));
+        let command = service.expand(&service.command, &self.services, slot);
+        let cwd = service.cwd.as_ref().map_or_else(|| self.root.clone(), |c| self.root.join(c));
+        self.terminal_seq += 1;
+        let seq = self.terminal_seq;
+        let tab = Self::make_terminal(
+            &self.root,
+            self.hook_socket.as_ref(),
+            &format!("▶ {name}"),
+            seq,
+            Some(command),
+            env,
+            Some((name.to_string(), cwd)),
+            window,
+            cx,
+        );
+        let at = self.tabs.iter().rposition(|t| matches!(t.kind, TabKind::Terminal(_))).map_or(0, |ix| ix + 1);
+        self.tabs.insert(at, tab);
+        Some(at)
+    }
+
+    fn start_service(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(e) = self.reload_services() {
+            window.push_notification(Notification::error(e).title("Services"), cx);
+            return;
+        }
+        let port = self.services.iter().find(|s| s.name == name).and_then(|s| s.port(self.port_slot));
+        if self.service_ix(name, cx).is_none() {
+            if let Some(owner) = port.and_then(crate::services::port_taken) {
+                window.push_notification(
+                    Notification::warning(format!("Port {} is in use by {owner}.", port.unwrap_or(0))).title(format!("{name} not started")),
+                    cx,
+                );
+                return;
+            }
+        }
+        if let Some(ix) = self.service_tab(name, window, cx) {
+            self.activate(ix, window, cx);
+        }
+        cx.emit(TaskEvent::Changed);
+    }
+
+    fn stop_service(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.service_ix(name, cx) else { return };
+        if let TabKind::Terminal(view) = &self.tabs[ix].kind {
+            TermView::end(&view.clone(), cx);
+        }
+        self.remove_tab(ix, window, cx);
+        cx.emit(TaskEvent::Changed);
+    }
+
+    fn open_service(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let url = self.services.iter().find(|s| s.name == name).and_then(|s| s.url(&self.services, self.port_slot));
+        if let Some(url) = url {
+            self.open_browser(&url, window, cx);
+        }
+    }
+
+    fn reload_services(&mut self) -> Result<(), String> {
+        self.services = crate::services::load(&self.root)?;
+        Ok(())
+    }
+
+    /// Writes a commented `.ideae.toml` to start from, and opens it.
+    fn create_services_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let path = self.root.join(crate::services::FILE);
+        if !path.exists() {
+            if let Err(e) = std::fs::write(&path, crate::services::TEMPLATE) {
+                window.push_notification(Notification::error(e.to_string()).title("Services"), cx);
+                return;
+            }
+        }
+        self.open_file(path, 0, window, cx);
+    }
+
+    fn render_run(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let running: Vec<String> = self.running_services(cx).into_iter().map(|(n, _)| n).collect();
+        let label = if running.is_empty() { "Run ▾".to_string() } else { format!("Run ▾ ({})", running.len()) };
+        let task = cx.weak_entity();
+        Button::new("run").xsmall().ghost().label(label).dropdown_menu(move |mut menu, _, cx| {
+            use gpui_kit::component::menu::PopupMenuItem;
+            let Some(view) = task.upgrade() else { return menu };
+            let _ = view.update(cx, |t, _| t.reload_services());
+            let t = view.read(cx);
+            let (services, slot) = (t.services.clone(), t.port_slot);
+            if services.is_empty() {
+                let task = task.clone();
+                return menu.item(PopupMenuItem::new(format!("Describe services in {}…", crate::services::FILE)).on_click(
+                    move |_, window, cx| {
+                        let _ = task.update(cx, |t, cx| t.create_services_file(window, cx));
+                    },
+                ));
+            }
+            for service in &services {
+                let name = service.name.clone();
+                let port = service.port(slot).map(|p| format!(" :{p}")).unwrap_or_default();
+                let on = running.contains(&name);
+                let item = |label: String, action: fn(&mut TaskView, &str, &mut Window, &mut Context<TaskView>)| {
+                    let (task, name) = (task.clone(), name.clone());
+                    PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                        let _ = task.update(cx, |t, cx| action(t, &name, window, cx));
+                    })
+                };
+                if on {
+                    menu = menu
+                        .item(item(format!("Stop {name}{port}"), TaskView::stop_service))
+                        .item(item(format!("Restart {name}"), |t, n, w, cx| {
+                            t.stop_service(n, w, cx);
+                            t.start_service(n, w, cx);
+                        }));
+                } else {
+                    menu = menu.item(item(format!("Start {name}{port}"), TaskView::start_service));
+                }
+                if service.url.is_some() {
+                    menu = menu.item(item(format!("Open {name}"), TaskView::open_service));
+                }
+                menu = menu.separator();
+            }
+            let task = task.clone();
+            menu.item(PopupMenuItem::new(format!("Edit {}", crate::services::FILE)).on_click(move |_, window, cx| {
+                let _ = task.update(cx, |t, cx| t.create_services_file(window, cx));
+            }))
+        })
     }
 }
