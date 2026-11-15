@@ -17,6 +17,12 @@ fn main() {
         .file("vendor/tree-sitter-twig/src/parser.c")
         .warnings(false)
         .compile("tree-sitter-twig");
+    println!("cargo:rerun-if-changed=assets/icon/ideae.rc");
+    println!("cargo:rerun-if-changed=assets/icon/ideae.ico");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        // Without a resource compiler the program is built with no icon.
+        let _ = embed_resource::compile("assets/icon/ideae.rc", embed_resource::NONE).manifest_optional();
+    }
     let commit = git(&["rev-parse", "--short", "HEAD"]).unwrap_or_default();
     println!("cargo:rustc-env=IDEAE_COMMIT={commit}");
     // A new commit or checkout changes these.

@@ -123,25 +123,7 @@ jobs:
           bin="ideae-$IDEAE_VERSION-macos-arm64"
           cp target/release/ideae "$bin"
           codesign --force --sign - "$bin"
-          app=ideae.app/Contents
-          mkdir -p "$app/MacOS" "$app/Resources"
-          cp "$bin" "$app/MacOS/ideae"
-          cat > "$app/Info.plist" <<PLIST
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0"><dict>
-            <key>CFBundleName</key><string>ideae</string>
-            <key>CFBundleDisplayName</key><string>ideae</string>
-            <key>CFBundleIdentifier</key><string>io.github.scillarium.ideae</string>
-            <key>CFBundleExecutable</key><string>ideae</string>
-            <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleShortVersionString</key><string>$IDEAE_VERSION</string>
-            <key>CFBundleVersion</key><string>$IDEAE_VERSION</string>
-            <key>LSMinimumSystemVersion</key><string>11.0</string>
-            <key>NSHighResolutionCapable</key><true/>
-          </dict></plist>
-          PLIST
-          codesign --force --sign - ideae.app
+          scripts/macos-app.sh "$bin" ideae.app "$IDEAE_VERSION"
           ditto -c -k --keepParent ideae.app "ideae-$IDEAE_VERSION-macos-arm64.app.zip"
       - uses: actions/upload-artifact@v4
         with:

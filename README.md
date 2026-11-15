@@ -65,6 +65,11 @@ Shortcuts use Cmd where Linux uses Ctrl. Not there yet on macOS: the
 process monitor in the title bar, clicks on notifications, the Kotlin
 language server install.
 
+A build of your own becomes an app the Dock can keep with
+`scripts/macos-app.sh --link target/release/ideae ~/Applications/ideae.app`:
+the bundle links to the binary, so the app offers a restart after each
+`cargo build --release`.
+
 ## Updates
 
 Release builds ask the GitHub API for this repository's latest release at

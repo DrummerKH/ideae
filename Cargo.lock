@@ -3932,6 +3932,7 @@ dependencies = [
  "async-channel",
  "base64 0.22.1",
  "cc",
+ "embed-resource",
  "gpui-cn",
  "gpui-kit",
  "grep-matcher",

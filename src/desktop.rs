@@ -10,12 +10,7 @@ fn desktop_id() -> String {
     format!("{APP_ID}.desktop")
 }
 
-const ICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-<rect x="4" y="4" width="56" height="56" rx="12" fill="#1f2430"/>
-<path d="M16 22l10 10-10 10" fill="none" stroke="#ffcc66" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
-<path d="M32 44h16" stroke="#73d0ff" stroke-width="5" stroke-linecap="round"/>
-</svg>
-"##;
+const ICON: &str = include_str!("../assets/icon/ideae.svg");
 
 fn data_home() -> Option<PathBuf> {
     std::env::var_os("XDG_DATA_HOME")
@@ -169,24 +164,30 @@ pub fn unpin() {
     }
 }
 
+fn icon_file() -> Option<PathBuf> {
+    Some(data_home()?.join(format!("icons/hicolor/scalable/apps/{APP_ID}.svg")))
+}
+
 fn write_entry() -> Result<(), String> {
     let exe = exe().map_err(|e| e.to_string())?;
     let file = desktop_file().ok_or("no home directory")?;
     crate::state::write_atomic(&file, entry(&exe).as_bytes()).map_err(|e| e.to_string())?;
-    if let Some(icon) = data_home().map(|d| d.join(format!("icons/hicolor/scalable/apps/{APP_ID}.svg"))) {
+    if let Some(icon) = icon_file() {
         let _ = crate::state::write_atomic(&icon, ICON.as_bytes());
     }
     Ok(())
 }
 
-/// An entry written earlier points at where the binary was then: follow it.
+/// An entry written earlier points at where the binary was then, and its
+/// icon is the one of that build: follow both.
 pub fn refresh_entry() {
     if !can_pin() {
         return;
     }
     let (Some(file), Ok(exe)) = (desktop_file(), exe()) else { return };
     if let Ok(current) = std::fs::read_to_string(&file) {
-        if current != entry(&exe) && current.contains(&format!("StartupWMClass={APP_ID}\n")) {
+        let stale_icon = icon_file().is_some_and(|icon| std::fs::read_to_string(icon).is_ok_and(|old| old != ICON));
+        if (current != entry(&exe) || stale_icon) && current.contains(&format!("StartupWMClass={APP_ID}\n")) {
             let _ = write_entry();
         }
     }
@@ -194,5 +195,48 @@ pub fn refresh_entry() {
 
 /// Starts a new instance with the same arguments; the caller quits.
 pub fn spawn_again() -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    if let Some(app) = linked_bundle() {
+        let mut open = crate::procs::command("open");
+        open.arg("-n");
+        // Launch Services starts the app with its own environment, not ours.
+        for (name, value) in std::env::vars().filter(|(name, _)| name.starts_with("IDEAE_")) {
+            open.arg("--env").arg(format!("{name}={value}"));
+        }
+        return open.arg(app).arg("--args").args(std::env::args_os().skip(1)).spawn().map(|_| ());
+    }
     crate::procs::command(exe()?).args(std::env::args_os().skip(1)).spawn().map(|_| ())
+}
+
+/// The .app this process was opened from when its binary is a symlink out
+/// of the bundle (scripts/macos-app.sh --link): started directly, the
+/// binary would be a second, iconless app in the Dock.
+#[cfg(target_os = "macos")]
+fn linked_bundle() -> Option<PathBuf> {
+    let out = crate::procs::command("lsappinfo")
+        .args(["info", "-only", "bundlepath", &std::process::id().to_string()])
+        .output()
+        .ok()?;
+    let app = bundle_path(&String::from_utf8_lossy(&out.stdout))?;
+    let inside = exe().is_ok_and(|exe| exe.starts_with(&app));
+    (!inside && app.join("Contents/Info.plist").is_file()).then_some(app)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn bundle_path(lsappinfo: &str) -> Option<PathBuf> {
+    let path = lsappinfo.split_once("bundle path=\"")?.1.split_once("\"\n")?.0;
+    path.ends_with(".app").then(|| PathBuf::from(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundle_path_from_lsappinfo() {
+        let out = "[ NULL ]  ASN:0x0-0x1: \n    bundleID=[ NULL ] \n    bundle path=\"/Applications/my \"x\" ideae.app\"\n    executable path=[ NULL ] \n";
+        assert_eq!(bundle_path(out), Some(PathBuf::from("/Applications/my \"x\" ideae.app")));
+        assert_eq!(bundle_path("    bundle path=[ NULL ] \n"), None);
+        assert_eq!(bundle_path("    bundle path=\"/usr/bin/thing\"\n"), None);
+    }
 }

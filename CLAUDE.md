@@ -23,7 +23,8 @@ src/desktop.rs     launcher entry, dash pin, restart
 src/naming.rs      branch names from task titles
 src/services.rs    `.ideae.toml` services (Run ▾): per-task port slots, IDEAE_PORT_<NAME>
 vendor/            patched gpui-component, gpui-base, gpui-cn; changes marked `ideae patch`
-scripts/           Xvfb driver for UI checks
+assets/icon/       the app icon: ideae.svg, and the .icns and .ico made from it by scripts/icons.py
+scripts/           Xvfb driver for UI checks, icons.py, macos-app.sh (a .app around a binary)
 ```
 
 ## Build and test
