@@ -64,7 +64,7 @@ pub struct Workspace {
     pub active: Option<PathBuf>,
     pub active_collapsed: bool,
     agent: Option<String>,
-    hook_socket: Option<PathBuf>,
+    hook_socket: Option<String>,
     /// Kept alive for the app's lifetime: dropping it removes the socket.
     _bridge: Option<agent::Bridge>,
     pub appearance: Appearance,
@@ -801,10 +801,7 @@ impl Workspace {
                 agent::AgentStatus::NeedsInput(message) => message.clone(),
                 _ => "Finished".to_string(),
             };
-            // Waited for off the UI thread, or each one stays a zombie.
-            if let Ok(mut child) = std::process::Command::new("notify-send").args(["-a", state::APP_ID, &label, &body]).spawn() {
-                std::thread::spawn(move || child.wait());
-            }
+            crate::desktop::notify(&label, &body);
         }
         cx.notify();
     }

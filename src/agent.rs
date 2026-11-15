@@ -2,13 +2,13 @@
 //!
 //! The agent tab starts `claude --settings <file>`, where the file holds hooks
 //! that run `ideae --hook <Event>`. That subcommand forwards the event over a
-//! unix socket, with the task taken from `IDEAE_TASK` in its environment.
+//! unix socket (on Windows a loopback TCP port and a token), with the task
+//! taken from `IDEAE_TASK` in its environment.
 //! Settings passed this way add to the user's own; nothing is written to
 //! `~/.claude` or the repository.
 
 use std::{
     io::{BufRead, BufReader, Read, Write},
-    os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -90,28 +90,73 @@ impl HookEvent {
 
 /// The socket and the hooks file of this app instance.
 pub struct Bridge {
-    pub socket: PathBuf,
+    /// What `IDEAE_SOCK` holds: the socket's path, or `127.0.0.1:port/token`.
+    pub socket: String,
+    socket_file: Option<PathBuf>,
     pub settings: PathBuf,
+}
+
+#[cfg(unix)]
+fn listen(dir: &Path, pid: u32) -> std::io::Result<(String, Option<PathBuf>, impl Iterator<Item = impl Read + use<>> + Send + use<>)> {
+    let socket = dir.join(format!("{pid}.sock"));
+    let _ = std::fs::remove_file(&socket);
+    let listener = std::os::unix::net::UnixListener::bind(&socket)?;
+    let incoming = std::iter::from_fn(move || listener.accept().ok().map(|(stream, _)| stream));
+    Ok((socket.display().to_string(), Some(socket), incoming))
+}
+
+/// Any local program can reach a loopback port, so each line must carry the
+/// token, which only the app's terminals get.
+#[cfg(windows)]
+fn listen(_: &Path, _: u32) -> std::io::Result<(String, Option<PathBuf>, impl Iterator<Item = impl Read + use<>> + Send + use<>)> {
+    use std::hash::{BuildHasher as _, Hasher as _};
+    let random = || std::collections::hash_map::RandomState::new().build_hasher().finish();
+    let token = format!("{:016x}{:016x}", random(), random());
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    let address = format!("{}/{token}", listener.local_addr()?);
+    let incoming = std::iter::from_fn(move || loop {
+        let (mut stream, _) = listener.accept().ok()?;
+        let mut first = [0u8; 33];
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        if stream.read_exact(&mut first).is_ok() && first[..32] == *token.as_bytes() && first[32] == b'\n' {
+            let _ = stream.set_read_timeout(None);
+            return Some(stream);
+        }
+    });
+    Ok((address, None, incoming))
+}
+
+#[cfg(unix)]
+fn send(address: &str, line: &str) {
+    if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(address) {
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+        let _ = writeln!(stream, "{line}");
+    }
+}
+
+#[cfg(windows)]
+fn send(address: &str, line: &str) {
+    let Some((addr, token)) = address.split_once('/') else { return };
+    let Ok(addr) = addr.parse::<std::net::SocketAddr>() else { return };
+    if let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(1)) {
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+        let _ = write!(stream, "{token}\n{line}\n");
+    }
 }
 
 impl Bridge {
     /// Listens on a fresh socket and writes the hooks settings file. Events
     /// go to `on_event` from a background thread.
     pub fn start(on_event: impl Fn(HookEvent) + Send + 'static) -> std::io::Result<Self> {
-        let dir = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
-            .join(crate::state::APP_ID);
+        let dir = crate::state::runtime_dir();
         std::fs::create_dir_all(&dir)?;
         remove_stale(&dir);
         let pid = std::process::id();
-        let socket = dir.join(format!("{pid}.sock"));
         let settings = dir.join(format!("hooks-{pid}.json"));
-        let _ = std::fs::remove_file(&socket);
+        let (socket, socket_file, incoming) = listen(&dir, pid)?;
 
-        let listener = UnixListener::bind(&socket)?;
         std::thread::Builder::new().name("hook-listener".into()).spawn(move || {
-            for stream in listener.incoming().flatten() {
+            for stream in incoming {
                 let reader = BufReader::new(stream);
                 for line in reader.lines().map_while(Result::ok) {
                     if let Some(event) = parse_line(&line) {
@@ -123,20 +168,27 @@ impl Bridge {
 
         let exe = std::env::current_exe()?;
         std::fs::write(&settings, serde_json::to_vec_pretty(&hooks_settings(&exe))?)?;
-        Ok(Self { socket, settings })
+        Ok(Self { socket, socket_file, settings })
     }
 
     /// The shell command for the agent tab: continue the last conversation in
-    /// this worktree, or start one when there is none.
+    /// this worktree, or start one when there is none. On Windows the shell
+    /// is PowerShell, whose 5.1 has no `||`.
     pub fn claude_command(&self, claude: &str) -> String {
         let settings = shell_quote(&self.settings.display().to_string());
-        format!("{claude} --settings {settings} --continue || {claude} --settings {settings}")
+        if cfg!(windows) {
+            format!("{claude} --settings {settings} --continue; if (-not $?) {{ {claude} --settings {settings} }}")
+        } else {
+            format!("{claude} --settings {settings} --continue || {claude} --settings {settings}")
+        }
     }
 }
 
 impl Drop for Bridge {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.socket);
+        if let Some(file) = &self.socket_file {
+            let _ = std::fs::remove_file(file);
+        }
         let _ = std::fs::remove_file(&self.settings);
     }
 }
@@ -154,7 +206,7 @@ fn remove_stale(dir: &Path) {
             .next()
             .and_then(|p| p.parse::<u32>().ok());
         if let Some(pid) = pid {
-            if !Path::new(&format!("/proc/{pid}")).exists() {
+            if !crate::procs::alive(pid) {
                 // Sockets and hook files, and Chrome profiles of the browser tabs.
                 let _ = std::fs::remove_file(entry.path());
                 let _ = std::fs::remove_dir_all(entry.path());
@@ -163,10 +215,20 @@ fn remove_stale(dir: &Path) {
     }
 }
 
+/// The hook's command line. Claude Code on Windows runs hooks with Git Bash,
+/// where a double-quoted path with forward slashes works as in cmd.
+fn hook_command(exe: &Path, event: &str) -> String {
+    if cfg!(windows) {
+        format!("\"{}\" --hook {event}", exe.display().to_string().replace('\\', "/"))
+    } else {
+        format!("{} --hook {event}", shell_quote(&exe.display().to_string()))
+    }
+}
+
 fn hooks_settings(exe: &Path) -> Value {
     let mut hooks = serde_json::Map::new();
     for event in EVENTS {
-        let command = format!("{} --hook {event}", shell_quote(&exe.display().to_string()));
+        let command = hook_command(exe, event);
         let mut matcher = json!({ "hooks": [{ "type": "command", "command": command, "timeout": 5 }] });
         if *event == "PreToolUse" {
             matcher["matcher"] = json!("*");
@@ -186,8 +248,9 @@ fn parse_line(line: &str) -> Option<HookEvent> {
     })
 }
 
+/// Single quotes, for sh and PowerShell alike; each escapes a quote its own way.
 fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
+    if cfg!(windows) { format!("'{}'", s.replace('\'', "''")) } else { format!("'{}'", s.replace('\'', r"'\''")) }
 }
 
 /// `ideae --hook <Event>`: run by Claude Code, forwards the event and exits.
@@ -196,7 +259,7 @@ pub fn run_hook(event: &str) {
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
     let payload: Value = serde_json::from_str(&input).unwrap_or(Value::Null);
-    let (Some(socket), Some(task)) = (std::env::var_os(SOCK_ENV), std::env::var(TASK_ENV).ok()) else {
+    let (Some(socket), Some(task)) = (std::env::var(SOCK_ENV).ok(), std::env::var(TASK_ENV).ok()) else {
         return;
     };
     let line = json!({
@@ -205,10 +268,7 @@ pub fn run_hook(event: &str) {
         "message": payload["message"].as_str(),
         "kind": payload["notification_type"].as_str(),
     });
-    if let Ok(mut stream) = UnixStream::connect(socket) {
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
-        let _ = writeln!(stream, "{line}");
-    }
+    send(&socket, &line.to_string());
 }
 
 #[cfg(test)]
@@ -218,6 +278,24 @@ mod tests {
     fn note(message: &str, kind: Option<&str>) -> Option<AgentStatus> {
         HookEvent { task: PathBuf::new(), event: "Notification".into(), message: Some(message.into()), kind: kind.map(Into::into) }
             .status()
+    }
+
+    #[test]
+    fn events_reach_the_bridge() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let bridge = Bridge::start(move |event| {
+            let _ = tx.send(event);
+        })
+        .unwrap();
+        send(&bridge.socket, r#"{"task":"/w/t","event":"Stop"}"#);
+        let event = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!((event.task, event.event), (PathBuf::from("/w/t"), "Stop".to_string()));
+        #[cfg(windows)]
+        {
+            let (addr, _) = bridge.socket.split_once('/').unwrap();
+            send(&format!("{addr}/{}", "0".repeat(32)), r#"{"task":"/w/t","event":"Stop"}"#);
+            assert!(rx.recv_timeout(Duration::from_millis(500)).is_err(), "a wrong token got through");
+        }
     }
 
     #[test]

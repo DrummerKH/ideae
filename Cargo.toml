@@ -13,7 +13,6 @@ grep-regex = "0.1.14"
 grep-searcher = "0.1.17"
 ignore = "0.4.34"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-libc = "0.2.191"
 lsp-types = { version = "0.97", features = ["proposed"] }
 notify = "8"
 serde = { version = "1", features = ["derive"] }
@@ -28,6 +27,12 @@ tree-sitter-powershell = "0.26"
 tree-sitter-properties = "0.3"
 tree-sitter-xml = "0.7"
 tungstenite = "0.30"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.191"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 # GPUI and libghostty are unusably slow unoptimized; our own crate stays debug for fast rebuilds.
 [profile.dev.package."*"]

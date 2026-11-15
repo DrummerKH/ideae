@@ -888,7 +888,7 @@ pub struct TaskView {
     pub root: PathBuf,
     pub branch: SharedString,
     pub agent_status: crate::agent::AgentStatus,
-    hook_socket: Option<PathBuf>,
+    hook_socket: Option<String>,
     /// Numbers terminals so each has a unique element id and default title.
     terminal_seq: usize,
     /// Status changed to one that wants attention while the task was not in view.
@@ -959,7 +959,7 @@ impl TaskView {
         root: PathBuf,
         branch: String,
         agent: Option<String>,
-        hook_socket: Option<PathBuf>,
+        hook_socket: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -1111,7 +1111,7 @@ impl TaskView {
 
     fn make_terminal(
         root: &PathBuf,
-        hook_socket: Option<&PathBuf>,
+        hook_socket: Option<&String>,
         title: &str,
         seq: usize,
         input: Option<String>,
@@ -1123,7 +1123,7 @@ impl TaskView {
         // claude started by hand reports too once given the settings file.
         if let Some(socket) = hook_socket {
             options = options
-                .with_env(crate::agent::SOCK_ENV, socket.display().to_string())
+                .with_env(crate::agent::SOCK_ENV, socket.clone())
                 .with_env(crate::agent::TASK_ENV, root.display().to_string());
         }
         // Set either way: an ideae started from an agent's terminal inherits "agent".
@@ -1604,7 +1604,7 @@ impl TaskView {
         };
         let path = path.strip_prefix("~/").map_or_else(
             || PathBuf::from(path),
-            |rest| std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join(rest),
+            |rest| std::env::home_dir().unwrap_or_default().join(rest),
         );
         let candidates = if path.is_absolute() {
             vec![path.clone()]

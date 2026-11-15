@@ -1,0 +1,108 @@
+name: Release
+
+# Every push to main is a release, tagged with its UTC time (yyyymmddhhmmss),
+# with a binary for each supported system.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Releases queue up rather than cancel each other: each push gets its own.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - id: tag
+        run: echo "tag=$(date -u +%Y%m%d%H%M%S)" >> "$GITHUB_OUTPUT"
+
+  linux:
+    needs: version
+    runs-on: ubuntu-24.04
+    env:
+      IDEAE_VERSION: ${{ needs.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libxcb-xkb-dev \
+            libx11-xcb-dev libwayland-dev libvulkan-dev libfontconfig-dev libfreetype-dev libasound2-dev
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+      # Against glibc 2.31, so it runs on older distributions too (see README).
+      - name: Build
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-Wl,--allow-shlib-undefined
+        run: cargo zigbuild --release --locked --target x86_64-unknown-linux-gnu.2.31
+      - name: Package
+        run: |
+          name=ideae-$IDEAE_VERSION-linux-x86_64
+          mkdir "$name"
+          cp target/x86_64-unknown-linux-gnu/release/ideae README.md "$name/"
+          tar czf "$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: ideae-*-linux-x86_64.tar.gz
+
+  windows:
+    needs: version
+    runs-on: windows-latest
+    env:
+      IDEAE_VERSION: ${{ needs.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+      # gpui compiles its HLSL shaders with the Windows SDK's fxc.exe.
+      - name: Find fxc
+        shell: pwsh
+        run: |
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\fxc.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $fxc) { throw "fxc.exe not found" }
+          "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
+      - run: cargo build --release --locked
+      - name: Package
+        shell: pwsh
+        run: Copy-Item target/release/ideae.exe "ideae-$env:IDEAE_VERSION-windows-x86_64.exe"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: ideae-*-windows-x86_64.exe
+
+  release:
+    needs: [version, linux, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "$TAG" --generate-notes ideae-*

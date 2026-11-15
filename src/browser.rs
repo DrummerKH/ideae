@@ -7,9 +7,8 @@
 use std::{
     io::ErrorKind,
     net::TcpStream,
-    os::unix::process::CommandExt as _,
     path::PathBuf,
-    process::{Child, Command, Stdio},
+    process::{Child, Stdio},
     sync::{Arc, Mutex, OnceLock, mpsc},
     time::{Duration, Instant},
 };
@@ -43,6 +42,28 @@ impl Drop for Chrome {
     }
 }
 
+#[cfg(unix)]
+fn find_chrome() -> Option<PathBuf> {
+    ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"]
+        .into_iter()
+        .find(|p| crate::procs::command(p).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success()))
+        .map(PathBuf::from)
+}
+
+/// `chrome.exe --version` opens a window instead of answering, so the
+/// usual install places are looked at. Edge, which every Windows has, is
+/// Chromium too.
+#[cfg(windows)]
+fn find_chrome() -> Option<PathBuf> {
+    let roots: Vec<PathBuf> =
+        ["LOCALAPPDATA", "ProgramFiles", "ProgramFiles(x86)"].iter().filter_map(std::env::var_os).map(PathBuf::from).collect();
+    let in_roots = |rel: &str| roots.iter().map(|r| r.join(rel)).find(|p| p.is_file());
+    in_roots(r"Google\Chrome\Application\chrome.exe")
+        .or_else(|| crate::procs::which("chrome.exe"))
+        .or_else(|| in_roots(r"Chromium\Application\chrome.exe"))
+        .or_else(|| in_roots(r"Microsoft\Edge\Application\msedge.exe"))
+}
+
 static CHROME: OnceLock<Mutex<Option<Arc<Chrome>>>> = OnceLock::new();
 
 /// The app's Chrome, started on first use.
@@ -52,18 +73,12 @@ fn chrome() -> Result<Arc<Chrome>> {
     if let Some(chrome) = slot.as_ref() {
         return Ok(chrome.clone());
     }
-    let program = ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"]
-        .into_iter()
-        .find(|p| Command::new(p).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success()))
-        .ok_or_else(|| anyhow!("no Chrome or Chromium found"))?;
-    let profile = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join(crate::state::APP_ID)
-        .join(format!("chrome-{}", std::process::id()));
+    let program = find_chrome().ok_or_else(|| anyhow!("no Chrome or Chromium found"))?;
+    let program = program.as_path();
+    let profile = crate::state::runtime_dir().join(format!("chrome-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&profile);
     std::fs::create_dir_all(&profile)?;
-    let mut command = Command::new(program);
+    let mut command = crate::procs::command(program);
     command
         .args([
             "--headless=new",
@@ -77,14 +92,7 @@ fn chrome() -> Result<Arc<Chrome>> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    // Chrome must not outlive the app, even when the app is killed.
-    unsafe {
-        command.pre_exec(|| {
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
-            Ok(())
-        });
-    }
-    let child = command.spawn().with_context(|| format!("starting {program}"))?;
+    let child = crate::procs::spawn_tied(&mut command).with_context(|| format!("starting {}", program.display()))?;
 
     // Chrome writes the port it picked and the browser socket path here.
     let port_file = profile.join("DevToolsActivePort");

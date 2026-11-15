@@ -32,6 +32,9 @@ fn lock_owner(reason: &str) -> Option<(u32, Option<u64>)> {
 /// The process exists and, when its start time is known, is the same one
 /// and not a later process given the same pid.
 fn process_alive(pid: u32, start: Option<u64>) -> bool {
+    if cfg!(not(target_os = "linux")) {
+        return crate::procs::alive(pid);
+    }
     let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else { return false };
     let Some(start) = start else { return true };
     // Field 22, counted after the parenthesized command name.
@@ -42,7 +45,7 @@ fn process_alive(pid: u32, start: Option<u64>) -> bool {
 fn git(root: &Path, args: &[&str]) -> Option<String> {
     // No optional locks: status and diff must not rewrite the index, or the
     // file watcher would see our own refresh and refresh again forever.
-    let output = Command::new("git")
+    let output = crate::procs::command("git")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .arg("-C")
         .arg(root)
@@ -252,7 +255,7 @@ pub fn file_states(root: &Path) -> std::collections::HashMap<String, FileState> 
 /// Runs a command in `root` for a user action: stdout on success, stderr (or
 /// stdout) as the error.
 pub fn run(root: &Path, program: &str, args: &[&str]) -> Result<String, String> {
-    let output = Command::new(program)
+    let output = crate::procs::command(program)
         .current_dir(root)
         .args(args)
         .stdin(std::process::Stdio::null())
@@ -489,12 +492,15 @@ mod lock_tests {
         assert_eq!(lock_owner("claude agent agent-a3 (pid 1532754 start 82664722)"), Some((1532754, Some(82664722))));
         assert_eq!(lock_owner("moved to usb disk"), None);
         assert!(process_alive(me, None));
-        assert!(!process_alive(me, Some(1)));
+        if cfg!(target_os = "linux") {
+            assert!(!process_alive(me, Some(1)));
+        }
         assert!(!process_alive(u32::MAX - 1, None));
     }
 }
 
-#[cfg(test)]
+// They script repositories with bash, which Windows lacks or has as WSL's.
+#[cfg(all(test, unix))]
 mod pull_tests {
     use super::pull_safe;
     use std::{path::Path, process::Command};

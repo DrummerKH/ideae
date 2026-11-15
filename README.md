@@ -7,7 +7,8 @@ Every task gets the agent in a terminal, more terminals, an editor, the
 diff of its changes, git history, and a headless browser tab, and keeps
 all of it while you switch between tasks.
 
-Status: early, Linux only (Ubuntu 24.04 or newer is what it is tested on).
+Status: early. Linux (Ubuntu 24.04 or newer is what it is tested on); a
+Windows build exists and is being tried out (see [Windows](#windows)).
 
 ## What it does
 
@@ -62,6 +63,35 @@ To run on older glibc, build against glibc 2.31 with
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-Wl,--allow-shlib-undefined" \
   cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.31
 ```
+
+### Releases
+
+Every push to `main` builds a release tagged with its UTC time
+(`yyyymmddhhmmss`): a Linux tarball and a single Windows `.exe`
+(`.github/workflows/release.yml`). `ideae --version` names the release.
+
+### Windows
+
+Windows 10 1903 or newer, x64. The `.exe` is self-contained: it needs only
+system DLLs. Terminals run PowerShell (`pwsh` when installed). Git must be
+on PATH; Claude Code on Windows brings Git Bash, which also runs the agent
+hooks. The headless browser tab uses Chrome, or Edge when there is no
+Chrome.
+
+State and language servers live in `%LOCALAPPDATA%\ideae`.
+
+Not there yet on Windows: the CPU/RAM readout in the title bar, pinning
+to a launcher, the Kotlin language server install.
+
+To build on Windows: Rust (MSVC), Zig 0.17.x and the Windows SDK (gpui
+compiles its shaders with `fxc.exe`; point `GPUI_FXC_PATH` at it when it is
+not found), then `cargo build --release`.
+
+A debug build cross-compiles on Linux with
+`cargo build --target x86_64-pc-windows-gnu` (needs `mingw-w64`), enough to
+check that it compiles and to run the tests under Wine. Such a build reads
+its shaders from this checkout at run time, so it cannot be handed out, and
+a release build needs a Windows host for `fxc.exe`.
 
 ## Keys
 

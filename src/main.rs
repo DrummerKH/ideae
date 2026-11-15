@@ -1,3 +1,6 @@
+// A release build on Windows opens no console window next to its own.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod agent;
 mod browser;
 mod desktop;
@@ -66,7 +69,7 @@ impl Render for Workspace {
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .on_click(|_, _, cx| cx.stop_propagation())
                                 .gap_3()
-                                .child(div().mr_2().child(sysmon::SysMon::render_widget(&self.sysmon, cx)))
+                                .when(sysmon::SUPPORTED, |row| row.child(div().mr_2().child(sysmon::SysMon::render_widget(&self.sysmon, cx))))
                                 .child(self.render_power_saving(cx))
                                 .child(
                                     Button::new("go-to-file")
@@ -242,7 +245,7 @@ impl Workspace {
                 }))
             })
             .separator()
-            .item(PopupMenuItem::new(if pinned { "Unpin from dash" } else { "Pin to dash" }).on_click(
+            .when(desktop::can_pin(), |menu| menu.item(PopupMenuItem::new(if pinned { "Unpin from dash" } else { "Pin to dash" }).on_click(
                 move |_, window, cx| {
                     let result = if pinned { Ok(desktop::unpin()) } else { desktop::pin() };
                     match result {
@@ -258,7 +261,7 @@ impl Workspace {
                         ),
                     }
                 },
-            ))
+            )))
             .item(PopupMenuItem::new("Restart").on_click(move |_, window, cx| {
                 let _ = c.update(cx, |w, cx| w.save(cx));
                 match desktop::spawn_again() {
@@ -369,8 +372,12 @@ fn main() {
             "--theme" => {
                 appearance = args.next().and_then(|v| Appearance::parse(&v))
             }
+            "--version" | "-V" => {
+                println!("ideae {}", option_env!("IDEAE_VERSION").unwrap_or(concat!(env!("CARGO_PKG_VERSION"), "-local")));
+                return;
+            }
             "--help" | "-h" => {
-                println!("usage: ideae [--agent CMD | --no-agent] [--theme auto|light|dark] [REPO...]\nRepos join the project list, kept in ~/.local/share/ideae/state.json.");
+                println!("usage: ideae [--agent CMD | --no-agent] [--theme auto|light|dark] [--version] [REPO...]\nRepos join the project list, kept in {}.", state::data_dir().join("state.json").display());
                 return;
             }
             _ => repos.push(PathBuf::from(arg)),

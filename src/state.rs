@@ -1,5 +1,5 @@
 //! What survives a restart: projects, their tasks and each task's tabs, kept
-//! in `~/.local/share/ideae/state.json`.
+//! in `~/.local/share/ideae/state.json` (`%LOCALAPPDATA%\ideae` on Windows).
 
 use std::path::{Path, PathBuf};
 
@@ -75,12 +75,22 @@ pub struct TabSession {
 /// and launcher, so a dev build never touches the release one's tasks.
 pub const APP_ID: &str = if cfg!(debug_assertions) { "ideae-dev" } else { "ideae" };
 
+/// Where apps keep their data: `~/.local/share`, `%LOCALAPPDATA%` on Windows.
+pub fn data_home() -> PathBuf {
+    let var = |name| std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from);
+    if cfg!(windows) {
+        return var("LOCALAPPDATA").unwrap_or_else(std::env::temp_dir);
+    }
+    var("XDG_DATA_HOME").or_else(|| var("HOME").map(|h| h.join(".local/share"))).unwrap_or_else(std::env::temp_dir)
+}
+
+/// Sockets, hook files and browser profiles of running instances.
+pub fn runtime_dir() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join(APP_ID)
+}
+
 pub fn data_dir() -> PathBuf {
-    std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        .unwrap_or_else(std::env::temp_dir)
-        .join(APP_ID)
+    data_home().join(APP_ID)
 }
 
 fn state_path() -> PathBuf {

@@ -4,7 +4,7 @@ Context for AI coding agents working on ideae. Human docs: [README.md](README.md
 
 ## Layout
 
-One Rust binary on GPUI (`gpui-kit`), Linux first.
+One Rust binary on GPUI (`gpui-kit`), Linux first, Windows too.
 
 ```
 src/main.rs        CLI, key bindings, title bar, window
@@ -16,7 +16,7 @@ src/agent.rs       Claude Code hooks bridge (unix socket, `ideae --hook`)
 src/git.rs         git CLI wrappers, worktrees
 src/lsp.rs         language server client
 src/lsp_install.rs language servers installed on request, ~/.local/share/ideae/lsp
-src/procs.rs       ending child sessions on quit, quit signals
+src/procs.rs       starting helper programs (no console on Windows), ending child sessions on quit
 src/desktop.rs     launcher entry, dash pin, restart
 src/naming.rs      branch names from task titles
 vendor/            patched gpui-component, gpui-base, gpui-cn; changes marked `ideae patch`
@@ -47,6 +47,10 @@ IDEAE_STATE=/tmp/x/state.json scripts/drive.sh /tmp/x/run.log 7 \
 
 ## Rules
 
+- Windows: start helper programs with `procs::command` (it hides the console
+  window and finds `npm.cmd` and the like), and programs that must die with
+  the app with `procs::spawn_tied`. Check the Windows side compiles with
+  `cargo check --target x86_64-pc-windows-gnu --target-dir target/win`.
 - The repository is public: no personal paths, hostnames, emails or private project names in code, tests or commits.
 - Agents and terminals belong to tasks; whatever a task starts must end on Close, Delete and quit.
 - No comments unless the why is non-obvious.

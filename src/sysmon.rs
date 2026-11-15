@@ -4,8 +4,11 @@
 //! CPU is a share of the whole machine (all cores = 100%), for processes as
 //! for the system, so the numbers add up. Memory is PSS where readable:
 //! shared pages are split between the processes that map them.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
-use std::{collections::HashMap, path::PathBuf, rc::Rc, time::{Duration, Instant}};
+use std::{collections::HashMap, rc::Rc, time::{Duration, Instant}};
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 
 use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
 use gpui_kit::{prelude::FluentBuilder as _, *};
@@ -59,6 +62,7 @@ pub struct Snapshot {
     pub app_mem: u64,
 }
 
+#[cfg(target_os = "linux")]
 struct Raw {
     ppid: i32,
     sid: i32,
@@ -73,16 +77,29 @@ struct Sampler {
     at: Option<Instant>,
 }
 
+#[cfg(target_os = "linux")]
 fn clk_tck() -> f32 {
     // SAFETY: sysconf only reads a constant.
     (unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).max(1) as f32
 }
 
+#[cfg(target_os = "linux")]
 fn page_size() -> u64 {
     // SAFETY: as above.
     (unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).max(1) as u64
 }
 
+/// Only Linux is read for now; elsewhere the readout stays hidden.
+pub const SUPPORTED: bool = cfg!(target_os = "linux");
+
+#[cfg(not(target_os = "linux"))]
+impl Sampler {
+    fn sample(&mut self) -> Snapshot {
+        Snapshot::default()
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl Sampler {
     fn sample(&mut self) -> Snapshot {
         let now = Instant::now();
@@ -219,6 +236,7 @@ impl Sampler {
     }
 }
 
+#[cfg(target_os = "linux")]
 /// PSS, or RSS when smaps_rollup cannot be read.
 fn memory(pid: i32, page: u64) -> u64 {
     if let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")) {
@@ -232,6 +250,7 @@ fn memory(pid: i32, page: u64) -> u64 {
         .map_or(0, |pages| pages * page)
 }
 
+#[cfg(target_os = "linux")]
 /// The task a terminal's shell was started for, and whether it is the
 /// agent's tab, from its environment.
 fn session_env(pid: i32) -> (Option<String>, bool) {

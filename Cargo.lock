@@ -3951,6 +3951,7 @@ dependencies = [
  "tree-sitter-properties",
  "tree-sitter-xml",
  "tungstenite",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

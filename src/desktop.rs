@@ -1,5 +1,6 @@
 //! The app in the desktop: a launcher entry pinned to the GNOME dash, kept
-//! pointing at the binary when it moves, and restarting.
+//! pointing at the binary when it moves, notifications, and restarting. On
+//! Windows there is no dash to pin to.
 
 use std::path::PathBuf;
 
@@ -46,7 +47,7 @@ fn entry(exe: &std::path::Path) -> String {
 }
 
 fn favorites() -> Option<Vec<String>> {
-    let out = std::process::Command::new("gsettings").args(["get", "org.gnome.shell", "favorite-apps"]).output().ok()?;
+    let out = crate::procs::command("gsettings").args(["get", "org.gnome.shell", "favorite-apps"]).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -57,10 +58,41 @@ fn favorites() -> Option<Vec<String>> {
 
 fn set_favorites(list: &[String]) {
     let value = format!("[{}]", list.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(", "));
-    let _ = std::process::Command::new("gsettings").args(["set", "org.gnome.shell", "favorite-apps", &value]).status();
+    let _ = crate::procs::command("gsettings").args(["set", "org.gnome.shell", "favorite-apps", &value]).status();
+}
+
+/// A desktop notification. On Windows a balloon from PowerShell, which needs
+/// no app registration as a toast does.
+pub fn notify(title: &str, body: &str) {
+    #[cfg(windows)]
+    let child = {
+        let quote = |s: &str| format!("'{}'", s.replace('\'', "''"));
+        let script = format!(
+            "Add-Type -AssemblyName System.Windows.Forms; $n = New-Object System.Windows.Forms.NotifyIcon; \
+             $n.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon({exe}); $n.Visible = $true; \
+             $n.ShowBalloonTip(5000, {title}, {body}, 'None'); Start-Sleep 6; $n.Dispose()",
+            exe = quote(&exe().map(|e| e.display().to_string()).unwrap_or_default()),
+            title = quote(title),
+            body = quote(body),
+        );
+        crate::procs::command("powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command", &script]).spawn()
+    };
+    #[cfg(not(windows))]
+    let child = crate::procs::command("notify-send").args(["-a", APP_ID, title, body]).spawn();
+    // Waited for off the UI thread, or each one stays a zombie.
+    if let Ok(mut child) = child {
+        std::thread::spawn(move || child.wait());
+    }
+}
+
+pub fn can_pin() -> bool {
+    cfg!(target_os = "linux")
 }
 
 pub fn is_pinned() -> bool {
+    if !can_pin() {
+        return false;
+    }
     favorites().is_some_and(|f| f.iter().any(|s| *s == desktop_id()))
 }
 
@@ -94,6 +126,9 @@ fn write_entry() -> Result<(), String> {
 
 /// An entry written earlier points at where the binary was then: follow it.
 pub fn refresh_entry() {
+    if !can_pin() {
+        return;
+    }
     let (Some(file), Ok(exe)) = (desktop_file(), exe()) else { return };
     if let Ok(current) = std::fs::read_to_string(&file) {
         if current != entry(&exe) && current.contains(&format!("StartupWMClass={APP_ID}\n")) {
@@ -104,5 +139,5 @@ pub fn refresh_entry() {
 
 /// Starts a new instance with the same arguments; the caller quits.
 pub fn spawn_again() -> std::io::Result<()> {
-    std::process::Command::new(exe()?).args(std::env::args_os().skip(1)).spawn().map(|_| ())
+    crate::procs::command(exe()?).args(std::env::args_os().skip(1)).spawn().map(|_| ())
 }

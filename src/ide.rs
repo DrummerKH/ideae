@@ -2,7 +2,7 @@
 
 use std::{
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     sync::OnceLock,
 };
 
@@ -61,7 +61,7 @@ pub fn installed() -> &'static [Ide] {
 impl Ide {
     /// Opens `file` at `line` (1-based) in this editor, detached.
     pub fn open(&self, file: &Path, line: u32) {
-        let mut command = Command::new(&self.program);
+        let mut command = crate::procs::command(&self.program);
         match self.style {
             Style::JetBrains => command.arg("--line").arg(line.to_string()).arg(file),
             Style::Colon => command.arg(format!("{}:{line}", file.display())),

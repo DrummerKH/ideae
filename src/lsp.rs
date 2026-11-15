@@ -5,7 +5,7 @@ use std::{
     collections::{HashMap, HashSet},
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Child, ChildStdin, Stdio},
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicI64, Ordering},
@@ -99,7 +99,7 @@ fn runs(program: &str) -> bool {
             return on_path(program);
         }
         on_path(program)
-            && Command::new(program)
+            && crate::procs::command(program)
                 .arg("--version")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -110,12 +110,7 @@ fn runs(program: &str) -> bool {
 }
 
 pub fn on_path(program: &str) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::env::var_os("PATH").is_some_and(|path| {
-        std::env::split_paths(&path).any(|dir| {
-            std::fs::metadata(dir.join(program)).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        })
-    })
+    crate::procs::which(program).is_some()
 }
 
 /// The directory a server should treat as its workspace: the nearest ancestor
@@ -210,11 +205,36 @@ pub fn language_for(path: &Path) -> &'static str {
     }
 }
 
+/// `/a/b.rs` → `file:///a/b.rs`; `C:\a\b.rs` → `file:///C:/a/b.rs`.
 pub fn path_to_uri(path: &Path) -> String {
-    format!("file://{}", path.display())
+    let text = path.to_string_lossy();
+    let text = if cfg!(windows) { format!("/{}", text.replace('\\', "/")) } else { text.into_owned() };
+    let mut uri = String::from("file://");
+    for b in text.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b':' | b'-' | b'.' | b'_' | b'~' | b'+' | b'@' => uri.push(b as char),
+            _ => uri.push_str(&format!("%{b:02X}")),
+        }
+    }
+    uri
 }
 
 pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
+    let path = decode_uri_path(uri)?;
+    if !cfg!(windows) {
+        return Some(PathBuf::from(path));
+    }
+    // `/c:/a/b.rs`, as servers write it, is `C:\a\b.rs`, the drive in capitals
+    // as the rest of the app has it.
+    let path = path.strip_prefix('/').filter(|p| p.as_bytes().get(1) == Some(&b':')).unwrap_or(&path);
+    let mut path = path.replace('/', "\\");
+    if path.as_bytes().get(1) == Some(&b':') {
+        path[..1].make_ascii_uppercase();
+    }
+    Some(PathBuf::from(path))
+}
+
+fn decode_uri_path(uri: &str) -> Option<String> {
     let raw = uri.strip_prefix("file://")?;
     let mut out = Vec::with_capacity(raw.len());
     let bytes = raw.as_bytes();
@@ -230,26 +250,17 @@ pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
         out.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8(out).ok().map(PathBuf::from)
+    String::from_utf8(out).ok()
 }
 
 impl LspClient {
     /// Starts the server; initialization runs on its own thread, and every
     /// call waits for it.
     pub fn spawn(program: &str, executable: &Path, args: &[&str], root: &Path, init_options: Value) -> Result<Arc<Self>> {
-        let mut command = Command::new(executable);
+        let mut command = crate::procs::command(executable);
         command.args(args).current_dir(root).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
         // Dies with the app even when it exits without running destructors.
-        // SAFETY: prctl only sets a flag of the child.
-        unsafe {
-            use std::os::unix::process::CommandExt as _;
-            command.pre_exec(|| {
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
-                Ok(())
-            });
-        }
-        let mut child = command
-            .spawn()
+        let mut child = crate::procs::spawn_tied(&mut command)
             .with_context(|| format!("starting {program}"))?;
         let stdin = Arc::new(Mutex::new(child.stdin.take().expect("piped stdin")));
         let stdout = child.stdout.take().expect("piped stdout");
@@ -542,6 +553,18 @@ fn read_loop(stdout: impl Read, stdin: Arc<Mutex<ChildStdin>>, pending: Pending,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uris_round_trip() {
+        let path = if cfg!(windows) { PathBuf::from(r"C:\Users\A B\src\main.rs") } else { PathBuf::from("/home/a b/src/main.rs") };
+        let uri = path_to_uri(&path);
+        assert!(!uri.contains(' ') && !uri.contains('\\'), "{uri}");
+        assert_eq!(uri_to_path(&uri), Some(path));
+        if cfg!(windows) {
+            assert_eq!(uri, "file:///C:/Users/A%20B/src/main.rs");
+            assert_eq!(uri_to_path("file:///c%3A/Users/x.rs"), Some(PathBuf::from(r"C:\Users\x.rs")));
+        }
+    }
 
     /// Needs gopls: `cargo test -- --ignored`.
     #[test]

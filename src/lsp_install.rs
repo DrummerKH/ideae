@@ -1,6 +1,7 @@
 //! Language servers ideae installs itself when the user asks, each in its own
-//! directory under `~/.local/share/ideae/lsp/`, shared by the release and dev
-//! builds. A server on PATH always wins over these.
+//! directory under `~/.local/share/ideae/lsp/` (`%LOCALAPPDATA%\ideae\lsp` on
+//! Windows), shared by the release and dev builds. A server on PATH always
+//! wins over these.
 
 use std::{
     collections::HashSet,
@@ -20,11 +21,13 @@ pub struct Recipe {
 pub fn recipe(program: &str) -> Option<Recipe> {
     let (summary, needs): (&str, &[&str]) = match program {
         "gopls" => ("Builds the latest gopls with `go install`.", &["go"]),
+        "rust-analyzer" if cfg!(windows) => ("Downloads the latest rust-analyzer release from GitHub, about 16 MB.", &["curl", "tar"]),
         "rust-analyzer" => ("Downloads the latest rust-analyzer release from GitHub, about 16 MB.", &["curl", "gzip"]),
         "typescript-language-server" => {
             ("Installs typescript-language-server and typescript with npm, about 30 MB.", &["npm"])
         }
         "intelephense" => ("Installs intelephense with npm, about 20 MB.", &["npm"]),
+        "kotlin-lsp" if cfg!(windows) => return None,
         "kotlin-lsp" => (
             "Downloads the latest JetBrains Kotlin LSP release: about 370 MB, 1.2 GB unpacked, Java included. The download is checked against its published SHA-256.",
             &["curl", "tar", "sha256sum"],
@@ -43,15 +46,15 @@ pub fn root() -> PathBuf {
     if let Some(dir) = std::env::var_os("IDEAE_LSP_DIR") {
         return PathBuf::from(dir);
     }
-    std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        .unwrap_or_else(std::env::temp_dir)
-        .join("ideae/lsp")
+    crate::state::data_home().join("ideae").join("lsp")
 }
 
 fn executable(program: &str) -> Option<&'static str> {
     Some(match program {
+        "gopls" if cfg!(windows) => "bin/gopls.exe",
+        "rust-analyzer" if cfg!(windows) => "bin/rust-analyzer.exe",
+        "typescript-language-server" if cfg!(windows) => "node_modules/.bin/typescript-language-server.cmd",
+        "intelephense" if cfg!(windows) => "node_modules/.bin/intelephense.cmd",
         "gopls" => "bin/gopls",
         "rust-analyzer" => "bin/rust-analyzer",
         "typescript-language-server" => "node_modules/.bin/typescript-language-server",
@@ -63,9 +66,15 @@ fn executable(program: &str) -> Option<&'static str> {
 
 /// The server's executable, when ideae has installed it.
 pub fn installed(program: &str) -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt as _;
     let path = root().join(program).join(executable(program)?);
-    std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0).then_some(path)
+    #[cfg(unix)]
+    let runnable = {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    };
+    #[cfg(not(unix))]
+    let runnable = path.is_file();
+    runnable.then_some(path)
 }
 
 /// `initializationOptions` an installed copy needs: typescript-language-server
@@ -125,7 +134,7 @@ fn install_inner(program: &str) -> Result<PathBuf> {
 fn build(program: &str, staging: &Path) -> Result<PathBuf> {
     match program {
         "gopls" => {
-            run(Command::new("go").args(["install", "golang.org/x/tools/gopls@latest"]).env("GOBIN", staging.join("bin")))?;
+            run(crate::procs::command("go").args(["install", "golang.org/x/tools/gopls@latest"]).env("GOBIN", staging.join("bin")))?;
         }
         // TypeScript 7 is native and has no tsserver.js for the server to run.
         "typescript-language-server" => npm(staging, &["typescript-language-server", "typescript@6"])?,
@@ -135,16 +144,25 @@ fn build(program: &str, staging: &Path) -> Result<PathBuf> {
                 "x86_64" | "aarch64" => std::env::consts::ARCH,
                 other => bail!("no rust-analyzer build for {other}"),
             };
-            let url = format!(
-                "https://github.com/rust-lang/rust-analyzer/releases/latest/download/rust-analyzer-{arch}-unknown-linux-gnu.gz"
-            );
             let bin = staging.join("bin");
             std::fs::create_dir_all(&bin)?;
-            let gz = bin.join("rust-analyzer.gz");
-            download(&url, &gz)?;
-            run(Command::new("gzip").arg("-d").arg(&gz))?;
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(bin.join("rust-analyzer"), std::fs::Permissions::from_mode(0o755))?;
+            let latest = "https://github.com/rust-lang/rust-analyzer/releases/latest/download";
+            #[cfg(windows)]
+            {
+                // Windows' own tar.exe unpacks zip archives.
+                let zip = bin.join("rust-analyzer.zip");
+                download(&format!("{latest}/rust-analyzer-{arch}-pc-windows-msvc.zip"), &zip)?;
+                run(crate::procs::command("tar").arg("-xf").arg(&zip).arg("-C").arg(&bin))?;
+                std::fs::remove_file(&zip)?;
+            }
+            #[cfg(unix)]
+            {
+                let gz = bin.join("rust-analyzer.gz");
+                download(&format!("{latest}/rust-analyzer-{arch}-unknown-linux-gnu.gz"), &gz)?;
+                run(crate::procs::command("gzip").arg("-d").arg(&gz))?;
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(bin.join("rust-analyzer"), std::fs::Permissions::from_mode(0o755))?;
+            }
         }
         "kotlin-lsp" => {
             let suffix = match std::env::consts::ARCH {
@@ -166,7 +184,7 @@ fn build(program: &str, staging: &Path) -> Result<PathBuf> {
             if expected.len() != 64 || expected != actual {
                 bail!("{name}: SHA-256 {actual} does not match the published {expected}");
             }
-            run(Command::new("tar").arg("xzf").arg(&archive).arg("-C").arg(staging))?;
+            run(crate::procs::command("tar").arg("xzf").arg(&archive).arg("-C").arg(staging))?;
             std::fs::remove_file(&archive)?;
             let unpacked = std::fs::read_dir(staging)?
                 .filter_map(|e| e.ok())
@@ -187,18 +205,18 @@ fn kotlin_version(tag: &str) -> Option<&str> {
 }
 
 fn npm(prefix: &Path, packages: &[&str]) -> Result<()> {
-    run(Command::new("npm")
+    run(crate::procs::command("npm")
         .args(["install", "--no-fund", "--no-audit", "--no-save", "--prefix"])
         .arg(prefix)
         .args(packages))
 }
 
 fn download(url: &str, to: &Path) -> Result<()> {
-    run(Command::new("curl").args(["-fsSL", "--retry", "2", "-o"]).arg(to).arg(url))
+    run(crate::procs::command("curl").args(["-fsSL", "--retry", "2", "-o"]).arg(to).arg(url))
 }
 
 fn fetch(url: &str) -> Result<Vec<u8>> {
-    let out = Command::new("curl").args(["-fsSL", "--retry", "2", url]).stdin(Stdio::null()).output()?;
+    let out = crate::procs::command("curl").args(["-fsSL", "--retry", "2", url]).stdin(Stdio::null()).output()?;
     if !out.status.success() {
         bail!("{url}: {}", last_line(&out.stderr));
     }
@@ -206,7 +224,7 @@ fn fetch(url: &str) -> Result<Vec<u8>> {
 }
 
 fn sha256(path: &Path) -> Result<String> {
-    let out = Command::new("sha256sum").arg(path).stdin(Stdio::null()).output()?;
+    let out = crate::procs::command("sha256sum").arg(path).stdin(Stdio::null()).output()?;
     if !out.status.success() {
         bail!("sha256sum: {}", last_line(&out.stderr));
     }
@@ -243,6 +261,9 @@ mod tests {
     #[test]
     fn every_server_has_a_recipe_and_an_executable() {
         for program in ["gopls", "rust-analyzer", "typescript-language-server", "intelephense", "kotlin-lsp"] {
+            if cfg!(windows) && program == "kotlin-lsp" {
+                continue;
+            }
             assert!(recipe(program).is_some() && executable(program).is_some(), "{program}");
         }
     }
