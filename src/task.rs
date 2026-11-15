@@ -291,7 +291,7 @@ fn shell_quote(s: &str) -> String {
 
 // ---------------------------------------------------------------- file
 
-actions!(ideae_file, [SaveFile, ExpandSelection, ShrinkSelection, ToggleComment, ShowOutline, ShowUsages, SendToAgent]);
+actions!(ideae_file, [SaveFile, ExpandSelection, ShrinkSelection, ToggleComment, ShowOutline, ShowUsages, SendToAgent, CompareFileWith]);
 actions!(ideae_edit, [DeleteLine, DuplicateLine, MoveLineUp, MoveLineDown, JoinLines, ToggleCase, NextOccurrence, GoToLine, RenameSymbol, FormatFile, Fold, Unfold, FoldAll, UnfoldAll, ParameterInfo]);
 actions!(ideae_task, [ToggleZoom, SendDiffToAgent, CommentOnDiff, FindInTerminal]);
 
@@ -1169,6 +1169,7 @@ impl Render for FileView {
                                 .separator()
                                 .menu("Comment / Uncomment", Box::new(ToggleComment))
                                 .menu("File Structure", Box::new(ShowOutline))
+                                .menu("Compare with Branch, Tag or Commit…", Box::new(CompareFileWith))
                                 .separator()
                                 .menu("Send to Agent", Box::new(SendToAgent))
                         })
@@ -1669,6 +1670,13 @@ impl Render for ChangesView {
                                 // As listed last; asked again for the next time it opens.
                                 load_branches(root.clone(), known.clone(), cx);
                                 let branches = known.borrow().clone();
+                                let direct = task.clone();
+                                menu = menu
+                                    .item(gpui_kit::component::menu::PopupMenuItem::new("With a branch, tag or commit as it is…").on_click(move |_, window, cx| {
+                                        let _ = direct.update(cx, |t, cx| t.compare_with_dialog(None, window, cx));
+                                    }))
+                                    .separator()
+                                    .label("Since the branch left");
                                 for branch in branches {
                                     let (task, view, name) = (task.clone(), view.clone(), branch.clone());
                                     menu = menu.item(gpui_kit::component::menu::PopupMenuItem::new(branch).on_click(
@@ -3081,6 +3089,56 @@ impl TaskView {
     }
 
     /// Opens History on one commit (from a blame line).
+    /// Asks what to compare the worktree with, or `file` of it alone: a
+    /// branch, a tag, one of the latest commits.
+    pub fn compare_with_dialog(&mut self, file: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let (root, task) = (self.root.clone(), cx.weak_entity());
+        cx.spawn_in(window, async move |_, cx| {
+            let from = root.clone();
+            let refs = cx.background_spawn(async move { git::refs(&from) }).await;
+            let items = refs
+                .into_iter()
+                .map(|(name, what)| crate::finder::Hit { text: format!("{name}{}{what}", crate::finder::DETAIL), path: name, line: 0, col: 0, ranges: Vec::new() })
+                .collect();
+            let title = match &file {
+                Some(file) => format!("Compare {file} with…"),
+                None => "Compare the working tree with…".to_string(),
+            };
+            let picked = task.clone();
+            let _ = cx.update(|window, cx| {
+                crate::finder::Finder::open_pick(
+                    title,
+                    root,
+                    items,
+                    Rc::new(move |rev, window, cx| {
+                        let file = file.clone();
+                        let _ = picked.update(cx, |task, cx| task.compare_with(rev, file, window, cx));
+                    }),
+                    task,
+                    window,
+                    cx,
+                )
+            });
+        })
+        .detach();
+    }
+
+    /// What the worktree has that `rev` has not, in a diff of its own.
+    pub fn compare_with(&mut self, rev: String, file: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let root = self.root.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            let title = match &file {
+                Some(file) => format!("{file}: {rev} on the left, as it is now on the right"),
+                None => format!("{rev} on the left, the working tree on the right"),
+            };
+            let files = cx
+                .background_spawn(async move { DiffFile::parse(&git::diff_against(&root, &rev, file.as_deref())).map(with_languages).unwrap_or_default() })
+                .await;
+            let _ = cx.update(|window, cx| show_diff_dialog(title, files, window, cx));
+        })
+        .detach();
+    }
+
     pub fn show_commit(&mut self, hash: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.show_tab(|k| matches!(k, TabKind::History), window, cx);
         self.history.update(cx, |h, cx| h.select_hash(hash, cx));
@@ -5445,6 +5503,11 @@ impl Render for TaskView {
             .on_action(cx.listener(|this, _: &ShowOutline, window, cx| this.show_outline(window, cx)))
             .on_action(cx.listener(|this, _: &ShowUsages, window, cx| this.show_usages_at_cursor(window, cx)))
             .on_action(cx.listener(|this, _: &SendToAgent, window, cx| this.send_editor_selection(window, cx)))
+            .on_action(cx.listener(|this, _: &CompareFileWith, window, cx| {
+                let Some(TabKind::File(file)) = this.focused_ix().map(|ix| &this.tabs[ix].kind) else { return };
+                let Ok(file) = file.read(cx).path.strip_prefix(&this.root).map(|path| path.to_string_lossy().into_owned()) else { return };
+                this.compare_with_dialog(Some(file), window, cx)
+            }))
             .child(
                 h_resizable("task")
                     .on_resize(|state, _, cx| {

@@ -1275,7 +1275,7 @@ mod lock_tests {
 // They script repositories with bash, which Windows lacks or has as WSL's.
 #[cfg(all(test, unix))]
 mod pull_tests {
-    use super::{between, conflict_marked, hunks, pull_conflicts, pull_safe, refresh, stash, stash_apply, stash_drop, stash_patch, working_patch, Known};
+    use super::{between, conflict_marked, diff_against, hunks, pull_conflicts, pull_safe, refresh, refs, stash, stash_apply, stash_drop, stash_patch, working_patch, Known};
     use std::{path::Path, process::Command};
 
     fn sh(dir: &Path, script: &str) {
@@ -1384,6 +1384,26 @@ mod pull_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// What there is to compare with is listed with what each is, and the
+    /// worktree is compared with any of it: all of it, or one file.
+    #[test]
+    fn the_worktree_compares_with_a_branch_a_tag_or_a_commit() {
+        let base = setup("against");
+        let b = base.join("b");
+        sh(&b, "git tag v1; printf 'one\\ntwo\\nthree\\nfour\\n' > f.txt; echo other > g.txt; git add g.txt; git commit -qam four
+            git branch side v1; printf 'one\\ntwo\\nthree\\nfour\\nfive\\n' > f.txt");
+        let found = refs(&b);
+        let what = |name: &str| found.iter().find(|(known, _)| known == name).map(|(_, what)| what.split(" · ").next().unwrap_or_default().to_string());
+        assert_eq!((what("main"), what("side"), what("origin/main"), what("v1")), (Some("branch".into()), Some("branch".into()), Some("remote branch".into()), Some("tag".into())));
+        assert!(found.iter().any(|(_, what)| what.starts_with("commit · ") && what.ends_with("four")), "{found:?}");
+        let against_tag = diff_against(&b, "v1", None);
+        assert!(against_tag.contains("+four") && against_tag.contains("+five") && against_tag.contains("g.txt"), "{against_tag}");
+        let one_file = diff_against(&b, "side", Some("f.txt"));
+        assert!(one_file.contains("+five") && !one_file.contains("g.txt"), "{one_file}");
+        assert_eq!(diff_against(&b, "HEAD", Some("g.txt")), "", "as committed");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn conflict_is_undone() {
         let base = setup("conflict");
@@ -1435,6 +1455,39 @@ mod pull_tests {
 }
 
 /// Local and remote branches, for picking what to diff against.
+/// What the worktree can be compared with: branches, tags, the latest
+/// commits. Each as git names it, and what it is.
+pub fn refs(root: &Path) -> Vec<(String, String)> {
+    let listed = |args: &[&str]| git(root, args).unwrap_or_default();
+    let named = listed(&["for-each-ref", "--sort=-committerdate", "--format=%(refname)%1f%(refname:short)%1f%(committerdate:relative)%1f%(subject)", "refs/heads", "refs/remotes", "refs/tags"]);
+    let mut found: Vec<(String, String)> = named
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\x1f');
+            let (full, short, when, subject) = (parts.next()?, parts.next()?, parts.next()?, parts.next().unwrap_or_default());
+            let kind = if full.starts_with("refs/tags") { "tag" } else if full.starts_with("refs/remotes") { "remote branch" } else { "branch" };
+            (!short.ends_with("/HEAD") && short != "origin").then(|| (short.to_string(), format!("{kind} · {when} · {subject}")))
+        })
+        .collect();
+    let commits = listed(&["log", "-60", "--format=%h%x1f%cr%x1f%s"]);
+    found.extend(commits.lines().filter_map(|line| {
+        let mut parts = line.split('\x1f');
+        Some((parts.next()?.to_string(), format!("commit · {} · {}", parts.next()?, parts.next().unwrap_or_default())))
+    }));
+    found
+}
+
+/// The worktree against `rev`, all of it or the one file: what is here
+/// that the commit, tag or branch does not have.
+pub fn diff_against(root: &Path, rev: &str, file: Option<&str>) -> String {
+    let mut args = vec!["diff", rev];
+    args.extend_from_slice(DIFF_ARGS);
+    if let Some(file) = file {
+        args.extend(["--", file]);
+    }
+    git(root, &args).unwrap_or_default()
+}
+
 pub fn branches(root: &Path) -> Vec<String> {
     git(root, &["for-each-ref", "--sort=-committerdate", "--format=%(refname:short)", "refs/heads", "refs/remotes"])
         .unwrap_or_default()

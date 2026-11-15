@@ -23,7 +23,12 @@ pub enum FinderKind {
     Places,
     /// What the project declares under a name: asked of `symbols` as you type.
     Symbols,
+    /// A list to choose one of, such as branches: the choice goes to `picked`.
+    Pick,
 }
+
+/// What is done with the one chosen from a `Pick` list: given its `path`.
+pub type Picked = Rc<dyn Fn(String, &mut Window, &mut App)>;
 
 /// Finds declarations by a part of their name. A hit's text is the name,
 /// then `DETAIL` and what it is.
@@ -68,6 +73,13 @@ pub struct Finder {
     regex: bool,
     mask: Option<Entity<gpui_kit::component::input::InputState>>,
     symbols: Option<SymbolSource>,
+    picked: Option<(String, Picked)>,
+}
+
+thread_local! {
+    /// The title and the taker of the list being opened: on their way from
+    /// `open_pick` into the finder it makes.
+    static PICK: std::cell::RefCell<Option<(String, Picked)>> = const { std::cell::RefCell::new(None) };
 }
 
 const FILE_LIMIT: usize = 100;
@@ -125,6 +137,13 @@ impl Finder {
         Self::open_inner(FinderKind::Symbols, root, Arc::default(), Vec::new(), Vec::new(), String::new(), Some(symbols), task, window, cx)
     }
 
+    /// One of `items` to choose, each a name with `DETAIL` and what it is;
+    /// `picked` gets the `path` of the one chosen.
+    pub fn open_pick(title: String, root: PathBuf, items: Vec<Hit>, picked: Picked, task: WeakEntity<TaskView>, window: &mut Window, cx: &mut App) {
+        PICK.with(|pick| *pick.borrow_mut() = Some((title, picked)));
+        Self::open_inner(FinderKind::Pick, root, Arc::default(), items, Vec::new(), String::new(), None, task, window, cx)
+    }
+
     fn open_with(
         kind: FinderKind,
         root: PathBuf,
@@ -165,7 +184,12 @@ impl Finder {
             regex: false,
             mask: None,
             symbols,
+            picked: None,
         });
+        if kind == FinderKind::Pick {
+            let picked = PICK.with(|pick| pick.borrow_mut().take());
+            finder.update(cx, |f, _| f.picked = picked);
+        }
         if kind == FinderKind::Grep {
             use gpui_kit::component::input::{InputEvent, InputState};
             let mask = cx.new(|cx| InputState::new(window, cx).placeholder("*.rs, src/**, !*_test.go"));
@@ -195,9 +219,9 @@ impl Finder {
                     let command = command.clone();
                     window.defer(cx, move |window, cx| command.read(cx).focus_handle(cx).focus(window, cx));
                 }
-                let (kind, hits, shown) = {
+                let (kind, hits, shown, pick_title) = {
                     let f = finder.read(cx);
-                    (f.kind, f.hits.clone(), f.shown.clone())
+                    (f.kind, f.hits.clone(), f.shown.clone(), f.picked.as_ref().map(|(title, _)| title.clone()).unwrap_or_default())
                 };
                 let mut palette = Command::new(&command)
                     .bordered(false)
@@ -208,6 +232,7 @@ impl Finder {
                         FinderKind::Outline => "Go to declaration…".to_string(),
                         FinderKind::Places => title.clone(),
                         FinderKind::Symbols => "Go to class, function, type…".to_string(),
+                        FinderKind::Pick => pick_title,
                     })
                     .min_h(px(420.))
                     .max_h(px(420.));
@@ -310,7 +335,7 @@ impl Finder {
                 self.shown = Rc::new(shown);
                 self.set_hits(hits, cx);
             }
-            FinderKind::Outline => {
+            FinderKind::Outline | FinderKind::Pick => {
                 let needle = query.to_lowercase();
                 let hits = self
                     .outline
@@ -372,6 +397,9 @@ impl Finder {
         };
         let Some(hit) = self.hits.get(row).cloned() else { return };
         window.close_dialog(cx);
+        if let Some((_, picked)) = &self.picked {
+            return picked(hit.path, window, cx);
+        }
         let path = self.root.join(&hit.path);
         let line = hit.line.saturating_sub(1);
         let _ = self.task.update(cx, |t, cx| t.open_file_at(path, line, hit.col, window, cx));
@@ -384,6 +412,7 @@ fn item(hit: &Hit, kind: FinderKind) -> CommandItem {
         FinderKind::Files => hit.path.clone(),
         FinderKind::Outline => hit.text.clone(),
         FinderKind::Symbols => format!("{} {}:{}", hit.text, hit.path, hit.line),
+        FinderKind::Pick => hit.text.clone(),
         FinderKind::Grep | FinderKind::Places => format!("{}:{} {}", hit.path, hit.line, hit.text),
     };
     CommandItem::new().label(label).child(move |_, cx| {
@@ -414,6 +443,15 @@ fn item(hit: &Hit, kind: FinderKind) -> CommandItem {
                     .child(div().flex_none().text_xs().text_color(cx.theme().muted_foreground).child(detail.to_string()))
                     .child(div().flex_1())
                     .child(div().truncate().text_xs().text_color(cx.theme().muted_foreground).child(format!("{}:{}", hit.path, hit.line)))
+                    .into_any_element()
+            }
+            FinderKind::Pick => {
+                let (name, detail) = hit.text.split_once(DETAIL).unwrap_or((&hit.text, ""));
+                h_flex()
+                    .gap_3()
+                    .min_w_0()
+                    .child(div().flex_none().font_family(cx.theme().mono_font_family.clone()).text_sm().child(name.to_string()))
+                    .child(div().truncate().text_xs().text_color(cx.theme().muted_foreground).child(detail.to_string()))
                     .into_any_element()
             }
             FinderKind::Files => h_flex()

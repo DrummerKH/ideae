@@ -73,7 +73,9 @@ Windows build exists and is being tried out (see [Windows](#windows)).
   branch against its base, history, safe pull: Pull is marked when what
   comes would conflict with your work, committed or only written, and is
   then not tried; conflict markers left in a file are named above the
-  commit box. Stash puts what is not committed away; the repository's
+  commit box. The working tree, or one file of it, compares with any
+  branch, tag or commit as it is (▾ in Changes, a commit in History, the
+  editor's menu). Stash puts what is not committed away; the repository's
   stashes are listed under the changes, to look into, bring back or drop. Each hunk of a diff can be
   reverted on its own, and staged.
 - **Terminals.** Built on libghostty-vt. Ctrl+click on paths, `file:line`,

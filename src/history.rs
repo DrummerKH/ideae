@@ -1,7 +1,8 @@
 use std::{path::PathBuf, rc::Rc};
 
 use gpui_kit::component::{
-    ActiveTheme as _, StyledExt as _,
+    ActiveTheme as _, Sizable as _, StyledExt as _,
+    button::{Button, ButtonVariants as _},
     diff::{Diff, DiffFile, DiffMode, DiffState},
     h_flex,
     list::ListItem,
@@ -231,10 +232,29 @@ impl Render for HistoryView {
                                 .border_color(cx.theme().border)
                                 .child(div().font_semibold().child(c.subject.clone()))
                                 .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(format!("{} · {} · {}", c.short, c.author, c.date)),
+                                    h_flex()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(format!("{} · {} · {}", c.short, c.author, c.date)),
+                                        )
+                                        .child({
+                                            let (task, hash) = (self.task.clone(), c.hash.clone());
+                                            Button::new("commit-compare")
+                                                .xsmall()
+                                                .ghost()
+                                                .label("Compare with working tree")
+                                                .tooltip("What is here now that this commit did not have")
+                                                .on_click(move |_, window, cx| {
+                                                    let hash = hash.clone();
+                                                    let _ = task.update(cx, |t, cx| t.compare_with(hash, None, window, cx));
+                                                })
+                                        }),
                                 ),
                         )
                     })
