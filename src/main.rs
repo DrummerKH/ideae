@@ -386,6 +386,7 @@ fn main() {
                     KeyBinding::new("ctrl-f12", task::ShowOutline, Some("Input")),
                     // JetBrains' Go to Declaration, same as Ctrl+click.
                     KeyBinding::new("ctrl-b", gpui_kit::component::input::GoToDefinition, Some("Input")),
+                    KeyBinding::new("ctrl-alt-b", task::ShowUsages, Some("Input")),
                     KeyBinding::new("shift-escape", task::ToggleZoom, context),
                     KeyBinding::new("ctrl-shift-n", GoToFile, context),
                     KeyBinding::new("ctrl-shift-f", FindInFiles, context),

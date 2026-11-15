@@ -5,7 +5,7 @@ use std::{path::PathBuf, rc::Rc, sync::Arc, time::Duration};
 
 use gpui_kit::component::{
     ActiveTheme as _, IndexPath, WindowExt as _,
-    command::{Command, CommandItem, CommandState},
+    command::{Command, CommandGroup, CommandItem, CommandState},
     h_flex, v_flex,
 };
 use gpui_kit::*;
@@ -18,6 +18,8 @@ pub enum FinderKind {
     Grep,
     /// The declarations of one file (Ctrl+F12); `files` holds that file.
     Outline,
+    /// Places in sections under headings, such as implementations and usages.
+    Places,
 }
 
 /// A declaration for the outline: nesting depth, label, 0-based line.
@@ -32,6 +34,8 @@ pub struct Hit {
     pub path: String,
     /// 1-based; 0 for a file hit.
     pub line: u32,
+    /// 0-based, in characters.
+    pub col: u32,
     pub text: String,
 }
 
@@ -39,6 +43,10 @@ pub struct Finder {
     kind: FinderKind,
     /// The whole outline, filtered into `hits` by the query.
     outline: Arc<Vec<Hit>>,
+    /// For `Places`: the headings, each with its places; `hits` holds them
+    /// all and `shown` how many of each pass the query.
+    sections: Arc<Vec<(String, Vec<Hit>)>>,
+    shown: Rc<Vec<usize>>,
     root: PathBuf,
     files: Arc<Vec<String>>,
     task: WeakEntity<TaskView>,
@@ -66,6 +74,20 @@ impl Finder {
         Self::open_with(FinderKind::Outline, root, Arc::default(), hits, task, window, cx)
     }
 
+    /// Places under headings (Ctrl+Alt+B: implementations, then usages).
+    /// Sections without places are left out.
+    pub fn open_places(
+        root: PathBuf,
+        title: String,
+        sections: Vec<(String, Vec<Hit>)>,
+        task: WeakEntity<TaskView>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let sections = sections.into_iter().filter(|(_, hits)| !hits.is_empty()).collect();
+        Self::open_inner(FinderKind::Places, root, Arc::default(), Vec::new(), sections, title, task, window, cx)
+    }
+
     /// The outline of `path`, from items already extracted.
     pub fn open_outline(
         root: PathBuf,
@@ -77,7 +99,7 @@ impl Finder {
     ) {
         let hits = items
             .into_iter()
-            .map(|i| Hit { path: path.clone(), line: i.line + 1, text: format!("{}{}", "    ".repeat(i.depth), i.label) })
+            .map(|i| Hit { path: path.clone(), line: i.line + 1, col: 0, text: format!("{}{}", "    ".repeat(i.depth), i.label) })
             .collect();
         Self::open_with(FinderKind::Outline, root, Arc::default(), hits, task, window, cx)
     }
@@ -91,10 +113,27 @@ impl Finder {
         window: &mut Window,
         cx: &mut App,
     ) {
+        Self::open_inner(kind, root, files, outline, Vec::new(), String::new(), task, window, cx)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_inner(
+        kind: FinderKind,
+        root: PathBuf,
+        files: Arc<Vec<String>>,
+        outline: Vec<Hit>,
+        sections: Vec<(String, Vec<Hit>)>,
+        title: String,
+        task: WeakEntity<TaskView>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         let command = cx.new(|cx| CommandState::new(window, cx));
         let finder = cx.new(|_| Finder {
             kind,
             outline: Arc::new(outline),
+            sections: Arc::new(sections),
+            shown: Rc::default(),
             root,
             hits: Rc::new(Vec::new()),
             files,
@@ -108,30 +147,48 @@ impl Finder {
             let finder = finder.clone();
             let command = command.clone();
             let focused = focused.clone();
+            let title = title.clone();
             dialog.close_button(false).p_0().w(px(720.)).content(move |content, window, cx| {
                 if !focused.replace(true) {
                     let command = command.clone();
                     window.defer(cx, move |window, cx| command.read(cx).focus_handle(cx).focus(window, cx));
                 }
-                let (kind, hits) = {
+                let (kind, hits, shown) = {
                     let f = finder.read(cx);
-                    (f.kind, f.hits.clone())
+                    (f.kind, f.hits.clone(), f.shown.clone())
                 };
-                let items = hits.iter().map(|hit| item(hit, kind));
+                let mut palette = Command::new(&command)
+                    .bordered(false)
+                    .filterable(false)
+                    .placeholder(match kind {
+                        FinderKind::Files => "Go to file…".to_string(),
+                        FinderKind::Grep => "Find in files…".to_string(),
+                        FinderKind::Outline => "Go to declaration…".to_string(),
+                        FinderKind::Places => title.clone(),
+                    })
+                    .min_h(px(420.))
+                    .max_h(px(420.));
+                if kind == FinderKind::Places {
+                    let sections = finder.read(cx).sections.clone();
+                    let mut rest = &hits[..];
+                    for ((heading, all), &count) in sections.iter().zip(shown.iter()) {
+                        let (these, after) = rest.split_at(count.min(rest.len()));
+                        rest = after;
+                        // Every section stays, even when the query empties it:
+                        // the confirmed index names the section by position.
+                        palette = palette.group(
+                            CommandGroup::new()
+                                .label(format!("{heading} ({})", all.len()))
+                                .items(these.iter().map(|hit| item(hit, kind))),
+                        );
+                    }
+                } else {
+                    palette = palette.items(hits.iter().map(|hit| item(hit, kind)));
+                }
                 let query_owner = finder.clone();
                 let confirm_owner = finder.clone();
                 content.child(
-                    Command::new(&command)
-                        .bordered(false)
-                        .filterable(false)
-                        .placeholder(match kind {
-                            FinderKind::Files => "Go to file…",
-                            FinderKind::Grep => "Find in files…",
-                            FinderKind::Outline => "Go to declaration…",
-                        })
-                        .min_h(px(420.))
-                        .max_h(px(420.))
-                        .items(items)
+                    palette
                         .on_query(move |query, _, cx| {
                             let _ = query_owner.update(cx, |f, cx| f.query(query, cx));
                         })
@@ -146,6 +203,21 @@ impl Finder {
     fn query(&mut self, query: &str, cx: &mut Context<Self>) {
         let query = query.trim().to_string();
         match self.kind {
+            FinderKind::Places => {
+                let needle = query.to_lowercase();
+                let matches = |h: &Hit| {
+                    needle.is_empty() || h.text.to_lowercase().contains(&needle) || h.path.to_lowercase().contains(&needle)
+                };
+                let mut hits = Vec::new();
+                let mut shown = Vec::new();
+                for (_, section) in self.sections.iter() {
+                    let before = hits.len();
+                    hits.extend(section.iter().filter(|h| matches(h)).cloned());
+                    shown.push(hits.len() - before);
+                }
+                self.shown = Rc::new(shown);
+                self.set_hits(hits, cx);
+            }
             FinderKind::Outline => {
                 let needle = query.to_lowercase();
                 let hits = self
@@ -187,11 +259,15 @@ impl Finder {
     }
 
     fn confirm(&mut self, index: IndexPath, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(hit) = self.hits.get(index.row).cloned() else { return };
+        let row = match self.kind {
+            FinderKind::Places => self.shown.iter().take(index.section).sum::<usize>() + index.row,
+            _ => index.row,
+        };
+        let Some(hit) = self.hits.get(row).cloned() else { return };
         window.close_dialog(cx);
         let path = self.root.join(&hit.path);
         let line = hit.line.saturating_sub(1);
-        let _ = self.task.update(cx, |t, cx| t.open_file(path, line, window, cx));
+        let _ = self.task.update(cx, |t, cx| t.open_file_at(path, line, hit.col, window, cx));
     }
 }
 
@@ -200,7 +276,7 @@ fn item(hit: &Hit, kind: FinderKind) -> CommandItem {
     let label = match kind {
         FinderKind::Files => hit.path.clone(),
         FinderKind::Outline => hit.text.clone(),
-        FinderKind::Grep => format!("{}:{} {}", hit.path, hit.line, hit.text),
+        FinderKind::Grep | FinderKind::Places => format!("{}:{} {}", hit.path, hit.line, hit.text),
     };
     CommandItem::new().label(label).child(move |_, cx| {
         let (dir, name) = match hit.path.rsplit_once('/') {
@@ -227,7 +303,7 @@ fn item(hit: &Hit, kind: FinderKind) -> CommandItem {
                 .child(div().flex_none().child(name))
                 .child(div().truncate().text_xs().text_color(cx.theme().muted_foreground).child(dir))
                 .into_any_element(),
-            FinderKind::Grep => v_flex()
+            FinderKind::Grep | FinderKind::Places => v_flex()
                 .min_w_0()
                 .child(
                     div()
@@ -260,7 +336,7 @@ fn match_files(files: &[String], query: &str) -> Vec<Hit> {
     scored
         .into_iter()
         .take(FILE_LIMIT)
-        .map(|(_, path)| Hit { path: path.clone(), line: 0, text: String::new() })
+        .map(|(_, path)| Hit { path: path.clone(), line: 0, col: 0, text: String::new() })
         .collect()
 }
 
@@ -296,6 +372,6 @@ fn grep(root: &PathBuf, query: &str) -> Vec<Hit> {
     let Some(matcher) = search::literal(query) else { return Vec::new() };
     search::search(root, &matcher, 20, 300, GREP_LIMIT)
         .into_iter()
-        .map(|m| Hit { path: m.path.to_string_lossy().into_owned(), line: m.line as u32, text: m.text })
+        .map(|m| Hit { path: m.path.to_string_lossy().into_owned(), line: m.line as u32, col: 0, text: m.text })
         .collect()
 }

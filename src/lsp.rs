@@ -1,5 +1,5 @@
-//! Minimal stdio LSP client: just enough for hover and go-to-definition on
-//! read-only files. Calls block, so run them on the background executor.
+//! Minimal stdio LSP client: hover, go to definition, implementations and
+//! references. Calls block, so run them on the background executor.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -29,6 +29,8 @@ pub struct LspClient {
     ready: (Mutex<Option<Result<(), String>>>, Condvar),
     opened: Mutex<HashSet<String>>,
     progress: Progress,
+    /// `capabilities` from the server's answer to `initialize`.
+    capabilities: Mutex<Value>,
     child: Mutex<Child>,
 }
 
@@ -235,6 +237,7 @@ impl LspClient {
             ready: (Mutex::new(None), Condvar::new()),
             opened: Mutex::default(),
             progress,
+            capabilities: Mutex::new(Value::Null),
             child: Mutex::new(child),
         });
 
@@ -254,7 +257,7 @@ impl LspClient {
     fn initialize(&self, root: &Path) -> Result<()> {
         let uri = path_to_uri(root);
         let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        self.raw_request(
+        let answer = self.raw_request(
             "initialize",
             json!({
                 "processId": std::process::id(),
@@ -266,6 +269,8 @@ impl LspClient {
                     "textDocument": {
                         "hover": { "contentFormat": ["markdown", "plaintext"] },
                         "definition": { "linkSupport": true },
+                        "implementation": { "linkSupport": true },
+                        "references": {},
                         "synchronization": { "didSave": false },
                     },
                     "workspace": { "workspaceFolders": true, "configuration": true },
@@ -273,6 +278,7 @@ impl LspClient {
                 },
             }),
         )?;
+        *self.capabilities.lock().unwrap() = answer["capabilities"].clone();
         self.notify("initialized", json!({}))
     }
 
@@ -348,6 +354,45 @@ impl LspClient {
             lsp_types::GotoDefinitionResponse::Array(ls) => ls.into_iter().map(to_link).collect(),
             lsp_types::GotoDefinitionResponse::Link(links) => links,
         })
+    }
+
+    /// Whether the server offers `provider` (such as `referencesProvider`):
+    /// `true` or options. Waits for initialization.
+    pub fn supports(&self, provider: &str) -> bool {
+        self.wait_ready().is_ok()
+            && match &self.capabilities.lock().unwrap()[provider] {
+                Value::Bool(b) => *b,
+                Value::Null => false,
+                _ => true,
+            }
+    }
+
+    /// textDocument/implementation: the types implementing an interface or
+    /// trait, the overrides of a method.
+    pub fn implementation(&self, uri: &str, pos: lsp_types::Position) -> Result<Vec<lsp_types::Location>> {
+        self.wait_ready()?;
+        let value = self.raw_request("textDocument/implementation", position_params(uri, pos))?;
+        if value.is_null() {
+            return Ok(vec![]);
+        }
+        let response: lsp_types::GotoDefinitionResponse = serde_json::from_value(value)?;
+        Ok(match response {
+            lsp_types::GotoDefinitionResponse::Scalar(l) => vec![l],
+            lsp_types::GotoDefinitionResponse::Array(ls) => ls,
+            lsp_types::GotoDefinitionResponse::Link(links) => links
+                .into_iter()
+                .map(|l| lsp_types::Location { uri: l.target_uri, range: l.target_selection_range })
+                .collect(),
+        })
+    }
+
+    /// textDocument/references, without the declaration itself.
+    pub fn references(&self, uri: &str, pos: lsp_types::Position) -> Result<Vec<lsp_types::Location>> {
+        self.wait_ready()?;
+        let mut params = position_params(uri, pos);
+        params["context"] = json!({ "includeDeclaration": false });
+        let value = self.raw_request("textDocument/references", params)?;
+        Ok(serde_json::from_value::<Option<Vec<lsp_types::Location>>>(value)?.unwrap_or_default())
     }
 
     fn raw_request(&self, method: &str, params: Value) -> Result<Value> {

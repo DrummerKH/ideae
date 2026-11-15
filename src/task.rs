@@ -93,7 +93,7 @@ fn shell_quote(s: &str) -> String {
 
 // ---------------------------------------------------------------- file
 
-actions!(ideae_file, [SaveFile, ExpandSelection, ShrinkSelection, ToggleComment, ShowOutline, SendToAgent]);
+actions!(ideae_file, [SaveFile, ExpandSelection, ShrinkSelection, ToggleComment, ShowOutline, ShowUsages, SendToAgent]);
 actions!(ideae_task, [ToggleZoom, SendDiffToAgent]);
 
 actions!(ideae_task, [NextTab, PrevTab]);
@@ -336,9 +336,9 @@ impl FileView {
         });
     }
 
-    fn go_to_line(&mut self, line: u32, window: &mut Window, cx: &mut Context<Self>) {
+    fn go_to_line(&mut self, line: u32, col: u32, window: &mut Window, cx: &mut Context<Self>) {
         self.editor.update(cx, |state, cx| {
-            state.set_cursor_position(Position::new(line, 0), window, cx);
+            state.set_cursor_position(Position::new(line, col), window, cx);
         });
         self.editor.read(cx).focus_handle(cx).focus(window, cx);
     }
@@ -447,7 +447,9 @@ impl Render for FileView {
                         // Replaces the built-in menu, so its items are listed again.
                         .context_menu(|menu, _, _| {
                             use gpui_kit::component::input::{Copy, Cut, GoToDefinition, Paste, SelectAll};
-                            menu.menu("Go to Definition", Box::new(GoToDefinition))
+                            // Ctrl+B on a declaration lists its usages.
+                            menu.menu("Go to Definition / Usages", Box::new(GoToDefinition))
+                                .menu("Implementations and Usages", Box::new(ShowUsages))
                                 .separator()
                                 .menu("Cut", Box::new(Cut))
                                 .menu("Copy", Box::new(Copy))
@@ -1185,6 +1187,7 @@ impl TaskView {
                 .track_focus(&self.focus)
                 .on_action(cx.listener(|this, _: &ToggleZoom, window, cx| this.toggle_zoom_focused(window, cx)))
                 .on_action(cx.listener(|this, _: &ShowOutline, window, cx| this.show_outline(window, cx)))
+                .on_action(cx.listener(|this, _: &ShowUsages, window, cx| this.show_usages_at_cursor(window, cx)))
                 .on_action(cx.listener(|this, _: &SendToAgent, window, cx| this.send_editor_selection(window, cx)))
                 .child(self.render_pane(right, cx))
                 .into_any_element(),
@@ -1354,6 +1357,75 @@ impl TaskView {
         crate::finder::Finder::open_outline(self.root.clone(), shown, items, cx.weak_entity(), window, cx);
     }
 
+    /// Ctrl+Alt+B: the implementations and usages of the name at the cursor.
+    fn show_usages_at_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(TabKind::File(file)) = self.focused_ix().map(|ix| &self.tabs[ix].kind) else { return };
+        let (path, pos) = {
+            let f = file.read(cx);
+            let editor = f.editor.read(cx);
+            (f.path.clone(), editor.text().offset_to_position(editor.cursor()))
+        };
+        self.show_places(path, pos, true, window, cx);
+    }
+
+    /// The usages of the name at `pos` in the open file `path`, after its
+    /// implementations when `implementations`: from the language server, by
+    /// text search without one. One place opens at once, several in a list.
+    fn show_places(&mut self, path: PathBuf, pos: Position, implementations: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(file) = self.tabs.iter().find_map(|t| match &t.kind {
+            TabKind::File(f) if f.read(cx).path == path => Some(f.clone()),
+            _ => None,
+        }) else {
+            return;
+        };
+        let (text, client) = {
+            let f = file.read(cx);
+            let client = f.lsp_client.clone().filter(|_| f.lsp_ok != Some(false));
+            (f.editor.read(cx).text().clone(), client)
+        };
+        let Some(range) = text.word_range(text.position_to_offset(&pos)) else { return };
+        let word = text.slice(range).to_string();
+        if !word.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return;
+        }
+        let (root, files, buffer) = (self.root.clone(), self.shared_files.clone(), text.to_string());
+        let query = PlacesQuery { path, pos, word: word.clone(), implementations };
+        cx.spawn_in(window, async move |this, cx| {
+            let places = cx
+                .background_spawn(async move {
+                    let files = files.read().unwrap().clone();
+                    find_places(&root, &files, &query, &buffer, client.as_deref())
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| this.present_places(&word, implementations, places, window, cx));
+        })
+        .detach();
+    }
+
+    fn present_places(&mut self, word: &str, implementations: bool, places: Places, window: &mut Window, cx: &mut Context<Self>) {
+        let what = if implementations { "Implementations and usages" } else { "Usages" };
+        let mut all = places.implementations.iter().chain(&places.usages);
+        match (all.next(), all.next()) {
+            (None, _) => {
+                let message = format!("{what} of {word}: none found");
+                window.push_notification(gpui_kit::component::notification::Notification::info(message), cx);
+            }
+            (Some(only), None) => {
+                let path = self.root.join(&only.path);
+                self.open_file_at(path, only.line.saturating_sub(1), only.col, window, cx);
+            }
+            _ => {
+                let by_search = |found: bool| if found { " · text search" } else { "" };
+                let sections = vec![
+                    (format!("Implementations{}", by_search(places.implementations_by_search)), places.implementations),
+                    (format!("Usages{}", by_search(places.usages_by_search)), places.usages),
+                ];
+                let title = format!("{what} of {word}…");
+                crate::finder::Finder::open_places(self.root.clone(), title, sections, cx.weak_entity(), window, cx);
+            }
+        }
+    }
+
     /// Opens History on one commit (from a blame line).
     pub fn show_commit(&mut self, hash: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.show_tab(|k| matches!(k, TabKind::History), window, cx);
@@ -1438,7 +1510,7 @@ impl TaskView {
                     .into_iter()
                     .map(|(path, line, code)| {
                         let shown = path.strip_prefix(&self.root).unwrap_or(&path).display().to_string();
-                        crate::finder::Hit { text: format!("{}   {shown}", code.trim()), path: shown, line: line + 1 }
+                        crate::finder::Hit { text: format!("{}   {shown}", code.trim()), path: shown, line: line + 1, col: 0 }
                     })
                     .collect();
                 crate::finder::Finder::open_hits(self.root.clone(), hits, cx.weak_entity(), window, cx)
@@ -1886,7 +1958,7 @@ impl TaskView {
                             if let Some(tab) = self.tabs.iter().position(|t| t.id == id) {
                                 self.activate(tab, window, cx);
                             }
-                            file.update(cx, |f, cx| f.go_to_line(line, window, cx));
+                            file.update(cx, |f, cx| f.go_to_line(line, 0, window, cx));
                         }
                     }
                 }
@@ -2075,13 +2147,18 @@ impl TaskView {
     }
 
     pub fn open_file(&mut self, path: PathBuf, line: u32, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_file_at(path, line, 0, window, cx)
+    }
+
+    /// Opens `path` (or its tab) with the cursor at 0-based `line`, `col`.
+    pub fn open_file_at(&mut self, path: PathBuf, line: u32, col: u32, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(ix) = self.tabs.iter().position(|t| match &t.kind {
             TabKind::File(f) => f.read(cx).path == path,
             _ => false,
         }) {
             self.activate(ix, window, cx);
             if let TabKind::File(file) = &self.tabs[ix].kind {
-                file.update(cx, |f, cx| f.go_to_line(line, window, cx));
+                file.update(cx, |f, cx| f.go_to_line(line, col, window, cx));
             }
             return;
         }
@@ -2116,7 +2193,7 @@ impl TaskView {
         });
         editor.update(cx, |state, cx| {
             state.set_value(content.clone(), window, cx);
-            state.set_cursor_position(Position::new(line, 0), window, cx);
+            state.set_cursor_position(Position::new(line, col), window, cx);
         });
 
         let saved: SharedString = content.clone().into();
@@ -2185,13 +2262,16 @@ impl TaskView {
         file.update(cx, |f, cx| f.load_blame(cx));
         self.attach_lsp(&path, content, &editor, &file, cx);
         // No language server: definitions by search, so Ctrl+click and Ctrl+B still work.
-        let search = SearchDefinitionProvider { root: self.root.clone(), files: self.shared_files.clone() };
+        let search = UsagesAtDeclaration::wrap(
+            Rc::new(SearchDefinitionProvider { root: self.root.clone(), files: self.shared_files.clone() }),
+            &path,
+        );
         let task_weak = cx.weak_entity();
         let this_path = path.clone();
         editor.update(cx, |state, _| {
             let lsp = state.lsp_mut();
             if lsp.definition_provider.is_none() {
-                lsp.definition_provider = Some(Rc::new(search));
+                lsp.definition_provider = Some(search);
                 lsp.show_document = Some(show_document_handler(task_weak, this_path));
             }
         });
@@ -2274,7 +2354,7 @@ impl TaskView {
         editor.update(cx, |state, cx| {
             let lsp = state.lsp_mut();
             lsp.hover_provider = Some(bridge.clone());
-            lsp.definition_provider = Some(bridge);
+            lsp.definition_provider = Some(UsagesAtDeclaration::wrap(bridge, &this_path));
             lsp.show_document = Some(show_document_handler(task, this_path));
             cx.notify();
         });
@@ -2537,7 +2617,7 @@ impl TaskView {
                         if let Some(ix) = this.tabs.iter().position(|t| t.id == id) {
                             this.activate(ix, window, cx);
                         }
-                        file.update(cx, |f, cx| f.go_to_line(line, window, cx));
+                        file.update(cx, |f, cx| f.go_to_line(line, 0, window, cx));
                     }))
             }))
             .overflow_y_scrollbar()
@@ -2867,6 +2947,7 @@ impl Render for TaskView {
             .track_focus(&self.focus)
             .on_action(cx.listener(|this, _: &ToggleZoom, window, cx| this.toggle_zoom_focused(window, cx)))
             .on_action(cx.listener(|this, _: &ShowOutline, window, cx| this.show_outline(window, cx)))
+            .on_action(cx.listener(|this, _: &ShowUsages, window, cx| this.show_usages_at_cursor(window, cx)))
             .on_action(cx.listener(|this, _: &SendToAgent, window, cx| this.send_editor_selection(window, cx)))
             .child(
                 h_resizable("task")
@@ -3178,6 +3259,76 @@ fn collect_declarations(node: tree_sitter::Node, text: &str, depth: usize, items
 }
 
 #[cfg(test)]
+mod places_tests {
+    use super::{Position, find_places, is_at, search_places, PlacesQuery};
+
+    fn project(files: &[(&str, &str)]) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("ideae-places-{}-{}", std::process::id(), files.len()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (path, text) in files {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn search_finds_implementations_and_usages_without_declarations() {
+        let root = project(&[
+            ("Shape.kt", "interface Shape {\n    fun area(): Double\n}\n"),
+            ("Circle.kt", "class Circle(val r: Double) : Shape {\n    override fun area() = 3.14 * r * r\n}\n"),
+            ("Square.java", "class Square implements Shape {}\n"),
+            ("Main.kt", "fun total(shapes: List<Shape>) = shapes.sumOf { it.area() }\nval s: Shape = Circle(1.0)\n"),
+        ]);
+        let files = vec!["Shape.kt".into(), "Circle.kt".into(), "Square.java".into(), "Main.kt".into()];
+        let (implementations, usages) = search_places(&root, &files, "Shape", true);
+        let at = |hits: &[crate::finder::Hit]| hits.iter().map(|h| format!("{}:{}", h.path, h.line)).collect::<Vec<_>>();
+        let mut found = at(&implementations);
+        found.sort();
+        assert_eq!(found, ["Circle.kt:1", "Square.java:1"]);
+        let mut found = at(&usages);
+        found.sort();
+        assert_eq!(found, ["Main.kt:1", "Main.kt:2"]);
+        assert_eq!(usages.iter().find(|h| h.line == 2).unwrap().col, 7);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_search_result_is_here_on_its_line() {
+        let range = |a: (u32, u32), b: (u32, u32)| lsp_types::Range { start: Position::new(a.0, a.1), end: Position::new(b.0, b.1) };
+        assert!(is_at(range((3, 0), (3, 0)), Position::new(3, 12)));
+        assert!(!is_at(range((3, 0), (3, 0)), Position::new(4, 0)));
+        assert!(is_at(range((3, 4), (3, 9)), Position::new(3, 9)));
+        assert!(!is_at(range((3, 4), (3, 9)), Position::new(3, 10)));
+    }
+
+    /// Needs gopls: `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn gopls_implementations_and_usages() {
+        let root = project(&[
+            ("go.mod", "module example.com/m\n\ngo 1.21\n"),
+            ("shape.go", "package main\n\ntype Shape interface{ Area() float64 }\n\ntype Sq struct{}\n\nfunc (Sq) Area() float64 { return 1 }\n\nfunc main() { var s Shape = Sq{}; _ = s.Area() }\n"),
+        ]);
+        let file = root.join("shape.go");
+        let text = std::fs::read_to_string(&file).unwrap();
+        let client = crate::lsp::LspClient::spawn("gopls", &[], &root).unwrap();
+        client.did_open(&file, "go", &text).unwrap();
+        let query = PlacesQuery { path: file.clone(), pos: Position::new(2, 6), word: "Shape".into(), implementations: true };
+        // Ctrl+B on the declaration turns into its usages only if the server
+        // answers with the declaration itself.
+        let links = client.definition(&crate::lsp::path_to_uri(&file), query.pos).unwrap();
+        assert!(!links.is_empty() && links.iter().all(|l| is_at(l.target_selection_range, query.pos)), "{links:?}");
+        let places = find_places(&root, &[], &query, &text, Some(&client));
+        assert!(!places.implementations_by_search && !places.usages_by_search);
+        assert_eq!(places.implementations.iter().map(|h| h.line).collect::<Vec<_>>(), [5]);
+        assert_eq!(places.usages.iter().map(|h| (h.line, h.text.as_str())).collect::<Vec<_>>(), [(9, "func main() { var s Shape = Sq{}; _ = s.Area() }")]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
 mod outline_tests {
     use super::outline;
     use std::path::Path;
@@ -3248,24 +3399,14 @@ pub fn find_symbol(root: &std::path::Path, files: &[String], symbol: &str) -> Ve
     };
     let lowercase = symbol.chars().next().is_some_and(|c| c.is_ascii_lowercase() || c == '_');
     if lowercase && !symbol.contains('.') {
-        let name = symbol;
-        return rg(
-            &[
-                format!(r"\b(fun|func|function|def|fn|val|var|const|let)\s+([A-Za-z_][\w.]*\.)?{name}\b"),
-                // Go methods: func (r *T) name(
-                format!(r"\bfunc\s*\([^)]*\)\s*{name}\b"),
-                // Java/C-style: a type then the name then "(" at the start of a line.
-                format!(r"^\s*(public|private|protected|static|final|override|suspend|internal|\s)*[\w<>\[\],.? ]+\s+{name}\s*\("),
-            ],
-            5,
-        );
+        return rg(&function_declarations(symbol), 5);
     }
     let (class, member) = symbol.split_once('.').map_or((symbol, None), |(c, m)| (c, Some(m)));
     let found = files
         .iter()
         .find(|f| file_name_of(f).split('.').next() == Some(class) && f.contains('.'))
         .map(|f| (root.join(f), 0u32, String::new()))
-        .or_else(|| rg(&[format!(r"\b(class|object|interface|struct|enum|trait|type)\s+{class}\b")], 1).into_iter().next());
+        .or_else(|| rg(&type_declarations(class), 1).into_iter().next());
     let Some((path, mut line, code)) = found else { return Vec::new() };
     if let Some(member) = member {
         if let Ok(text) = std::fs::read_to_string(&path) {
@@ -3275,6 +3416,238 @@ pub fn find_symbol(root: &std::path::Path, files: &[String], symbol: &str) -> Ve
         }
     }
     vec![(path, line, code)]
+}
+
+/// Lines that declare a function or variable `name`, for ripgrep.
+fn function_declarations(name: &str) -> Vec<String> {
+    vec![
+        format!(r"\b(fun|func|function|def|fn|val|var|const|let)\s+([A-Za-z_][\w.]*\.)?{name}\b"),
+        // Go methods: func (r *T) name(
+        format!(r"\bfunc\s*\([^)]*\)\s*{name}\b"),
+        // Java/C-style: a type then the name then "(" at the start of a line.
+        format!(r"^\s*(public|private|protected|static|final|override|suspend|internal|\s)*[\w<>\[\],.? ]+\s+{name}\s*\("),
+    ]
+}
+
+/// Lines that declare a type `name`, for ripgrep.
+fn type_declarations(name: &str) -> Vec<String> {
+    vec![format!(r"\b(class|object|interface|struct|enum|trait|type)\s+{name}\b")]
+}
+
+/// Lines that implement or extend a type `name`, for ripgrep.
+fn implementing_declarations(name: &str) -> Vec<String> {
+    vec![
+        // Rust: impl<T> Name<T> for Type
+        format!(r"\bimpl\b[^{{;]*\b{name}\b[^{{;]*\bfor\b"),
+        // Java, TypeScript, PHP: class A extends B implements Name
+        format!(r"\b(implements|extends)\b[^{{]*\b{name}\b"),
+        // Kotlin, Swift, C#, C++: class A : Name, after a name or a constructor.
+        format!(r"\b(class|object|struct|enum|interface|record)\s+\w+\s*(<[^>]*>)?\s*:[^{{=]*\b{name}\b"),
+        format!(r"\b(class|object)\s+\w+.*\)\s*:[^{{=(]*\b{name}\b"),
+        // Python: class A(Name)
+        format!(r"^\s*class\s+\w+\s*\([^)]*\b{name}\b"),
+        // Go: a struct does not name its interface, so nothing to find there.
+    ]
+}
+
+/// What Ctrl+Alt+B or Ctrl+B on a declaration asks for.
+struct PlacesQuery {
+    path: PathBuf,
+    pos: Position,
+    word: String,
+    implementations: bool,
+}
+
+/// The answer, each list sorted by file and line.
+#[derive(Default)]
+struct Places {
+    implementations: Vec<crate::finder::Hit>,
+    usages: Vec<crate::finder::Hit>,
+    implementations_by_search: bool,
+    usages_by_search: bool,
+}
+
+/// Off the UI thread: the language server where it answers, text search
+/// where it cannot (none, not started, no such request, an error). `buffer`
+/// is the open file's text, which may differ from the disk.
+fn find_places(
+    root: &std::path::Path,
+    files: &[String],
+    query: &PlacesQuery,
+    buffer: &str,
+    client: Option<&lsp::LspClient>,
+) -> Places {
+    let uri = lsp::path_to_uri(&query.path);
+    let ask = |provider: &str, request: &dyn Fn() -> anyhow::Result<Vec<lsp_types::Location>>| {
+        let client = client?;
+        if !client.supports(provider) {
+            return None;
+        }
+        request().inspect_err(|e| eprintln!("{provider}: {e:#}")).ok()
+    };
+    let (implementations, usages) = std::thread::scope(|s| {
+        let implementations = s.spawn(|| {
+            if !query.implementations {
+                return Some(Vec::new());
+            }
+            ask("implementationProvider", &|| client.unwrap().implementation(&uri, query.pos))
+        });
+        let usages = ask("referencesProvider", &|| client.unwrap().references(&uri, query.pos));
+        (implementations.join().unwrap_or(None), usages)
+    });
+
+    let mut places = Places::default();
+    let mut texts = TextCache::new(&query.path, buffer);
+    let mut search = None;
+    let mut by_search = || search.get_or_insert_with(|| search_places(root, files, &query.word, query.implementations)).clone();
+    match implementations {
+        Some(found) => places.implementations = found.iter().filter_map(|l| texts.hit(root, l)).collect(),
+        None => {
+            places.implementations = by_search().0;
+            places.implementations_by_search = true;
+        }
+    }
+    match usages {
+        Some(found) => places.usages = found.iter().filter_map(|l| texts.hit(root, l)).collect(),
+        None => {
+            places.usages = by_search().1;
+            places.usages_by_search = true;
+        }
+    }
+    for list in [&mut places.implementations, &mut places.usages] {
+        list.sort_by(|a, b| (&a.path, a.line, a.col).cmp(&(&b.path, b.line, b.col)));
+        list.dedup_by(|a, b| a.path == b.path && a.line == b.line && a.col == b.col);
+    }
+    // Some servers list an implementation among the references too.
+    let implemented: HashSet<(String, u32)> = places.implementations.iter().map(|h| (h.path.clone(), h.line)).collect();
+    places.usages.retain(|h| !implemented.contains(&(h.path.clone(), h.line)));
+    places
+}
+
+/// Lines of the files locations point into, read once each.
+struct TextCache {
+    texts: HashMap<PathBuf, Option<String>>,
+}
+
+impl TextCache {
+    fn new(open: &std::path::Path, buffer: &str) -> Self {
+        Self { texts: HashMap::from([(open.to_path_buf(), Some(buffer.to_string()))]) }
+    }
+
+    /// A location as a place in the list: its path relative to `root` when
+    /// inside it, its line's code.
+    fn hit(&mut self, root: &std::path::Path, location: &lsp_types::Location) -> Option<crate::finder::Hit> {
+        let path = lsp::uri_to_path(location.uri.as_str())?;
+        let start = location.range.start;
+        let text = self
+            .texts
+            .entry(path.clone())
+            .or_insert_with(|| std::fs::read_to_string(&path).ok())
+            .as_deref()
+            .and_then(|t| t.lines().nth(start.line as usize))
+            .map(|l| l.trim().chars().take(300).collect())
+            .unwrap_or_default();
+        let shown = path.strip_prefix(root).unwrap_or(&path).display().to_string();
+        Some(crate::finder::Hit { path: shown, line: start.line + 1, col: start.character, text })
+    }
+}
+
+/// Without a language server: implementations by the declarations that name
+/// the type, usages as every whole-word occurrence that is no declaration.
+fn search_places(
+    root: &std::path::Path,
+    files: &[String],
+    word: &str,
+    implementations: bool,
+) -> (Vec<crate::finder::Hit>, Vec<crate::finder::Hit>) {
+    let rg = |patterns: &[String], per_file: u64, limit: usize| -> Vec<crate::finder::Hit> {
+        let Some(matcher) = crate::search::regexes(patterns) else { return Vec::new() };
+        crate::search::search(root, &matcher, per_file, 300, limit)
+            .into_iter()
+            .map(|m| {
+                let col = m.text.find(word).map_or(0, |b| m.text[..b].chars().count() as u32);
+                crate::finder::Hit { path: m.path.display().to_string(), line: m.line as u32, col, text: m.text.trim().to_string() }
+            })
+            .collect()
+    };
+    let is_type = word.chars().next().is_some_and(|c| c.is_uppercase());
+    let found_implementations = if implementations && is_type { rg(&implementing_declarations(word), 20, 200) } else { Vec::new() };
+    let mut declarations: Vec<String> = function_declarations(word);
+    declarations.extend(type_declarations(word));
+    let declared: HashSet<(String, u32)> = rg(&declarations, 20, 200)
+        .into_iter()
+        .chain(find_symbol(root, files, word).into_iter().map(|(path, line, _)| crate::finder::Hit {
+            path: path.strip_prefix(root).unwrap_or(&path).display().to_string(),
+            line: line + 1,
+            col: 0,
+            text: String::new(),
+        }))
+        .chain(found_implementations.iter().cloned())
+        .map(|h| (h.path, h.line))
+        .collect();
+    let usages = rg(&[format!(r"\b{word}\b")], 100, 1000)
+        .into_iter()
+        .filter(|h| !declared.contains(&(h.path.clone(), h.line)))
+        .collect();
+    (found_implementations, usages)
+}
+
+/// The location `UsagesAtDeclaration` hands the editor for "show usages".
+const USAGES_URI: &str = "ideae-usages:here";
+
+/// Ctrl+B and Ctrl+click on a declaration itself list its usages, as in
+/// IntelliJ, rather than jump to where the cursor already is. The editor
+/// follows whatever location it is given, so the request travels as a
+/// location of its own (`USAGES_URI`), which `show_document_handler` takes.
+struct UsagesAtDeclaration {
+    inner: Rc<dyn DefinitionProvider>,
+    path: PathBuf,
+}
+
+impl UsagesAtDeclaration {
+    fn wrap(inner: Rc<dyn DefinitionProvider>, path: &std::path::Path) -> Rc<dyn DefinitionProvider> {
+        Rc::new(Self { inner, path: path.to_path_buf() })
+    }
+}
+
+/// Whether `target` is where `pos` is: inside the range, or on its line for
+/// a search result, which has a line only.
+fn is_at(target: lsp_types::Range, pos: Position) -> bool {
+    if target.start == target.end {
+        return target.start.line == pos.line;
+    }
+    let key = |p: Position| (p.line, p.character);
+    key(target.start) <= key(pos) && key(pos) <= key(target.end)
+}
+
+impl DefinitionProvider for UsagesAtDeclaration {
+    fn definitions(
+        &self,
+        text: &Rope,
+        offset: usize,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<Vec<lsp_types::LocationLink>>> {
+        let pos = text.offset_to_position(offset);
+        let found = self.inner.definitions(text, offset, window, cx);
+        let path = self.path.clone();
+        cx.spawn(async move |_| {
+            let links = found.await?;
+            let here = |l: &lsp_types::LocationLink| {
+                lsp::uri_to_path(l.target_uri.as_str()).as_deref() == Some(path.as_path()) && is_at(l.target_selection_range, pos)
+            };
+            if links.is_empty() || !links.iter().all(here) {
+                return Ok(links);
+            }
+            let at = lsp_types::Range { start: pos, end: pos };
+            Ok(vec![lsp_types::LocationLink {
+                origin_selection_range: links[0].origin_selection_range,
+                target_uri: USAGES_URI.parse()?,
+                target_range: at,
+                target_selection_range: at,
+            }])
+        })
+    }
 }
 
 /// Ctrl+click and Ctrl+B in the editor when no language server runs: the
@@ -3331,6 +3704,15 @@ impl DefinitionProvider for SearchDefinitionProvider {
 /// the editor's own cursor move.
 fn show_document_handler(task: WeakEntity<TaskView>, this_path: PathBuf) -> gpui_kit::component::input::ShowDocumentHandler {
     Rc::new(move |params, window, cx| {
+        if params.uri.as_str() == USAGES_URI {
+            let pos = params.selection.map(|r| r.start).unwrap_or_default();
+            let (path, task) = (this_path.clone(), task.clone());
+            // Called while the editor is being updated, and the list reads it.
+            window.defer(cx, move |window, cx| {
+                let _ = task.update(cx, |task, cx| task.show_places(path, pos, false, window, cx));
+            });
+            return true;
+        }
         let Some(target) = lsp::uri_to_path(params.uri.as_str()) else {
             return false;
         };

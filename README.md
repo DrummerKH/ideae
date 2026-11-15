@@ -23,8 +23,9 @@ Status: early, Linux only (Ubuntu 24.04 or newer is what it is tested on).
   fires when a task out of view wants you.
 - **State.** Projects, tasks, open tabs, cursor lines and open folders
   survive a restart (`~/.local/share/ideae/state.json`).
-- **Editor.** Tree-sitter highlighting, go to definition (LSP when the
-  language server is installed, else a search-based fallback), file structure, blame of the cursor
+- **Editor.** Tree-sitter highlighting, go to definition, usages and
+  implementations (LSP when the language server is installed, else a
+  search-based fallback), file structure, blame of the cursor
   line, syntax-aware selection, autosave when you leave a file.
 - **Git.** Changes with stage/unstage/discard, commit, push, PR (`gh`), the
   branch against its base, history, safe pull.
@@ -68,7 +69,9 @@ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-Wl,--allow-shlib-u
 | Ctrl+Shift+T | New task |
 | Ctrl+1 / Ctrl+2 / Ctrl+3 / Ctrl+\` | Agent / Changes / History / shell |
 | Ctrl+Shift+N, Ctrl+Shift+F | Go to file, find in files |
-| Ctrl+B, Ctrl+F12 | Go to definition, file structure |
+| Ctrl+B / Ctrl+click | Go to definition; on a declaration, its usages |
+| Ctrl+Alt+B | Implementations, then usages |
+| Ctrl+F12 | File structure |
 | Alt+1 / Alt+2 / Alt+3 | Changes / Files / Structure panel |
 | Shift+Esc | Focus mode |
 
