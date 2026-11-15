@@ -39,6 +39,7 @@ pub static SHORTCUTS: &[Shortcut] = &[
     shortcut!("next_waiting", "Next waiting task", "alt-down", Everywhere, palette::NextWaiting),
     shortcut!("new_task", "New task", "ctrl-shift-t", Everywhere, NewTask),
     shortcut!("go_to_file", "Go to file", "ctrl-shift-n", Everywhere, GoToFile),
+    shortcut!("branches", "Branches", "ctrl-shift-`", NotInTerminal, task::ShowBranches),
     shortcut!("go_to_symbol", "Go to class or symbol", "ctrl-n", NotInTerminal, GoToSymbol),
     shortcut!("find_in_files", "Find in files", "ctrl-shift-f", Everywhere, FindInFiles),
     shortcut!("find_in_terminal", "Find in terminal", "ctrl-f", Terminal, task::FindInTerminal),

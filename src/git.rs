@@ -1275,7 +1275,7 @@ mod lock_tests {
 // They script repositories with bash, which Windows lacks or has as WSL's.
 #[cfg(all(test, unix))]
 mod pull_tests {
-    use super::{between, conflict_marked, diff_against, hunks, pull_conflicts, pull_safe, refresh, refs, stash, stash_apply, stash_drop, stash_patch, working_patch, Known};
+    use super::{branch_rows, branch_worktree, delete_branch, between, conflict_marked, diff_against, hunks, pull_conflicts, pull_safe, refresh, refs, stash, stash_apply, stash_drop, stash_patch, working_patch, Known};
     use std::{path::Path, process::Command};
 
     fn sh(dir: &Path, script: &str) {
@@ -1404,6 +1404,41 @@ mod pull_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// The branches are listed with what is known of each; one gets a
+    /// worktree of its own, a remote one a local branch that follows it;
+    /// one is deleted, here and on the remote, not merged only when told.
+    #[test]
+    fn branches_are_listed_opened_and_deleted() {
+        let base = setup("branches");
+        let b = base.join("b");
+        sh(&b, "git branch done; git checkout -q -b wip; echo more >> f.txt; git commit -qam wip; git push -q -u origin wip 2>/dev/null
+            git checkout -q main; cd ../a; git checkout -q -b theirs; echo x > t.txt; git add t.txt; git commit -qm theirs; git push -q origin theirs 2>/dev/null
+            cd ../b; git fetch -q");
+        let rows = branch_rows(&b);
+        let row = |name: &str| rows.iter().find(|r| r.name == name).unwrap_or_else(|| panic!("{name} in {rows:?}")).clone();
+        assert!(rows.iter().all(|r| r.name != "main" && r.name != "origin/main"), "not the branch work starts from: {rows:?}");
+        assert!(row("done").merged && !row("wip").merged && row("origin/theirs").remote && row("wip").subject == "wip");
+        assert_eq!(row("done").held, None);
+
+        let opened = branch_worktree(&b, &row("origin/theirs"), false).unwrap();
+        assert!(opened.join("t.txt").is_file(), "the remote branch, in a worktree of its own");
+        let rows = branch_rows(&b);
+        let theirs = rows.iter().find(|r| r.name == "theirs").expect("a local branch that follows it");
+        assert_eq!(theirs.held.as_ref().map(|p| p.canonicalize().unwrap()), Some(opened.canonicalize().unwrap()));
+        assert!(branch_worktree(&b, &row("origin/theirs"), false).is_err(), "not twice");
+
+        delete_branch(&b, &row("done"), false).unwrap();
+        assert!(delete_branch(&b, &row("wip"), false).is_ok(), "pushed: git lets it go");
+        delete_branch(&b, &row("origin/wip"), false).unwrap();
+        sh(&b, "git branch loose; git checkout -q loose; echo y >> f.txt; git commit -qam loose; git checkout -q main");
+        let loose = branch_rows(&b).into_iter().find(|r| r.name == "loose").unwrap();
+        assert!(!loose.merged && delete_branch(&b, &loose, false).is_err(), "what it holds would be lost");
+        delete_branch(&b, &loose, true).unwrap();
+        let left: Vec<String> = branch_rows(&b).into_iter().map(|r| r.name).collect();
+        assert!(!left.iter().any(|n| ["done", "wip", "origin/wip", "loose"].contains(&n.as_str())), "{left:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn conflict_is_undone() {
         let base = setup("conflict");
@@ -1455,6 +1490,90 @@ mod pull_tests {
 }
 
 /// Local and remote branches, for picking what to diff against.
+/// A branch of the repository, here or on a remote, for the list one is
+/// chosen from.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BranchRow {
+    /// `fix-login`, `origin/fix-login`.
+    pub name: String,
+    pub remote: bool,
+    /// All of it is in the branch work starts from.
+    pub merged: bool,
+    pub when: String,
+    pub subject: String,
+    /// The worktree it is checked out in: a task has it.
+    pub held: Option<PathBuf>,
+}
+
+pub fn branch_rows(root: &Path) -> Vec<BranchRow> {
+    let base = base_ref(root).unwrap_or_else(|| "HEAD".into());
+    let listed = |merged: bool| {
+        let mut args = vec!["for-each-ref", "--sort=-committerdate", "--format=%(refname)%1f%(refname:short)%1f%(committerdate:relative)%1f%(subject)"];
+        if merged {
+            args.extend(["--merged", base.as_str()]);
+        }
+        args.extend(["refs/heads", "refs/remotes"]);
+        git(root, &args).unwrap_or_default()
+    };
+    let merged: std::collections::HashSet<String> = listed(true).lines().filter_map(|line| line.split('\x1f').next().map(str::to_string)).collect();
+    let held: std::collections::HashMap<String, PathBuf> = worktrees(root).into_iter().map(|w| (w.branch, w.path)).collect();
+    listed(false)
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\x1f');
+            let (full, name) = (parts.next()?, parts.next()?.to_string());
+            let remote = full.starts_with("refs/remotes/");
+            // The branch work starts from is not one to tidy away, nor the remote's pointer to it.
+            if name.ends_with("/HEAD") || name == "origin" || name == base || base.strip_prefix("origin/") == Some(name.as_str()) {
+                return None;
+            }
+            Some(BranchRow {
+                merged: merged.contains(full),
+                held: (!remote).then(|| held.get(&name).cloned()).flatten(),
+                when: parts.next()?.to_string(),
+                subject: parts.next().unwrap_or_default().to_string(),
+                name,
+                remote,
+            })
+        })
+        .collect()
+}
+
+/// Deletes a branch: here, or on its remote (`origin/x` is told to drop
+/// `x`). One not merged goes only with `force`.
+pub fn delete_branch(root: &Path, branch: &BranchRow, force: bool) -> Result<String, String> {
+    if branch.remote {
+        let (remote, name) = branch.name.split_once('/').ok_or("not a remote branch")?;
+        run(root, "git", &["push", remote, "--delete", name])?;
+    } else {
+        run(root, "git", &["branch", if force { "-D" } else { "-d" }, &branch.name])?;
+    }
+    Ok(format!("Deleted {}", branch.name))
+}
+
+/// A worktree for a branch there is already, next to the repository
+/// where a new task's would be: the app then shows it as a task. A remote
+/// branch gets a local one that follows it.
+pub fn branch_worktree(root: &Path, branch: &BranchRow, copy_env: bool) -> Result<PathBuf, String> {
+    let repo = main_worktree(root).ok_or("not a git repository")?;
+    let local = if branch.remote { branch.name.split_once('/').map_or(branch.name.as_str(), |(_, name)| name) } else { branch.name.as_str() };
+    let dir = task_worktree_dir(&repo, local);
+    if dir.exists() {
+        return Err(format!("{} already exists", dir.display()));
+    }
+    let dir_s = dir.to_string_lossy().into_owned();
+    let known = git(&repo, &["rev-parse", "--verify", "-q", &format!("refs/heads/{local}")]).is_some_and(|hash| !hash.trim().is_empty());
+    if branch.remote && !known {
+        git_status(&repo, &["worktree", "add", "--track", "-b", local, &dir_s, &branch.name])?;
+    } else {
+        git_status(&repo, &["worktree", "add", &dir_s, local])?;
+    }
+    if copy_env {
+        copy_env_files(&repo, &dir);
+    }
+    Ok(dir)
+}
+
 /// What the worktree can be compared with: branches, tags, the latest
 /// commits. Each as git names it, and what it is.
 pub fn refs(root: &Path) -> Vec<(String, String)> {
