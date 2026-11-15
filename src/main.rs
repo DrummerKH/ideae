@@ -488,6 +488,7 @@ fn main() {
                     KeyBinding::new(keys::bind("alt-1"), ShowSidePanel(0), context),
                     KeyBinding::new(keys::bind("alt-2"), ShowSidePanel(1), context),
                     KeyBinding::new(keys::bind("alt-3"), ShowSidePanel(2), context),
+                    KeyBinding::new(keys::bind("alt-4"), ShowSidePanel(3), context),
                     KeyBinding::new(keys::bind("ctrl-pagedown"), task::NextTab, context),
                     KeyBinding::new(keys::bind("ctrl-pageup"), task::PrevTab, context),
                 ]);

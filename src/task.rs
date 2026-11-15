@@ -1267,6 +1267,8 @@ enum RightPane {
     Files,
     /// The declarations of the file last in view.
     Structure,
+    /// The task's services (`.ideae.toml`): start, stop, open.
+    Run,
 }
 
 const NAV_LIMIT: usize = 100;
@@ -1342,6 +1344,10 @@ pub struct TaskView {
     /// Its share of the ports of `.ideae.toml`'s services, and those services.
     pub port_slot: u32,
     services: Vec<crate::services::Service>,
+    /// Why `.ideae.toml` could not be read, and what the project seems to
+    /// run, for the Run panel; read when it is shown.
+    services_error: Option<String>,
+    services_found: Vec<crate::services::Found>,
     hook_socket: Option<String>,
     /// Numbers terminals so each has a unique element id and default title.
     terminal_seq: usize,
@@ -1528,6 +1534,8 @@ impl TaskView {
             viewed: BTreeMap::new(),
             port_slot,
             services,
+            services_error: None,
+            services_found: Vec::new(),
             hook_socket,
             terminal_seq: 1,
             unseen: false,
@@ -2807,8 +2815,12 @@ impl TaskView {
         self.right = match which {
             0 => RightPane::Changes,
             1 => RightPane::Files,
-            _ => RightPane::Structure,
+            2 => RightPane::Structure,
+            _ => RightPane::Run,
         };
+        if self.right == RightPane::Run {
+            self.refresh_services();
+        }
         self.side_selected = match self.right {
             // Start on the declaration the cursor is in.
             RightPane::Structure => self.structure_items(cx).iter().rposition(|i| i.line <= self.structure_cursor(cx)).unwrap_or(0),
@@ -2825,7 +2837,7 @@ impl TaskView {
         let len = match self.right {
             RightPane::Changes => self.files.len(),
             RightPane::Structure => self.structure_items(cx).len(),
-            RightPane::Files => return,
+            RightPane::Files | RightPane::Run => return,
         };
         match event.keystroke.key.as_str() {
             "down" if len > 0 => self.side_selected = (self.side_selected + 1).min(len - 1),
@@ -2979,7 +2991,6 @@ impl TaskView {
                     .child(format!("· {} {}", b.last_hash, b.last_subject)),
             )
             .children(self.render_pr_feedback(cx))
-            .child(self.render_run(cx))
             .child(
                 Button::new("log")
                     .xsmall()
@@ -3508,8 +3519,23 @@ impl TaskView {
                                 this.right = RightPane::Structure;
                                 cx.notify();
                             })),
-                    ),
+                    )
+                    .child({
+                        let running = self.running_services(cx).len();
+                        Button::new("pane-run")
+                            .small()
+                            .ghost()
+                            .label(if running > 0 { format!("Run ● {running}") } else { "Run".to_string() })
+                            .tooltip(format!("Dev servers and workers of this task ({})", crate::keys::label("Alt+4")))
+                            .selected(self.right == RightPane::Run)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.right = RightPane::Run;
+                                this.refresh_services();
+                                cx.notify();
+                            }))
+                    }),
             )
+            .when(self.right == RightPane::Run, |this| this.child(self.render_run_panel(cx)))
             .when(self.right == RightPane::Files, |this| this.child(self.render_tree(cx)))
             .when(self.right == RightPane::Structure, |this| this.child(self.render_structure(cx)))
             .when(self.right == RightPane::Changes, |this| {
@@ -4940,6 +4966,7 @@ impl TaskView {
                 RightPane::Changes => 0,
                 RightPane::Files => 1,
                 RightPane::Structure => 2,
+                RightPane::Run => 3,
             },
         }
     }
@@ -5003,6 +5030,7 @@ impl TaskView {
         self.right = match session.side_panel {
             1 => RightPane::Files,
             2 => RightPane::Structure,
+            3 => RightPane::Run,
             _ => RightPane::Changes,
         };
         self.structure_file = self.focused_ix().filter(|&ix| matches!(self.tabs[ix].kind, TabKind::File(_))).map(|ix| self.tabs[ix].id);
@@ -5324,54 +5352,171 @@ impl TaskView {
         self.open_file(path, 0, window, cx);
     }
 
-    fn render_run(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let running: Vec<String> = self.running_services(cx).into_iter().map(|(n, _)| n).collect();
-        let label = if running.is_empty() { "Run ▾".to_string() } else { format!("Run ▾ ({})", running.len()) };
-        let task = cx.weak_entity();
-        Button::new("run").xsmall().ghost().label(label).dropdown_menu(move |mut menu, _, cx| {
-            use gpui_kit::component::menu::PopupMenuItem;
-            let Some(view) = task.upgrade() else { return menu };
-            let _ = view.update(cx, |t, _| t.reload_services());
-            let t = view.read(cx);
-            let (services, slot) = (t.services.clone(), t.port_slot);
-            if services.is_empty() {
-                let task = task.clone();
-                return menu.item(PopupMenuItem::new(format!("Describe services in {}…", crate::services::FILE)).on_click(
-                    move |_, window, cx| {
-                        let _ = task.update(cx, |t, cx| t.create_services_file(window, cx));
-                    },
-                ));
+    /// Rereads `.ideae.toml` and, without one, looks for what to suggest.
+    fn refresh_services(&mut self) {
+        match crate::services::load(&self.root) {
+            Ok(services) => {
+                self.services = services;
+                self.services_error = None;
             }
-            for service in &services {
-                let name = service.name.clone();
-                let port = service.port(slot).map(|p| format!(" :{p}")).unwrap_or_default();
-                let on = running.contains(&name);
-                let item = |label: String, action: fn(&mut TaskView, &str, &mut Window, &mut Context<TaskView>)| {
-                    let (task, name) = (task.clone(), name.clone());
-                    PopupMenuItem::new(label).on_click(move |_, window, cx| {
-                        let _ = task.update(cx, |t, cx| action(t, &name, window, cx));
-                    })
-                };
-                if on {
-                    menu = menu
-                        .item(item(format!("Stop {name}{port}"), TaskView::stop_service))
-                        .item(item(format!("Restart {name}"), |t, n, w, cx| {
+            Err(e) => self.services_error = Some(e),
+        }
+        let known: HashSet<String> = self.services.iter().map(|s| s.name.clone()).collect();
+        self.services_found = crate::services::detect(&self.root).into_iter().filter(|f| !known.contains(&f.service.name)).collect();
+    }
+
+    fn add_found_service(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(found) = self.services_found.get(ix).cloned() else { return };
+        if let Err(e) = crate::services::add(&self.root, &found.service) {
+            self.services_error = Some(e);
+        }
+        self.services_found.remove(ix);
+        if let Ok(services) = crate::services::load(&self.root) {
+            self.services = services;
+        }
+        cx.notify();
+    }
+
+    /// What the project seems to run and `.ideae.toml` lacks, each with Add.
+    fn render_found(&self, mut panel: Stateful<Div>, heading: &'static str, cx: &mut Context<Self>) -> Stateful<Div> {
+        if self.services_found.is_empty() {
+            return panel;
+        }
+        let muted = cx.theme().muted_foreground;
+        panel = panel.child(div().px_3().pt_2().text_xs().text_color(muted).child(heading));
+        for (ix, found) in self.services_found.iter().enumerate() {
+            let s = &found.service;
+            panel = panel.child(
+                h_flex()
+                    .id(("found", ix))
+                    .px_3()
+                    .py_1()
+                    .gap_2()
+                    .hover(|d| d.bg(cx.theme().accent))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(h_flex().gap_2().child(s.name.clone()).when_some(s.port, |row, p| {
+                                row.child(div().text_xs().text_color(muted).child(format!(":{p}")))
+                            }))
+                            .child(div().text_xs().text_color(muted).truncate().child(format!("{} · {}", s.command, found.source))),
+                    )
+                    .child(
+                        Button::new(("add-found", ix))
+                            .xsmall()
+                            .outline()
+                            .label("Add")
+                            .tooltip(format!("Write it to {} at the repository root", crate::services::FILE))
+                            .on_click(cx.listener(move |this, _, _, cx| this.add_found_service(ix, cx))),
+                    ),
+            );
+        }
+        panel
+    }
+
+    fn render_run_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let mut panel = v_flex().id("run-panel").flex_1().min_h_0().overflow_y_scroll().text_sm();
+        if let Some(error) = &self.services_error {
+            panel = panel.child(div().px_3().py_2().text_xs().text_color(gpui_kit::red()).child(error.clone()));
+        }
+        if self.services.is_empty() {
+            panel = panel.child(
+                v_flex()
+                    .gap_2()
+                    .px_3()
+                    .py_3()
+                    .child(div().font_semibold().child("Services"))
+                    .child(div().text_xs().text_color(muted).child(
+                        "Dev servers and workers this task runs. Each task gets its own ports, \
+                         so several branches run side by side; its terminals, the agent's too, \
+                         get them as IDEAE_PORT_<NAME>.",
+                    )),
+            );
+            panel = self.render_found(panel, "FOUND IN THE PROJECT", cx);
+            return panel
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .px_3()
+                        .py_3()
+                        .child(
+                            Button::new("describe-services")
+                                .small()
+                                .ghost()
+                                .label(format!("Describe by hand in {}…", crate::services::FILE))
+                                .on_click(cx.listener(|this, _, window, cx| this.create_services_file(window, cx))),
+                        )
+                        .child(div().text_xs().text_color(muted).child(format!(
+                            "{} goes to the repository root; commit it so every task has the same services.",
+                            crate::services::FILE
+                        ))),
+                )
+                .into_any_element();
+        }
+        let running: Vec<String> = self.running_services(cx).into_iter().map(|(n, _)| n).collect();
+        for (ix, service) in self.services.iter().enumerate() {
+            let name = service.name.clone();
+            let on = running.contains(&name);
+            let port = service.port(self.port_slot);
+            let command = service.expand(&service.command, &self.services, self.port_slot);
+            let action = |id: &'static str, label: &'static str, tip: String, f: fn(&mut TaskView, &str, &mut Window, &mut Context<TaskView>)| {
+                let name = name.clone();
+                Button::new((id, ix)).xsmall().ghost().label(label).tooltip(tip).on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    f(this, &name, window, cx);
+                    cx.notify();
+                }))
+            };
+            panel = panel.child(
+                h_flex()
+                    .id(("service", ix))
+                    .px_3()
+                    .py_1()
+                    .gap_2()
+                    .hover(|d| d.bg(cx.theme().accent))
+                    .child(div().text_color(if on { gpui_kit::green() } else { muted }).child(if on { "●" } else { "○" }))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(h_flex().gap_2().child(name.clone()).when_some(port, |row, p| {
+                                row.child(div().text_xs().text_color(muted).child(format!(":{p}")))
+                            }))
+                            .child(div().text_xs().text_color(muted).truncate().child(command)),
+                    )
+                    .when(on, |row| {
+                        row.child(action("svc-logs", "logs", "Its terminal".into(), |t, n, w, cx| {
+                            if let Some(ix) = t.service_ix(n, cx) {
+                                t.activate(ix, w, cx);
+                            }
+                        }))
+                        .child(action("svc-restart", "↻", "Restart".into(), |t, n, w, cx| {
                             t.stop_service(n, w, cx);
                             t.start_service(n, w, cx);
-                        }));
-                } else {
-                    menu = menu.item(item(format!("Start {name}{port}"), TaskView::start_service));
-                }
-                if service.url.is_some() {
-                    menu = menu.item(item(format!("Open {name}"), TaskView::open_service));
-                }
-                menu = menu.separator();
-            }
-            let task = task.clone();
-            menu.item(PopupMenuItem::new(format!("Edit {}", crate::services::FILE)).on_click(move |_, window, cx| {
-                let _ = task.update(cx, |t, cx| t.create_services_file(window, cx));
-            }))
-        })
+                        }))
+                        .child(action("svc-stop", "■", "Stop".into(), TaskView::stop_service))
+                    })
+                    .when(!on, |row| row.child(action("svc-start", "▶", "Start".into(), TaskView::start_service)))
+                    .when(service.url.is_some(), |row| {
+                        let url = service.url(&self.services, self.port_slot).unwrap_or_default();
+                        row.child(action("svc-open", "open", format!("Open {url} in a Web tab"), TaskView::open_service))
+                    }),
+            );
+        }
+        panel = self.render_found(panel, "ALSO IN THE PROJECT", cx);
+        panel
+            .child(
+                h_flex().px_3().py_2().child(
+                    Button::new("edit-services")
+                        .xsmall()
+                        .ghost()
+                        .label(format!("Edit {}", crate::services::FILE))
+                        .on_click(cx.listener(|this, _, window, cx| this.create_services_file(window, cx))),
+                ),
+            )
+            .into_any_element()
     }
 }
 

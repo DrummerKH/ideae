@@ -240,6 +240,7 @@ impl Workspace {
             Entry::action("Changes panel", "Alt+1", ShowSidePanel(0)),
             Entry::action("Files panel", "Alt+2", ShowSidePanel(1)).detail("project tree"),
             Entry::action("Structure panel", "Alt+3", ShowSidePanel(2)),
+            Entry::action("Run panel", "Alt+4", ShowSidePanel(3)).detail("services: dev servers, workers"),
             Entry::action("File structure", "Ctrl+F12", ShowOutline).detail("declarations of the open file"),
             Entry::action("Next tab", "Ctrl+PgDn", NextTab),
             Entry::action("Previous tab", "Ctrl+PgUp", PrevTab),

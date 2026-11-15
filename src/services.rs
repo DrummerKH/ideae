@@ -23,7 +23,7 @@ use serde::Deserialize;
 pub const FILE: &str = ".ideae.toml";
 const PORT_STEP: u32 = 100;
 
-pub const TEMPLATE: &str = r#"# Services ideae can start for each task (Run ▾ in the branch bar).
+pub const TEMPLATE: &str = r#"# Services ideae can start for each task (the Run panel, Alt+4).
 # Every task gets its own ports: {port} is `port` + 100 × the task's slot
 # (0 for the main checkout, 1, 2… for worktrees). Programs must take the
 # port from the environment or their arguments for that to help.
@@ -56,6 +56,129 @@ pub struct Service {
 struct Config {
     #[serde(default)]
     service: Vec<Service>,
+}
+
+/// What the top of a new `.ideae.toml` says.
+const HEADER: &str = "# Services ideae can start for each task (the Run panel, Alt+4).\n\
+# Every task gets its own ports: {port} is `port` + 100 × the task's slot\n\
+# (0 for the main checkout, 1, 2… for worktrees). Programs must take the\n\
+# port from the environment or their arguments for that to help.\n\
+# Terminals of a task, the agent's included, get IDEAE_PORT_<NAME>.\n";
+
+/// A service the project seems to have, from the files every such project
+/// has: package.json scripts, Makefile targets, a Procfile, a compose file.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Found {
+    pub service: Service,
+    /// Where it was found, for the list: "package.json", "Makefile"…
+    pub source: &'static str,
+}
+
+fn found(name: &str, command: String, port: Option<u16>, source: &'static str) -> Found {
+    Found {
+        service: Service {
+            name: name.to_string(),
+            command,
+            port,
+            url: port.map(|_| "http://localhost:{port}".to_string()),
+            env: BTreeMap::new(),
+            cwd: None,
+        },
+        source,
+    }
+}
+
+/// `--port 8080`, `--port=8080`, `PORT=8080`, `-p 8080` in a command line.
+fn port_in(command: &str) -> Option<u16> {
+    let words: Vec<&str> = command.split_whitespace().collect();
+    for (i, w) in words.iter().enumerate() {
+        for prefix in ["--port=", "PORT="] {
+            if let Some(n) = w.strip_prefix(prefix) {
+                return n.parse().ok();
+            }
+        }
+        if matches!(*w, "--port" | "-p") {
+            return words.get(i + 1)?.parse().ok();
+        }
+    }
+    None
+}
+
+pub fn detect(root: &Path) -> Vec<Found> {
+    let mut out = Vec::new();
+    if let Ok(text) = std::fs::read_to_string(root.join("package.json")) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+            let run = if root.join("pnpm-lock.yaml").exists() {
+                "pnpm"
+            } else if root.join("yarn.lock").exists() {
+                "yarn"
+            } else if root.join("bun.lockb").exists() || root.join("bun.lock").exists() {
+                "bun run"
+            } else {
+                "npm run"
+            };
+            for key in ["dev", "start", "serve", "preview", "storybook"] {
+                let Some(script) = json["scripts"][key].as_str() else { continue };
+                // Dev servers that take --port: each task on its own.
+                let default = [("vite", 5173), ("next", 3000), ("astro", 4321), ("react-scripts", 3000), ("storybook", 6006)]
+                    .into_iter()
+                    .find(|(tool, _)| script.split_whitespace().next() == Some(*tool) || script.contains(&format!("{tool} ")))
+                    .map(|(_, port)| port);
+                let (command, port) = match (port_in(script), default) {
+                    (Some(port), _) => (format!("{run} {key}"), Some(port)),
+                    (None, Some(port)) => {
+                        let sep = if run == "npm run" { " --" } else { "" };
+                        (format!("{run} {key}{sep} --port {{port}}"), Some(port))
+                    }
+                    (None, None) => (format!("{run} {key}"), None),
+                };
+                out.push(found(key, command, port, "package.json"));
+            }
+        }
+    }
+    for makefile in ["Makefile", "makefile", "GNUmakefile"] {
+        let Ok(text) = std::fs::read_to_string(root.join(makefile)) else { continue };
+        for line in text.lines() {
+            let Some((target, _)) = line.split_once(':') else { continue };
+            if matches!(target.trim(), "run" | "dev" | "serve" | "start" | "up" | "watch") && !line.starts_with(['\t', ' ']) {
+                out.push(found(target.trim(), format!("make {}", target.trim()), None, "Makefile"));
+            }
+        }
+        break;
+    }
+    if let Ok(text) = std::fs::read_to_string(root.join("Procfile")) {
+        for line in text.lines() {
+            let Some((name, command)) = line.split_once(':') else { continue };
+            if !name.trim().is_empty() && !name.starts_with('#') {
+                out.push(found(name.trim(), command.trim().to_string(), port_in(command), "Procfile"));
+            }
+        }
+    }
+    if ["compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml"].iter().any(|f| root.join(f).exists()) {
+        out.push(found("compose", "docker compose up".into(), None, "compose file"));
+    }
+    // A name once: the first source wins.
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|f| seen.insert(f.service.name.clone()));
+    out
+}
+
+/// Adds `service` to the task's `.ideae.toml`, making the file when missing.
+pub fn add(root: &Path, service: &Service) -> Result<(), String> {
+    let path = root.join(FILE);
+    let mut text = std::fs::read_to_string(&path).unwrap_or_else(|_| HEADER.to_string());
+    let quote = |s: &str| toml::Value::String(s.to_string()).to_string();
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&format!("\n[[service]]\nname = {}\ncommand = {}\n", quote(&service.name), quote(&service.command)));
+    if let Some(port) = service.port {
+        text.push_str(&format!("port = {port}\n"));
+    }
+    if let Some(url) = &service.url {
+        text.push_str(&format!("url = {}\n", quote(url)));
+    }
+    std::fs::write(&path, text).map_err(|e| format!("{FILE}: {e}"))
 }
 
 /// The services of the task at `root`, or why the file could not be read.
@@ -154,7 +277,29 @@ fn owner(_: u16) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, task_env};
+    use super::{Config, detect, load, task_env};
+
+    #[test]
+    fn finds_scripts_and_adds_them() {
+        let root = std::env::temp_dir().join(format!("ideae-services-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("package.json"), r#"{"scripts":{"dev":"vite","start":"node server.js --port 8080","test":"vitest"}}"#).unwrap();
+        std::fs::write(root.join("Makefile"), "run:\n\tgo run .\nbuild:\n\tgo build\n").unwrap();
+        let found = detect(&root);
+        let names: Vec<_> = found.iter().map(|f| f.service.name.as_str()).collect();
+        assert_eq!(names, ["dev", "start", "run"]);
+        assert_eq!(found[0].service.command, "npm run dev -- --port {port}");
+        assert_eq!(found[0].service.port, Some(5173));
+        assert_eq!(found[1].service.port, Some(8080));
+        super::add(&root, &found[0].service).unwrap();
+        super::add(&root, &found[2].service).unwrap();
+        let loaded = load(&root).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].url.as_deref(), Some("http://localhost:{port}"));
+        assert_eq!(loaded[1].command, "make run");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn ports_follow_the_slot() {
