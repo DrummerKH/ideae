@@ -2206,10 +2206,17 @@ pub(crate) mod tests {
             assert!(saved.projects[0].verdicts.get(&group).is_some_and(|run| run.output.contains("KEEP: B")));
             assert!(saved.projects[0].tasks.iter().all(|t| t.check.as_ref().is_some_and(|run| run.state == RunState::Passed)));
         });
+        // What an agent has used is known: its task shows how full its context is, the title what the day took.
+        workspace.update(cx, |w, cx| {
+            let used = crate::usage::Usage { context: 170_000, recent: 495_000, ..Default::default() };
+            w.usage.insert(paths[0].clone(), (None, used));
+            cx.notify();
+        });
         // The screen draws with all of it on.
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             assert!(window.find("group-judge").visible());
+            assert!(window.find("tokens-day").visible() && window.find("context-bar").visible());
             assert!(window.find("compare-A-B").visible(), "the pair, by the files changed");
         })
         .unwrap();

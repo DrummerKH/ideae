@@ -473,6 +473,11 @@ impl Workspace {
         if let Some(pr) = t.pr.as_ref().filter(|p| p.open_feedback > 0 && pr_status) {
             details.push(format!("{} review comment{}", pr.open_feedback, if pr.open_feedback == 1 { "" } else { "s" }));
         }
+        // How full its agent's context is, once that is worth knowing.
+        let fill = self.usage.get(&path).map_or(0., |(_, usage)| usage.fill());
+        if fill >= 0.5 {
+            details.push(format!("context {:.0}%", fill * 100.));
+        }
         if t.starred {
             details.push("★".into());
         }
@@ -683,6 +688,14 @@ impl Workspace {
                         }
                     }
                 }));
+        }
+        // Under the row, how full the agent's context is: yellow when it
+        // will soon be squeezed, red when that is about to happen.
+        if fill > 0.02 {
+            let color = if fill >= 0.9 { gpui_kit::red() } else if fill >= 0.75 { gpui_kit::yellow() } else { muted.opacity(0.5) };
+            row = row.child(
+                div().id("context-bar").test_support().mt_0p5().ml(px(18.)).h(px(2.)).rounded_full().bg(muted.opacity(0.12)).child(div().h_full().w(relative(fill)).rounded_full().bg(color)),
+            );
         }
         row.context_menu(menu).into_any_element()
     }

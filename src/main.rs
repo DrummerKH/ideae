@@ -92,6 +92,21 @@ impl Render for Workspace {
                                 .when(!lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed), |row| {
                                     row.child(div().mr_2().child(self.sysmon.clone()))
                                 })
+                                .when(self.tokens_of_the_day() > 0, |row| {
+                                    row.child(
+                                        div()
+                                            .id("tokens-day")
+                                            .test_support()
+                                            .mr_2()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(format!("tokens 24h {}", usage::tokens(self.tokens_of_the_day())))
+                                            .tooltip(|window, cx| {
+                                                gpui_kit::component::tooltip::Tooltip::new("What the agents of the tasks open here took in the last 24 hours: input not read from the cache, and output")
+                                                    .build(window, cx)
+                                            }),
+                                    )
+                                })
                                 .children(self.render_update(cx))
                                 .children(self.render_new_build(cx))
                                 .child(self.render_power_saving(cx))
@@ -526,9 +541,13 @@ fn main() {
                 WindowBounds::Windowed(b) => Some(b.origin),
                 _ => None,
             };
+            // Debug aid for runs that are only looked at: IDEAE_BEHIND opens
+            // the window without taking the keyboard or coming to the front.
+            let behind = std::env::var_os("IDEAE_BEHIND").is_some();
             let options = WindowOptions {
                 window_bounds: Some(window_bounds),
                 app_id: Some(state::APP_ID.into()),
+                focus: !behind,
                 ..TitleBar::window_options()
             };
             gpui_kit::open_window(options, cx, |window, cx| {
@@ -542,7 +561,9 @@ fn main() {
                 })
             })
             .expect("failed to open window");
-            cx.activate(true);
+            if !behind {
+                cx.activate(true);
+            }
             // A quit signal (logout, kill) goes the same way as Exit.
             cx.spawn(async move |cx| {
                 loop {

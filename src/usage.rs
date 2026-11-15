@@ -44,6 +44,36 @@ pub struct Usage {
     pub cache_read: u64,
     pub output: u64,
     pub answers: u32,
+    /// What the answers of the last day took: input not read from the
+    /// cache, and output.
+    pub recent: u64,
+}
+
+impl Usage {
+    /// The session so far, what was read from the cache again not counted.
+    pub fn spent(&self) -> u64 {
+        self.input + self.output
+    }
+
+    /// How full the context is, 0 to 1: of 200k tokens, or of a million
+    /// once it holds more than the smaller window can.
+    pub fn fill(&self) -> f32 {
+        let window = if self.context > 200_000 || self.model.contains("[1m]") { 1_000_000 } else { 200_000 };
+        (self.context as f32 / window as f32).min(1.)
+    }
+}
+
+/// Seconds since 1970 of a time as transcripts write it: `2026-11-15T19:45:55.123Z`.
+fn epoch(time: &str) -> Option<u64> {
+    let number = |range: std::ops::Range<usize>| time.get(range)?.parse::<u64>().ok();
+    let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
+    let (hour, minute, second) = (number(11..13)?, number(14..16)?, number(17..19)?);
+    // Days from the civil date, the year starting in March.
+    let year = if month <= 2 { year - 1 } else { year };
+    let (era, of_era) = (year / 400, year % 400);
+    let of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let days = era * 146_097 + of_era * 365 + of_era / 4 - of_era / 100 + of_year;
+    Some((days.checked_sub(719_468)?) * 86_400 + hour * 3600 + minute * 60 + second)
 }
 
 /// Claude Code keeps a project's sessions in a folder named after its path,
@@ -70,8 +100,9 @@ pub fn transcript(root: &Path) -> Option<PathBuf> {
 pub fn read(path: &Path) -> Option<Usage> {
     let file = std::fs::File::open(path).ok()?;
     // A message is written again as it grows: the last copy of each counts.
-    let mut answers: HashMap<String, (u64, u64, u64)> = HashMap::new();
+    let mut answers: HashMap<String, (u64, u64, u64, u64)> = HashMap::new();
     let mut usage = Usage::default();
+    let day_ago = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |now| now.as_secs().saturating_sub(86_400));
     for line in BufReader::new(file).lines().map_while(Result::ok) {
         if !line.contains("\"usage\"") {
             continue;
@@ -86,22 +117,26 @@ pub fn read(path: &Path) -> Option<Usage> {
         let (input, created, read, output) =
             (n("input_tokens"), n("cache_creation_input_tokens"), n("cache_read_input_tokens"), n("output_tokens"));
         let id = message["id"].as_str().unwrap_or_default().to_string();
-        answers.insert(id, (input + created, read, output));
+        let at = v["timestamp"].as_str().and_then(epoch).unwrap_or(0);
+        answers.insert(id, (input + created, read, output, at));
         usage.context = input + created + read;
         if let Some(model) = message["model"].as_str().filter(|m| !m.starts_with('<')) {
             usage.model = model.to_string();
         }
     }
-    for (input, read, output) in answers.values() {
+    for (input, read, output, at) in answers.values() {
         usage.input += input;
         usage.cache_read += read;
         usage.output += output;
+        if *at >= day_ago {
+            usage.recent += input + output;
+        }
     }
     usage.answers = answers.len() as u32;
     Some(usage)
 }
 
-fn tokens(n: u64) -> String {
+pub fn tokens(n: u64) -> String {
     match n {
         0..1_000 => n.to_string(),
         1_000..1_000_000 => format!("{:.0}k", n as f64 / 1e3),
@@ -179,6 +214,43 @@ mod tests {
         ];
         std::fs::write(&path, lines.join("\n")).unwrap();
         assert_eq!(last_answer(&path).as_deref(), Some("Fixed the login.\nTests pass."));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_last_day_and_how_full_the_context_is() {
+        use super::{Usage, epoch};
+        assert_eq!(epoch("1970-01-01T00:00:00.000Z"), Some(0));
+        assert_eq!(epoch("2026-11-15T19:45:55.123Z"), Some(1_794_771_955));
+        assert_eq!(epoch("2024-02-29T12:00:00Z"), Some(1_709_208_000), "a leap day");
+        assert_eq!(epoch("yesterday"), None);
+
+        let path = std::env::temp_dir().join(format!("ideae-recent-{}.jsonl", std::process::id()));
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        // Back to a date: the inverse of what is read.
+        let written = |ago: u64| {
+            let at = now - ago;
+            let (days, of_day) = (at / 86_400, at % 86_400);
+            let shifted = days + 719_468;
+            let (era, of_era) = (shifted / 146_097, shifted % 146_097);
+            let year_of_era = (of_era - of_era / 1460 + of_era / 36_524 - of_era / 146_096) / 365;
+            let of_year = of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+            let month_part = (5 * of_year + 2) / 153;
+            let (day, month) = (of_year - (153 * month_part + 2) / 5 + 1, if month_part < 10 { month_part + 3 } else { month_part - 9 });
+            let year = year_of_era + era * 400 + u64::from(month <= 2);
+            format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.000Z", of_day / 3600, of_day % 3600 / 60, of_day % 60)
+        };
+        let answer = |id: &str, ago: u64, input: u64, read: u64, output: u64| {
+            format!(
+                r#"{{"type":"assistant","timestamp":"{}","message":{{"id":"{id}","model":"claude-x","usage":{{"input_tokens":{input},"cache_creation_input_tokens":0,"cache_read_input_tokens":{read},"output_tokens":{output}}}}}}}"#,
+                written(ago)
+            )
+        };
+        std::fs::write(&path, [answer("old", 3 * 86_400, 1000, 0, 500), answer("new", 3600, 200, 149_800, 50)].join("\n")).unwrap();
+        let usage = read(&path).unwrap();
+        assert_eq!((usage.spent(), usage.recent), (1750, 250), "of the last day only the later answer");
+        assert_eq!(usage.fill(), 0.75, "150k of 200k");
+        assert_eq!(Usage { context: 300_000, ..Usage::default() }.fill(), 0.3, "more than the small window holds: it is the large one");
         let _ = std::fs::remove_file(&path);
     }
 

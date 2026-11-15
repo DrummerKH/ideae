@@ -64,6 +64,17 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
         })
         .default_value(SharedString::from(default.fetch_minutes.to_string()))
     };
+    let token_warn = {
+        let (read, write) = (draft.clone(), draft.clone());
+        let options = [(0, "Never"), (500, "500k tokens"), (1000, "1M tokens"), (2000, "2M tokens"), (5000, "5M tokens"), (10000, "10M tokens")]
+            .into_iter()
+            .map(|(k, label)| (SharedString::from(k.to_string()), SharedString::from(label)))
+            .collect();
+        SettingField::dropdown(options, move |_| read.borrow().token_warn_k.to_string().into(), move |value, _| {
+            write.borrow_mut().token_warn_k = value.parse().unwrap_or(0)
+        })
+        .default_value(SharedString::from(default.token_warn_k.to_string()))
+    };
     let servers = lsp::SERVERS.iter().map(|def| {
         let program = def.program;
         let (read, write) = (draft.clone(), draft.clone());
@@ -109,7 +120,11 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
                     "Claude Code's LSP plugins, a rust-analyzer and the like per agent: much memory for every agent that runs, for go-to-definition in what it reads. For agents started after Save.",
                     |s| s.agent_lsp,
                     |s, v| s.agent_lsp = v,
-                )),
+                ))
+                .item(
+                    SettingItem::new("Tell me when a session has used", token_warn)
+                        .description("A notification, once for a session, when its agent has used this much: input not read from the cache, and output. The agent is not stopped."),
+                ),
         ),
         SettingPage::new("Editor").group(SettingGroup::new().item(switch(
             draft,

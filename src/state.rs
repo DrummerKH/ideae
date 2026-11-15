@@ -49,6 +49,9 @@ pub struct Settings {
     pub gutter_since_base: bool,
     /// Agents keep Claude Code's LSP plugins (a rust-analyzer per agent…).
     pub agent_lsp: bool,
+    /// A session that has used this many thousand tokens is told of, once;
+    /// 0 for never.
+    pub token_warn_k: u32,
     /// Shortcuts set by hand, by id (keymap.rs): keystrokes such as
     /// "ctrl-e", empty for none.
     pub keys: std::collections::BTreeMap<String, String>,
@@ -68,6 +71,7 @@ impl Default for Settings {
             hump_words: false,
             gutter_since_base: false,
             agent_lsp: false,
+            token_warn_k: 0,
             keys: std::collections::BTreeMap::new(),
         }
     }

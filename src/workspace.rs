@@ -145,6 +145,12 @@ pub struct Workspace {
     pub collapsed_groups: std::collections::HashSet<String>,
     /// What the group's screen shows of each variant, by worktree path.
     pub variant_info: std::collections::HashMap<PathBuf, variants::VariantInfo>,
+    /// What each task's agent has used, by worktree, with when the
+    /// transcript it is read from was last written to.
+    pub usage: std::collections::HashMap<PathBuf, (Option<std::time::SystemTime>, crate::usage::Usage)>,
+    reading_usage: bool,
+    /// Sessions already told of as over the limit set.
+    usage_warned: std::collections::HashSet<PathBuf>,
     /// Variants whose agent's answer is shown whole on the group's screen.
     whole_answers: std::collections::HashSet<PathBuf>,
     /// The command run in every variant of the group in view, how it went
@@ -383,6 +389,9 @@ impl Workspace {
                     if n % often == 1 {
                         this.refresh_touched(false, window, cx);
                     }
+                    if n % often == 4 {
+                        this.refresh_usage(window, cx);
+                    }
                     if n % 5 == 2 {
                         this.fetch_bases(cx);
                     }
@@ -425,6 +434,9 @@ impl Workspace {
             active_group: None,
             collapsed_groups: Default::default(),
             variant_info: Default::default(),
+            usage: Default::default(),
+            reading_usage: false,
+            usage_warned: Default::default(),
             whole_answers: Default::default(),
             check_command: {
                 let command = cx.new(|cx| InputState::new(window, cx).placeholder("Run in every variant: cargo test, npm run bench…"));
@@ -1730,6 +1742,7 @@ impl Workspace {
         if turn_over {
             self.projects[pi].tasks[ti].done_at = state::now();
             self.refresh_variant_info(window, cx);
+            self.refresh_usage(window, cx);
             if let Some(group) = &group {
                 self.refresh_touched(true, window, cx);
                 if !event.replayed && !more_coming && self.group_settled(group, cx) {
@@ -1764,6 +1777,64 @@ impl Workspace {
 
     /// Power saving: stops every language server and starts none until
     /// turned off, when the open files get theirs again.
+    /// What the agents of the tasks that run have used: each transcript
+    /// read again only when it was written to, off the UI thread.
+    pub fn refresh_usage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if std::mem::replace(&mut self.reading_usage, true) {
+            return;
+        }
+        let known: Vec<(PathBuf, Option<std::time::SystemTime>)> = self
+            .projects
+            .iter()
+            .flat_map(|p| &p.tasks)
+            .filter(|t| t.view.is_some())
+            .map(|t| (t.path.clone(), self.usage.get(&t.path).and_then(|(written, _)| *written)))
+            .collect();
+        cx.spawn_in(window, async move |this, cx| {
+            let read = cx
+                .background_spawn(async move {
+                    known
+                        .into_iter()
+                        .filter_map(|(path, before)| {
+                            let transcript = crate::usage::transcript(&path)?;
+                            let written = std::fs::metadata(&transcript).and_then(|m| m.modified()).ok();
+                            (written != before).then(|| crate::usage::read(&transcript)).flatten().map(|usage| (path, written, usage))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            if std::env::var_os("IDEAE_DEBUG").is_some() {
+                eprintln!("usage read: {:?}", read.iter().map(|(path, _, usage)| (path, usage.context, usage.recent)).collect::<Vec<_>>());
+            }
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.reading_usage = false;
+                let limit = u64::from(state::with_settings(|s| s.token_warn_k)) * 1000;
+                for (path, written, usage) in read {
+                    // A new session of the task starts its count again.
+                    if this.usage.get(&path).is_some_and(|(_, before)| before.spent() > usage.spent()) {
+                        this.usage_warned.remove(&path);
+                    }
+                    if limit > 0 && usage.spent() >= limit && this.usage_warned.insert(path.clone()) {
+                        let name = this.find(&path).map(|(pi, ti)| format!("{} · {}", this.projects[pi].name, this.projects[pi].tasks[ti].label())).unwrap_or_default();
+                        let told = format!("{name}: its agent has used {} tokens in this session.", crate::usage::tokens(usage.spent()));
+                        window.push_notification(gpui_kit::component::notification::Notification::warning(told.clone()).title("Tokens"), cx);
+                        if state::with_settings(|s| s.notifications) && !window.is_window_active() {
+                            crate::desktop::notify("Tokens", &told);
+                        }
+                    }
+                    this.usage.insert(path, (written, usage));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// What all the tasks' agents took in the last day.
+    pub fn tokens_of_the_day(&self) -> u64 {
+        self.usage.values().map(|(_, usage)| usage.recent).sum()
+    }
+
     pub fn toggle_power_saving(&mut self, cx: &mut Context<Self>) {
         let on = !crate::lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed);
         crate::lsp::POWER_SAVING.store(on, std::sync::atomic::Ordering::Relaxed);
