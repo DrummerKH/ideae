@@ -692,6 +692,18 @@ impl Workspace {
         }
         // Under the row, how full the agent's context is: yellow when it
         // will soon be squeezed, red when that is about to happen.
+        // What the agent has used, in words, when the pointer rests on the task.
+        if let Some((_, usage)) = self.usage.get(&path).filter(|(_, usage)| usage.context > 0) {
+            let window = if usage.context > 200_000 || usage.model.contains("[1m]") { "1M" } else { "200k" };
+            let told = format!(
+                "Context {:.0}% full: {} of {window} tokens\nThis session: {} tokens · last 24 hours: {}",
+                fill * 100.,
+                crate::usage::tokens(usage.context),
+                crate::usage::tokens(usage.spent()),
+                crate::usage::tokens(usage.recent)
+            );
+            row = row.tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(told.clone()).build(window, cx));
+        }
         // Not before it is half full: an all but empty bar under every task says nothing.
         if fill >= 0.5 {
             let color = if fill >= 0.9 { gpui_kit::red() } else if fill >= 0.75 { gpui_kit::yellow() } else { cx.theme().primary };
