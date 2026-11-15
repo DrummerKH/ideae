@@ -375,6 +375,7 @@ fn notify(hook: &Hook) {
         event: hook.event.clone(),
         message: hook.message.clone(),
         kind: hook.kind.clone(),
+        file: hook.file.clone(),
         replayed: false,
     };
     let Some(status) = event.status().filter(|s| s.is_attention()) else { return };

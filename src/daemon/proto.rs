@@ -48,6 +48,9 @@ pub struct Hook {
     pub event: String,
     pub message: Option<String>,
     pub kind: Option<String>,
+    /// The file a tool call is about to change.
+    #[serde(default)]
+    pub file: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

@@ -21,7 +21,9 @@ Windows build exists and is being tried out (see [Windows](#windows)).
 - **Agent status.** Claude Code runs with hooks passed through
   `--settings`. Nothing is written to `~/.claude` or the repository. The
   sidebar shows working / needs input / done, and a desktop notification
-  fires when a task out of view wants you.
+  fires when a task out of view wants you. The Changes and Files panels
+  mark the file the agent is writing to and those it wrote to since your
+  last prompt.
 - **State.** Projects, tasks, open tabs, cursor lines and open folders
   survive a restart (`~/.local/share/ideae/state.json`).
 - **Editor.** Tree-sitter highlighting, go to definition, usages and

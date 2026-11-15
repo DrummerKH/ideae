@@ -156,6 +156,7 @@ impl Workspace {
                 event: h.event,
                 message: h.message,
                 kind: h.kind,
+                file: h.file,
                 replayed,
             };
             match crate::daemon::client::connect(move |h| {
@@ -1325,6 +1326,7 @@ impl Workspace {
         let was = view.read(cx).agent_status.clone();
         view.update(cx, |t, cx| {
             t.set_agent_status(status.clone(), seen, cx);
+            t.follow_agent(&event.event, event.file.as_deref());
             match event.event.as_str() {
                 "PreToolUse" => t.agent_activity = event.message.clone(),
                 "UserPromptSubmit" => t.agent_activity = Some("Thinking".into()),

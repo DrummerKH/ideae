@@ -59,6 +59,8 @@ pub struct HookEvent {
     pub message: Option<String>,
     /// Of a Notification: permission_prompt, idle_prompt, …
     pub kind: Option<String>,
+    /// The file a tool call is about to change.
+    pub file: Option<String>,
     /// The daemon's record of an earlier event, handed over on connect: it
     /// sets the status but notifies nobody again.
     pub replayed: bool,
@@ -315,6 +317,7 @@ fn parse_line(line: &str) -> Option<HookEvent> {
         event: v["event"].as_str()?.to_string(),
         message: v["message"].as_str().map(str::to_string),
         kind: v["kind"].as_str().map(str::to_string),
+        file: v["file"].as_str().map(str::to_string),
         replayed: false,
     })
 }
@@ -352,6 +355,17 @@ pub fn activity(payload: &Value) -> Option<String> {
     })
 }
 
+/// The file a tool call writes to, as the agent names it.
+pub fn edited_file(payload: &Value) -> Option<String> {
+    let input = &payload["tool_input"];
+    match payload["tool_name"].as_str()? {
+        "Edit" | "MultiEdit" | "Write" => input["file_path"].as_str(),
+        "NotebookEdit" => input["notebook_path"].as_str(),
+        _ => None,
+    }
+    .map(str::to_string)
+}
+
 /// `ideae --hook <Event>`: run by Claude Code, forwards the event and exits.
 /// It must never block or fail the agent, so every error is swallowed.
 pub fn run_hook(event: &str) {
@@ -371,6 +385,7 @@ pub fn run_hook(event: &str) {
         "event": event,
         "message": message,
         "kind": payload["notification_type"].as_str(),
+        "file": if event == "PreToolUse" { edited_file(&payload) } else { None },
     });
     #[cfg(unix)]
     if Path::new(&socket).file_name().is_some_and(|name| name.to_string_lossy().starts_with("daemon")) {
@@ -379,6 +394,7 @@ pub fn run_hook(event: &str) {
             event: event.to_string(),
             message: line["message"].as_str().map(str::to_string),
             kind: line["kind"].as_str().map(str::to_string),
+            file: line["file"].as_str().map(str::to_string),
         });
         return;
     }
@@ -390,7 +406,7 @@ mod tests {
     use super::*;
 
     fn note(message: &str, kind: Option<&str>) -> Option<AgentStatus> {
-        HookEvent { task: PathBuf::new(), event: "Notification".into(), message: Some(message.into()), kind: kind.map(Into::into), replayed: false }
+        HookEvent { task: PathBuf::new(), event: "Notification".into(), message: Some(message.into()), kind: kind.map(Into::into), file: None, replayed: false }
             .status()
     }
 
@@ -416,6 +432,8 @@ mod tests {
     fn activities() {
         let a = |v: Value| activity(&v);
         assert_eq!(a(json!({"tool_name":"Edit","tool_input":{"file_path":"/x/src/task.rs"}})).as_deref(), Some("Editing task.rs"));
+        assert_eq!(edited_file(&json!({"tool_name":"Write","tool_input":{"file_path":"/x/src/task.rs"}})).as_deref(), Some("/x/src/task.rs"));
+        assert_eq!(edited_file(&json!({"tool_name":"Read","tool_input":{"file_path":"/x/src/task.rs"}})), None);
         assert_eq!(a(json!({"tool_name":"Bash","tool_input":{"command":"cargo test --all","description":""}})).as_deref(), Some("Running cargo test --all"));
         assert_eq!(a(json!({"tool_name":"Bash","tool_input":{"command":"x","description":"Build the app"}})).as_deref(), Some("Build the app"));
         assert_eq!(a(json!({"tool_name":"Grep","tool_input":{"pattern":"fn main"}})).as_deref(), Some("Searching \"fn main\""));

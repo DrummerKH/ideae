@@ -1330,6 +1330,10 @@ pub struct TaskView {
     pub agent_status: crate::agent::AgentStatus,
     /// What the working agent does now: its latest tool call, in words.
     pub agent_activity: Option<String>,
+    /// The file the agent is writing to now, and those it wrote to since
+    /// the last prompt: marked in the Changes and Files panels.
+    agent_editing: Option<SharedString>,
+    agent_touched: HashSet<SharedString>,
     /// The command that starts the agent, for Restart.
     agent: Option<String>,
     /// Text for the agent's prompt once it is ready to take it.
@@ -1532,6 +1536,8 @@ impl TaskView {
             branch: branch.into(),
             agent_status: crate::agent::AgentStatus::Unknown,
             agent_activity: None,
+            agent_editing: None,
+            agent_touched: HashSet::new(),
             agent: agent.clone(),
             pending_prompt: None,
             recent: Vec::new(),
@@ -2347,10 +2353,35 @@ impl TaskView {
         self.unseen = status.is_attention() && !seen;
         if status != crate::agent::AgentStatus::Working {
             self.agent_activity = None;
+            self.agent_editing = None;
         }
         self.agent_status = status;
         cx.emit(TaskEvent::Changed);
         cx.notify();
+    }
+
+    /// Keeps up with what the agent writes: `file` is what a tool call is
+    /// about to change. A new prompt starts the turn's list over.
+    pub fn follow_agent(&mut self, event: &str, file: Option<&str>) {
+        match event {
+            "UserPromptSubmit" => {
+                self.agent_touched.clear();
+                self.agent_editing = None;
+            }
+            "PreToolUse" => {
+                self.agent_editing = file.and_then(|file| path_in(&self.root, std::path::Path::new(file))).map(SharedString::from);
+                self.agent_touched.extend(self.agent_editing.clone());
+            }
+            _ => {}
+        }
+    }
+
+    /// "editing" by the file the agent writes to now, a dot by those it
+    /// wrote to since the last prompt.
+    fn agent_mark(&self, path: &str) -> Option<Div> {
+        let editing = self.agent_editing.as_deref() == Some(path);
+        (editing || self.agent_touched.contains(path))
+            .then(|| div().text_xs().text_color(gpui_kit::blue()).child(if editing { "editing" } else { "●" }))
     }
 
     pub fn change_count(&self) -> usize {
@@ -3056,6 +3087,8 @@ impl TaskView {
         let view = cx.weak_entity();
         let root = self.root.clone();
         let changed: Rc<HashSet<SharedString>> = Rc::new(self.files.iter().map(|f| f.path.clone()).collect());
+        let touched = Rc::new(self.agent_touched.clone());
+        let editing = self.agent_editing.clone();
         div().flex_1().min_h_0().child(
             tree(&self.tree, move |ix, entry, selected, _, _| {
                 let item = entry.item();
@@ -3067,6 +3100,18 @@ impl TaskView {
                     IconName::Folder
                 };
                 let is_changed = changed.contains(&item.id);
+                // The agent's work shows in place of the plain "changed" dot;
+                // a folder leads to the file being written.
+                let on_the_way = editing.as_deref().is_some_and(|e| {
+                    e.strip_prefix(item.id.as_ref()).is_some_and(|rest| rest.is_empty() || (item.is_folder() && rest.starts_with('/')))
+                });
+                let agent = if on_the_way && !item.is_folder() {
+                    Some("editing")
+                } else if on_the_way || touched.contains(&item.id) {
+                    Some("●")
+                } else {
+                    None
+                };
                 let path = root.join(item.id.as_ref());
                 let folder = item.is_folder();
                 let view = view.clone();
@@ -3082,7 +3127,8 @@ impl TaskView {
                             .text_sm()
                             .child(icon)
                             .child(div().truncate().child(item.label.clone()))
-                            .when(is_changed, |this| this.child(div().text_xs().text_color(gpui_kit::green()).child("●"))),
+                            .when(is_changed && agent.is_none(), |this| this.child(div().text_xs().text_color(gpui_kit::green()).child("●")))
+                            .when_some(agent, |this, mark| this.child(div().text_xs().text_color(gpui_kit::blue()).child(mark))),
                     )
                     .on_click(move |_, window, cx| {
                         if folder {
@@ -3913,6 +3959,7 @@ impl TaskView {
             .hover(|s| s.bg(cx.theme().accent))
             .child(div().w(px(12.)).text_color(cx.theme().muted_foreground).child(status))
             .child(div().flex_1().min_w_0().truncate().when(viewed, |d| d.text_color(cx.theme().muted_foreground)).child(name))
+            .children(self.agent_mark(&file.path))
             .when(viewed, |row| row.child(div().text_xs().text_color(gpui_kit::green()).child("✓")))
             .child(div().text_xs().text_color(gpui_kit::green()).child(format!("+{}", file.additions)))
             .child(div().text_xs().text_color(gpui_kit::red()).child(format!("-{}", file.deletions)))
@@ -5709,5 +5756,44 @@ impl TaskView {
             });
         })
         .detach();
+    }
+}
+
+/// `file` as the panels name it: relative to the worktree, with slashes.
+/// The agent may name the worktree through another path than the app does
+/// (a symlink on the way), so the real paths are compared too.
+fn path_in(root: &std::path::Path, file: &std::path::Path) -> Option<String> {
+    let real = |path: &std::path::Path| match (path.parent(), path.file_name()) {
+        // The file itself may not be there yet.
+        (Some(parent), Some(name)) => parent.canonicalize().ok().map(|parent| parent.join(name)),
+        _ => None,
+    };
+    let rel = match file.strip_prefix(root) {
+        Ok(rel) => rel.to_path_buf(),
+        Err(_) => real(file)?.strip_prefix(root.canonicalize().ok()?).ok()?.to_path_buf(),
+    };
+    let parts: Vec<_> = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+#[cfg(test)]
+mod path_in_tests {
+    use std::path::Path;
+
+    use super::path_in;
+
+    #[test]
+    fn relative_to_the_worktree_also_through_a_symlink() {
+        assert_eq!(path_in(Path::new("/w/t"), Path::new("/w/t/src/a.rs")).as_deref(), Some("src/a.rs"));
+        assert_eq!(path_in(Path::new("/w/t"), Path::new("/w/other/a.rs")), None);
+        #[cfg(unix)]
+        {
+            let dir = std::env::temp_dir().join(format!("ideae-path-in-{}", std::process::id()));
+            let (real, link) = (dir.join("real"), dir.join("link"));
+            std::fs::create_dir_all(real.join("src")).unwrap();
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            assert_eq!(path_in(&link, &real.join("src/new.rs")).as_deref(), Some("src/new.rs"));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
