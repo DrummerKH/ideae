@@ -424,6 +424,28 @@ pub fn branch_patch(root: &Path, base: &str) -> Option<String> {
     Some(patch_from(root, &fork))
 }
 
+/// The files the task changed since it forked off `base`, committed or
+/// not, untracked included; lockfiles left out, as their clashes resolve
+/// themselves.
+pub fn touched_files(root: &Path, base: &str) -> Option<std::collections::BTreeSet<String>> {
+    let fork = git(root, &["merge-base", "HEAD", base]).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())?;
+    let changed = git(root, &["diff", "--name-only", "--no-renames", "-z", &fork])?;
+    let untracked = git(root, &["ls-files", "--others", "--exclude-standard", "-z"]).unwrap_or_default();
+    Some(
+        changed
+            .split('\0')
+            .chain(untracked.split('\0'))
+            .filter(|f| !f.is_empty() && !is_lockfile(f))
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+fn is_lockfile(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name.ends_with(".lock") || matches!(name, "package-lock.json" | "pnpm-lock.yaml" | "go.sum")
+}
+
 #[derive(Clone, Debug)]
 pub struct BlameLine {
     pub hash: String,
@@ -724,6 +746,17 @@ mod pull_tests {
             cd ../b; echo local > g.txt; git add g.txt; git commit -qm local");
         let out = pull_safe(&base.join("b")).unwrap();
         assert!(out.starts_with("Rebased"), "{out}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn touched_files_since_the_fork() {
+        let base = setup("touched");
+        sh(&base, "cd a; echo later > h.txt; git add h.txt; git commit -qm later; git push -q origin main
+            cd ../b; git checkout -qb task; echo c > g.txt; echo x > Cargo.lock; git add .; git commit -qm task
+            echo changed >> f.txt; echo new > n.txt; git fetch -q");
+        let files: Vec<String> = super::touched_files(&base.join("b"), "origin/main").unwrap().into_iter().collect();
+        assert_eq!(files, ["f.txt", "g.txt", "n.txt"]);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

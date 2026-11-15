@@ -108,6 +108,9 @@ pub struct Workspace {
     pub updating: bool,
     /// Quitting while the agents go on: a restart, or the window's ×.
     keep_terminals: bool,
+    /// What each task changed since its fork, by worktree path: tasks of
+    /// a project that touch the same files are marked before they clash.
+    pub touched: std::collections::HashMap<PathBuf, std::collections::BTreeSet<String>>,
 }
 
 impl Workspace {
@@ -287,6 +290,9 @@ impl Workspace {
                         this.sleep_idle_language_servers(cx);
                         this.refresh_prs(false, window, cx);
                     }
+                    if n % 10 == 1 {
+                        this.refresh_touched(window, cx);
+                    }
                 });
                 if alive.is_err() {
                     break;
@@ -325,6 +331,7 @@ impl Workspace {
             update: None,
             updating: false,
             keep_terminals: false,
+            touched: Default::default(),
             build: crate::build_watch::BuildWatch::new(),
         };
         this.restore(&saved, window, cx);
@@ -620,6 +627,53 @@ impl Workspace {
             });
         })
         .detach();
+    }
+
+    /// Asks git what each task changed, in projects with more than one task.
+    fn refresh_touched(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let due: Vec<PathBuf> = self
+            .projects
+            .iter()
+            .filter(|p| p.tasks.iter().filter(|t| !t.main).count() > 1)
+            .flat_map(|p| p.tasks.iter().filter(|t| !t.main && t.busy.is_none()).map(|t| t.path.clone()))
+            .collect();
+        cx.spawn_in(window, async move |this, cx| {
+            let found = cx
+                .background_spawn(async move {
+                    due.into_iter()
+                        .filter_map(|path| {
+                            let base = git::base_ref(&path)?;
+                            Some((git::touched_files(&path, &base)?, path))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let touched: std::collections::HashMap<_, _> = found.into_iter().map(|(files, path)| (path, files)).collect();
+                if touched != this.touched {
+                    this.touched = touched;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Other tasks of the project that changed files this one changed too,
+    /// with those files.
+    pub fn overlaps(&self, project: &Project, path: &Path) -> Vec<(String, Vec<String>)> {
+        let Some(mine) = self.touched.get(path).filter(|m| !m.is_empty()) else {
+            return Vec::new();
+        };
+        project
+            .tasks
+            .iter()
+            .filter(|t| t.path != path)
+            .filter_map(|t| {
+                let shared: Vec<String> = self.touched.get(&t.path)?.intersection(mine).cloned().collect();
+                (!shared.is_empty()).then(|| (t.label(), shared))
+            })
+            .collect()
     }
 
     /// Deletes every task of the project whose PR was merged, after a list.

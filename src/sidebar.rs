@@ -368,6 +368,7 @@ impl Workspace {
         }
         let needs = if in_active { None } else { needs };
         let pr = t.pr.clone().filter(|_| crate::state::settings().pr_status);
+        let overlaps = self.overlaps(project, &path);
 
         let this = cx.weak_entity();
         let (starred, main) = (t.starred, t.main);
@@ -465,7 +466,7 @@ impl Workspace {
                         )
                     }),
             )
-            .when(!details.is_empty() || pr.is_some(), |s| {
+            .when(!details.is_empty() || pr.is_some() || !overlaps.is_empty(), |s| {
                 s.child(
                     h_flex()
                         .pl(px(18.))
@@ -493,6 +494,31 @@ impl Workspace {
                                     .on_click(move |_, _, cx| {
                                         cx.stop_propagation();
                                         cx.open_url(&url);
+                                    }),
+                            )
+                        })
+                        .when(!overlaps.is_empty(), |row| {
+                            let files: std::collections::BTreeSet<&String> = overlaps.iter().flat_map(|(_, f)| f).collect();
+                            let n = files.len();
+                            let tip = overlaps
+                                .iter()
+                                .map(|(task, files)| {
+                                    let mut list = files.iter().take(8).cloned().collect::<Vec<_>>().join("\n  ");
+                                    if files.len() > 8 {
+                                        list.push_str(&format!("\n  … {} more", files.len() - 8));
+                                    }
+                                    format!("Also changed in {task}:\n  {list}")
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            row.child(
+                                div()
+                                    .id(SharedString::from(format!("overlap-{}", path.display())))
+                                    .flex_none()
+                                    .text_color(hsla(0.11, 0.8, 0.5, 1.))
+                                    .child(format!("⇄ {n}"))
+                                    .tooltip(move |window, cx| {
+                                        gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
                                     }),
                             )
                         })
