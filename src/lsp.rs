@@ -113,11 +113,13 @@ pub fn on_path(program: &str) -> bool {
     crate::procs::which(program).is_some()
 }
 
-/// The directory a server should treat as its workspace: the nearest ancestor
-/// of `file` holding one of the server's project markers, no higher than
-/// `limit`. A monorepo root is rarely what tsserver wants. Rust takes the
-/// outermost crate instead: its server covers the path dependencies (vendored
-/// crates) too, and each extra rust-analyzer costs gigabytes.
+/// The directory a server should treat as its workspace: the outermost
+/// ancestor of `file` holding one of the server's project markers, no higher
+/// than `limit`. Dependencies inside a project carry markers of their own
+/// (vendor/*/Cargo.toml, vendor/*/composer.json, node_modules/*/package.json,
+/// included Gradle builds), and rooting at them would start one more server
+/// indexing it all again, gigabytes apiece. Projects side by side in a repo
+/// without a root marker still get one server each.
 pub fn project_root(program: &str, file: &Path, limit: &Path) -> PathBuf {
     let markers: &[&str] = match program {
         "gopls" => &["go.work", "go.mod"],
@@ -127,15 +129,11 @@ pub fn project_root(program: &str, file: &Path, limit: &Path) -> PathBuf {
         "kotlin-lsp" => &["settings.gradle.kts", "settings.gradle"],
         _ => &[],
     };
-    let outermost = program == "rust-analyzer";
     let mut found = None;
     let mut dir = file.parent();
     while let Some(d) = dir {
         if markers.iter().any(|m| d.join(m).is_file()) {
             found = Some(d.to_path_buf());
-            if !outermost {
-                break;
-            }
         }
         if d == limit {
             break;
@@ -563,18 +561,23 @@ mod root_tests {
     use std::path::Path;
 
     #[test]
-    fn rust_takes_the_outermost_crate() {
+    fn dependencies_share_the_project_server() {
         let base = std::env::temp_dir().join(format!("ideae-root-{}", std::process::id()));
         let vendored = base.join("vendor/dep/src");
         std::fs::create_dir_all(&vendored).unwrap();
         std::fs::write(base.join("Cargo.toml"), "").unwrap();
         std::fs::write(base.join("vendor/dep/Cargo.toml"), "").unwrap();
-        std::fs::create_dir_all(base.join("web")).unwrap();
-        std::fs::write(base.join("package.json"), "").unwrap();
-        std::fs::write(base.join("web/package.json"), "").unwrap();
+        // Two web apps side by side, no package.json above them.
+        for app in ["apps/a", "apps/b"] {
+            std::fs::create_dir_all(base.join(app).join("node_modules/lib")).unwrap();
+            std::fs::write(base.join(app).join("package.json"), "").unwrap();
+            std::fs::write(base.join(app).join("node_modules/lib/package.json"), "").unwrap();
+        }
         let file = vendored.join("lib.rs");
         assert_eq!(project_root("rust-analyzer", &file, &base), base);
-        assert_eq!(project_root("typescript-language-server", &base.join("web/a.ts"), &base), base.join("web"));
+        let ts = "typescript-language-server";
+        assert_eq!(project_root(ts, &base.join("apps/a/node_modules/lib/x.d.ts"), &base), base.join("apps/a"));
+        assert_eq!(project_root(ts, &base.join("apps/b/src.ts"), &base), base.join("apps/b"));
         assert_eq!(project_root("rust-analyzer", &base.join("_"), Path::new(&base)), base);
         let _ = std::fs::remove_dir_all(&base);
     }
