@@ -53,25 +53,34 @@ pub fn server_for(
     Ok(entry)
 }
 
-/// Whether the program's version command succeeds. A PATH lookup is not enough: rustup
-/// puts a `rust-analyzer` proxy on PATH that fails when the component is missing.
+/// Whether the server is there. Found on PATH is enough, except for
+/// rust-analyzer: rustup puts a proxy on PATH that fails when the component
+/// is missing, so that one has to answer `--version`. Others cannot be asked
+/// (intelephense crashes without a transport flag).
 fn runs(program: &str) -> bool {
     static CACHE: Mutex<Option<HashMap<String, bool>>> = Mutex::new(None);
     let mut cache = CACHE.lock().unwrap();
-    *cache
-        .get_or_insert_with(HashMap::new)
-        .entry(program.to_string())
-        .or_insert_with(|| {
-            // gopls rejects `--version`.
-            let probe = if program == "gopls" { "version" } else { "--version" };
-            Command::new(program)
-                .arg(probe)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success())
+    *cache.get_or_insert_with(HashMap::new).entry(program.to_string()).or_insert_with(|| {
+        if program != "rust-analyzer" {
+            return on_path(program);
+        }
+        Command::new(program)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    })
+}
+
+fn on_path(program: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| {
+            std::fs::metadata(dir.join(program)).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         })
+    })
 }
 
 /// The directory a server should treat as its workspace: the nearest ancestor
