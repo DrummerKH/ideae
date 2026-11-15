@@ -170,6 +170,7 @@ impl Workspace {
             Entry::action("New task…", "Ctrl+Shift+T", NewTask),
             Entry::action("Go to file…", "Ctrl+Shift+N", GoToFile),
             Entry::action("Find in files…", "Ctrl+Shift+F", FindInFiles),
+            Entry::action("Find in terminal…", "Ctrl+F", task::FindInTerminal).detail("the scrollback"),
             Entry::new("Recent tasks", move |window, cx| {
                 let _ = w.update(cx, |w, cx| w.recent_tasks(window, cx));
             })
