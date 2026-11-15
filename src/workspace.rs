@@ -344,12 +344,19 @@ impl Workspace {
                     if n % 7200 == 3 {
                         this.check_update(window, cx);
                     }
-                    if n % 10 == 0 {
+                    // Saving power, what only reads the local repositories
+                    // runs every five minutes, not every half: the list
+                    // of tasks still follows worktrees made elsewhere.
+                    let saving = crate::lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed);
+                    let often = if saving { 100 } else { 10 };
+                    if n % often == 0 {
                         this.sync_worktrees(window, cx);
+                    }
+                    if n % 10 == 0 {
                         this.sleep_idle_language_servers(cx);
                         this.refresh_prs(false, window, cx);
                     }
-                    if n % 10 == 1 {
+                    if n % often == 1 {
                         this.refresh_touched(window, cx);
                     }
                     if n % 5 == 2 {
@@ -728,7 +735,8 @@ impl Workspace {
     /// task just shown.
     fn refresh_prs(&mut self, now: bool, window: &mut Window, cx: &mut Context<Self>) {
         use crate::pr::PrState;
-        if !state::settings().pr_status {
+        // Not while saving power: each asks GitHub. What is known stays on the rows.
+        if !state::settings().pr_status || crate::lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
         use std::time::Duration;
@@ -785,7 +793,8 @@ impl Workspace {
     /// Settings say; the task views see the new refs on their next poll.
     fn fetch_bases(&mut self, cx: &mut Context<Self>) {
         let minutes = state::settings().fetch_minutes;
-        if minutes == 0 {
+        // Not while saving power: a fetch wakes the network for every project.
+        if minutes == 0 || crate::lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
         let every = std::time::Duration::from_secs(u64::from(minutes) * 60);

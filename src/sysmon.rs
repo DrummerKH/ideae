@@ -610,6 +610,14 @@ impl SysMon {
         let poll = cx.spawn(async move |this, cx| {
             let sampler = std::sync::Arc::new(std::sync::Mutex::new(Sampler::default()));
             loop {
+                // Not while saving power: reading every process every two seconds is work too.
+                if crate::lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed) {
+                    cx.background_executor().timer(Duration::from_secs(2)).await;
+                    if this.upgrade().is_none() {
+                        break;
+                    }
+                    continue;
+                }
                 let s = sampler.clone();
                 let snap = cx.background_spawn(async move { s.lock().unwrap().sample() }).await;
                 if this

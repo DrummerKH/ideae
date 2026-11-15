@@ -87,7 +87,10 @@ impl Render for Workspace {
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .on_click(|_, _, cx| cx.stop_propagation())
                                 .gap_3()
-                                .child(div().mr_2().child(sysmon::SysMon::render_widget(&self.sysmon, cx)))
+                                // Not read while saving power, so not shown: its numbers would be old.
+                                .when(!lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed), |row| {
+                                    row.child(div().mr_2().child(sysmon::SysMon::render_widget(&self.sysmon, cx)))
+                                })
                                 .children(self.render_update(cx))
                                 .children(self.render_new_build(cx))
                                 .child(self.render_power_saving(cx))
@@ -292,9 +295,9 @@ impl Workspace {
             .when(saving, |b| b.text_color(hsla(0.11, 0.9, 0.55, 1.)))
             .when(!saving, |b| b.text_color(cx.theme().muted_foreground))
             .tooltip(if saving {
-                "Power saving is on: language servers are off. Click to start them for the open files."
+                "Power saving is on: no language servers, no background fetch, no pull request status, no load readout. Click to turn it off."
             } else {
-                "Power saving: click to stop all language servers and start none."
+                "Power saving: click to stop the language servers, the background fetch, the pull request status and the load readout."
             })
             .on_click(cx.listener(|this, _, _, cx| this.toggle_power_saving(cx)))
     }
