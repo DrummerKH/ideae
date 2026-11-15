@@ -117,6 +117,23 @@ pub struct TaskSession {
     pub expanded: Vec<String>,
     /// 0 Changes, 1 Files, 2 Structure.
     pub side_panel: u8,
+    /// Review comments not sent to the agent yet.
+    pub review: Vec<ReviewNote>,
+}
+
+/// A review comment on lines of the diff.
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq, Debug)]
+#[serde(default)]
+pub struct ReviewNote {
+    /// "path:12-14".
+    pub location: String,
+    pub code: String,
+    pub language: String,
+    pub text: String,
+    /// Where it shows in the diff: under this line of the file.
+    pub path: String,
+    pub modified_side: bool,
+    pub line: usize,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq)]

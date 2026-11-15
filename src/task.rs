@@ -13,7 +13,7 @@ use gpui_kit::component::{
     ActiveTheme as _, Sizable as _, StyledExt as _, h_flex,
     scroll::ScrollableElement as _,
     button::{Button, ButtonVariants as _},
-    diff::{Diff, DiffEvent, DiffFile, DiffFileStatus, DiffLineRange, DiffMode, DiffState},
+    diff::{Diff, DiffAnnotation, DiffEvent, DiffFile, DiffFileStatus, DiffLinePosition, DiffLineRange, DiffMode, DiffSide, DiffState},
     input::{DefinitionProvider, Editor, EditorState, HoverProvider, InputEvent, Position, Rope, RopeExt as _},
     resizable::{h_resizable, resizable_panel},
     tab::{Tab, TabBar},
@@ -590,18 +590,10 @@ pub struct ChangesView {
     selection: Option<DiffLineRange>,
     task: WeakEntity<TaskView>,
     /// Review comments on lines of the diff, sent to the agent as one message.
-    review: Vec<ReviewComment>,
+    review: Vec<crate::state::ReviewNote>,
     /// The text of the last selection: a click in the context menu clears
     /// the selection before its action runs.
     selected_code: String,
-}
-
-#[derive(Clone)]
-struct ReviewComment {
-    location: String,
-    code: String,
-    language: &'static str,
-    text: String,
 }
 
 impl ChangesView {
@@ -635,7 +627,7 @@ impl ChangesView {
 
     /// The selected lines: where they are, their text, their language.
     fn selected(&self, cx: &App) -> Option<(String, String, &'static str)> {
-        let range = self.diff.read(cx).selected_lines().or(self.selection.clone())?;
+        let range = self.selected_range(cx)?;
         let mut code = self.diff.read(cx).selected_text(cx);
         if code.is_empty() {
             code = self.selected_code.clone();
@@ -643,33 +635,65 @@ impl ChangesView {
         if code.is_empty() {
             return None;
         }
-        let location = if range.start() == range.end() {
-            format!("{}:{}", range.path(), range.start())
-        } else {
-            format!("{}:{}-{}", range.path(), range.start(), range.end())
-        };
-        Some((location, code, lsp::language_for(std::path::Path::new(range.path().as_ref()))))
+        Some((location_of(&range), code, lsp::language_for(std::path::Path::new(range.path().as_ref()))))
+    }
+
+    fn selected_range(&self, cx: &App) -> Option<DiffLineRange> {
+        self.diff.read(cx).selected_lines().or(self.selection.clone())
+    }
+
+    /// A review note for `range`: the selected text when that is the range,
+    /// else the lines read from the file (the changed side).
+    fn note_for(&self, range: &DiffLineRange, cx: &App) -> crate::state::ReviewNote {
+        let modified = range.end_side() == DiffSide::Modified;
+        let mut code = String::new();
+        if self.selected_range(cx).as_ref() == Some(range) {
+            code = self.diff.read(cx).selected_text(cx);
+            if code.is_empty() {
+                code = self.selected_code.clone();
+            }
+        }
+        if code.is_empty() && modified {
+            if let Ok(text) = std::fs::read_to_string(self.root.join(range.path().as_ref())) {
+                let (a, b) = (range.start().min(range.end()), range.start().max(range.end()));
+                code = text.lines().skip(a.saturating_sub(1)).take(b + 1 - a.max(1)).collect::<Vec<_>>().join("\n");
+            }
+        }
+        crate::state::ReviewNote {
+            location: location_of(range),
+            code,
+            language: lsp::language_for(std::path::Path::new(range.path().as_ref())).to_string(),
+            text: String::new(),
+            path: range.path().to_string(),
+            modified_side: modified,
+            line: range.end(),
+        }
     }
 
     /// Asks for a comment on the selected lines and adds it to the review.
     fn comment_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((location, code, language)) = self.selected(cx) else { return };
+        let Some(range) = self.selected_range(cx) else { return };
+        let note = self.note_for(&range, cx);
+        self.ask_comment(note, window, cx);
+    }
+
+    fn ask_comment(&mut self, note: crate::state::ReviewNote, window: &mut Window, cx: &mut Context<Self>) {
         let input = cx.new(|cx| {
             gpui_kit::component::input::TextareaState::new(window, cx).auto_grow(3, 12).placeholder("What should change here?")
         });
         let view = cx.weak_entity();
         let focused = Rc::new(std::cell::Cell::new(false));
-        let title = location.clone();
+        let title = note.location.clone();
         window.open_dialog(cx, move |dialog, _, _| {
             let (input, view, focused) = (input.clone(), view.clone(), focused.clone());
-            let (location, code) = (location.clone(), code.clone());
+            let note = note.clone();
             let shown = input.clone();
             let add = move |window: &mut Window, cx: &mut App| {
                 let text = input.read(cx).value().trim().to_string();
                 if text.is_empty() {
                     return;
                 }
-                let comment = ReviewComment { location: location.clone(), code: code.clone(), language, text };
+                let comment = crate::state::ReviewNote { text, ..note.clone() };
                 let _ = view.update(cx, |c, cx| {
                     c.review.push(comment);
                     cx.notify();
@@ -917,8 +941,49 @@ impl Render for ChangesView {
                         .text_color(cx.theme().muted_foreground)
                         .child("No uncommitted changes")
                 } else {
+                    let notes = Rc::new(self.review.clone());
+                    let view = cx.weak_entity();
+                    let add_view = cx.weak_entity();
                     this.child(
                         Diff::new(&self.diff)
+                            .annotations(notes.iter().enumerate().map(|(i, n)| {
+                                let side = if n.modified_side { DiffSide::Modified } else { DiffSide::Original };
+                                DiffAnnotation::line(("review-note", i), DiffLinePosition::new(n.path.clone(), side, n.line))
+                            }))
+                            .render_annotation(move |annotation, _, cx| {
+                                let i = match annotation.id() {
+                                    ElementId::NamedInteger(_, i) => *i as usize,
+                                    _ => usize::MAX,
+                                };
+                                let text = notes.get(i).map(|n| n.text.clone()).unwrap_or_default();
+                                let view = view.clone();
+                                h_flex()
+                                    .mx_2()
+                                    .my_1()
+                                    .px_3()
+                                    .py_1p5()
+                                    .gap_2()
+                                    .rounded_md()
+                                    .border_l_2()
+                                    .border_color(cx.theme().primary)
+                                    .bg(cx.theme().secondary)
+                                    .text_sm()
+                                    .child(div().flex_1().min_w_0().child(text))
+                                    .child(Button::new(("review-note-remove", i)).xsmall().ghost().label("×").on_click(move |_, _, cx| {
+                                        let _ = view.update(cx, |c, cx| {
+                                            if i < c.review.len() {
+                                                c.review.remove(i);
+                                            }
+                                            cx.notify();
+                                        });
+                                    }))
+                            })
+                            .on_add_annotation(move |range, window, cx| {
+                                let _ = add_view.update(cx, |c, cx| {
+                                    let note = c.note_for(range, cx);
+                                    c.ask_comment(note, window, cx);
+                                });
+                            })
                             .code_font_size(crate::zoom::size(crate::zoom::Kind::Changes, cx))
                             .line_number(true)
                             .render_header_suffix({
@@ -4368,6 +4433,7 @@ impl TaskView {
             right_active: index(self.right_active),
             focus_right: self.focus_right,
             expanded: self.expanded.iter().map(|e| e.to_string()).collect(),
+            review: self.changes.read(cx).review.clone(),
             side_panel: match self.right {
                 RightPane::Changes => 0,
                 RightPane::Files => 1,
@@ -4420,6 +4486,11 @@ impl TaskView {
         self.focus_right = session.focus_right;
         self.normalize();
         self.expanded = session.expanded.iter().map(|e| SharedString::from(e.clone())).collect();
+        let review = session.review.clone();
+        self.changes.update(cx, |c, cx| {
+            c.review = review;
+            cx.notify();
+        });
         self.right = match session.side_panel {
             1 => RightPane::Files,
             2 => RightPane::Structure,
@@ -4629,5 +4700,13 @@ mod change_tree_tests {
                 ChangeNode::File { ix: 0, depth: 0 },
             ]
         );
+    }
+}
+
+fn location_of(range: &DiffLineRange) -> String {
+    if range.start() == range.end() {
+        format!("{}:{}", range.path(), range.start())
+    } else {
+        format!("{}:{}-{}", range.path(), range.start(), range.end())
     }
 }
