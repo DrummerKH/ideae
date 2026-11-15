@@ -2065,6 +2065,10 @@ pub struct TaskView {
     branch_paths: Rc<BTreeSet<String>>,
     /// The single changes of each, to take back or stage one alone.
     uncommitted_hunks: Rc<Vec<git::Hunk>>,
+    /// Files with conflict markers left in them, and whether committing
+    /// them as they are was asked for a second time.
+    conflict_marked: Vec<(String, u32)>,
+    markers_accepted: bool,
     branch_hunks: Rc<Vec<git::Hunk>>,
     /// The Changes tab shows an older diff than the one read last.
     diff_stale: bool,
@@ -2312,6 +2316,8 @@ impl TaskView {
             branch_lines: Rc::default(),
             branch_paths: Rc::default(),
             uncommitted_hunks: Rc::default(),
+            conflict_marked: Vec::new(),
+            markers_accepted: false,
             branch_hunks: Rc::default(),
             diff_stale: false,
             branch_info: git::BranchInfo::default(),
@@ -2834,6 +2840,42 @@ impl TaskView {
 
     /// Which of the views `show_view` knows is in front: the agent, the
     /// changes, the history or a shell.
+    /// Where in the task you are looking, for another variant to show the
+    /// same: the file at the top of the diff (true), or the file open in
+    /// the editor and the line the cursor is on.
+    pub fn shown_place(&self, cx: &App) -> Option<(bool, String, u32)> {
+        match &self.tabs.get(self.focused_ix()?)?.kind {
+            TabKind::Changes => {
+                let top = self.changes.read(cx).diff.read(cx).top_file()?;
+                Some((true, top.to_string(), 0))
+            }
+            TabKind::File(file) => {
+                let file = file.read(cx);
+                let path = file.path.strip_prefix(&self.root).ok()?.to_string_lossy().into_owned();
+                Some((false, path, file.editor.read(cx).cursor_position().line))
+            }
+            _ => None,
+        }
+    }
+
+    /// The same place in this task: its changes at that file, or the file
+    /// at that line. False when this task has no such file.
+    pub fn show_place(&mut self, in_changes: bool, path: &str, line: u32, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if in_changes {
+            match self.changed_paths.contains(path) {
+                true => self.show_changed_file(SharedString::from(path.to_string()), window, cx),
+                false => self.show_view(1, window, cx),
+            }
+            return true;
+        }
+        let file = self.root.join(path);
+        let there = file.is_file();
+        if there {
+            self.open_file(file, line, window, cx);
+        }
+        there
+    }
+
     pub fn shown_view(&self) -> usize {
         match self.focused_ix().and_then(|ix| self.tabs.get(ix)) {
             Some(tab) => match &tab.kind {
@@ -3521,8 +3563,12 @@ impl TaskView {
     }
 
     fn apply_patch(&mut self, parsed: ParsedPatch, cx: &mut Context<Self>) {
-        let ParsedPatch { files, first_lines, hashes, hunks } = parsed;
+        let ParsedPatch { files, first_lines, hashes, hunks, marked } = parsed;
         self.uncommitted_hunks = Rc::new(hunks);
+        if self.conflict_marked != marked {
+            self.conflict_marked = marked;
+            self.markers_accepted = false;
+        }
         self.files = files
             .iter()
             .map(|f| ChangedFile {
@@ -4043,8 +4089,17 @@ impl TaskView {
                         .xsmall()
                         .ghost()
                         .disabled(busy)
-                        .label(if b.behind > 0 { format!("Pull ↓{}", b.behind) } else { "Pull".to_string() })
-                        .tooltip("Fast-forward, or rebase local commits; undone on any conflict")
+                        .label(match (b.behind, b.pull_conflicts.is_empty()) {
+                            (0, _) => "Pull".to_string(),
+                            (behind, true) => format!("Pull ↓{behind}"),
+                            (behind, false) => format!("Pull ↓{behind} ⚠"),
+                        })
+                        .when(!b.pull_conflicts.is_empty(), |button| button.text_color(gpui_kit::yellow()))
+                        .tooltip(if b.pull_conflicts.is_empty() {
+                            "Fast-forward, or rebase local commits; not tried when it would conflict".to_string()
+                        } else {
+                            format!("Would conflict with your work in {}: commit, or let the agent merge it first", b.pull_conflicts.join(", "))
+                        })
                         .on_click(cx.listener(|this, _, window, cx| {
                             cx.stop_propagation();
                             this.run_action("Pull", |root| git::pull_safe(&root), false, window, cx)
@@ -4702,6 +4757,16 @@ impl TaskView {
             .p_2()
             .border_t_1()
             .border_color(cx.theme().border)
+            .children(self.conflict_marked.iter().map(|(path, line)| {
+                let (open, line) = (self.root.join(path), line.saturating_sub(1));
+                div()
+                    .id(SharedString::from(format!("marked-{path}")))
+                    .text_xs()
+                    .text_color(gpui_kit::red())
+                    .cursor_pointer()
+                    .child(format!("⚠ conflict left in {path}:{}", line + 1))
+                    .on_click(cx.listener(move |this, _, window, cx| this.open_file(open.clone(), line, window, cx)))
+            }))
             .when_some(self.busy, |this, label| {
                 this.child(div().text_xs().text_color(cx.theme().muted_foreground).child(format!("{label}…")))
             })
@@ -5141,6 +5206,11 @@ impl TaskView {
             cx.notify();
             return;
         }
+        if !self.conflict_marked.is_empty() && !std::mem::replace(&mut self.markers_accepted, true) {
+            self.action = Some((false, "Conflict markers are left in the files above. Commit again to commit them as they are.".into()));
+            cx.notify();
+            return;
+        }
         let all = self.staged_paths().is_empty();
         self.run_action("Commit", move |root| git::commit(&root, &message, all), false, window, cx);
     }
@@ -5345,6 +5415,8 @@ struct ParsedPatch {
     first_lines: HashMap<String, u32>,
     hashes: HashMap<String, u64>,
     hunks: Vec<git::Hunk>,
+    /// Files with a conflict left in them, and its line.
+    marked: Vec<(String, u32)>,
 }
 
 fn text_hash(text: &str) -> u64 {
@@ -5365,6 +5437,7 @@ fn parse_patch(patch: String, seen: &mut u64) -> Option<ParsedPatch> {
         first_lines: git::first_changed_lines(&patch),
         hashes: file_patch_hashes(&patch),
         hunks: git::hunks(&patch),
+        marked: git::conflict_marked(&patch),
         files: with_languages(files),
     })
 }

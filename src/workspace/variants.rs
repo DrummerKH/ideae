@@ -474,20 +474,26 @@ impl Workspace {
         cx.notify();
     }
 
-    /// From one variant to another, the same view in front: the changes of
-    /// one, then of the next.
+    /// From one variant to another, the same view in front and the same
+    /// file in it: the changes one made to it, then the next.
     pub fn switch_variant(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
-        let (shown, page) = self.active_view().map_or((0, None), |v| {
+        let (shown, page, place) = self.active_view().map_or((0, None, None), |v| {
             let v = v.read(cx);
-            (v.shown_view(), v.shown_page(cx))
+            (v.shown_view(), v.shown_page(cx), v.shown_place(cx))
         });
         self.switch(path, window, cx);
         if let Some(view) = self.active_view() {
-            view.update(cx, |t, cx| match page {
+            view.update(cx, |t, cx| {
                 // The same page of this variant's site.
-                Some(page) => t.show_site(Some(&page), window, cx),
+                if let Some(page) = page {
+                    return t.show_site(Some(&page), window, cx);
+                }
+                // The same file: how this variant changed it, or how it has it.
+                if place.is_some_and(|(in_changes, path, line)| t.show_place(in_changes, &path, line, window, cx)) {
+                    return;
+                }
                 // A shell of its own is not something every variant has.
-                None => t.show_view(if shown == 3 { 0 } else { shown }, window, cx),
+                t.show_view(if shown == 3 { 0 } else { shown }, window, cx)
             });
         }
     }
@@ -2161,6 +2167,24 @@ pub(crate) mod tests {
             assert!(window.find("group-judge").visible());
         })
         .unwrap();
+
+        // From A to B on a chip: the file open in A is the one B shows, and the changes stay the changes.
+        step(cx, &mut |w, window, cx| {
+            w.switch(&paths[0], window, cx);
+            let file = paths[0].join("f.txt");
+            w.active_view().unwrap().update(cx, |t, cx| t.open_file(file, 1, window, cx));
+        });
+        step(cx, &mut |w, window, cx| w.switch_variant(&paths[1], window, cx));
+        workspace.update(cx, |w, cx| {
+            assert_eq!(w.active.as_deref(), Some(paths[1].as_path()));
+            let place = w.active_view().unwrap().read(cx).shown_place(cx).expect("a file in front");
+            assert_eq!((place.0, place.1.as_str()), (false, "f.txt"), "B's own f.txt");
+        });
+        step(cx, &mut |w, window, cx| {
+            w.active_view().unwrap().update(cx, |t, cx| t.show_view(1, window, cx));
+            w.switch_variant(&paths[0], window, cx);
+        });
+        workspace.update(cx, |w, cx| assert_eq!(w.active_view().unwrap().read(cx).shown_view(), 1, "A's changes"));
 
         // B is kept: A goes, parked; B gets the clean branch name.
         step(cx, &mut |w, window, cx| w.settle_group(&group, Some(&paths[1]), &super::pushed_of(&w.member_paths(&group)), window, cx));

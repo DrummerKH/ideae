@@ -68,7 +68,10 @@ Windows build exists and is being tried out (see [Windows](#windows)).
   Shift. Markdown has a Preview
   in its header.
 - **Git.** Changes with stage/unstage/discard, commit, push, PR (`gh`), the
-  branch against its base, history, safe pull. Each hunk of a diff can be
+  branch against its base, history, safe pull: Pull is marked when what
+  comes would conflict with your work, committed or only written, and is
+  then not tried; conflict markers left in a file are named above the
+  commit box. Each hunk of a diff can be
   reverted on its own, and staged.
 - **Terminals.** Built on libghostty-vt. Ctrl+click on paths, `file:line`,
   class and function names opens them in the editor.
