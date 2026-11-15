@@ -470,7 +470,7 @@ impl Workspace {
             self.check_command.update(cx, |input, cx| input.set_value(check, window, cx));
         }
         self.refresh_variant_info(window, cx);
-        self.refresh_touched(window, cx);
+        self.refresh_touched(true, window, cx);
         cx.notify();
     }
 

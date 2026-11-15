@@ -381,7 +381,7 @@ impl Workspace {
                         this.refresh_prs(false, window, cx);
                     }
                     if n % often == 1 {
-                        this.refresh_touched(window, cx);
+                        this.refresh_touched(false, window, cx);
                     }
                     if n % 5 == 2 {
                         this.fetch_bases(cx);
@@ -909,7 +909,9 @@ impl Workspace {
     }
 
     /// Asks git what each task changed, in projects with more than one task.
-    fn refresh_touched(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// `now`: a turn just ended or a group came into view, and what the
+    /// tasks have read may be of before: git is asked for all of them.
+    fn refresh_touched(&mut self, now: bool, window: &mut Window, cx: &mut Context<Self>) {
         let due: Vec<PathBuf> = self
             .projects
             .iter()
@@ -920,7 +922,7 @@ impl Workspace {
         let mut known = Vec::new();
         let mut ask = Vec::new();
         for path in due {
-            match self.find(&path).and_then(|(pi, ti)| self.projects[pi].tasks[ti].view.clone()) {
+            match self.find(&path).and_then(|(pi, ti)| self.projects[pi].tasks[ti].view.clone()).filter(|_| !now) {
                 Some(view) => known.extend(view.read(cx).touched(cx).map(|files| (files, path))),
                 None => ask.push(path),
             }
@@ -1724,7 +1726,7 @@ impl Workspace {
             self.projects[pi].tasks[ti].done_at = state::now();
             self.refresh_variant_info(window, cx);
             if let Some(group) = &group {
-                self.refresh_touched(window, cx);
+                self.refresh_touched(true, window, cx);
                 if !event.replayed && !more_coming && self.group_settled(group, cx) {
                     self.group_came_through(group, window, cx);
                 }
