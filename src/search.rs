@@ -9,9 +9,13 @@ use std::{
     },
 };
 
+use grep_matcher::Matcher as _;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{BinaryDetection, SearcherBuilder, sinks::Bytes};
-use ignore::{WalkBuilder, WalkState};
+use ignore::{
+    WalkBuilder, WalkState,
+    overrides::{Override, OverrideBuilder},
+};
 
 pub struct Line {
     /// Relative to the searched root.
@@ -19,11 +23,32 @@ pub struct Line {
     /// 1-based.
     pub line: u64,
     pub text: String,
+    /// Where in `text` the matches are, in bytes.
+    pub matches: Vec<std::ops::Range<usize>>,
 }
 
 /// `rg --fixed-strings --smart-case`.
 pub fn literal(query: &str) -> Option<RegexMatcher> {
     builder().fixed_strings(true).case_smart(true).build(query).ok()
+}
+
+/// `rg --smart-case <pattern>`.
+pub fn regex(query: &str) -> Option<RegexMatcher> {
+    builder().case_smart(true).build(query).ok()
+}
+
+/// `rg -g`: globs separated by commas or spaces, `!` before one leaves those
+/// files out. With only `!` globs every other file still counts.
+pub fn mask(root: &Path, mask: &str) -> Option<Override> {
+    let globs: Vec<&str> = mask.split([',', ' ']).map(str::trim).filter(|g| !g.is_empty()).collect();
+    if globs.is_empty() {
+        return None;
+    }
+    let mut builder = OverrideBuilder::new(root);
+    for glob in globs {
+        builder.add(glob).ok()?;
+    }
+    builder.build().ok()
 }
 
 /// `rg -e <pattern>...`.
@@ -41,10 +66,27 @@ fn builder() -> RegexMatcherBuilder {
 /// Matching lines under `root`, at most `per_file` from each file and `limit`
 /// in all, sorted by path and line. Each line is cut to `max_columns` chars.
 pub fn search(root: &Path, matcher: &RegexMatcher, per_file: u64, max_columns: usize, limit: usize) -> Vec<Line> {
+    search_in(root, matcher, None, per_file, max_columns, limit)
+}
+
+/// [`search`] over the files `mask` lets through.
+pub fn search_in(
+    root: &Path,
+    matcher: &RegexMatcher,
+    mask: Option<Override>,
+    per_file: u64,
+    max_columns: usize,
+    limit: usize,
+) -> Vec<Line> {
     let found = Mutex::new(Vec::new());
     let count = AtomicUsize::new(0);
     // .gitignore counts in plain folders too: a project need not be a repository.
-    WalkBuilder::new(root).require_git(false).build_parallel().run(|| {
+    let mut walk = WalkBuilder::new(root);
+    walk.require_git(false);
+    if let Some(mask) = mask {
+        walk.overrides(mask);
+    }
+    walk.build_parallel().run(|| {
         let mut searcher = SearcherBuilder::new()
             .binary_detection(BinaryDetection::quit(b'\0'))
             .max_matches(Some(per_file))
@@ -66,7 +108,14 @@ pub fn search(root: &Path, matcher: &RegexMatcher, per_file: u64, max_columns: u
                 if let Some((cut, _)) = text.char_indices().nth(max_columns) {
                     text.truncate(cut);
                 }
-                lines.push(Line { path: path.clone(), line, text });
+                let mut matches = Vec::new();
+                let _ = matcher.find_iter(text.as_bytes(), |m| {
+                    if !m.is_empty() {
+                        matches.push(m.start()..m.end());
+                    }
+                    true
+                });
+                lines.push(Line { path: path.clone(), line, text, matches });
                 Ok(true)
             });
             let _ = searcher.search_path(matcher, entry.path(), sink);
@@ -87,7 +136,7 @@ pub fn search(root: &Path, matcher: &RegexMatcher, per_file: u64, max_columns: u
 mod tests {
     use std::{fs, path::PathBuf};
 
-    use super::{literal, regexes, search};
+    use super::{literal, regexes, search, search_in};
 
     fn tree() -> PathBuf {
         let root = std::env::temp_dir().join(format!("ideae-search-{}", std::process::id()));
@@ -123,6 +172,14 @@ mod tests {
 
         let fixed = search(&root, &literal("needle()").unwrap(), 20, 300, 200);
         assert_eq!(fixed.len(), 1, "fixed string, not a regex");
+
+        let a = hits.iter().find(|h| h.path.ends_with("a.rs")).unwrap();
+        assert_eq!(a.matches, [3..9], "where the match is in the line");
+
+        let rs = search_in(&root, &literal("needle").unwrap(), super::mask(&root, "*.rs"), 20, 300, 200);
+        assert!(rs.iter().all(|h| h.path.ends_with("a.rs")) && !rs.is_empty(), "mask lets only .rs through");
+        let not_txt = search_in(&root, &literal("needle").unwrap(), super::mask(&root, "!*.txt"), 20, 300, 200);
+        assert!(not_txt.iter().all(|h| !h.path.to_string_lossy().ends_with(".txt")) && !not_txt.is_empty());
 
         let re = search(&root, &regexes(&[r"\bfn\s+needle\b".into(), r"^needle 2\d$".into()]).unwrap(), 20, 300, 200);
         assert_eq!(re.len(), 11);

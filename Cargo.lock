@@ -3934,6 +3934,7 @@ dependencies = [
  "cc",
  "gpui-cn",
  "gpui-kit",
+ "grep-matcher",
  "grep-regex",
  "grep-searcher",
  "ignore",

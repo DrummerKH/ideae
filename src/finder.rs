@@ -4,7 +4,8 @@
 use std::{path::PathBuf, rc::Rc, sync::Arc, time::Duration};
 
 use gpui_kit::component::{
-    ActiveTheme as _, IndexPath, WindowExt as _,
+    ActiveTheme as _, IndexPath, Selectable as _, Sizable as _, WindowExt as _,
+    button::ButtonVariants as _,
     command::{Command, CommandGroup, CommandItem, CommandState},
     h_flex, v_flex,
 };
@@ -37,6 +38,8 @@ pub struct Hit {
     /// 0-based, in characters.
     pub col: u32,
     pub text: String,
+    /// The matches in `text`, in bytes, for Find in files.
+    pub ranges: Vec<std::ops::Range<usize>>,
 }
 
 pub struct Finder {
@@ -52,6 +55,11 @@ pub struct Finder {
     task: WeakEntity<TaskView>,
     hits: Rc<Vec<Hit>>,
     _search: Task<()>,
+    /// Find in files: the query as typed, whether it is a regex, and the
+    /// file mask.
+    last_query: String,
+    regex: bool,
+    mask: Option<Entity<gpui_kit::component::input::InputState>>,
 }
 
 const FILE_LIMIT: usize = 100;
@@ -99,7 +107,7 @@ impl Finder {
     ) {
         let hits = items
             .into_iter()
-            .map(|i| Hit { path: path.clone(), line: i.line + 1, col: 0, text: format!("{}{}", "    ".repeat(i.depth), i.label) })
+            .map(|i| Hit { path: path.clone(), line: i.line + 1, col: 0, text: format!("{}{}", "    ".repeat(i.depth), i.label), ranges: Vec::new() })
             .collect();
         Self::open_with(FinderKind::Outline, root, Arc::default(), hits, task, window, cx)
     }
@@ -139,7 +147,25 @@ impl Finder {
             files,
             task,
             _search: Task::ready(()),
+            last_query: String::new(),
+            regex: false,
+            mask: None,
         });
+        if kind == FinderKind::Grep {
+            use gpui_kit::component::input::{InputEvent, InputState};
+            let mask = cx.new(|cx| InputState::new(window, cx).placeholder("*.rs, !*_test.go"));
+            let owner = finder.clone();
+            cx.subscribe(&mask, move |_, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    owner.update(cx, |f, cx| {
+                        let query = f.last_query.clone();
+                        f.query(&query, cx)
+                    });
+                }
+            })
+            .detach();
+            finder.update(cx, |f, _| f.mask = Some(mask));
+        }
         finder.update(cx, |f, cx| f.query("", cx));
 
         let focused = Rc::new(std::cell::Cell::new(false));
@@ -187,6 +213,40 @@ impl Finder {
                 }
                 let query_owner = finder.clone();
                 let confirm_owner = finder.clone();
+                if kind == FinderKind::Grep {
+                    let options = finder.clone();
+                    palette = palette.header(move |_, _, cx| {
+                        let f = options.read(cx);
+                        let (regex, mask) = (f.regex, f.mask.clone());
+                        let toggle = options.clone();
+                        h_flex()
+                            .gap_2()
+                            .px_3()
+                            .py_1p5()
+                            .border_b_1()
+                            .border_color(cx.theme().border)
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Files")
+                            .children(mask.map(|m| div().w(px(240.)).child(gpui_kit::component::input::Input::new(&m).small())))
+                            .child(div().flex_1())
+                            .child(
+                                gpui_kit::component::button::Button::new("grep-regex")
+                                    .xsmall()
+                                    .ghost()
+                                    .label(".* Regex")
+                                    .selected(regex)
+                                    .tooltip("The query as a regular expression")
+                                    .on_click(move |_, _, cx| {
+                                        toggle.update(cx, |f, cx| {
+                                            f.regex = !f.regex;
+                                            let query = f.last_query.clone();
+                                            f.query(&query, cx);
+                                        })
+                                    }),
+                            )
+                    });
+                }
                 content.child(
                     palette
                         .on_query(move |query, _, cx| {
@@ -201,6 +261,7 @@ impl Finder {
     }
 
     fn query(&mut self, query: &str, cx: &mut Context<Self>) {
+        self.last_query = query.to_string();
         let query = query.trim().to_string();
         match self.kind {
             FinderKind::Places => {
@@ -241,10 +302,12 @@ impl Finder {
                     return;
                 }
                 let root = self.root.clone();
+                let regex = self.regex;
+                let mask = self.mask.as_ref().map(|m| m.read(cx).value().to_string()).unwrap_or_default();
                 self._search = cx.spawn(async move |this, cx| {
                     // Wait for typing to pause; a newer query replaces this task.
                     cx.background_executor().timer(Duration::from_millis(200)).await;
-                    let hits = cx.background_spawn(async move { grep(&root, &query) }).await;
+                    let hits = cx.background_spawn(async move { grep(&root, &query, regex, &mask) }).await;
                     let _ = this.update(cx, |f, cx| f.set_hits(hits, cx));
                 });
             }
@@ -310,7 +373,7 @@ fn item(hit: &Hit, kind: FinderKind) -> CommandItem {
                         .truncate()
                         .font_family(cx.theme().mono_font_family.clone())
                         .text_sm()
-                        .child(hit.text.trim().to_string()),
+                        .child(highlighted(&hit, cx)),
                 )
                 .child(
                     div()
@@ -322,6 +385,27 @@ fn item(hit: &Hit, kind: FinderKind) -> CommandItem {
                 .into_any_element(),
         }
     })
+}
+
+/// The line without its indent, the matches marked.
+fn highlighted(hit: &Hit, cx: &App) -> StyledText {
+    let indent = hit.text.len() - hit.text.trim_start().len();
+    let text = hit.text.trim().to_string();
+    let style = HighlightStyle {
+        background_color: Some(hsla(0.14, 0.95, 0.55, 0.35)),
+        font_weight: Some(FontWeight::BOLD),
+        ..Default::default()
+    };
+    let _ = cx;
+    let ranges: Vec<_> = hit
+        .ranges
+        .iter()
+        .filter_map(|r| {
+            let (start, end) = (r.start.checked_sub(indent)?, r.end.saturating_sub(indent).min(text.len()));
+            (start < end && text.is_char_boundary(start) && text.is_char_boundary(end)).then(|| (start..end, style))
+        })
+        .collect();
+    StyledText::new(text).with_highlights(ranges)
 }
 
 /// Subsequence match, scored so that consecutive characters, matches in the
@@ -336,7 +420,7 @@ fn match_files(files: &[String], query: &str) -> Vec<Hit> {
     scored
         .into_iter()
         .take(FILE_LIMIT)
-        .map(|(_, path)| Hit { path: path.clone(), line: 0, col: 0, text: String::new() })
+        .map(|(_, path)| Hit { path: path.clone(), line: 0, col: 0, text: String::new(), ranges: Vec::new() })
         .collect()
 }
 
@@ -368,10 +452,15 @@ pub(crate) fn score(path: &str, query: &[char]) -> Option<i64> {
     (qi == query.len()).then_some(score * 100 - path.len() as i64)
 }
 
-fn grep(root: &PathBuf, query: &str) -> Vec<Hit> {
-    let Some(matcher) = search::literal(query) else { return Vec::new() };
-    search::search(root, &matcher, 20, 300, GREP_LIMIT)
+fn grep(root: &PathBuf, query: &str, regex: bool, mask: &str) -> Vec<Hit> {
+    let matcher = if regex { search::regex(query) } else { search::literal(query) };
+    let Some(matcher) = matcher else { return Vec::new() };
+    search::search_in(root, &matcher, search::mask(root, mask), 20, 300, GREP_LIMIT)
         .into_iter()
-        .map(|m| Hit { path: m.path.to_string_lossy().into_owned(), line: m.line as u32, col: 0, text: m.text })
+        .map(|m| {
+            // The cursor goes to the first match.
+            let col = m.matches.first().map_or(0, |r| m.text[..r.start].chars().count() as u32);
+            Hit { path: m.path.to_string_lossy().into_owned(), line: m.line as u32, col, text: m.text, ranges: m.matches }
+        })
         .collect()
 }

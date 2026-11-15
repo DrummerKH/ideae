@@ -2246,7 +2246,7 @@ impl TaskView {
                     .into_iter()
                     .map(|(path, line, code)| {
                         let shown = path.strip_prefix(&self.root).unwrap_or(&path).display().to_string();
-                        crate::finder::Hit { text: format!("{}   {shown}", code.trim()), path: shown, line: line + 1, col: 0 }
+                        crate::finder::Hit { text: format!("{}   {shown}", code.trim()), path: shown, line: line + 1, col: 0, ranges: Vec::new() }
                     })
                     .collect();
                 crate::finder::Finder::open_hits(self.root.clone(), hits, cx.weak_entity(), window, cx)
@@ -4619,7 +4619,7 @@ impl TextCache {
             .map(|l| l.trim().chars().take(300).collect())
             .unwrap_or_default();
         let shown = path.strip_prefix(root).unwrap_or(&path).display().to_string();
-        Some(crate::finder::Hit { path: shown, line: start.line + 1, col: start.character, text })
+        Some(crate::finder::Hit { path: shown, line: start.line + 1, col: start.character, text, ranges: Vec::new() })
     }
 }
 
@@ -4637,7 +4637,7 @@ fn search_places(
             .into_iter()
             .map(|m| {
                 let col = m.text.find(word).map_or(0, |b| m.text[..b].chars().count() as u32);
-                crate::finder::Hit { path: m.path.display().to_string(), line: m.line as u32, col, text: m.text.trim().to_string() }
+                crate::finder::Hit { path: m.path.display().to_string(), line: m.line as u32, col, text: m.text.trim().to_string(), ranges: Vec::new() }
             })
             .collect()
     };
@@ -4652,6 +4652,7 @@ fn search_places(
             line: line + 1,
             col: 0,
             text: String::new(),
+            ranges: Vec::new(),
         }))
         .chain(found_implementations.iter().cloned())
         .map(|h| (h.path, h.line))
