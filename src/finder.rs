@@ -153,7 +153,7 @@ impl Finder {
         });
         if kind == FinderKind::Grep {
             use gpui_kit::component::input::{InputEvent, InputState};
-            let mask = cx.new(|cx| InputState::new(window, cx).placeholder("*.rs, !*_test.go"));
+            let mask = cx.new(|cx| InputState::new(window, cx).placeholder("*.rs, src/**, !*_test.go"));
             let owner = finder.clone();
             cx.subscribe(&mask, move |_, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -231,7 +231,17 @@ impl Finder {
                             .border_color(cx.theme().border)
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child("Files")
+                            .child(
+                                div()
+                                    .id("grep-mask-hint")
+                                    .child("Files")
+                                    .tooltip(|window, cx| {
+                                        gpui_kit::component::tooltip::Tooltip::new(
+                                            "Globs, as rg -g: *.rs for Rust files, src/** for a folder, ! before one leaves those out. Commas between them.",
+                                        )
+                                        .build(window, cx)
+                                    }),
+                            )
                             .children(mask.map(|m| div().w(px(240.)).child(gpui_kit::component::input::Input::new(&m).small())))
                             .child(div().flex_1())
                             .child(
