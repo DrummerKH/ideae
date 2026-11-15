@@ -691,8 +691,9 @@ impl Workspace {
         }
         // Under the row, how full the agent's context is: yellow when it
         // will soon be squeezed, red when that is about to happen.
-        if fill > 0.02 {
-            let color = if fill >= 0.9 { gpui_kit::red() } else if fill >= 0.75 { gpui_kit::yellow() } else { muted.opacity(0.5) };
+        // Not before it is half full: an all but empty bar under every task says nothing.
+        if fill >= 0.5 {
+            let color = if fill >= 0.9 { gpui_kit::red() } else if fill >= 0.75 { gpui_kit::yellow() } else { cx.theme().primary };
             row = row.child(
                 div().id("context-bar").test_support().mt_0p5().ml(px(18.)).h(px(2.)).rounded_full().bg(muted.opacity(0.12)).child(div().h_full().w(relative(fill)).rounded_full().bg(color)),
             );
