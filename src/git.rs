@@ -653,6 +653,8 @@ mod snapshot_tests {
         std::fs::create_dir_all(&root).unwrap();
         let git = |args: &[&str]| run(&root, "git", args).unwrap();
         git(&["init", "-q"]);
+        // Windows runners have core.autocrlf on, which would check out "one\r\n".
+        git(&["config", "core.autocrlf", "false"]);
         std::fs::write(root.join("a.txt"), "one\n").unwrap();
         git(&["add", "a.txt"]);
         git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"]);
