@@ -181,12 +181,29 @@ impl Bridge {
     /// is PowerShell, whose 5.1 has no `||`.
     pub fn claude_command(&self, claude: &str) -> String {
         let settings = shell_quote(&self.settings.display().to_string());
+        // The user's own choice of conversation stands.
+        let picks_conversation = claude
+            .split_whitespace()
+            .skip(1)
+            .any(|a| matches!(a, "-c" | "--continue" | "-r" | "--resume" | "--session-id") || a.starts_with("--resume=") || a.starts_with("--session-id="));
+        if picks_conversation {
+            return format!("{claude} --settings {settings}");
+        }
         if cfg!(windows) {
             format!("{claude} --settings {settings} --continue; if (-not $?) {{ {claude} --settings {settings} }}")
         } else {
             format!("{claude} --settings {settings} --continue || {claude} --settings {settings}")
         }
     }
+}
+
+/// Whether an agent command runs Claude Code (`claude`, a path to it, with
+/// arguments or not): it gets the hooks and continues its conversation.
+pub fn is_claude(command: &str) -> bool {
+    command.split_whitespace().next().and_then(|program| {
+        let name = Path::new(program).file_name()?.to_string_lossy().to_lowercase();
+        Some(matches!(name.trim_end_matches(".exe").trim_end_matches(".cmd"), "claude"))
+    }) == Some(true)
 }
 
 impl Drop for Bridge {
@@ -314,6 +331,20 @@ mod tests {
             send(&format!("{addr}/{}", "0".repeat(32)), r#"{"task":"/w/t","event":"Stop"}"#);
             assert!(rx.recv_timeout(Duration::from_millis(500)).is_err(), "a wrong token got through");
         }
+    }
+
+    #[test]
+    fn claude_commands() {
+        assert!(is_claude("claude"));
+        assert!(is_claude("claude --model opus"));
+        assert!(is_claude("/home/u/.local/bin/claude"));
+        assert!(!is_claude("aider"));
+        assert!(!is_claude(""));
+        let bridge = Bridge { socket: String::new(), socket_file: None, settings: PathBuf::from("/run/h.json") };
+        let with_args = bridge.claude_command("claude --model opus");
+        assert!(with_args.starts_with("claude --model opus --settings '/run/h.json' --continue ||"), "{with_args}");
+        assert_eq!(bridge.claude_command("claude --resume abc"), "claude --resume abc --settings '/run/h.json'");
+        std::mem::forget(bridge);
     }
 
     #[test]

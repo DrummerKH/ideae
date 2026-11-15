@@ -46,19 +46,43 @@ pub struct Server {
     pub args: &'static [&'static str],
 }
 
-/// Every language server ideae knows, for Settings.
-pub const SERVERS: &[&str] = &["gopls", "rust-analyzer", "typescript-language-server", "intelephense", "kotlin-lsp"];
+/// A language server ideae can run: the program, its arguments, and the
+/// file extensions it serves with their LSP language ids. The one list:
+/// Settings shows what is here.
+pub struct ServerDef {
+    pub program: &'static str,
+    pub args: &'static [&'static str],
+    pub languages: &'static [(&'static str, &'static str)],
+}
+
+pub const SERVERS: &[ServerDef] = &[
+    ServerDef { program: "gopls", args: &[], languages: &[("go", "go")] },
+    ServerDef { program: "rust-analyzer", args: &[], languages: &[("rs", "rust")] },
+    ServerDef {
+        program: "typescript-language-server",
+        args: &["--stdio"],
+        languages: &[("ts", "typescript"), ("tsx", "typescriptreact"), ("js", "javascript"), ("jsx", "javascriptreact")],
+    },
+    ServerDef { program: "intelephense", args: &["--stdio"], languages: &[("php", "php")] },
+    ServerDef { program: "kotlin-lsp", args: &["--stdio"], languages: &[("kt", "kotlin"), ("kts", "kotlin")] },
+];
+
+impl ServerDef {
+    /// ".go", ".ts .tsx .js .jsx": what it is for, in Settings.
+    pub fn extensions(&self) -> String {
+        self.languages.iter().map(|(ext, _)| format!(".{ext}")).collect::<Vec<_>>().join(" ")
+    }
+
+    /// On PATH or installed by ideae.
+    pub fn available(&self) -> bool {
+        locate(self.program).is_some()
+    }
+}
 
 fn known(path: &Path) -> Option<(&'static str, &'static str, &'static [&'static str])> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
-    Some(match ext {
-        "go" => ("go", "gopls", &[]),
-        "rs" => ("rust", "rust-analyzer", &[]),
-        "ts" | "tsx" => ("typescript", "typescript-language-server", &["--stdio"]),
-        "js" | "jsx" => ("javascript", "typescript-language-server", &["--stdio"]),
-        "php" => ("php", "intelephense", &["--stdio"]),
-        "kt" | "kts" => ("kotlin", "kotlin-lsp", &["--stdio"]),
-        _ => return None,
+    SERVERS.iter().find_map(|def| {
+        def.languages.iter().find(|(e, _)| *e == ext).map(|(_, language)| (*language, def.program, def.args))
     })
 }
 

@@ -1055,7 +1055,7 @@ impl Workspace {
             None => Some(state::settings().agent).filter(|a| !a.trim().is_empty()),
         };
         match (cmd, bridge) {
-            (Some(cmd), Some(bridge)) if cmd.trim() == "claude" => Some(bridge.claude_command("claude")),
+            (Some(cmd), Some(bridge)) if agent::is_claude(&cmd) => Some(bridge.claude_command(cmd.trim())),
             (cmd, _) => cmd,
         }
     }

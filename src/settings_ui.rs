@@ -72,11 +72,13 @@ impl Workspace {
                             window.refresh();
                         })
                     };
-                    let servers = lsp::SERVERS.iter().map(|&program| {
+                    let servers = lsp::SERVERS.iter().map(|def| {
+                        let program = def.program;
                         let draft = draft.clone();
                         let on = !d.lsp_off.iter().any(|p| p == program);
+                        let missing = if def.available() { "" } else { ", not installed" };
                         Checkbox::new(SharedString::from(format!("lsp-{program}")))
-                            .label(program)
+                            .label(format!("{program}  ({}{missing})", def.extensions()))
                             .checked(on)
                             .on_click(move |value: &bool, window, _| {
                                 let mut d = draft.borrow_mut();
@@ -104,7 +106,7 @@ impl Workspace {
                                 cx,
                             ))
                             .child(section("LANGUAGE SERVERS", cx))
-                            .child(h_flex().flex_wrap().gap_x_4().gap_y_1().children(servers))
+                            .child(v_flex().gap_1().children(servers))
                             .child(row(
                                 "Sleep after (minutes)",
                                 "A task out of view this long stops its language servers.",
