@@ -82,8 +82,8 @@ pub struct Workspace {
     _subscriptions: Vec<Subscription>,
     _tick: Task<()>,
     pub build: crate::build_watch::BuildWatch,
-    /// Quitting to start again: the daemon's terminals stay.
-    restarting: bool,
+    /// Quitting while the agents go on: a restart, or the window's ×.
+    keep_terminals: bool,
 }
 
 impl Workspace {
@@ -179,7 +179,7 @@ impl Workspace {
             // window; any other quit ends them with everything else.
             cx.on_app_quit(|this: &mut Self, cx| {
                 this.save(cx);
-                if this.restarting {
+                if this.keep_terminals {
                     for view in this.views() {
                         view.update(cx, |t, cx| t.autosave_all(cx));
                     }
@@ -196,6 +196,13 @@ impl Workspace {
                 async {}
             }),
         ];
+
+        // Closing the window the window manager's way is the same as ×.
+        let closing = cx.weak_entity();
+        window.on_window_should_close(cx, move |_, cx| {
+            let _ = closing.update(cx, |w, cx| w.close_window(cx));
+            true
+        });
 
         // Saves now and then, and picks up worktrees made outside the app.
         let tick = cx.spawn_in(window, async move |this, cx| {
@@ -240,7 +247,7 @@ impl Workspace {
             last_saved: String::new(),
             _subscriptions: subscriptions,
             _tick: tick,
-            restarting: false,
+            keep_terminals: false,
             build: crate::build_watch::BuildWatch::new(),
         };
         this.restore(&saved, window, cx);
@@ -913,13 +920,54 @@ impl Workspace {
         .detach();
     }
 
+    /// The window's ×: the window goes, the daemon's agents and terminals
+    /// stay for the next one.
+    pub fn close_window(&mut self, cx: &mut Context<Self>) {
+        #[cfg(unix)]
+        if crate::daemon::client::get().is_some() {
+            self.keep_terminals = true;
+        }
+        self.save(cx);
+        cx.quit();
+    }
+
+    /// Exit: ends every agent and terminal, after a word when any run.
+    pub fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let running = self.views().len();
+        if running == 0 {
+            self.save(cx);
+            return cx.quit();
+        }
+        let busy = self.views().iter().filter(|v| v.read(cx).agent_busy()).count();
+        let mut description = format!(
+            "Stops the agents and terminals of {running} running task{}",
+            if running == 1 { "" } else { "s" }
+        );
+        if busy > 0 {
+            description.push_str(&format!(", {busy} of them working right now"));
+        }
+        description.push_str(". Closing the window (×) keeps them running instead.");
+        let this = cx.weak_entity();
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            let this = this.clone();
+            dialog.confirm().title("Quit ideae?").description(description.clone()).ok_text("Quit").on_ok(move |_, _, cx| {
+                let _ = this.update(cx, |w, cx| {
+                    w.keep_terminals = false;
+                    w.save(cx);
+                    cx.quit();
+                });
+                true
+            })
+        });
+    }
+
     pub fn restart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.save(cx);
-        self.restarting = true;
+        self.keep_terminals = true;
         match crate::desktop::spawn_again() {
             Ok(()) => cx.quit(),
             Err(e) => {
-                self.restarting = false;
+                self.keep_terminals = false;
                 window.push_notification(Notification::error(e.to_string()).title("Restart"), cx)
             }
         }

@@ -48,7 +48,14 @@ impl Render for Workspace {
             .size_full()
             .bg(cx.theme().background)
             .child(
-                TitleBar::new().child(
+                TitleBar::new()
+                    .on_close_window({
+                        let this = cx.weak_entity();
+                        move |_, _, cx| {
+                            let _ = this.update(cx, |w, cx| w.close_window(cx));
+                        }
+                    })
+                    .child(
                     h_flex()
                         .w_full()
                         .pr_4()
@@ -188,6 +195,7 @@ impl Render for Workspace {
                 }
             }))
             .on_action(cx.listener(|this, _: &FindInFiles, window, cx| this.finder(finder::FinderKind::Grep, window, cx)))
+            .on_action(cx.listener(|this, _: &Quit, window, cx| this.request_quit(window, cx)))
             .on_action(cx.listener(|this, _: &NewTask, window, cx| {
                 if let Some(project) = this.active_project().or((!this.projects.is_empty()).then_some(0)) {
                     this.new_task_dialog(project, window, cx);
@@ -196,7 +204,7 @@ impl Render for Workspace {
     }
 }
 
-actions!(ideae, [GoToFile, FindInFiles, NewTask]);
+actions!(ideae, [GoToFile, FindInFiles, NewTask, Quit]);
 
 impl Workspace {
     fn finder(&mut self, kind: finder::FinderKind, window: &mut Window, cx: &mut Context<Self>) {
@@ -292,9 +300,8 @@ impl Workspace {
             .item(PopupMenuItem::new("Restart").on_click(move |_, window, cx| {
                 let _ = c.update(cx, |w, cx| w.restart(window, cx));
             }))
-            .item(PopupMenuItem::new("Exit").on_click(move |_, _, cx| {
-                let _ = d.update(cx, |w, cx| w.save(cx));
-                cx.quit();
+            .item(PopupMenuItem::new("Exit  Ctrl+Q").on_click(move |_, window, cx| {
+                let _ = d.update(cx, |w, cx| w.request_quit(window, cx));
             }))
         })
     }
@@ -450,6 +457,7 @@ fn main() {
                     KeyBinding::new("ctrl-shift-n", GoToFile, context),
                     KeyBinding::new("ctrl-shift-f", FindInFiles, context),
                     KeyBinding::new("ctrl-shift-t", NewTask, context),
+                    KeyBinding::new("ctrl-q", Quit, context),
                 ]);
             }
             // Ctrl+Alt+Left/Right switch GNOME workspaces. In a terminal Alt+Left

@@ -19,9 +19,8 @@ use super::proto::{self, Fg, Frame, Hook, KIND_BYTES, KIND_REPLAY, Msg, Size, Sp
 
 /// Output kept per session for a window that attaches later.
 const REPLAY_BYTES: usize = 2 << 20;
-/// With no window attached: how long sessions wait for one to come back
-/// (the app crashed), and how long an empty daemon stays.
-const ORPHANED: Duration = Duration::from_secs(15 * 60);
+/// How long a daemon with no sessions and no window stays. With sessions it
+/// stays: a closed window leaves the agents working.
 const EMPTY: Duration = Duration::from_secs(60);
 
 struct Session {
@@ -103,7 +102,7 @@ fn housekeeping(shared: Shared) {
         std::thread::sleep(Duration::from_secs(1));
         let unattended = {
             let s = shared.lock().unwrap();
-            s.alone_since.is_some_and(|since| (s.sessions.is_empty() && since.elapsed() > EMPTY) || since.elapsed() > ORPHANED)
+            s.alone_since.is_some_and(|since| s.sessions.is_empty() && since.elapsed() > EMPTY)
         };
         if unattended {
             shutdown(&shared);
@@ -180,6 +179,9 @@ fn serve(shared: Shared, stream: UnixStream) {
             Frame::Msg(Msg::Shutdown) => shutdown(&shared),
             Frame::Msg(Msg::Hook(hook)) => {
                 let mut s = shared.lock().unwrap();
+                if s.clients.is_empty() {
+                    notify(&hook);
+                }
                 s.broadcast(&proto::encode_msg(&Msg::Hook(hook.clone())));
                 s.hooks.insert(hook.task.clone(), hook);
             }
@@ -333,4 +335,24 @@ fn shutdown(shared: &Shared) -> ! {
     }
     let _ = std::fs::remove_file(proto::socket_path());
     std::process::exit(0);
+}
+
+/// No window to show it: an agent that wants the user says so on the desktop.
+fn notify(hook: &Hook) {
+    let event = crate::agent::HookEvent {
+        task: hook.task.clone().into(),
+        event: hook.event.clone(),
+        message: hook.message.clone(),
+        kind: hook.kind.clone(),
+        replayed: false,
+    };
+    let Some(status) = event.status().filter(|s| s.is_attention()) else { return };
+    let body = match status {
+        crate::agent::AgentStatus::NeedsInput(message) => message,
+        _ => "Finished".into(),
+    };
+    let task = std::path::Path::new(&hook.task).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if let Ok(mut child) = std::process::Command::new("notify-send").args(["-a", crate::state::APP_ID, &task, &body]).spawn() {
+        std::thread::spawn(move || child.wait());
+    }
 }
