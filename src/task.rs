@@ -118,7 +118,7 @@ fn shell_quote(s: &str) -> String {
 // ---------------------------------------------------------------- file
 
 actions!(ideae_file, [SaveFile, ExpandSelection, ShrinkSelection, ToggleComment, ShowOutline, ShowUsages, SendToAgent]);
-actions!(ideae_task, [ToggleZoom, SendDiffToAgent]);
+actions!(ideae_task, [ToggleZoom, SendDiffToAgent, CommentOnDiff]);
 
 actions!(ideae_task, [NextTab, PrevTab, NavigateBack, NavigateForward]);
 
@@ -589,6 +589,19 @@ pub struct ChangesView {
     first_lines: Rc<HashMap<String, u32>>,
     selection: Option<DiffLineRange>,
     task: WeakEntity<TaskView>,
+    /// Review comments on lines of the diff, sent to the agent as one message.
+    review: Vec<ReviewComment>,
+    /// The text of the last selection: a click in the context menu clears
+    /// the selection before its action runs.
+    selected_code: String,
+}
+
+#[derive(Clone)]
+struct ReviewComment {
+    location: String,
+    code: String,
+    language: &'static str,
+    text: String,
 }
 
 impl ChangesView {
@@ -598,6 +611,7 @@ impl ChangesView {
         cx.subscribe(&diff, |this, _, event: &DiffEvent, cx| match event {
             DiffEvent::SelectionEnded(range) => {
                 this.selection = Some(range.clone());
+                this.selected_code = this.diff.read(cx).selected_text(cx);
                 cx.notify();
             }
             // Not cleared on SelectionChanged(None): pressing the Open button
@@ -605,22 +619,170 @@ impl ChangesView {
             _ => {}
         })
         .detach();
-        Self { root, diff, scope: DiffScope::Uncommitted, counts: (0, 0), base: None, first_lines: Rc::default(), selection: None, task }
+        Self {
+            root,
+            diff,
+            scope: DiffScope::Uncommitted,
+            counts: (0, 0),
+            base: None,
+            first_lines: Rc::default(),
+            selection: None,
+            task,
+            review: Vec::new(),
+            selected_code: String::new(),
+        }
     }
 
-    /// The lines selected by their numbers, to the agent with their location.
-    fn send_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(range) = self.diff.read(cx).selected_lines().or(self.selection.clone()) else { return };
-        let code = self.diff.read(cx).selected_text(cx);
+    /// The selected lines: where they are, their text, their language.
+    fn selected(&self, cx: &App) -> Option<(String, String, &'static str)> {
+        let range = self.diff.read(cx).selected_lines().or(self.selection.clone())?;
+        let mut code = self.diff.read(cx).selected_text(cx);
         if code.is_empty() {
-            return;
+            code = self.selected_code.clone();
+        }
+        if code.is_empty() {
+            return None;
         }
         let location = if range.start() == range.end() {
             format!("{}:{}", range.path(), range.start())
         } else {
             format!("{}:{}-{}", range.path(), range.start(), range.end())
         };
-        let language = lsp::language_for(std::path::Path::new(range.path().as_ref()));
+        Some((location, code, lsp::language_for(std::path::Path::new(range.path().as_ref()))))
+    }
+
+    /// Asks for a comment on the selected lines and adds it to the review.
+    fn comment_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((location, code, language)) = self.selected(cx) else { return };
+        let input = cx.new(|cx| {
+            gpui_kit::component::input::TextareaState::new(window, cx).auto_grow(3, 12).placeholder("What should change here?")
+        });
+        let view = cx.weak_entity();
+        let focused = Rc::new(std::cell::Cell::new(false));
+        let title = location.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (input, view, focused) = (input.clone(), view.clone(), focused.clone());
+            let (location, code) = (location.clone(), code.clone());
+            let shown = input.clone();
+            let add = move |window: &mut Window, cx: &mut App| {
+                let text = input.read(cx).value().trim().to_string();
+                if text.is_empty() {
+                    return;
+                }
+                let comment = ReviewComment { location: location.clone(), code: code.clone(), language, text };
+                let _ = view.update(cx, |c, cx| {
+                    c.review.push(comment);
+                    cx.notify();
+                });
+                window.close_dialog(cx);
+            };
+            dialog
+                .title(format!("Comment on {title}"))
+                .w(px(560.))
+                .content(move |content, window, cx| {
+                    if !focused.replace(true) {
+                        let input = shown.clone();
+                        window.defer(cx, move |window, cx| input.read(cx).focus_handle(cx).focus(window, cx));
+                    }
+                    content.child(gpui_kit::component::input::Textarea::new(&shown))
+                })
+                .footer(
+                    h_flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(Button::new("review-cancel").ghost().label("Cancel").on_click(|_, window, cx| window.close_dialog(cx)))
+                        .child(Button::new("review-add").primary().label("Add comment").on_click(move |_, window, cx| add(window, cx))),
+                )
+        });
+    }
+
+    /// Every review comment to the agent in one message, pasted for the user
+    /// to send; the review starts over.
+    fn send_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.review.is_empty() {
+            return;
+        }
+        let mut message = String::from("Review comments on the changes:\n");
+        for (i, c) in self.review.iter().enumerate() {
+            message.push_str(&format!(
+                "\n{}. {}\n```{}\n{}\n```\n{}\n",
+                i + 1,
+                c.location,
+                c.language,
+                c.code.trim_end_matches('\n'),
+                c.text
+            ));
+        }
+        self.review.clear();
+        cx.notify();
+        let _ = self.task.update(cx, |t, cx| t.paste_to_agent(message, window, cx));
+    }
+
+    fn render_review(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.review.is_empty() {
+            return None;
+        }
+        let muted = cx.theme().muted_foreground;
+        Some(
+            v_flex()
+                .px_3()
+                .py_2()
+                .gap_1()
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .bg(cx.theme().secondary.opacity(0.5))
+                .child(
+                    h_flex()
+                        .justify_between()
+                        .child(div().text_xs().text_color(muted).child(format!("REVIEW ({})", self.review.len())))
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .child(
+                                    Button::new("review-clear")
+                                        .xsmall()
+                                        .ghost()
+                                        .label("Clear")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.review.clear();
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    Button::new("review-send")
+                                        .xsmall()
+                                        .primary()
+                                        .label("Send to agent")
+                                        .on_click(cx.listener(|this, _, window, cx| this.send_review(window, cx))),
+                                ),
+                        ),
+                )
+                .children(self.review.iter().enumerate().map(|(i, c)| {
+                    h_flex()
+                        .gap_2()
+                        .text_sm()
+                        .child(div().flex_none().font_family(cx.theme().mono_font_family.clone()).text_xs().text_color(muted).child(c.location.clone()))
+                        .child(div().flex_1().min_w_0().truncate().child(c.text.clone()))
+                        .child(
+                            Button::new(("review-remove", i))
+                                .xsmall()
+                                .ghost()
+                                .label("×")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if i < this.review.len() {
+                                        this.review.remove(i);
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                }))
+                .into_any_element(),
+        )
+    }
+
+    /// The lines selected by their numbers, to the agent with their location.
+    fn send_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((location, code, language)) = self.selected(cx) else { return };
         let _ = self.task.update(cx, |t, cx| t.send_to_agent(location, code, language, window, cx));
     }
 
@@ -738,10 +900,15 @@ impl Render for ChangesView {
                             .child("Ctrl+click a line to open the file there"),
                     ),
             )
+            .children(self.render_review(cx))
             .child(div().id("changes-diff").relative().flex_1().min_h_0()
                 .child(crate::zoom::wheel(crate::zoom::Kind::Changes))
                 .on_action(cx.listener(|this, _: &SendDiffToAgent, window, cx| this.send_selection(window, cx)))
-                .context_menu(|menu, _, _| menu.menu("Send selected lines to Agent", Box::new(SendDiffToAgent)))
+                .on_action(cx.listener(|this, _: &CommentOnDiff, window, cx| this.comment_selection(window, cx)))
+                .context_menu(|menu, _, _| {
+                    menu.menu("Comment on selected lines…", Box::new(CommentOnDiff))
+                        .menu("Send selected lines to Agent", Box::new(SendDiffToAgent))
+                })
                 .map(|this| {
                 if empty {
                     this.flex()
@@ -1425,12 +1592,17 @@ impl TaskView {
     /// Puts code into the agent's prompt, without sending it: the location,
     /// then the code fenced, so you can type the question after it.
     pub fn send_to_agent(&mut self, location: String, code: String, language: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let text = format!("{location}\n```{language}\n{}\n```\n", code.trim_end_matches('\n'));
+        self.paste_to_agent(text, window, cx);
+    }
+
+    /// Text into the agent's prompt, for the user to add to and send.
+    pub fn paste_to_agent(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.tabs.iter().position(|t| t.title == "agent" && matches!(t.kind, TabKind::Terminal(_))) else {
             return;
         };
         let TabKind::Terminal(view) = &self.tabs[ix].kind else { return };
         let state = view.read(cx).state.clone();
-        let text = format!("{location}\n```{language}\n{}\n```\n", code.trim_end_matches('\n'));
         // Bracketed paste: Claude Code shows it as pasted text, not a prompt sent.
         state.update(cx, |s, cx| s.paste_text(text, cx));
         self.activate(ix, window, cx);
