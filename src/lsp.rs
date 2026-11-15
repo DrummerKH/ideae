@@ -21,6 +21,14 @@ use serde_json::{Value, json};
 type Pending = Arc<Mutex<HashMap<i64, mpsc::Sender<Result<Value>>>>>;
 /// Work-done progress the server has begun and not ended: token → title.
 type Progress = Arc<Mutex<HashMap<String, String>>>;
+type Import = Arc<Mutex<ImportState>>;
+
+/// The server's import of the build: its errors so far, and how it ended.
+#[derive(Default)]
+struct ImportState {
+    log: Vec<String>,
+    failed: Option<String>,
+}
 
 pub struct LspClient {
     stdin: Arc<Mutex<ChildStdin>>,
@@ -29,6 +37,7 @@ pub struct LspClient {
     ready: (Mutex<Option<Result<(), String>>>, Condvar),
     opened: Mutex<HashSet<String>>,
     progress: Progress,
+    import: Import,
     /// `capabilities` from the server's answer to `initialize`.
     capabilities: Mutex<Value>,
     child: Mutex<Child>,
@@ -311,7 +320,7 @@ impl LspClient {
     /// call waits for it.
     pub fn spawn(program: &str, executable: &Path, args: &[&str], root: &Path, init_options: Value) -> Result<Arc<Self>> {
         let mut command = crate::procs::command(executable);
-        command.args(args).current_dir(root).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+        command.args(args).envs(server_env(program)).current_dir(root).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
         // Dies with the app even when it exits without running destructors.
         let mut child = crate::procs::spawn_tied(&mut command)
             .with_context(|| format!("starting {program}"))?;
@@ -323,9 +332,11 @@ impl LspClient {
         let reader_stdin = stdin.clone();
         let reader_pending = pending.clone();
         let reader_progress = progress.clone();
+        let import: Import = Arc::default();
+        let reader_import = import.clone();
         thread::Builder::new()
             .name(format!("lsp-read-{program}"))
-            .spawn(move || read_loop(stdout, reader_stdin, reader_pending, reader_progress))?;
+            .spawn(move || read_loop(stdout, reader_stdin, reader_pending, reader_progress, reader_import))?;
 
         let client = Arc::new(Self {
             stdin,
@@ -334,6 +345,7 @@ impl LspClient {
             ready: (Mutex::new(None), Condvar::new()),
             opened: Mutex::default(),
             progress,
+            import,
             capabilities: Mutex::new(Value::Null),
             child: Mutex::new(child),
         });
@@ -396,6 +408,13 @@ impl LspClient {
     /// Title of some work the server is still doing, such as indexing.
     pub fn busy(&self) -> Option<String> {
         self.progress.lock().unwrap().values().next().cloned()
+    }
+
+    /// Why the server knows less of the project than it should: its import
+    /// of the build failed, so what other modules and libraries declare is
+    /// not found.
+    pub fn problem(&self) -> Option<String> {
+        self.import.lock().unwrap().failed.clone()
     }
 
     pub fn did_open(&self, path: &Path, language_id: &str, text: &str) -> Result<()> {
@@ -538,7 +557,7 @@ fn write_message(stdin: &Mutex<ChildStdin>, message: &Value) -> Result<()> {
     Ok(())
 }
 
-fn read_loop(stdout: impl Read, stdin: Arc<Mutex<ChildStdin>>, pending: Pending, progress: Progress) {
+fn read_loop(stdout: impl Read, stdin: Arc<Mutex<ChildStdin>>, pending: Pending, progress: Progress, import: Import) {
     let mut reader = BufReader::new(stdout);
     loop {
         let mut length = None;
@@ -598,8 +617,87 @@ fn read_loop(stdout: impl Read, stdin: Arc<Mutex<ChildStdin>>, pending: Pending,
                     _ => {}
                 }
             }
+            // kotlin-lsp tells how its import of the Gradle or Maven build went.
+            (None, Some(method)) if method == "intellij/importLog" => {
+                let params = &message["params"];
+                let mut import = import.lock().unwrap();
+                if params["started"] == true {
+                    import.log.clear();
+                }
+                let text = params["message"].as_str().unwrap_or_default();
+                if params["type"].as_i64().is_some_and(|t| t <= 2) && !text.starts_with('\t') && import.log.len() < 200 {
+                    import.log.push(text.trim_end().to_string());
+                }
+            }
+            (None, Some(method)) if method == "intellij/workspaceImportState" => {
+                let params = &message["params"];
+                if params["phase"] != "FINISHED" {
+                    continue;
+                }
+                let failed = params["folders"].as_array().and_then(|f| f.iter().find(|f| f["status"] == "FAILED"));
+                let mut import = import.lock().unwrap();
+                import.failed = failed.map(|folder| {
+                    let what = folder["message"].as_str().unwrap_or("import failed");
+                    match build_failure(&import.log) {
+                        Some(reason) => format!("{what}: {reason}"),
+                        None => what.to_string(),
+                    }
+                });
+            }
             _ => {}
         }
+    }
+}
+
+/// What Gradle says went wrong, from its output: the lines between
+/// "* What went wrong:" and the next section.
+fn build_failure(log: &[String]) -> Option<String> {
+    let start = log.iter().position(|l| l.starts_with("* What went wrong"))? + 1;
+    let reason: Vec<&str> = log[start..]
+        .iter()
+        .take_while(|l| !l.starts_with("* "))
+        .map(|l| l.trim().trim_start_matches("> "))
+        .filter(|l| !l.is_empty())
+        .collect();
+    (!reason.is_empty()).then(|| reason.join(" "))
+}
+
+/// Variables a server needs that the user's environment does not give.
+/// Android's Gradle plugin fails to configure a project without the SDK,
+/// which Android Studio names in an untracked local.properties: a new
+/// worktree has none.
+fn server_env(program: &str) -> Vec<(&'static str, PathBuf)> {
+    if program != "kotlin-lsp" || ["ANDROID_HOME", "ANDROID_SDK_ROOT"].iter().any(|v| std::env::var_os(v).is_some()) {
+        return vec![];
+    }
+    let sdk = if cfg!(target_os = "macos") {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Android/sdk"))
+    } else if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("Android").join("Sdk"))
+    } else {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Android/Sdk"))
+    };
+    sdk.filter(|dir| dir.is_dir()).map(|dir| ("ANDROID_HOME", dir)).into_iter().collect()
+}
+
+#[cfg(test)]
+mod import_tests {
+    #[test]
+    fn gradle_failure_reason() {
+        let log: Vec<String> = [
+            "FAILURE: Build failed with an exception.",
+            "",
+            "* What went wrong:",
+            "A problem occurred configuring project ':app'.",
+            "> SDK location not found.",
+            "",
+            "* Try:",
+            "> Run with --info",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(super::build_failure(&log).as_deref(), Some("A problem occurred configuring project ':app'. SDK location not found."));
+        assert_eq!(super::build_failure(&log[..2]), None);
     }
 }
 

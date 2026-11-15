@@ -581,11 +581,21 @@ impl FileView {
         )
     }
 
+    /// The server runs, but its import of the build failed.
+    fn lsp_problem(&self) -> Option<String> {
+        self.lsp_client.as_ref().and_then(|c| c.problem())
+    }
+
     fn status_text(&self) -> String {
         let busy = self.lsp_client.as_ref().and_then(|c| c.busy());
         match (self.lsp_program.is_empty(), self.lsp_ok, busy) {
             (true, _, _) => self.lsp_status.to_string(),
             (false, Some(true), Some(work)) => format!("{}: {work}…", self.lsp_program),
+            (false, Some(true), None) if self.lsp_problem().is_some() => {
+                let problem = self.lsp_problem().unwrap_or_default();
+                let short: String = problem.chars().take(90).collect();
+                format!("{}: {short}{}", self.lsp_program, if short.len() < problem.len() { "…" } else { "" })
+            }
             (false, _, _) => format!("{}: {}", self.lsp_program, self.lsp_status),
         }
     }
@@ -657,10 +667,16 @@ impl Render for FileView {
                     })
                     .child(
                         div()
+                            .id("lsp-status")
                             .flex_none()
                             .when(self.lsp_ok == Some(true) && !self.is_busy(), |s| s.text_color(gpui_kit::green()))
                             .when(self.lsp_ok == Some(false) && self.lsp_status.contains("failed"), |s| {
                                 s.text_color(gpui_kit::red())
+                            })
+                            .when_some(self.lsp_problem().filter(|_| !self.is_busy()), |s, problem| {
+                                s.text_color(gpui_kit::red()).tooltip(move |window, cx| {
+                                    gpui_kit::component::tooltip::Tooltip::new(problem.clone()).build(window, cx)
+                                })
                             })
                             .child(if self.lsp_missing.is_some_and(crate::lsp_install::is_installing) {
                                 format!("installing {}…", self.lsp_missing.unwrap_or_default())
@@ -3303,7 +3319,7 @@ impl TaskView {
                 let mut last = None;
                 loop {
                     cx.background_executor().timer(Duration::from_millis(500)).await;
-                    let Ok(busy) = this.update(cx, |f, _| f.lsp_client.as_ref().and_then(|c| c.busy())) else {
+                    let Ok(busy) = this.update(cx, |f, _| f.lsp_client.as_ref().map(|c| (c.busy(), c.problem()))) else {
                         break;
                     };
                     if busy != last {

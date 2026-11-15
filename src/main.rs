@@ -468,6 +468,7 @@ fn main() {
             _ => repos.push(PathBuf::from(arg)),
         }
     }
+    procs::adopt_shell_env();
     desktop::refresh_entry();
     procs::catch_quit_signals();
 

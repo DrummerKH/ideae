@@ -62,6 +62,94 @@ pub fn which(program: impl AsRef<OsStr>) -> Option<PathBuf> {
     })
 }
 
+/// Started from the Dock or a launcher, the app has the session's bare
+/// environment: none of what the user's shell profile sets (PATH with go,
+/// cargo and node in it, JAVA_HOME, ANDROID_HOME), so language servers and
+/// the builds they run are not found or fail. This takes those variables
+/// from a login shell. Variables the app already has stay; PATH gets the
+/// shell's directories first. Call before any thread starts.
+#[cfg(unix)]
+pub fn adopt_shell_env() {
+    use std::io::Read as _;
+    // Started from a terminal: the environment is the shell's already.
+    if std::env::var_os("TERM").is_some() || std::env::var_os("IDEAE_NO_SHELL_ENV").is_some() {
+        return;
+    }
+    let Some(shell) = std::env::var_os("SHELL").filter(|s| !s.is_empty()) else { return };
+    const MARK: &str = "__ideae_env__";
+    let Ok(mut child) = Command::new(shell)
+        .args(["-l", "-i", "-c", &format!("printf {MARK}; env -0; printf {MARK}")])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let _ = stdout.read_to_end(&mut out);
+        let _ = tx.send(out);
+    });
+    // A profile that waits for input or the network must not hold the window.
+    let out = rx.recv_timeout(Duration::from_secs(5));
+    let _ = child.kill();
+    let _ = child.wait();
+    let Ok(out) = out else { return };
+    for (name, value) in shell_env_changes(&String::from_utf8_lossy(&out), MARK, |name| std::env::var(name).ok()) {
+        // SAFETY: main calls this before it starts any thread; the reader above has ended.
+        unsafe { std::env::set_var(name, value) };
+    }
+}
+
+#[cfg(not(unix))]
+pub fn adopt_shell_env() {}
+
+/// The variables to set from `env -0` output between two marks: those
+/// missing here, and PATH with the shell's directories ahead of ours.
+#[cfg(unix)]
+fn shell_env_changes(out: &str, mark: &str, current: impl Fn(&str) -> Option<String>) -> Vec<(String, String)> {
+    let mut parts = out.split(mark);
+    let (Some(_), Some(env), Some(_)) = (parts.next(), parts.next(), parts.next()) else { return vec![] };
+    env.split('\0')
+        .filter_map(|entry| entry.split_once('='))
+        .filter(|(name, _)| !matches!(*name, "_" | "PWD" | "OLDPWD" | "SHLVL" | "TERM"))
+        .filter_map(|(name, value)| match current(name) {
+            None => Some((name.to_string(), value.to_string())),
+            Some(ours) if name == "PATH" => {
+                let mut dirs: Vec<&str> = value.split(':').filter(|d| !d.is_empty()).collect();
+                for dir in ours.split(':').filter(|d| !d.is_empty()) {
+                    if !dirs.contains(&dir) {
+                        dirs.push(dir);
+                    }
+                }
+                let path = dirs.join(":");
+                (path != ours).then(|| (name.to_string(), path))
+            }
+            Some(_) => None,
+        })
+        .collect()
+}
+
+#[cfg(all(test, unix))]
+mod shell_env_tests {
+    #[test]
+    fn takes_what_is_missing_and_merges_path() {
+        let out = "motd\nMARKPATH=/opt/bin:/usr/bin\0HOME=/other\0ANDROID_HOME=/sdk\0MULTI=a\nb\0SHLVL=2\0MARK";
+        let current = |name: &str| match name {
+            "PATH" => Some("/usr/bin:/bin".to_string()),
+            "HOME" => Some("/home/me".to_string()),
+            _ => None,
+        };
+        let changes = super::shell_env_changes(out, "MARK", current);
+        let expected = [("PATH", "/opt/bin:/usr/bin:/bin"), ("ANDROID_HOME", "/sdk"), ("MULTI", "a\nb")];
+        assert_eq!(changes, expected.map(|(n, v)| (n.to_string(), v.to_string())));
+        assert!(super::shell_env_changes("no marks", "MARK", current).is_empty());
+    }
+}
+
 /// Starts a program that must not outlive the app, even when the app is
 /// killed: a language server, the headless browser.
 pub fn spawn_tied(command: &mut Command) -> std::io::Result<Child> {
