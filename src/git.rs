@@ -160,6 +160,10 @@ pub struct BranchInfo {
     pub has_origin: bool,
     pub ahead: u32,
     pub behind: u32,
+    /// The branch work starts from (origin/main), and the commits there
+    /// this branch lacks.
+    pub base: Option<String>,
+    pub behind_base: u32,
     pub last_hash: String,
     pub last_subject: String,
 }
@@ -182,6 +186,13 @@ pub fn branch_info(root: &Path) -> BranchInfo {
         }
     }
     info.has_origin = git(root, &["remote", "get-url", "origin"]).is_some();
+    // Not for the base branch itself (main, tracking origin/main).
+    if let Some(base) = base_ref(root).filter(|b| b.rsplit('/').next() != Some(info.head.as_str())) {
+        info.behind_base = git(root, &["rev-list", "--count", &format!("HEAD..{base}")])
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or(0);
+        info.base = Some(base);
+    }
     if let Some(last) = git(root, &["log", "-1", "--format=%h%x1f%s"]) {
         if let Some((hash, subject)) = last.trim_end().split_once('\x1f') {
             info.last_hash = hash.to_string();
@@ -465,6 +476,37 @@ pub fn fetch(root: &Path) -> Result<String, String> {
 /// Brings in the upstream without ever leaving a mess: a fast-forward when
 /// there is nothing local, else a rebase that is aborted on any conflict.
 /// Uncommitted work is stashed around it either way.
+/// Why a rebase onto the base did not happen.
+pub enum RebaseError {
+    /// These files conflict; the rebase was undone.
+    Conflicts(Vec<String>),
+    Failed(String),
+}
+
+/// Fetches the base and rebases the branch onto it, uncommitted changes
+/// stashed and put back. On a conflict nothing changes.
+pub fn rebase_onto(root: &Path, base: &str) -> Result<String, RebaseError> {
+    if let Some((remote, branch)) = base.split_once('/') {
+        let _ = run(root, "git", &["fetch", remote, branch]);
+    }
+    match run(root, "git", &["rebase", "--autostash", base]) {
+        Ok(_) => Ok(format!("Rebased onto {base}")),
+        Err(e) => {
+            let conflicts: Vec<String> = git(root, &["diff", "--name-only", "--diff-filter=U"])
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect();
+            let _ = run(root, "git", &["rebase", "--abort"]);
+            if conflicts.is_empty() {
+                Err(RebaseError::Failed(e.lines().next().unwrap_or_default().to_string()))
+            } else {
+                Err(RebaseError::Conflicts(conflicts))
+            }
+        }
+    }
+}
+
 pub fn pull_safe(root: &Path) -> Result<String, String> {
     run(root, "git", &["fetch", "--prune"])?;
     let ahead = run(root, "git", &["rev-list", "--count", "@{u}..HEAD"])?.trim().parse::<u32>().unwrap_or(0);

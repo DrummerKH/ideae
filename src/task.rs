@@ -2586,6 +2586,23 @@ impl TaskView {
             .when(b.upstream.is_none() && !b.head.is_empty(), |this| {
                 this.child(div().text_color(cx.theme().muted_foreground).child("no upstream"))
             })
+            .when_some(b.base.clone().filter(|_| b.behind_base > 0), |this, base| {
+                let busy = self.busy.is_some();
+                this.child(
+                    Button::new("rebase")
+                        .xsmall()
+                        .ghost()
+                        .disabled(busy)
+                        .label(format!("{base} ↓{} · Rebase", b.behind_base))
+                        .tooltip(format!(
+                            "Rebase this branch onto {base}. On a conflict nothing changes, and the agent's prompt gets a request to do it."
+                        ))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.rebase_onto_base(base.clone(), window, cx)
+                        })),
+                )
+            })
             .child(
                 div()
                     .flex_1()
@@ -3513,6 +3530,42 @@ impl TaskView {
 
     /// Runs a git/gh job off the UI thread, shows its outcome under the
     /// buttons, and refreshes. A successful commit clears the message.
+    /// Rebase onto the base; conflicts go to the agent as a request.
+    fn rebase_onto_base(&mut self, base: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy.is_some() {
+            return;
+        }
+        self.busy = Some("Rebase");
+        self.action = None;
+        cx.notify();
+        let root = self.root.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let job_base = base.clone();
+            let result = cx.background_spawn(async move { git::rebase_onto(&root, &job_base) }).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.busy = None;
+                this.action = Some(match result {
+                    Ok(out) => (true, out),
+                    Err(git::RebaseError::Failed(e)) => (false, format!("Rebase: {e}")),
+                    Err(git::RebaseError::Conflicts(files)) => {
+                        let list = files.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n");
+                        this.paste_to_agent(
+                            format!(
+                                "Rebase this branch onto {base} (`git fetch` first). It conflicts in:\n{list}\n\nResolve the conflicts keeping what both sides meant, check that it builds and the tests pass, then finish the rebase."
+                            ),
+                            window,
+                            cx,
+                        );
+                        (false, format!("Rebase: {} conflicting file(s), nothing changed; the agent's prompt has a request", files.len()))
+                    }
+                });
+                let _ = this.refresh_tx.try_send(());
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn run_action(
         &mut self,
         label: &'static str,
