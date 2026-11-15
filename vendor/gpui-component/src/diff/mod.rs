@@ -564,6 +564,21 @@ fn render_diff(
     let tail = state.viewport().height * (2. / 3.);
     let horizontal = state.horizontal_scroll().clone();
     let has_rows = !rows.is_empty();
+    // ideae patch: the header of the file under the top edge stays there
+    // while its changes scroll past.
+    let top = scrollbar.logical_scroll_top();
+    let sticky = rows
+        .get(top.item_ix)
+        .filter(|row| {
+            props.header_visible
+                && !(matches!(row, DisplayRow::File(_)) && top.offset_in_item <= px(0.))
+        })
+        .map(|row| {
+            // This runs inside the state's own update, where the header
+            // cannot read the state for itself.
+            let collapsed = state.is_file_collapsed(state.files()[row.file()].path());
+            render_file_header(row.file(), Some(collapsed), &code, window, cx)
+        });
     let label = match state.files() {
         [file] => t!("Diff.Viewer", name = file.path().as_str()).to_string(),
         files => t!("Diff.ViewerFiles", count = files.len()).to_string(),
@@ -606,6 +621,19 @@ fn render_diff(
         .when(has_rows && !soft_wrap, |this| {
             this.child(
                 ScrollableMask::new(Axis::Horizontal, &horizontal).id("diff-horizontal-wheel"),
+            )
+        })
+        .when_some(sticky, |this, header| {
+            this.child(
+                div()
+                    .id("diff-sticky")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .bg(cx.theme().background)
+                    .block_mouse_except_scroll()
+                    .child(header),
             )
         })
         .when(has_rows, |this| {
@@ -893,7 +921,7 @@ fn render_row(
     cx: &mut App,
 ) -> AnyElement {
     match row {
-        DisplayRow::File(file) => render_file_header(*file, &code, window, cx),
+        DisplayRow::File(file) => render_file_header(*file, None, &code, window, cx),
         DisplayRow::Notice(file) => render_notice(&code.files[*file], cx),
         DisplayRow::Hunk { file, hunk } => render_hunk_separator(*file, *hunk, &code, cx),
         DisplayRow::Fold { file, pairs } => render_fold(*file, pairs.clone(), &code, cx),
@@ -1137,6 +1165,9 @@ fn conflict_tint(part: Option<ConflictPart>, cx: &App) -> Hsla {
 
 fn render_file_header(
     file: usize,
+    // ideae patch: for the header that sticks to the top, whether its file
+    // is collapsed.
+    sticky: Option<bool>,
     code: &CodePresentation,
     window: &mut Window,
     cx: &mut App,
@@ -1149,7 +1180,10 @@ fn render_file_header(
     let document = &code.files[file];
     let foreground = cx.theme().muted_foreground;
     let border = cx.theme().border;
-    let collapsed = code.state.read(cx).is_file_collapsed(document.path());
+    let (sticky, collapsed) = match sticky {
+        Some(collapsed) => (true, collapsed),
+        None => (false, code.state.read(cx).is_file_collapsed(document.path())),
+    };
     let content = if let Some(render) = &code.header.content {
         render(document, window, cx)
     } else {
@@ -1210,7 +1244,7 @@ fn render_file_header(
     v_flex()
         .id("file-header")
         .w_full()
-        .when(file > 0, |this| this.border_t_1())
+        .when(file > 0 && !sticky, |this| this.border_t_1())
         .border_b_1()
         .border_color(border)
         .child(
@@ -1244,7 +1278,7 @@ fn render_file_header(
                 )
                 .child(div().flex_1().min_w_0().child(content)),
         )
-        .children(file_annotations(file, code, window, cx))
+        .when(!sticky, |this| this.children(file_annotations(file, code, window, cx)))
         .into_any_element()
 }
 

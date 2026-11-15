@@ -65,6 +65,10 @@ IDEAE_STATE=/tmp/x/state.json scripts/drive.sh /tmp/x/run.log 7 \
 - macOS: `scripts/check-macos.sh` type-checks it from Linux (cargo-zigbuild).
   Keys go through `keys::bind`/`keys::label` (Cmd on macOS); Linux-only
   process code (`/proc`, `prctl`) needs a macOS branch (`libproc`) or a cfg.
+- macOS permissions (Screen Recording, Accessibility) are given to a
+  signature, and the linker's ad-hoc one changes with every build: run
+  `scripts/macos-sign.sh` after `cargo build --release` on a Mac where the
+  app has them, or they are gone at the next restart.
 - The repository is public: no personal paths, hostnames, emails or private project names in code, tests or commits.
 - Agents and terminals belong to tasks; whatever a task starts must end on Close, Delete and quit.
 - No comments unless the why is non-obvious.

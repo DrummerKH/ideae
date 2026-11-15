@@ -171,6 +171,154 @@ fn new_file_patch(root: &Path, file: &str, in_full: bool, patch: &mut String) {
     }
 }
 
+/// One change of a patch, on its own: a run of lines added and removed,
+/// enough to take back or to stage without the rest of its file, or of
+/// its hunk, where git puts changes a few lines apart together.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Hunk {
+    pub path: String,
+    /// The last line it changes: on the new side, or on the old one
+    /// (`modified` false) when it only removes.
+    pub line: u32,
+    pub modified: bool,
+    /// The file's header and this change as `git apply -R` takes it from
+    /// the file as it is now: the other changes of its hunk are there.
+    pub patch: String,
+    /// The same for `git apply` to the file as it was: they are not.
+    pub stage: String,
+}
+
+/// The changes of a patch `git diff` made. Not those of files that are new
+/// or gone: there the file is the change.
+pub fn hunks(patch: &str) -> Vec<Hunk> {
+    let mut found = Vec::new();
+    let (mut header, mut path, mut whole_file) = (String::new(), String::new(), false);
+    // (first old line, first new line, lines)
+    let mut open: Option<(u32, u32, Vec<&str>)> = None;
+    let mut close = |open: &mut Option<(u32, u32, Vec<&str>)>, header: &str, path: &str, whole_file: bool| {
+        let Some((old, new, lines)) = open.take() else { return };
+        if whole_file || path.is_empty() {
+            return;
+        }
+        let changed = |line: &str| line.starts_with(['+', '-']);
+        let mut at = 0;
+        while at < lines.len() {
+            if !changed(lines[at]) {
+                at += 1;
+                continue;
+            }
+            let end = (at..lines.len()).find(|&i| !changed(lines[i]) && !lines[i].starts_with('\\')).unwrap_or(lines.len());
+            // With `as_it_is` the lines the other changes added are around
+            // this one, and those they removed are not; without, the reverse.
+            let alone = |as_it_is: bool| {
+                let (mut body, mut olds, mut news, mut kept) = (String::new(), 0, 0, true);
+                for (i, line) in lines.iter().enumerate() {
+                    let (sign, rest) = line.split_at(1.min(line.len()));
+                    let here = (at..end).contains(&i);
+                    let stays = if as_it_is { "+" } else { "-" };
+                    kept = match sign {
+                        "\\" => kept,
+                        "+" | "-" if !here => sign == stays,
+                        _ => true,
+                    };
+                    if !kept {
+                        continue;
+                    }
+                    let sign = if here || !changed(line) { sign } else { " " };
+                    olds += u32::from(sign == " " || sign == "-");
+                    news += u32::from(sign == " " || sign == "+");
+                    body.push_str(sign);
+                    body.push_str(rest);
+                }
+                format!("{header}@@ -{old},{olds} +{new},{news} @@\n{body}")
+            };
+            let (mut old_line, mut new_line, mut last) = (old, new, None);
+            for (i, line) in lines.iter().enumerate().take(end) {
+                let here = i >= at;
+                match line.as_bytes().first() {
+                    Some(b'+') => {
+                        if here {
+                            last = Some((new_line, true));
+                        }
+                        new_line += 1;
+                    }
+                    Some(b'-') => {
+                        // A line added after it speaks for the change.
+                        if here && !last.is_some_and(|(_, modified)| modified) {
+                            last = Some((old_line, false));
+                        }
+                        old_line += 1;
+                    }
+                    Some(b' ') => {
+                        old_line += 1;
+                        new_line += 1;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some((line, modified)) = last {
+                found.push(Hunk { path: path.to_string(), line, modified, patch: alone(true), stage: alone(false) });
+            }
+            at = end;
+        }
+    };
+    for line in patch.split_inclusive('\n') {
+        if line.starts_with("diff --git ") {
+            close(&mut open, &header, &path, whole_file);
+            (header, path, whole_file) = (line.to_string(), String::new(), false);
+        } else if let Some(at) = line.strip_prefix("@@ -") {
+            close(&mut open, &header, &path, whole_file);
+            // "12,3 +14,5 @@ fn name"
+            let start = |side: &str| side.split(',').next().and_then(|n| n.parse::<u32>().ok()).unwrap_or(0);
+            let mut sides = at.split(' ');
+            let (old, new) = (start(sides.next().unwrap_or_default()), start(sides.next().unwrap_or_default().trim_start_matches('+')));
+            open = Some((old, new, Vec::new()));
+        } else if let Some((_, _, lines)) = open.as_mut() {
+            lines.push(line);
+        } else {
+            if line.starts_with("--- /dev/null") || line.starts_with("+++ /dev/null") || line.starts_with("Binary files") {
+                whole_file = true;
+            }
+            if let Some(name) = line.strip_prefix("+++ b/") {
+                path = name.trim_end().to_string();
+            }
+            header.push_str(line);
+        }
+    }
+    close(&mut open, &header, &path, whole_file);
+    found
+}
+
+/// Applies one hunk: to the worktree (`reverse` takes the change back),
+/// or with `cached` to the index (stages it).
+pub fn apply_hunk(root: &Path, patch: &str, reverse: bool, cached: bool) -> Result<String, String> {
+    use std::io::Write as _;
+    let mut command = crate::procs::command("git");
+    command.current_dir(root).args(["apply", "--whitespace=nowarn"]);
+    if reverse {
+        command.arg("-R");
+    }
+    if cached {
+        command.arg("--cached");
+    }
+    let mut child = command
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("git: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(patch.as_bytes());
+    }
+    let done = child.wait_with_output().map_err(|e| format!("git: {e}"))?;
+    if done.status.success() {
+        Ok(String::new())
+    } else {
+        Err(String::from_utf8_lossy(&done.stderr).lines().next().unwrap_or("the change no longer applies").to_string())
+    }
+}
+
 /// First line of each file's first hunk on the new side, keyed by path.
 pub fn first_changed_lines(patch: &str) -> std::collections::HashMap<String, u32> {
     let mut lines = std::collections::HashMap::new();
@@ -1148,6 +1296,21 @@ pub fn unsaved_work(root: &Path) -> (usize, usize) {
     (dirty, unpushed)
 }
 
+/// The file as the last commit has it, or with `since_fork` as the commit
+/// the branch left its base at has it. Empty for a file that commit lacks:
+/// every line of it is new. None for what git ignores, or outside a
+/// repository: there is nothing to compare such a file with.
+pub fn committed_text(root: &Path, file: &Path, since_fork: bool) -> Option<String> {
+    let rel = file.strip_prefix(root).ok()?.to_string_lossy().replace('\\', "/");
+    let commit = since_fork.then(|| fork_point(root)).flatten().unwrap_or_else(|| "HEAD".into());
+    if let Ok(text) = git_status(root, &["show", &format!("{commit}:./{rel}")]) {
+        return Some(text);
+    }
+    let in_repository = git_status(root, &["rev-parse", "--is-inside-work-tree"]).is_ok();
+    let ignored = git_status(root, &["check-ignore", "-q", "--", &rel]).is_ok();
+    (in_repository && !ignored).then(String::new)
+}
+
 /// A new name for the branch a worktree is on.
 pub fn rename_branch(root: &Path, from: &str, to: &str) -> Result<(), String> {
     git_status(root, &["branch", "-m", from, to]).map(|_| ())
@@ -1226,6 +1389,44 @@ mod variant_tests {
         // A later try at the task starts where the first did.
         let later = create_variant_worktrees(&repo, &["fix-c".to_string()], fork_point(&made[0]).as_deref(), false).unwrap().1.remove(0).unwrap();
         assert_eq!(head(&later), head(&repo));
+
+        // What the gutter compares a file with: the last commit, or where the branch forked.
+        assert_eq!(committed_text(&made[0], &made[0].join("f.txt"), false).as_deref(), Some("one\ntwo\n"), "A committed its line");
+        assert_eq!(committed_text(&made[0], &made[0].join("f.txt"), true).as_deref(), Some("one\n"), "before the branch");
+        assert_eq!(committed_text(&made[1], &made[1].join("g.txt"), false).as_deref(), Some(""), "a new file: all of it is new");
+        sh(&later, "echo 'build/' > .gitignore; mkdir build; echo x > build/out.txt");
+        assert_eq!(committed_text(&later, &later.join("build/out.txt"), false), None, "what git ignores is compared with nothing");
+        assert_eq!(committed_text(&base, &base.join("state.json"), false), None, "nor what is in no repository");
+
+        // One change of two in a file is taken back, then staged, the other stays.
+        sh(&repo, "seq 1 30 > n.txt; git add n.txt; git commit -qm numbers; sed -i.bak -e 's/^2$/two/' -e 's/^28$/twenty-eight/' n.txt; rm n.txt.bak");
+        let found = hunks(&working_patch(&repo));
+        assert_eq!(found.iter().map(|h| (h.path.as_str(), h.line, h.modified)).collect::<Vec<_>>(), [("n.txt", 2, true), ("n.txt", 28, true)]);
+        apply_hunk(&repo, &found[0].patch, true, false).unwrap();
+        let text = std::fs::read_to_string(repo.join("n.txt")).unwrap();
+        assert!(text.starts_with("1\n2\n3\n") && text.contains("twenty-eight"), "the first is back, the second is there");
+        apply_hunk(&repo, &hunks(&working_patch(&repo))[0].stage, false, true).unwrap();
+        assert!(git(&repo, &["diff", "--cached"]).unwrap().contains("+twenty-eight"), "staged");
+        assert!(apply_hunk(&repo, &found[0].patch, true, false).is_err(), "what is no longer there cannot be taken back");
+        sh(&repo, "git reset -q --hard; rm -f gone.txt; echo new > untracked.txt");
+        assert!(hunks(&working_patch(&repo)).is_empty(), "a new file is no hunk");
+
+        // Changes a line apart are one hunk to git, and still each its own:
+        // a line changed, one removed, two added.
+        sh(&repo, "git checkout -q -- n.txt; git reset -q; printf '1\\ntwo\\n3\\n5\\n6\\nsix\\nand a half\\n' > m.txt; seq 7 12 >> m.txt
+            seq 1 12 > n.txt; git add n.txt; git commit -qm short; mv m.txt n.txt");
+        let found = hunks(&working_patch(&repo));
+        assert_eq!(found.iter().map(|h| (h.line, h.modified)).collect::<Vec<_>>(), [(2, true), (4, false), (7, true)]);
+        let numbers = |repo: &Path| std::fs::read_to_string(repo.join("n.txt")).unwrap().replace('\n', " ");
+        apply_hunk(&repo, &found[1].patch, true, false).unwrap();
+        assert_eq!(numbers(&repo), "1 two 3 4 5 6 six and a half 7 8 9 10 11 12 ", "the removed line is back, alone");
+        apply_hunk(&repo, &found[2].stage, false, true).unwrap();
+        assert_eq!(git(&repo, &["diff", "--cached", "--numstat"]).unwrap().trim(), "2\t0\tn.txt", "only the two added lines are staged");
+        let left = hunks(&working_patch(&repo));
+        assert_eq!(left.len(), 2, "the patch is against the commit: what is staged is still in it");
+        apply_hunk(&repo, &left[0].patch, true, false).unwrap();
+        assert_eq!(numbers(&repo), "1 2 3 4 5 6 six and a half 7 8 9 10 11 12 ");
+        sh(&repo, "rm untracked.txt");
 
         assert!(!has_upstream(&made[0]));
         let parked = format!("{PARKED}/1000-fix/b");

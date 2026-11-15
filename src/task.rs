@@ -14,7 +14,7 @@ use gpui_kit::component::{
     scroll::ScrollableElement as _,
     button::{Button, ButtonVariants as _},
     diff::{Diff, DiffAnnotation, DiffEvent, DiffFile, DiffFileStatus, DiffLinePosition, DiffLineRange, DiffMode, DiffSide, DiffState},
-    input::{DefinitionProvider, Editor, EditorState, HoverProvider, InputEvent, Position, Rope, RopeExt as _},
+    input::{CodeActionProvider, CompletionProvider, DefinitionProvider, Editor, EditorState, HoverProvider, InputEvent, Position, Rope, RopeExt as _},
     resizable::{h_resizable, resizable_panel},
     tab::{Tab, TabBar},
     list::ListItem,
@@ -292,6 +292,7 @@ fn shell_quote(s: &str) -> String {
 // ---------------------------------------------------------------- file
 
 actions!(ideae_file, [SaveFile, ExpandSelection, ShrinkSelection, ToggleComment, ShowOutline, ShowUsages, SendToAgent]);
+actions!(ideae_edit, [DeleteLine, DuplicateLine, MoveLineUp, MoveLineDown, JoinLines, ToggleCase, NextOccurrence, GoToLine, RenameSymbol, FormatFile]);
 actions!(ideae_task, [ToggleZoom, SendDiffToAgent, CommentOnDiff, FindInTerminal]);
 
 actions!(ideae_task, [NextTab, PrevTab, NavigateBack, NavigateForward]);
@@ -349,6 +350,16 @@ pub struct FileView {
     lsp_missing: Option<&'static str>,
     /// Markdown shown as it reads instead of its source.
     preview: bool,
+    /// The text whose next occurrence was added to the selection last,
+    /// and where that one ends.
+    occurrence: Option<(String, usize)>,
+    /// The file as the last commit has it, for the gutter's marks of what
+    /// changed since; None for a file that commit lacks.
+    committed: Option<Arc<str>>,
+    _marks: Task<()>,
+    /// The count of the language server's reports when its problems were
+    /// last put into the editor.
+    problems_seen: u64,
     _poll: Task<()>,
 }
 
@@ -403,8 +414,37 @@ fn changed_on_disk(known: Vec<(PathBuf, Option<std::time::SystemTime>)>) -> Vec<
 }
 
 impl FileView {
+    /// The gutter's marks of what differs from the last commit: green by
+    /// the lines added, blue by those changed, red where some are gone.
+    /// After `typing`, once it pauses.
+    fn mark_changes(&mut self, typing: bool, cx: &mut Context<Self>) {
+        use gpui_kit::base::input::LineMarks;
+        let Some(committed) = self.committed.clone() else {
+            // Nothing to compare with: git ignores it, or there is no repository.
+            self.editor.update(cx, |state, cx| state.set_line_marks(LineMarks::default(), cx));
+            return;
+        };
+        self._marks = cx.spawn(async move |this, cx| {
+            if typing {
+                cx.background_executor().timer(Duration::from_millis(250)).await;
+            }
+            // Taken once typing pauses, not on every key: it is the whole file.
+            let Ok(text) = this.update(cx, |this, cx| this.editor.read(cx).value()) else { return };
+            let changes = cx.background_spawn(async move { crate::edit::line_changes(&committed, &text) }).await;
+            let _ = this.update(cx, |this, cx| {
+                let (added, changed, gone) = (hsla(0.33, 0.6, 0.45, 1.), hsla(0.58, 0.7, 0.55, 1.), hsla(0.0, 0.7, 0.55, 1.));
+                let mut marks = LineMarks::default();
+                marks.rows.extend(changes.added.into_iter().map(|row| (row, added)));
+                marks.rows.extend(changes.changed.into_iter().map(|row| (row, changed)));
+                marks.gone_before.extend(changes.gone_before.into_iter().map(|row| (row, gone)));
+                this.editor.update(cx, |state, cx| state.set_line_marks(marks, cx));
+            });
+        });
+    }
+
     fn on_edit(&mut self, cx: &mut Context<Self>) {
         self.edit_version += 1;
+        self.mark_changes(true, cx);
         let dirty = !same_text(self.editor.read(cx).text(), &self.saved);
         if dirty != self.dirty {
             self.dirty = dirty;
@@ -548,9 +588,13 @@ impl FileView {
     pub fn load_blame(&mut self, cx: &mut Context<Self>) {
         let (root, path) = (self.root.clone(), self.path.clone());
         self._blame = cx.spawn(async move |this, cx| {
-            let blame = cx.background_spawn(async move { git::blame(&root, &path) }).await;
+            let since_base = crate::state::settings().gutter_since_base;
+            let (blame, committed) =
+                cx.background_spawn(async move { (git::blame(&root, &path), git::committed_text(&root, &path, since_base)) }).await;
             let _ = this.update(cx, |this, cx| {
                 this.blame = Rc::new(blame);
+                this.committed = committed.map(Arc::from);
+                this.mark_changes(false, cx);
                 cx.notify();
             });
         });
@@ -630,6 +674,204 @@ impl FileView {
         });
     }
 
+    /// One edit of the text, undone as one: what `change` makes of the
+    /// text and the selection.
+    fn edit(&mut self, window: &mut Window, cx: &mut Context<Self>, change: impl FnOnce(&str, std::ops::Range<usize>) -> Option<crate::edit::Edit>) {
+        let (text, selection) = {
+            let state = self.editor.read(cx);
+            (state.text().to_string(), state.selected_range())
+        };
+        let Some(edit) = change(&text, selection) else { return };
+        self.editor.update(cx, |state, cx| {
+            state.set_selected_range(edit.range, cx);
+            state.replace(edit.text, window, cx);
+            state.set_selected_range(edit.select, cx);
+        });
+    }
+
+    /// The word under the cursor, then with every press one more place
+    /// where the selected text is: all of them are typed over at once.
+    fn select_next_occurrence(&mut self, cx: &mut Context<Self>) {
+        let (text, selection) = {
+            let state = self.editor.read(cx);
+            (state.text().to_string(), state.selected_range())
+        };
+        if selection.is_empty() {
+            self.occurrence = None;
+            if let Some(word) = crate::edit::word_at(&text, selection.start) {
+                self.editor.update(cx, |state, cx| state.set_selected_range(word, cx));
+            }
+            return;
+        }
+        let needle = text[selection.clone()].to_string();
+        // After the one added last, while the same text is being looked for.
+        let from = self.occurrence.as_ref().filter(|(of, _)| *of == needle).map_or(selection.end, |(_, end)| *end);
+        if let Some(found) = crate::edit::next_occurrence(&text, &needle, from, selection.start) {
+            self.occurrence = Some((needle, found.end));
+            self.editor.update(cx, |state, cx| state.add_selection(found, cx));
+        }
+    }
+
+    /// The language server's latest word on what is wrong in the file, into
+    /// the editor: underlined there, with the fixes it offers.
+    fn show_problems(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = &self.lsp_client else { return };
+        let (count, found) = client.problems(&lsp::path_to_uri(&self.path));
+        if count == self.problems_seen {
+            return;
+        }
+        self.problems_seen = count;
+        self.editor.update(cx, |state, cx| {
+            let text = state.text().clone();
+            if let Some(shown) = state.diagnostics_mut() {
+                shown.reset(&text);
+                shown.extend(found);
+            }
+            cx.notify();
+        });
+    }
+
+    /// Every edit of a workspace edit: those of this file in the editor,
+    /// undone there as one; those of others on disk, where their tabs pick
+    /// them up. How many files changed.
+    fn apply_workspace_edit(&mut self, edit: &lsp_types::WorkspaceEdit, window: &mut Window, cx: &mut Context<Self>) -> usize {
+        let mut files = 0;
+        for (path, edits) in lsp::edits_by_file(edit) {
+            if path == self.path {
+                let before = files;
+                self.edit(window, cx, |text, selection| {
+                    let rewritten = crate::edit::rewrite(text, &lsp::apply_edits(text, &edits), selection.start);
+                    files += usize::from(rewritten.is_some());
+                    rewritten
+                });
+                debug_assert!(files >= before);
+            } else if let Ok(text) = std::fs::read_to_string(&path) {
+                let new = lsp::apply_edits(&text, &edits);
+                files += usize::from(new != text && std::fs::write(&path, new).is_ok());
+            }
+        }
+        files
+    }
+
+    /// The server is told the text as it is now, then asked: the answer
+    /// comes back to `then`, in the window.
+    fn ask_server<T: Send + 'static>(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        ask: impl FnOnce(&lsp::LspClient, &str, lsp_types::Position) -> anyhow::Result<T> + Send + 'static,
+        then: impl FnOnce(&mut Self, T, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        let Some(client) = self.lsp_client.clone() else {
+            window.push_notification(Notification::info("No language server runs for this file."), cx);
+            return;
+        };
+        let (path, text, pos) = {
+            let state = self.editor.read(cx);
+            (self.path.clone(), state.value().to_string(), state.cursor_position())
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let uri = lsp::path_to_uri(&path);
+            let answer = cx
+                .background_spawn(async move {
+                    client.did_change(&path, 0, &text)?;
+                    ask(&client, &uri, pos)
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| match answer {
+                Ok(answer) => then(this, answer, window, cx),
+                Err(e) => window.push_notification(Notification::error(format!("{e:#}")).title("Language server"), cx),
+            });
+        })
+        .detach();
+    }
+
+    /// Formats the file as its language server would.
+    fn format(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ask_server(window, cx, |client, uri, _| client.formatting(uri, 4, true), |this, edits, window, cx| {
+            this.edit(window, cx, |text, selection| crate::edit::rewrite(text, &lsp::apply_edits(text, &edits), selection.start));
+        });
+    }
+
+    /// Asks for a new name of the symbol under the cursor and gives it that
+    /// name everywhere the language server knows it.
+    fn rename_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let old = {
+            let state = self.editor.read(cx);
+            let text = state.text().to_string();
+            crate::edit::word_at(&text, state.selected_range().start).map(|word| text[word].to_string()).unwrap_or_default()
+        };
+        if old.is_empty() {
+            return;
+        }
+        let input = cx.new(|cx| gpui_kit::component::input::InputState::new(window, cx));
+        input.update(cx, |input, cx| {
+            input.set_value(old.clone(), window, cx);
+            input.select_all(window, cx);
+        });
+        cx.subscribe_in(&input, window, move |this, input, event: &InputEvent, window, cx| {
+            let InputEvent::PressEnter { .. } = event else { return };
+            let name = input.read(cx).value().trim().to_string();
+            window.close_dialog(cx);
+            if name.is_empty() || name == old {
+                return;
+            }
+            this.ask_server(
+                window,
+                cx,
+                move |client, uri, pos| client.rename(uri, pos, &name),
+                |this, edit, window, cx| {
+                    let files = edit.map_or(0, |edit| this.apply_workspace_edit(&edit, window, cx));
+                    let told = match files {
+                        0 => "Nothing to rename here.".to_string(),
+                        1 => "Renamed in 1 file.".to_string(),
+                        n => format!("Renamed in {n} files."),
+                    };
+                    window.push_notification(Notification::info(told), cx);
+                },
+            );
+        })
+        .detach();
+        let focused = Rc::new(std::cell::Cell::new(false));
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (input, focused) = (input.clone(), focused.clone());
+            dialog.title("Rename").w(px(420.)).content(move |content, window, cx| {
+                if !focused.replace(true) {
+                    let input = input.clone();
+                    window.defer(cx, move |window, cx| input.read(cx).focus_handle(cx).focus(window, cx));
+                }
+                content.child(gpui_kit::component::input::Input::new(&input))
+            })
+        });
+    }
+
+    /// Asks for a line, `120` or `120:8`, and puts the cursor there.
+    fn go_to_line_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let lines = self.editor.read(cx).text().to_string().lines().count().max(1);
+        let input = cx.new(|cx| gpui_kit::component::input::InputState::new(window, cx).placeholder(format!("Line, or line:column, of {lines}")));
+        cx.subscribe_in(&input, window, |this, input, event: &InputEvent, window, cx| {
+            let InputEvent::PressEnter { .. } = event else { return };
+            let typed = input.read(cx).value().trim().to_string();
+            let (line, column) = typed.split_once(':').unwrap_or((typed.as_str(), "1"));
+            if let Ok(line) = line.trim().parse::<u32>() {
+                window.close_dialog(cx);
+                this.go_to_line(line.saturating_sub(1), column.trim().parse::<u32>().unwrap_or(1).saturating_sub(1), window, cx);
+            }
+        })
+        .detach();
+        let focused = Rc::new(std::cell::Cell::new(false));
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (input, focused) = (input.clone(), focused.clone());
+            dialog.title("Go to line").w(px(360.)).content(move |content, window, cx| {
+                if !focused.replace(true) {
+                    let input = input.clone();
+                    window.defer(cx, move |window, cx| input.read(cx).focus_handle(cx).focus(window, cx));
+                }
+                content.child(gpui_kit::component::input::Input::new(&input))
+            })
+        });
+    }
+
     fn go_to_line(&mut self, line: u32, col: u32, window: &mut Window, cx: &mut Context<Self>) {
         self.editor.update(cx, |state, cx| {
             state.jump_to_position(Position::new(line, col), JUMP_AT, window, cx);
@@ -700,6 +942,16 @@ impl Render for FileView {
             .on_action(cx.listener(|this, _: &ExpandSelection, _, cx| this.expand_selection(cx)))
             .on_action(cx.listener(|this, _: &ShrinkSelection, _, cx| this.shrink_selection(cx)))
             .on_action(cx.listener(|this, _: &ToggleComment, window, cx| this.toggle_comment(window, cx)))
+            .on_action(cx.listener(|this, _: &DeleteLine, window, cx| this.edit(window, cx, |text, selection| Some(crate::edit::delete_lines(text, selection)))))
+            .on_action(cx.listener(|this, _: &DuplicateLine, window, cx| this.edit(window, cx, |text, selection| Some(crate::edit::duplicate(text, selection)))))
+            .on_action(cx.listener(|this, _: &MoveLineUp, window, cx| this.edit(window, cx, |text, selection| crate::edit::move_lines(text, selection, true))))
+            .on_action(cx.listener(|this, _: &MoveLineDown, window, cx| this.edit(window, cx, |text, selection| crate::edit::move_lines(text, selection, false))))
+            .on_action(cx.listener(|this, _: &JoinLines, window, cx| this.edit(window, cx, crate::edit::join_lines)))
+            .on_action(cx.listener(|this, _: &ToggleCase, window, cx| this.edit(window, cx, crate::edit::toggle_case)))
+            .on_action(cx.listener(|this, _: &NextOccurrence, _, cx| this.select_next_occurrence(cx)))
+            .on_action(cx.listener(|this, _: &GoToLine, window, cx| this.go_to_line_dialog(window, cx)))
+            .on_action(cx.listener(|this, _: &RenameSymbol, window, cx| this.rename_dialog(window, cx)))
+            .on_action(cx.listener(|this, _: &FormatFile, window, cx| this.format(window, cx)))
             .child(
                 h_flex()
                     .justify_between()
@@ -851,6 +1103,77 @@ impl Render for FileView {
 struct LspBridge {
     client: Arc<lsp::LspClient>,
     uri: String,
+    path: PathBuf,
+    file: WeakEntity<FileView>,
+}
+
+impl CompletionProvider for LspBridge {
+    fn completions(
+        &self,
+        text: &Rope,
+        offset: usize,
+        trigger: lsp_types::CompletionContext,
+        _: &mut Window,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<lsp_types::CompletionResponse>> {
+        let pos = text.offset_to_position(offset);
+        let (client, uri, path, text) = (self.client.clone(), self.uri.clone(), self.path.clone(), text.to_string());
+        cx.background_spawn(async move {
+            // The server answers about the text it has: this one, typed a moment ago.
+            client.did_change(&path, 0, &text)?;
+            client.completion(&uri, pos, trigger.trigger_character)
+        })
+    }
+
+    fn is_completion_trigger(&self, _: usize, new_text: &str, _: &mut App) -> bool {
+        let Some(last) = new_text.chars().last() else { return false };
+        last.is_alphanumeric() || last == '_' || self.client.completion_triggers().iter().any(|t| new_text.ends_with(t.as_str()))
+    }
+}
+
+impl CodeActionProvider for LspBridge {
+    fn id(&self) -> SharedString {
+        "lsp".into()
+    }
+
+    fn code_actions(
+        &self,
+        state: Entity<EditorState>,
+        range: std::ops::Range<usize>,
+        _: &mut Window,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<Vec<lsp_types::CodeAction>>> {
+        let (text, range) = {
+            let text = state.read(cx).text();
+            (text.to_string(), lsp_types::Range::new(text.offset_to_position(range.start), text.offset_to_position(range.end)))
+        };
+        let (client, uri, path) = (self.client.clone(), self.uri.clone(), self.path.clone());
+        cx.background_spawn(async move {
+            client.did_change(&path, 0, &text)?;
+            client.code_actions(&uri, range)
+        })
+    }
+
+    fn perform_code_action(
+        &self,
+        _: Entity<EditorState>,
+        action: lsp_types::CodeAction,
+        _: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<()>> {
+        let (client, file) = (self.client.clone(), self.file.clone());
+        window.spawn(cx, async move |cx| {
+            let action = match action.edit {
+                Some(_) => action,
+                None => cx.background_spawn(async move { client.resolve_code_action(&action) }).await?,
+            };
+            let Some(edit) = action.edit else { return Ok(()) };
+            file.update_in(cx, |file, window, cx| {
+                file.apply_workspace_edit(&edit, window, cx);
+            })
+        })
+    }
 }
 
 impl HoverProvider for LspBridge {
@@ -915,6 +1238,9 @@ pub struct ChangesView {
     base: Option<String>,
     /// First changed line per file in the diff shown, for "open".
     first_lines: Rc<HashMap<String, u32>>,
+    /// The single changes of the diff shown: each can be taken back or
+    /// staged without the rest of its file.
+    hunks: Rc<Vec<git::Hunk>>,
     selection: Option<DiffLineRange>,
     task: WeakEntity<TaskView>,
     /// The branches to compare with, for the menu: listed off the UI thread.
@@ -964,6 +1290,7 @@ impl ChangesView {
             review: Vec::new(),
             selected_code: String::new(),
             branches,
+            hunks: Rc::default(),
         }
     }
 
@@ -1159,13 +1486,14 @@ impl ChangesView {
         self.scope = scope;
         // Read from the task rather than asking it to push: it would read this
         // view back while it is being updated.
-        let Ok((files, lines)) = self.task.read_with(cx, |task, _| match scope {
-            DiffScope::Uncommitted => (task.uncommitted_diff.clone(), task.uncommitted_lines.clone()),
-            DiffScope::Branch => (task.branch_diff.clone(), task.branch_lines.clone()),
+        let Ok((files, lines, hunks)) = self.task.read_with(cx, |task, _| match scope {
+            DiffScope::Uncommitted => (task.uncommitted_diff.clone(), task.uncommitted_lines.clone(), task.uncommitted_hunks.clone()),
+            DiffScope::Branch => (task.branch_diff.clone(), task.branch_lines.clone(), task.branch_hunks.clone()),
         }) else {
             return;
         };
         self.first_lines = lines;
+        self.hunks = hunks;
         self.diff.update(cx, |d, cx| d.set_files(files, cx));
         cx.notify();
     }
@@ -1289,17 +1617,56 @@ impl Render for ChangesView {
                     let notes = Rc::new(self.review.clone());
                     let view = cx.weak_entity();
                     let add_view = cx.weak_entity();
+                    // Under each change, what can be done with it alone.
+                    let (hunks, task, staging) = (self.hunks.clone(), self.task.clone(), self.scope == DiffScope::Uncommitted);
+                    let hunk_notes = hunks.iter().enumerate().map(|(i, h)| {
+                        let side = if h.modified { DiffSide::Modified } else { DiffSide::Original };
+                        DiffAnnotation::line(("hunk", i), DiffLinePosition::new(h.path.clone(), side, h.line as usize))
+                    });
                     this.child(
                         Diff::new(&self.diff)
-                            .annotations(notes.iter().enumerate().map(|(i, n)| {
-                                let side = if n.modified_side { DiffSide::Modified } else { DiffSide::Original };
-                                DiffAnnotation::line(("review-note", i), DiffLinePosition::new(n.path.clone(), side, n.line))
-                            }))
+                            .annotations(
+                                notes
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, n)| {
+                                        let side = if n.modified_side { DiffSide::Modified } else { DiffSide::Original };
+                                        DiffAnnotation::line(("review-note", i), DiffLinePosition::new(n.path.clone(), side, n.line))
+                                    })
+                                    .chain(hunk_notes)
+                                    .collect::<Vec<_>>(),
+                            )
                             .render_annotation(move |annotation, _, cx| {
-                                let i = match annotation.id() {
-                                    ElementId::NamedInteger(_, i) => *i as usize,
-                                    _ => usize::MAX,
+                                let (kind, i) = match annotation.id() {
+                                    ElementId::NamedInteger(kind, i) => (kind.clone(), *i as usize),
+                                    _ => (SharedString::default(), usize::MAX),
                                 };
+                                if kind.as_ref() == "hunk" {
+                                    let Some(hunk) = hunks.get(i).cloned() else { return div().into_any_element() };
+                                    let (revert, stage, staged) = (task.clone(), task.clone(), hunk.clone());
+                                    return h_flex()
+                                        .justify_end()
+                                        .gap_1()
+                                        .px_2()
+                                        .child(
+                                            Button::new(("hunk-revert", i))
+                                                .xsmall()
+                                                .ghost()
+                                                .label("↺ revert")
+                                                .tooltip("Take this change back; the rest of the file stays (Undo follows)")
+                                                .on_click(move |_, window, cx| {
+                                                    let _ = revert.update(cx, |t, cx| t.revert_hunk(hunk.clone(), window, cx));
+                                                }),
+                                        )
+                                        .when(staging, |row| {
+                                            row.child(Button::new(("hunk-stage", i)).xsmall().ghost().label("+ stage").tooltip("Stage this change alone").on_click(
+                                                move |_, window, cx| {
+                                                    let _ = stage.update(cx, |t, cx| t.stage_hunk(staged.clone(), window, cx));
+                                                },
+                                            ))
+                                        })
+                                        .into_any_element();
+                                }
                                 let text = notes.get(i).map(|n| n.text.clone()).unwrap_or_default();
                                 let view = view.clone();
                                 h_flex()
@@ -1322,6 +1689,7 @@ impl Render for ChangesView {
                                             cx.notify();
                                         });
                                     }))
+                                    .into_any_element()
                             })
                             .on_add_annotation(move |range, window, cx| {
                                 let _ = add_view.update(cx, |c, cx| {
@@ -1333,7 +1701,12 @@ impl Render for ChangesView {
                             .line_number(true)
                             .render_header_suffix({
                                 let (root, task, lines) = (self.root.clone(), self.task.clone(), self.first_lines.clone());
-                                move |file, _, _| open_file_button(&root, &task, file, &lines)
+                                move |file, _, cx| {
+                                    h_flex()
+                                        .gap_2()
+                                        .when(staging, |row| row.child(viewed_checkbox(&task, file, cx)))
+                                        .child(open_file_button(&root, &task, file, &lines))
+                                }
                             })
                             .on_line_click({
                                 let view = cx.weak_entity();
@@ -1566,6 +1939,9 @@ pub struct TaskView {
     /// The first changed line of each file, per scope, for "open".
     uncommitted_lines: Rc<HashMap<String, u32>>,
     branch_lines: Rc<HashMap<String, u32>>,
+    /// The single changes of each, to take back or stage one alone.
+    uncommitted_hunks: Rc<Vec<git::Hunk>>,
+    branch_hunks: Rc<Vec<git::Hunk>>,
     /// The Changes tab shows an older diff than the one read last.
     diff_stale: bool,
     branch_info: git::BranchInfo,
@@ -1794,6 +2170,8 @@ impl TaskView {
             branch_diff: Vec::new(),
             uncommitted_lines: Rc::default(),
             branch_lines: Rc::default(),
+            uncommitted_hunks: Rc::default(),
+            branch_hunks: Rc::default(),
             diff_stale: false,
             branch_info: git::BranchInfo::default(),
             right: RightPane::Changes,
@@ -2731,6 +3109,16 @@ impl TaskView {
             .then(|| div().text_xs().text_color(gpui_kit::blue()).child(if editing { "editing" } else { "●" }))
     }
 
+    /// The open files look again at what they differ from: after the
+    /// setting of what the gutter compares with changed.
+    pub fn reload_gutters(&mut self, cx: &mut Context<Self>) {
+        for tab in &self.tabs {
+            if let TabKind::File(file) = &tab.kind {
+                file.update(cx, |f, cx| f.load_blame(cx));
+            }
+        }
+    }
+
     pub fn change_count(&self) -> usize {
         self.files.len()
     }
@@ -2969,7 +3357,8 @@ impl TaskView {
     }
 
     fn apply_patch(&mut self, parsed: ParsedPatch, cx: &mut Context<Self>) {
-        let ParsedPatch { files, first_lines, hashes } = parsed;
+        let ParsedPatch { files, first_lines, hashes, hunks } = parsed;
+        self.uncommitted_hunks = Rc::new(hunks);
         self.files = files
             .iter()
             .map(|f| ChangedFile {
@@ -3001,6 +3390,7 @@ impl TaskView {
         if let Some(parsed) = parsed {
             self.branch_diff = parsed.files;
             self.branch_lines = Rc::new(parsed.first_lines);
+            self.branch_hunks = Rc::new(parsed.hunks);
         }
         self.changes.update(cx, |c, _| c.base = base);
         self.refresh_scope(DiffScope::Branch, cx);
@@ -3047,11 +3437,16 @@ impl TaskView {
             DiffScope::Uncommitted => (self.uncommitted_diff.clone(), self.uncommitted_lines.clone()),
             DiffScope::Branch => (self.branch_diff.clone(), self.branch_lines.clone()),
         };
+        let hunks = match scope {
+            DiffScope::Uncommitted => self.uncommitted_hunks.clone(),
+            DiffScope::Branch => self.branch_hunks.clone(),
+        };
         let diff = self.changes.read(cx).diff.clone();
         diff.update(cx, |state, cx| state.set_files(files, cx));
         self.changes.update(cx, |c, cx| {
             c.counts = counts;
             c.first_lines = lines;
+            c.hunks = hunks;
             cx.notify();
         });
     }
@@ -3498,8 +3893,9 @@ impl TaskView {
         let touched = self.agent_touched.clone();
         let editing = self.agent_editing.clone();
         div().flex_1().min_h_0().child(
-            tree(&self.tree, move |ix, entry, selected, _, _| {
+            tree(&self.tree, move |ix, entry, selected, _, cx| {
                 let item = entry.item();
+                let label = if entry.is_folder() { StyledText::new(item.label.clone()) } else { file_label(item.label.clone(), cx) };
                 let icon = if !entry.is_folder() {
                     IconName::File
                 } else if entry.is_expanded() {
@@ -3534,7 +3930,7 @@ impl TaskView {
                             .gap_2()
                             .text_sm()
                             .child(icon)
-                            .child(div().truncate().child(item.label.clone()))
+                            .child(div().truncate().child(label))
                             .when(is_changed && agent.is_none(), |this| this.child(div().text_xs().text_color(gpui_kit::green()).child("●")))
                             .when_some(agent, |this, mark| this.child(div().text_xs().text_color(gpui_kit::blue()).child(mark))),
                     )
@@ -3661,13 +4057,20 @@ impl TaskView {
             lsp_program: String::new(),
             lsp_missing: None,
             preview: false,
+            occurrence: None,
+            committed: None,
+            _marks: Task::ready(()),
+            problems_seen: 0,
             // Re-render while the server reports progress, so the header can
             // say "indexing" instead of a misleading "ready".
             _poll: cx.spawn(async move |this: WeakEntity<FileView>, cx| {
                 let mut last = None;
                 loop {
                     cx.background_executor().timer(Duration::from_millis(500)).await;
-                    let Ok(busy) = this.update(cx, |f, _| f.lsp_client.as_ref().map(|c| (c.busy(), c.problem()))) else {
+                    let Ok(busy) = this.update(cx, |f, cx| {
+                        f.show_problems(cx);
+                        f.lsp_client.as_ref().map(|c| (c.busy(), c.problem()))
+                    }) else {
                         break;
                     };
                     if busy != last {
@@ -3782,12 +4185,14 @@ impl TaskView {
         })
         .detach();
 
-        let bridge = Rc::new(LspBridge { client, uri: lsp::path_to_uri(path) });
+        let bridge = Rc::new(LspBridge { client, uri: lsp::path_to_uri(path), path: path.clone(), file: file.downgrade() });
         let task = cx.weak_entity();
         let this_path = path.clone();
         editor.update(cx, |state, cx| {
             let lsp = state.lsp_mut();
             lsp.hover_provider = Some(bridge.clone());
+            lsp.completion_provider = Some(bridge.clone());
+            lsp.code_action_providers = vec![bridge.clone()];
             lsp.definition_provider = Some(UsagesAtDeclaration::wrap(bridge, &this_path));
             lsp.show_document = Some(show_document_handler(task, this_path));
             cx.notify();
@@ -4341,6 +4746,10 @@ impl TaskView {
         self.viewed.get(file.path.as_ref()) == Some(&file.hash)
     }
 
+    fn is_path_viewed(&self, path: &str) -> bool {
+        self.files.iter().any(|f| f.path.as_ref() == path && self.viewed.get(path) == Some(&f.hash))
+    }
+
     fn toggle_viewed(&mut self, path: &str, cx: &mut Context<Self>) {
         let Some(file) = self.files.iter().find(|f| f.path.as_ref() == path) else { return };
         if self.viewed.get(path) == Some(&file.hash) {
@@ -4348,6 +4757,7 @@ impl TaskView {
         } else {
             self.viewed.insert(path.to_string(), file.hash);
         }
+        self.changes.update(cx, |_, cx| cx.notify());
         cx.emit(TaskEvent::Changed);
         cx.notify();
     }
@@ -4371,6 +4781,8 @@ impl TaskView {
         let keyboard = self.side_has_focus.get() && self.right == RightPane::Changes && ix == self.side_selected;
         let viewed = self.is_viewed(ix);
         let view_path = file.path.to_string();
+        let discard_path = file.path.to_string();
+        let view = cx.weak_entity();
         h_flex()
             .id(("file", id))
             .when(keyboard, |row| row.border_l_2().border_color(cx.theme().primary))
@@ -4383,7 +4795,7 @@ impl TaskView {
             .cursor_pointer()
             .hover(|s| s.bg(cx.theme().accent))
             .child(div().w(px(12.)).text_color(cx.theme().muted_foreground).child(status))
-            .child(div().flex_1().min_w_0().truncate().when(viewed, |d| d.text_color(cx.theme().muted_foreground)).child(name))
+            .child(div().flex_1().min_w_0().truncate().when(viewed, |d| d.text_color(cx.theme().muted_foreground)).child(file_label(name.into(), cx)))
             .children(self.agent_mark(&file.path))
             .when(viewed, |row| row.child(div().text_xs().text_color(gpui_kit::green()).child("✓")))
             .child(div().text_xs().text_color(gpui_kit::green()).child(format!("+{}", file.additions)))
@@ -4404,33 +4816,6 @@ impl TaskView {
                                 this.toggle_viewed(&view_path, cx)
                             })),
                     )
-                    .when(!deleted, |row| {
-                        row.child(
-                            Button::new(("open", id))
-                                .xsmall()
-                                .ghost()
-                                .label("open")
-                                .tooltip("Open the file at its first change")
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    cx.stop_propagation();
-                                    this.open_file(open_path.clone(), open_line, window, cx)
-                                })),
-                        )
-                    })
-                    .when(!in_staged, |row| {
-                        let discard_path = file.path.to_string();
-                        row.child(
-                            Button::new(("discard", id))
-                                .xsmall()
-                                .ghost()
-                                .label("↺")
-                                .tooltip("Discard the changes to this file (Undo follows)")
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    cx.stop_propagation();
-                                    this.confirm_discard(discard_path.clone(), window, cx)
-                                })),
-                        )
-                    })
                     .child(
                         Button::new(("stage", id))
                             .xsmall()
@@ -4444,7 +4829,55 @@ impl TaskView {
                     ),
             )
             .on_click(cx.listener(move |this, _, window, cx| this.show_changed_file(path.clone(), window, cx)))
+            .context_menu(move |menu, _, _| {
+                use gpui_kit::component::menu::PopupMenuItem;
+                let (open_view, open_path) = (view.clone(), open_path.clone());
+                let (discard_view, discard_path) = (view.clone(), discard_path.clone());
+                menu.when(!deleted, |menu| {
+                    menu.item(PopupMenuItem::new("Open").on_click(move |_, window, cx| {
+                        let path = open_path.clone();
+                        open_view.update(cx, |this, cx| this.open_file(path, open_line, window, cx)).ok();
+                    }))
+                })
+                .when(!in_staged, |menu| {
+                    menu.item(PopupMenuItem::new("Discard changes").on_click(move |_, window, cx| {
+                        let path = discard_path.clone();
+                        discard_view.update(cx, |this, cx| this.confirm_discard(path, window, cx)).ok();
+                    }))
+                })
+            })
             .into_any_element()
+    }
+
+    /// Takes one change of a file back; what the file was is kept for Undo
+    /// until the next git action, as when the whole file is discarded.
+    fn revert_hunk(&mut self, hunk: git::Hunk, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy.is_some() {
+            return;
+        }
+        let kept: Arc<std::sync::Mutex<Option<git::FileSnapshot>>> = Arc::default();
+        let slot = kept.clone();
+        self.run_action(
+            "Revert",
+            move |root| {
+                *slot.lock().unwrap() = Some(git::snapshot(&root, &hunk.path));
+                git::apply_hunk(&root, &hunk.patch, true, false).map(|_| format!("Took a change of {} back", hunk.path))
+            },
+            false,
+            window,
+            cx,
+        );
+        self.discard_undo = Some(kept);
+    }
+
+    fn stage_hunk(&mut self, hunk: git::Hunk, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_action(
+            "Stage",
+            move |root| git::apply_hunk(&root, &hunk.stage, false, true).map(|_| format!("Staged a change of {}", hunk.path)),
+            false,
+            window,
+            cx,
+        );
     }
 
     /// Discards at once; what was there is kept for Undo until the next
@@ -4722,6 +5155,7 @@ struct ParsedPatch {
     files: Vec<DiffFile>,
     first_lines: HashMap<String, u32>,
     hashes: HashMap<String, u64>,
+    hunks: Vec<git::Hunk>,
 }
 
 fn text_hash(text: &str) -> u64 {
@@ -4741,6 +5175,7 @@ fn parse_patch(patch: String, seen: &mut u64) -> Option<ParsedPatch> {
     Some(ParsedPatch {
         first_lines: git::first_changed_lines(&patch),
         hashes: file_patch_hashes(&patch),
+        hunks: git::hunks(&patch),
         files: with_languages(files),
     })
 }
@@ -5127,6 +5562,31 @@ mod outline_tests {
         let labels: Vec<String> = outline(Path::new("a.kt"), kt).into_iter().map(|i| i.label).collect();
         assert!(labels.iter().any(|l| l.ends_with("count")), "{labels:?}");
     }
+}
+
+/// A file name whose extension steps back: the name is what is read.
+fn file_label(name: SharedString, cx: &App) -> StyledText {
+    let extension = name
+        .rfind('.')
+        .filter(|&dot| dot > 0)
+        .map(|dot| (dot..name.len(), HighlightStyle { color: Some(cx.theme().muted_foreground), ..Default::default() }));
+    StyledText::new(name).with_highlights(extension)
+}
+
+/// "Viewed" in a diff file's header, the mark the Changes list shows too.
+fn viewed_checkbox(task: &WeakEntity<TaskView>, file: &DiffFile, cx: &App) -> AnyElement {
+    let path = file.path().clone();
+    let viewed = task.upgrade().is_some_and(|t| t.read(cx).is_path_viewed(&path));
+    let task = task.clone();
+    gpui_kit::component::checkbox::Checkbox::new(SharedString::from(format!("viewed-{path}")))
+        .label("Viewed")
+        .checked(viewed)
+        .tooltip("Viewed until it changes again")
+        .on_click(move |_, _, cx| {
+            cx.stop_propagation();
+            let _ = task.update(cx, |t, cx| t.toggle_viewed(&path, cx));
+        })
+        .into_any_element()
 }
 
 /// "open" in a diff file's header: the file as it is now, at the first line

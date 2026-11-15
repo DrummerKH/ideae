@@ -111,6 +111,19 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
                     |s, v| s.agent_lsp = v,
                 )),
         ),
+        SettingPage::new("Editor").group(SettingGroup::new().item(switch(
+            draft,
+            "CamelHumps words",
+            "Moving, selecting and deleting by word stops at the humps of camelCase and at the underscores of snake_case.",
+            |s| s.hump_words,
+            |s, v| s.hump_words = v,
+        )).item(switch(
+            draft,
+            "Gutter marks against the base branch",
+            "The marks beside the line numbers show what the task changed since it left its base branch, not only since the last commit.",
+            |s| s.gutter_since_base,
+            |s, v| s.gutter_since_base = v,
+        ))),
         SettingPage::new("Tasks").group(
             SettingGroup::new()
                 .item(switch(
@@ -333,12 +346,12 @@ mod tests {
     #[gpui_kit::test]
     fn every_page_draws(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
-        for page in 0..5 {
+        for page in 0..6 {
             let handle = window(cx);
             cx.update_window(handle, |_, window, cx| {
                 open(state::Settings::default(), page, window, cx, |_, _| {});
                 window.render_frame(cx);
-                assert_eq!(window.try_find("key-row-quit").is_some(), page == 4, "page {page}");
+                assert_eq!(window.try_find("key-row-quit").is_some(), page == 5, "page {page}");
             })
             .unwrap();
         }
@@ -353,7 +366,7 @@ mod tests {
             let mut current = state::Settings::default();
             current.agent = " mine ".into();
             let saved = saved.clone();
-            open(current, 4, window, cx, move |settings, _| *saved.borrow_mut() = Some(settings));
+            open(current, 5, window, cx, move |settings, _| *saved.borrow_mut() = Some(settings));
             window.render_frame(cx);
             let before = window.find("key-row-recent").bounds();
             assert!(window.try_find("key-row-comment").is_none_or(|row| !row.visible()), "the last keys start below the fold");
