@@ -67,6 +67,8 @@ pub struct Workspace {
     _bridge: Option<agent::Bridge>,
     pub appearance: Appearance,
     pub sidebar_width: Pixels,
+    /// In the GNOME dash; asked once, not while the menu opens.
+    pub pinned: bool,
     /// The state as last written, to write only changes.
     last_saved: String,
     _subscriptions: Vec<Subscription>,
@@ -165,6 +167,7 @@ impl Workspace {
             _bridge: bridge,
             appearance,
             sidebar_width: px(saved.sidebar_width.unwrap_or(260.)),
+            pinned: crate::desktop::is_pinned(),
             last_saved: String::new(),
             _subscriptions: subscriptions,
             _tick: tick,

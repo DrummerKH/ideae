@@ -198,9 +198,10 @@ impl Workspace {
         use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
         let this = cx.weak_entity();
         let project = self.active_project();
+        let pinned = self.pinned;
         Button::new("app-menu").xsmall().ghost().label("☰").dropdown_menu(move |menu, _, _| {
             let (a, b, c, d) = (this.clone(), this.clone(), this.clone(), this.clone());
-            let pinned = desktop::is_pinned();
+            let e = this.clone();
             menu.item(PopupMenuItem::new("Add project…").on_click(move |_, window, cx| {
                 let _ = a.update(cx, |w, cx| w.add_project_dialog(window, cx));
             }))
@@ -212,13 +213,18 @@ impl Workspace {
             .separator()
             .item(PopupMenuItem::new(if pinned { "Unpin from dash" } else { "Pin to dash" }).on_click(
                 move |_, window, cx| {
-                    if pinned {
-                        desktop::unpin();
-                    } else if let Err(e) = desktop::pin() {
-                        window.push_notification(
-                            gpui_kit::component::notification::Notification::error(e).title("Pin to dash"),
+                    let result = if pinned { Ok(desktop::unpin()) } else { desktop::pin() };
+                    match result {
+                        Ok(()) => {
+                            let _ = e.update(cx, |w, cx| {
+                                w.pinned = !pinned;
+                                cx.notify();
+                            });
+                        }
+                        Err(err) => window.push_notification(
+                            gpui_kit::component::notification::Notification::error(err).title("Pin to dash"),
                             cx,
-                        );
+                        ),
                     }
                 },
             ))
