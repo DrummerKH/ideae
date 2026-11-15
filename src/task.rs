@@ -4589,7 +4589,7 @@ impl TaskView {
     fn stage_hunk(&mut self, hunk: git::Hunk, window: &mut Window, cx: &mut Context<Self>) {
         self.run_action(
             "Stage",
-            move |root| git::apply_hunk(&root, &hunk.patch, false, true).map(|_| format!("Staged a change of {}", hunk.path)),
+            move |root| git::apply_hunk(&root, &hunk.stage, false, true).map(|_| format!("Staged a change of {}", hunk.path)),
             false,
             window,
             cx,
