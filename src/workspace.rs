@@ -786,6 +786,65 @@ impl Workspace {
         .detach();
     }
 
+    /// A new title for a task; its branch and worktree stay as they are.
+    pub fn rename_task_dialog(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(entry) = self.entry_mut(path) else { return };
+        let current = entry.label();
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Task title"));
+        input.update(cx, |i, cx| {
+            i.set_value(current, window, cx);
+            i.select_all(window, cx);
+        });
+        let path = path.to_path_buf();
+        let apply = {
+            let (input, path) = (input.clone(), path.clone());
+            move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+                let title = input.read(cx).value().trim().to_string();
+                if title.is_empty() {
+                    return;
+                }
+                if let Some(entry) = this.entry_mut(&path) {
+                    entry.title = title;
+                }
+                window.close_dialog(cx);
+                cx.notify();
+            }
+        };
+        let on_enter = apply.clone();
+        cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, window, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                on_enter(this, window, cx);
+            }
+        })
+        .detach();
+        let this = cx.weak_entity();
+        let focused = std::rc::Rc::new(std::cell::Cell::new(false));
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (input, focused, this, apply) = (input.clone(), focused.clone(), this.clone(), apply.clone());
+            dialog
+                .title("Rename task")
+                .w(px(480.))
+                .content(move |content, window, cx| {
+                    if !focused.replace(true) {
+                        let input = input.clone();
+                        window.defer(cx, move |window, cx| input.read(cx).focus_handle(cx).focus(window, cx));
+                    }
+                    content.child(
+                        v_flex()
+                            .gap_1()
+                            .child(Input::new(&input))
+                            .child(div().text_xs().text_color(cx.theme().muted_foreground).child("The branch keeps its name.")),
+                    )
+                })
+                .footer(h_flex().justify_end().child(Button::new("rename-task").primary().label("Rename").on_click(
+                    move |_, window, cx| {
+                        let apply = apply.clone();
+                        let _ = this.update(cx, |w, cx| apply(w, window, cx));
+                    },
+                )))
+        });
+    }
+
     pub fn toggle_star(&mut self, path: &Path, cx: &mut Context<Self>) {
         if let Some(entry) = self.entry_mut(path) {
             entry.starred = !entry.starred;

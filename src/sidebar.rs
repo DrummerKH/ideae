@@ -374,8 +374,8 @@ impl Workspace {
         let menu_path = path.clone();
         let branch = t.branch.clone();
         let menu = move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
-            let (a, b, c) = (this.clone(), this.clone(), this.clone());
-            let (pa, pb, pc) = (menu_path.clone(), menu_path.clone(), menu_path.clone());
+            let (a, b, c, d) = (this.clone(), this.clone(), this.clone(), this.clone());
+            let (pa, pb, pc, pd) = (menu_path.clone(), menu_path.clone(), menu_path.clone(), menu_path.clone());
             let branch = branch.clone();
             menu.item(PopupMenuItem::new(if starred { "Unstar" } else { "Star" }).on_click(move |_, _, cx| {
                 let _ = a.update(cx, |w, cx| w.toggle_star(&pa, cx));
@@ -386,6 +386,11 @@ impl Workspace {
                         let _ = b.update(cx, |w, cx| w.close_task(&pb, window, cx));
                     },
                 ))
+            })
+            .when(!main, |m| {
+                m.item(PopupMenuItem::new("Rename…").on_click(move |_, window, cx| {
+                    let _ = d.update(cx, |w, cx| w.rename_task_dialog(&pd, window, cx));
+                }))
             })
             .item(PopupMenuItem::new("Copy branch name").on_click(move |_, _, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(branch.clone()));
