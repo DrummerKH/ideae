@@ -475,8 +475,9 @@ impl Workspace {
         }
         // How full its agent's context is, once that is worth knowing.
         let fill = self.usage.get(&path).map_or(0., |(_, usage)| usage.fill());
+        // First, and short: the end of the line is what is cut off.
         if fill >= 0.5 {
-            details.push(format!("context {:.0}%", fill * 100.));
+            details.insert(0, format!("ctx {:.0}%", fill * 100.));
         }
         if t.starred {
             details.push("★".into());
