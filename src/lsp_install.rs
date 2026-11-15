@@ -261,8 +261,9 @@ mod tests {
 
     #[test]
     fn every_server_has_a_recipe_and_an_executable() {
-        for program in ["gopls", "rust-analyzer", "typescript-language-server", "intelephense", "kotlin-lsp"] {
-            if cfg!(windows) && program == "kotlin-lsp" {
+        for program in crate::lsp::SERVERS.iter().map(|s| s.program) {
+            // No Kotlin LSP install on Windows and macOS yet.
+            if cfg!(any(windows, target_os = "macos")) && program == "kotlin-lsp" {
                 continue;
             }
             assert!(recipe(program).is_some() && executable(program).is_some(), "{program}");
