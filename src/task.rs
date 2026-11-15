@@ -5228,14 +5228,16 @@ impl TaskView {
     /// and what they started that left their sessions.
     pub fn shut_down(&mut self, cx: &mut Context<Self>) {
         self.autosave_all(cx);
+        let task = self.root.display().to_string();
+        // Before the terminals go: what they started is told by them.
+        let seen = self.hook_socket.as_ref().map(|socket| crate::procs::task_processes(Some(&task), socket)).unwrap_or_default();
         for tab in &self.tabs {
             if let TabKind::Terminal(view) = &tab.kind {
                 TermView::end(&view, cx);
             }
         }
         if let Some(socket) = self.hook_socket.clone() {
-            let task = self.root.display().to_string();
-            std::thread::spawn(move || crate::procs::end_task_strays(Some(&task), &socket));
+            std::thread::spawn(move || crate::procs::end_task_strays(Some(&task), &socket, seen));
         }
     }
 }

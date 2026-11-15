@@ -414,16 +414,53 @@ pub fn environ(pid: i32) -> Option<Vec<u8>> {
 /// given, the task's root in its environment, wherever it went (a session
 /// of its own included). Another ideae started from a task's terminal
 /// inherits the same, so the trees of ideae processes are left out.
+///
+/// Not every process shows its environment: macOS keeps back that of its
+/// own programs (zsh, sleep), and root's (a terminal's `login`) cannot be
+/// read. Such a process goes by its family: what it started, else what
+/// started it, nearest first.
 #[cfg(unix)]
 pub fn task_processes(task: Option<&str>, socket: &str) -> Vec<i32> {
+    use std::collections::HashMap;
+    const NEAREST: usize = 16;
     let me = std::process::id() as i32;
     let daemon = crate::daemon::client::get().and_then(|d| d.pid()).map(|p| p as i32);
     let sock = format!("{}={socket}", crate::agent::SOCK_ENV);
     let task = task.map(|t| format!("{}={t}", crate::agent::TASK_ENV));
-    let tagged = |pid: i32| {
-        let Some(env) = environ(pid) else { return false };
-        let vars: Vec<&[u8]> = env.split(|&b| b == 0).collect();
-        vars.contains(&sock.as_bytes()) && task.as_ref().is_none_or(|t| vars.contains(&t.as_bytes()))
+
+    let running: Vec<i32> = pids().into_iter().filter(|&p| running(p)).collect();
+    let parents: HashMap<i32, i32> = running.iter().filter_map(|&p| Some((p, ppid(p)?))).collect();
+    let mut children: HashMap<i32, Vec<i32>> = HashMap::new();
+    for (&pid, &parent) in &parents {
+        children.entry(parent).or_default().push(pid);
+    }
+    // Whether its environment names the task; None when it shows none.
+    let mut shown: HashMap<i32, Option<bool>> = HashMap::new();
+    let mut own = |pid: i32| {
+        *shown.entry(pid).or_insert_with(|| {
+            let env = environ(pid).filter(|env| !env.is_empty())?;
+            let vars: Vec<&[u8]> = env.split(|&b| b == 0).collect();
+            Some(vars.contains(&sock.as_bytes()) && task.as_ref().is_none_or(|t| vars.contains(&t.as_bytes())))
+        })
+    };
+    let mut tagged = |pid: i32| {
+        let mut at = pid;
+        for _ in 0..64 {
+            // The process, then what it started, nearest first.
+            let mut queue = std::collections::VecDeque::from([at]);
+            for _ in 0..NEAREST {
+                let Some(next) = queue.pop_front() else { break };
+                match own(next) {
+                    Some(tagged) => return tagged,
+                    None => queue.extend(children.get(&next).into_iter().flatten()),
+                }
+            }
+            match parents.get(&at) {
+                Some(&parent) if parent > 1 && parent != me && Some(parent) != daemon => at = parent,
+                _ => return false,
+            }
+        }
+        false
     };
     let ideae = |pid: i32| name(pid as u32).is_some_and(|n| n.starts_with("ideae"));
     let in_other_app = |pid: i32| {
@@ -432,13 +469,13 @@ pub fn task_processes(task: Option<&str>, socket: &str) -> Vec<i32> {
             match at {
                 Some(p) if p == me || Some(p) == daemon || p <= 1 => return false,
                 Some(p) if ideae(p) => return true,
-                Some(p) => at = ppid(p),
+                Some(p) => at = parents.get(&p).copied(),
                 None => return false,
             }
         }
         false
     };
-    pids().into_iter().filter(|&p| p != me && Some(p) != daemon && running(p) && tagged(p) && !in_other_app(p)).collect()
+    running.iter().copied().filter(|&p| p != me && Some(p) != daemon && tagged(p) && !in_other_app(p)).collect()
 }
 
 #[cfg(not(unix))]
@@ -448,19 +485,32 @@ pub fn task_processes(_: Option<&str>, _: &str) -> Vec<i32> {
 
 /// Ends what a task started that left its terminals' sessions, such as a
 /// shell an agent runs in the background with a session of its own.
+/// `seen` is what [`task_processes`] found before the task's terminals
+/// were ended: once its parent is gone, a process that shows no
+/// environment is nobody's any more.
 #[cfg(unix)]
-pub fn end_task_strays(task: Option<&str>, socket: &str) {
+pub fn end_task_strays(task: Option<&str>, socket: &str, seen: Vec<i32>) {
+    // Not root's `login`, which ends with its terminal.
+    let ours = |pid: &i32| running(*pid) && unsafe { libc::kill(*pid, 0) } == 0;
+    let alive = || {
+        let mut all = task_processes(task, socket);
+        all.extend(&seen);
+        all.sort();
+        all.dedup();
+        all.retain(ours);
+        all
+    };
     for (signal, grace) in [(libc::SIGTERM, 500), (libc::SIGKILL, 0)] {
-        let alive = task_processes(task, socket);
-        if alive.is_empty() {
+        let alive_now = alive();
+        if alive_now.is_empty() {
             return;
         }
-        for pid in alive {
+        for pid in alive_now {
             // SAFETY: kill only sends a signal.
             unsafe { libc::kill(pid, signal) };
         }
         let deadline = Instant::now() + Duration::from_millis(grace);
-        while Instant::now() < deadline && !task_processes(task, socket).is_empty() {
+        while Instant::now() < deadline && !alive().is_empty() {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
@@ -468,7 +518,7 @@ pub fn end_task_strays(task: Option<&str>, socket: &str) {
 
 /// On Windows a terminal's tree is in a job that dies with it.
 #[cfg(not(unix))]
-pub fn end_task_strays(_: Option<&str>, _: &str) {}
+pub fn end_task_strays(_: Option<&str>, _: &str, _: Vec<i32>) {}
 
 #[cfg_attr(not(unix), allow(dead_code))]
 static QUIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -497,25 +547,94 @@ mod stray_tests {
     use std::os::unix::process::CommandExt as _;
     use std::process::{Child, Command};
 
-    fn tagged_sleep(task: &str, socket: &str) -> Child {
+    /// Stands in for an agent: started again by the test below with a task
+    /// in its environment, it starts a system program in a session of its
+    /// own, whose environment macOS keeps back.
+    #[test]
+    #[ignore]
+    fn agent_with_a_background_sleep() {
         let mut command = Command::new("sleep");
-        command.arg("30").env(crate::agent::TASK_ENV, task).env(crate::agent::SOCK_ENV, socket);
+        command.arg("30");
         // SAFETY: setsid in the child before exec, as a background shell does.
         unsafe { command.pre_exec(|| { libc::setsid(); Ok(()) }) };
-        command.spawn().unwrap()
+        let _sleep = command.spawn().unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    }
+
+    /// Under another name than this program's: what an ideae started is
+    /// another app's, and left alone.
+    fn agent(task: &str, socket: &str) -> Child {
+        let stand_in = std::env::temp_dir().join(format!("stray-agent-{}", std::process::id()));
+        // A link of its own, or a copy: a symlink keeps the program's name.
+        let this = std::env::current_exe().unwrap();
+        if !stand_in.exists() && std::fs::hard_link(&this, &stand_in).is_err() {
+            std::fs::copy(&this, &stand_in).unwrap();
+        }
+        Command::new(stand_in)
+            .args(["--exact", "procs::stray_tests::agent_with_a_background_sleep", "--ignored"])
+            .env(crate::agent::TASK_ENV, task)
+            .env(crate::agent::SOCK_ENV, socket)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    /// The agent's sleep, once it has started it.
+    fn sleep_of(agent: &Child) -> i32 {
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(pid) = super::pids().into_iter().find(|&p| super::ppid(p) == Some(agent.id() as i32) && super::running(p)) {
+                return pid;
+            }
+            assert!(started.elapsed() < std::time::Duration::from_secs(10), "the agent starts its sleep");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn gone(pid: i32) -> bool {
+        let started = std::time::Instant::now();
+        while super::running(pid) && started.elapsed() < std::time::Duration::from_secs(2) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        !super::running(pid)
     }
 
     #[test]
     fn ends_the_tasks_strays_and_only_them() {
         let socket = format!("/tmp/ideae-test-{}.sock", std::process::id());
-        let (mut ours, mut other_task, mut other_app) =
-            (tagged_sleep("/t/a", &socket), tagged_sleep("/t/b", &socket), tagged_sleep("/t/a", "elsewhere"));
-        super::end_task_strays(Some("/t/a"), &socket);
-        assert!(ours.try_wait().unwrap().is_some(), "the task's stray is ended");
-        assert!(other_task.try_wait().unwrap().is_none(), "another task's process lives on");
-        assert!(other_app.try_wait().unwrap().is_none(), "another app's process lives on");
-        let _ = other_task.kill();
-        let _ = other_app.kill();
-        let _ = (other_task.wait(), other_app.wait());
+        /// Whatever the test finds, nothing it started stays.
+        struct Started(Vec<i32>);
+        impl Drop for Started {
+            fn drop(&mut self) {
+                for &pid in &self.0 {
+                    // SAFETY: kill only sends a signal, to what this test started.
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+                let _ = std::fs::remove_file(std::env::temp_dir().join(format!("stray-agent-{}", std::process::id())));
+            }
+        }
+        let (mut ours, mut left, mut other_task, mut other_app) =
+            (agent("/t/a", &socket), agent("/t/a", &socket), agent("/t/b", &socket), agent("/t/a", "elsewhere"));
+        let mut started = Started([&ours, &left, &other_task, &other_app].map(|c| c.id() as i32).to_vec());
+        let sleeps = [&ours, &left, &other_task, &other_app].map(sleep_of);
+        started.0.extend(sleeps);
+
+        // One agent is gone before its sleep is looked for again, as when a
+        // task's terminals are ended first.
+        let seen = super::task_processes(Some("/t/a"), &socket);
+        assert!(seen.contains(&sleeps[0]) && seen.contains(&sleeps[1]), "a sleep goes by the agent that started it");
+        let _ = left.kill();
+        let _ = left.wait();
+        super::end_task_strays(Some("/t/a"), &socket, seen);
+
+        assert!(ours.try_wait().unwrap().is_some() || gone(ours.id() as i32), "the task's agent is ended");
+        assert!(gone(sleeps[0]), "and the sleep it started");
+        assert!(gone(sleeps[1]), "and the sleep whose agent was gone already");
+        assert!(other_task.try_wait().unwrap().is_none() && super::running(sleeps[2]), "another task's processes live on");
+        assert!(other_app.try_wait().unwrap().is_none() && super::running(sleeps[3]), "another app's processes live on");
+        drop(started);
+        for child in [&mut ours, &mut other_task, &mut other_app] {
+            let _ = child.wait();
+        }
     }
 }

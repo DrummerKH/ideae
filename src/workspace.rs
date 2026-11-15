@@ -212,6 +212,7 @@ impl Workspace {
                         view.update(cx, |t, cx| t.autosave_all(cx));
                     }
                 } else {
+                    let seen = this.hook_socket.as_ref().map(|socket| crate::procs::task_processes(None, socket)).unwrap_or_default();
                     for view in this.views() {
                         view.update(cx, |t, cx| t.shut_down(cx));
                     }
@@ -221,7 +222,7 @@ impl Workspace {
                     }
                     // Here, not on the tasks' threads: the app exits next.
                     if let Some(socket) = this.hook_socket.clone() {
-                        crate::procs::end_task_strays(None, &socket);
+                        crate::procs::end_task_strays(None, &socket, seen);
                     }
                 }
                 crate::procs::end_child_sessions();
