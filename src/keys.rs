@@ -23,12 +23,6 @@ pub fn key(linux: &str) -> String {
     .to_string()
 }
 
-/// For key bindings, which keep their keystrokes for the app's lifetime:
-/// made once at startup.
-pub fn bind(linux: &'static str) -> &'static str {
-    if cfg!(target_os = "macos") { Box::leak(key(linux).into_boxed_str()) } else { linux }
-}
-
 /// "Ctrl+Shift+T" as this platform shows it: "⌘⇧T" on macOS. Chords
 /// separated by spaces ("Ctrl+E Ctrl+E") each.
 pub fn label(linux: &str) -> String {

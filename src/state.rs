@@ -40,6 +40,9 @@ pub struct Settings {
     pub check_updates: bool,
     /// Agents keep Claude Code's LSP plugins (a rust-analyzer per agent…).
     pub agent_lsp: bool,
+    /// Shortcuts set by hand, by id (keymap.rs): keystrokes such as
+    /// "ctrl-e", empty for none.
+    pub keys: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for Settings {
@@ -53,6 +56,7 @@ impl Default for Settings {
             pr_status: true,
             check_updates: true,
             agent_lsp: true,
+            keys: std::collections::BTreeMap::new(),
         }
     }
 }

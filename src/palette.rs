@@ -29,11 +29,14 @@ impl Entry {
         Self { label: label.into(), detail: SharedString::default(), keys: SharedString::default(), run: Rc::new(run) }
     }
 
-    /// Runs an action the way its keys would, from where focus is.
-    fn action(label: &str, keys: &str, action: impl Action) -> Self {
-        let keys = &crate::keys::label(keys);
-        let action: Rc<dyn Action> = Rc::new(action);
-        Self::new(label.to_string(), move |window, cx| window.dispatch_action(action.boxed_clone(), cx)).keys(keys)
+    /// Runs a shortcut's action the way its keys would, from where focus is,
+    /// with its keys as Settings has them.
+    fn shortcut(label: &str, id: &str) -> Self {
+        let shortcut = crate::keymap::find(id).expect("a shortcut in keymap.rs");
+        let action: Rc<dyn Action> = Rc::from(shortcut.action());
+        let mut entry = Self::new(label.to_string(), move |window, cx| window.dispatch_action(action.boxed_clone(), cx));
+        entry.keys = crate::keymap::label(id).into();
+        entry
     }
 
     fn detail(mut self, detail: impl Into<SharedString>) -> Self {
@@ -41,9 +44,8 @@ impl Entry {
         self
     }
 
-    fn keys(mut self, keys: &str) -> Self {
-        let keys = &crate::keys::label(keys);
-        self.keys = keys.to_string().into();
+    fn keys(mut self, keys: String) -> Self {
+        self.keys = keys.into();
         self
     }
 }
@@ -153,7 +155,7 @@ fn open(placeholder: &str, entries: Vec<Entry>, recent: Option<(Recent, Run)>, w
                         .child(tab(Recent::Tasks, "Recent tasks", cx))
                         .child(tab(Recent::Files, "Recent files", cx))
                         .child(div().flex_1())
-                        .child(div().text_xs().text_color(cx.theme().muted_foreground).child(format!("{} switches", crate::keys::label("Ctrl+E"))))
+                        .child(div().text_xs().text_color(cx.theme().muted_foreground).child(format!("{} switches", crate::keymap::label("recent"))))
                 });
             }
             content.child(
@@ -200,8 +202,6 @@ fn item(entry: &Entry) -> CommandItem {
 
 impl Workspace {
     pub fn command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        use crate::{FindInFiles, GoToFile, NewTask, OpenSettings, Quit};
-        use task::{NavigateBack, NavigateForward, NextTab, PrevTab, ShowOutline, ShowSidePanel, ShowView, ToggleZoom};
         let this = cx.weak_entity();
         let with_task = |f: fn(&mut task::TaskView, &mut Window, &mut Context<task::TaskView>)| {
             let this = this.clone();
@@ -217,36 +217,39 @@ impl Workspace {
         let w4 = this.clone();
         let w5 = this.clone();
         let entries = vec![
-            Entry::action("New task…", "Ctrl+Shift+T", NewTask),
-            Entry::action("Go to file…", "Ctrl+Shift+N", GoToFile),
-            Entry::action("Find in files…", "Ctrl+Shift+F", FindInFiles),
-            Entry::action("Find in terminal…", "Ctrl+F", task::FindInTerminal).detail("the scrollback"),
-            Entry::action("Next waiting task", "Alt+Down", NextWaiting).detail("an agent that asks or is done"),
+            Entry::shortcut("New task…", "new_task"),
+            Entry::shortcut("Go to file…", "go_to_file"),
+            Entry::shortcut("Find in files…", "find_in_files"),
+            Entry::shortcut("Find in terminal…", "find_in_terminal").detail("the scrollback"),
+            Entry::shortcut("Next waiting task", "next_waiting").detail("an agent that asks or is done"),
             Entry::new("Recent tasks", move |window, cx| {
                 let _ = w.update(cx, |w, cx| w.recent_tasks(window, cx));
             })
-            .keys("Ctrl+E"),
+            .keys(crate::keymap::label("recent")),
             Entry::new("Recent files", move |window, cx| {
                 let _ = w2.update(cx, |w, cx| w.recent_files(window, cx));
             })
-            .keys("Ctrl+E Ctrl+E"),
-            Entry::action("Agent", "Ctrl+1", ShowView(0)),
-            Entry::action("Changes", "Ctrl+2", ShowView(1)).detail("the diff"),
-            Entry::action("History", "Ctrl+3", ShowView(2)).detail("the branch's commits"),
-            Entry::action("Shell", "Ctrl+`", ShowView(3)).detail("terminal"),
+            .keys({
+                let e = crate::keymap::label("recent");
+                if e.is_empty() { e } else { format!("{e} {e}") }
+            }),
+            Entry::shortcut("Agent", "agent"),
+            Entry::shortcut("Changes", "changes").detail("the diff"),
+            Entry::shortcut("History", "history").detail("the branch's commits"),
+            Entry::shortcut("Shell", "shell").detail("terminal"),
             Entry::new("New terminal", with_task(task::TaskView::new_terminal)),
             Entry::new("New browser tab", with_task(task::TaskView::new_browser)).detail("web"),
             Entry::new("Restart agent", with_task(task::TaskView::restart_agent)),
-            Entry::action("Changes panel", "Alt+1", ShowSidePanel(0)),
-            Entry::action("Files panel", "Alt+2", ShowSidePanel(1)).detail("project tree"),
-            Entry::action("Structure panel", "Alt+3", ShowSidePanel(2)),
-            Entry::action("Run panel", "Alt+4", ShowSidePanel(3)).detail("services: dev servers, workers"),
-            Entry::action("File structure", "Ctrl+F12", ShowOutline).detail("declarations of the open file"),
-            Entry::action("Next tab", "Ctrl+PgDn", NextTab),
-            Entry::action("Previous tab", "Ctrl+PgUp", PrevTab),
-            Entry::action("Back", "Alt+Left", NavigateBack).detail("navigate"),
-            Entry::action("Forward", "Alt+Right", NavigateForward).detail("navigate"),
-            Entry::action("Focus mode", "Shift+Esc", ToggleZoom).detail("zoom the pane"),
+            Entry::shortcut("Changes panel", "changes_panel"),
+            Entry::shortcut("Files panel", "files_panel").detail("project tree"),
+            Entry::shortcut("Structure panel", "structure_panel"),
+            Entry::shortcut("Run panel", "run_panel").detail("services: dev servers, workers"),
+            Entry::shortcut("File structure", "outline").detail("declarations of the open file"),
+            Entry::shortcut("Next tab", "next_tab"),
+            Entry::shortcut("Previous tab", "prev_tab"),
+            Entry::shortcut("Back", "back").detail("navigate"),
+            Entry::shortcut("Forward", "forward").detail("navigate"),
+            Entry::shortcut("Focus mode", "focus_mode").detail("zoom the pane"),
             Entry::new("Add project…", move |window, cx| {
                 let _ = w3.update(cx, |w, cx| w.add_project_dialog(window, cx));
             }),
@@ -261,8 +264,8 @@ impl Workspace {
                 let _ = w5.update(cx, |w, cx| w.toggle_power_saving(cx));
             })
             .detail("power saving"),
-            Entry::action("Settings", "Ctrl+,", OpenSettings),
-            Entry::action("Quit", "Ctrl+Q", Quit),
+            Entry::shortcut("Settings", "settings"),
+            Entry::shortcut("Quit", "quit"),
         ];
         open("Run a command…", entries, None, window, cx);
     }

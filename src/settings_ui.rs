@@ -1,16 +1,19 @@
 //! Settings (Ctrl+,): a dialog over the state's settings, applied on Save.
 
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
 use gpui_kit::component::{
-    ActiveTheme as _, Sizable as _, WindowExt as _,
+    ActiveTheme as _, Selectable as _, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     input::{Input, InputState},
     switch::Switch,
     h_flex, v_flex,
 };
-use gpui_kit::*;
+use gpui_kit::{prelude::FluentBuilder as _, *};
 
 use crate::{lsp, state, workspace::Workspace};
 
@@ -46,8 +49,13 @@ impl Workspace {
             input
         });
         let this = cx.weak_entity();
+        // The shortcut waiting for keys, and what catches them before any
+        // binding does.
+        let recording: Rc<Cell<Option<&'static str>>> = Rc::default();
+        let catcher: Rc<RefCell<Option<Subscription>>> = Rc::default();
         window.open_dialog(cx, move |dialog, _, _| {
             let (draft, agent, idle, this) = (draft.clone(), agent.clone(), idle.clone(), this.clone());
+            let (recording, catcher) = (recording.clone(), catcher.clone());
             let save = {
                 let (draft, agent, idle, this) = (draft.clone(), agent.clone(), idle.clone(), this.clone());
                 move |window: &mut Window, cx: &mut App| {
@@ -65,6 +73,7 @@ impl Workspace {
                 .w(px(620.))
                 .content(move |content, _, cx| {
                     let d = draft.borrow().clone();
+                    let keys = keys_section(&draft, &recording, &catcher);
                     let toggle = |id: &'static str, on: bool, set: fn(&mut state::Settings, bool)| {
                         let draft = draft.clone();
                         Switch::new(id).checked(on).on_click(move |value: &bool, window, _| {
@@ -90,7 +99,7 @@ impl Workspace {
                             })
                     });
                     content.child(
-                        v_flex()
+                        div().id("settings-body").h(px(560.)).overflow_y_scroll().pr_2().child(v_flex()
                             .gap_3()
                             .child(section("AGENT", cx))
                             .child(row(
@@ -137,7 +146,9 @@ impl Workspace {
                                 "Ask gh about each task's PR and show it on the row.",
                                 toggle("pr-status", d.pr_status, |s, v| s.pr_status = v),
                                 cx,
-                            )),
+                            ))
+                            .child(section("KEYS", cx))
+                            .child(keys)),
                     )
                 })
                 .footer({
@@ -150,4 +161,97 @@ impl Workspace {
                 })
         });
     }
+}
+
+/// The shortcuts, each with its keys: a click waits for new ones (Esc
+/// leaves them, Backspace removes them), ↺ puts the default back.
+fn keys_section(
+    draft: &Rc<RefCell<state::Settings>>,
+    recording: &Rc<Cell<Option<&'static str>>>,
+    catcher: &Rc<RefCell<Option<Subscription>>>,
+) -> impl IntoElement {
+    use crate::keymap::{SHORTCUTS, display};
+    let d = draft.borrow().clone();
+    let effective = |id: &str, default: String| d.keys.get(id).cloned().unwrap_or(default);
+    let all: Vec<(&'static str, &'static str, String)> =
+        SHORTCUTS.iter().map(|s| (s.id, s.name, effective(s.id, s.default_keys()))).collect();
+    v_flex().gap_0p5().children(SHORTCUTS.iter().map(|shortcut| {
+        let id = shortcut.id;
+        let keys = effective(id, shortcut.default_keys());
+        let waiting = recording.get() == Some(id);
+        let clash: Vec<&str> =
+            all.iter().filter(|(other, _, k)| *other != id && !keys.is_empty() && *k == keys).map(|(_, name, _)| *name).collect();
+        let (draft, recording, catcher) = (draft.clone(), recording.clone(), catcher.clone());
+        let reset_draft = draft.clone();
+        let changed = d.keys.contains_key(id);
+        h_flex()
+            .gap_2()
+            .child(div().flex_1().text_sm().child(shortcut.name))
+            .when(!clash.is_empty(), |row| {
+                row.child(div().text_xs().text_color(gpui_kit::red()).child(format!("also {}", clash.join(", "))))
+            })
+            .child(
+                Button::new(SharedString::from(format!("key-{id}")))
+                    .small()
+                    .outline()
+                    .w(px(150.))
+                    .label(if waiting {
+                        "Press keys… Esc".to_string()
+                    } else if keys.is_empty() {
+                        "none".to_string()
+                    } else {
+                        display(&keys)
+                    })
+                    .selected(waiting)
+                    .on_click(move |_, window, cx| {
+                        recording.set(Some(id));
+                        let (draft, recording, own) = (draft.clone(), recording.clone(), catcher.clone());
+                        let subscription = cx.intercept_keystrokes(move |event, window, cx| {
+                            let Some(id) = recording.get() else { return };
+                            let k = &event.keystroke;
+                            if matches!(k.key.as_str(), "shift" | "control" | "alt" | "platform" | "function" | "") {
+                                return;
+                            }
+                            cx.stop_propagation();
+                            let plain = !k.modifiers.modified();
+                            match k.key.as_str() {
+                                "escape" if plain => {}
+                                "backspace" | "delete" if plain => {
+                                    draft.borrow_mut().keys.insert(id.to_string(), String::new());
+                                }
+                                _ => {
+                                    let keys = k.unparse(cx.platform_info().os);
+                                    let default = crate::keymap::find(id).map(|s| s.default_keys()).unwrap_or_default();
+                                    let mut d = draft.borrow_mut();
+                                    if keys == default {
+                                        d.keys.remove(id);
+                                    } else {
+                                        d.keys.insert(id.to_string(), keys);
+                                    }
+                                }
+                            }
+                            recording.set(None);
+                            let own = own.clone();
+                            window.defer(cx, move |_, _| {
+                                own.borrow_mut().take();
+                            });
+                            window.refresh();
+                        });
+                        *catcher.borrow_mut() = Some(subscription);
+                        window.refresh();
+                    }),
+            )
+            .child(
+                Button::new(SharedString::from(format!("key-reset-{id}")))
+                    .small()
+                    .ghost()
+                    .label("↺")
+                    .tooltip("Back to the default")
+                    .when(!changed, |b| b.invisible())
+                    .on_click(move |_, window, _| {
+                        reset_draft.borrow_mut().keys.remove(id);
+                        window.refresh();
+                    }),
+            )
+    }))
 }

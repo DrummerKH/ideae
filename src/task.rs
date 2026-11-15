@@ -3539,7 +3539,7 @@ impl TaskView {
                             .small()
                             .ghost()
                             .label(if running > 0 { format!("Run ● {running}") } else { "Run".to_string() })
-                            .tooltip(format!("Dev servers and workers of this task ({})", crate::keys::label("Alt+4")))
+                            .tooltip(format!("Dev servers and workers of this task ({})", crate::keymap::label("run_panel")))
                             .selected(self.right == RightPane::Run)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.right = RightPane::Run;

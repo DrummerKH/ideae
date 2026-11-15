@@ -1,0 +1,205 @@
+//! The app's shortcuts in one table: what Settings lists and rebinds, and
+//! what labels in menus and the command palette show.
+
+use gpui_kit::{Action, App, KeyBinding, NoAction};
+
+use crate::{FindInFiles, GoToFile, NewTask, OpenSettings, Quit, keys, palette, task};
+
+/// Where a shortcut works.
+#[derive(Clone, Copy, PartialEq)]
+enum Scope {
+    /// Everywhere, terminals too: bound in theirs, which would take it first.
+    Everywhere,
+    /// Everywhere but terminals, where the key stays the shell's.
+    NotInTerminal,
+    /// Anywhere a terminal does not take it first.
+    App,
+    Editor,
+    Terminal,
+}
+
+pub struct Shortcut {
+    pub id: &'static str,
+    pub name: &'static str,
+    /// Written the Linux way; [`keys::key`] makes the macOS one.
+    default: &'static str,
+    scope: Scope,
+    action: fn() -> Box<dyn Action>,
+}
+
+macro_rules! shortcut {
+    ($id:literal, $name:literal, $keys:literal, $scope:ident, $action:expr) => {
+        Shortcut { id: $id, name: $name, default: $keys, scope: Scope::$scope, action: || Box::new($action) }
+    };
+}
+
+pub static SHORTCUTS: &[Shortcut] = &[
+    shortcut!("command_palette", "Command palette", "ctrl-shift-a", Everywhere, palette::CommandPalette),
+    shortcut!("recent", "Recent tasks, then files", "ctrl-e", Everywhere, palette::RecentPlaces),
+    shortcut!("next_waiting", "Next waiting task", "alt-down", Everywhere, palette::NextWaiting),
+    shortcut!("new_task", "New task", "ctrl-shift-t", Everywhere, NewTask),
+    shortcut!("go_to_file", "Go to file", "ctrl-shift-n", Everywhere, GoToFile),
+    shortcut!("find_in_files", "Find in files", "ctrl-shift-f", Everywhere, FindInFiles),
+    shortcut!("find_in_terminal", "Find in terminal", "ctrl-f", Terminal, task::FindInTerminal),
+    shortcut!("agent", "Agent", "ctrl-1", Everywhere, task::ShowView(0)),
+    shortcut!("changes", "Changes", "ctrl-2", Everywhere, task::ShowView(1)),
+    shortcut!("history", "History", "ctrl-3", Everywhere, task::ShowView(2)),
+    shortcut!("shell", "Shell", "ctrl-`", Everywhere, task::ShowView(3)),
+    shortcut!("changes_panel", "Changes panel", "alt-1", Everywhere, task::ShowSidePanel(0)),
+    shortcut!("files_panel", "Files panel", "alt-2", Everywhere, task::ShowSidePanel(1)),
+    shortcut!("structure_panel", "Structure panel", "alt-3", Everywhere, task::ShowSidePanel(2)),
+    shortcut!("run_panel", "Run panel", "alt-4", Everywhere, task::ShowSidePanel(3)),
+    shortcut!("next_tab", "Next tab", "ctrl-pagedown", Everywhere, task::NextTab),
+    shortcut!("prev_tab", "Previous tab", "ctrl-pageup", Everywhere, task::PrevTab),
+    shortcut!("back", "Back", "alt-left", NotInTerminal, task::NavigateBack),
+    shortcut!("forward", "Forward", "alt-right", NotInTerminal, task::NavigateForward),
+    shortcut!("focus_mode", "Focus mode", "shift-escape", Everywhere, task::ToggleZoom),
+    shortcut!("save", "Save", "ctrl-s", App, task::SaveFile),
+    shortcut!("definition", "Go to definition", "ctrl-b", Editor, gpui_kit::component::input::GoToDefinition),
+    shortcut!("usages", "Implementations and usages", "ctrl-alt-b", Editor, task::ShowUsages),
+    shortcut!("outline", "File structure", "ctrl-f12", Editor, task::ShowOutline),
+    shortcut!("expand_selection", "Expand selection", "ctrl-w", Editor, task::ExpandSelection),
+    shortcut!("shrink_selection", "Shrink selection", "ctrl-shift-w", Editor, task::ShrinkSelection),
+    shortcut!("comment", "Comment / uncomment", "ctrl-/", Editor, task::ToggleComment),
+    shortcut!("settings", "Settings", "ctrl-,", Everywhere, OpenSettings),
+    shortcut!("quit", "Exit", "ctrl-q", Everywhere, Quit),
+];
+
+pub fn find(id: &str) -> Option<&'static Shortcut> {
+    SHORTCUTS.iter().find(|s| s.id == id)
+}
+
+impl Shortcut {
+    pub fn action(&self) -> Box<dyn Action> {
+        (self.action)()
+    }
+
+    /// This platform's default keystrokes ("ctrl-e", "cmd-e").
+    pub fn default_keys(&self) -> String {
+        keys::key(self.default)
+    }
+
+    /// What is in force: Settings' choice, else the default; empty for none.
+    pub fn keys(&self) -> String {
+        crate::state::settings().keys.get(self.id).cloned().unwrap_or_else(|| self.default_keys())
+    }
+
+    fn bindings(&self, keys: &str, unbind: bool, cx: &App) -> Vec<KeyBinding> {
+        if keys.is_empty() {
+            return Vec::new();
+        }
+        let terminal = Some(gpui_cn::terminal::KEY_CONTEXT);
+        let action = || if unbind { Box::new(NoAction) as Box<dyn Action> } else { (self.action)() };
+        let bind = |context: Option<&str>, action: Box<dyn Action>| {
+            let predicate = context.and_then(|c| gpui_kit::KeyBindingContextPredicate::parse(c).ok()).map(std::rc::Rc::new);
+            KeyBinding::load(keys, action, predicate, false, None, cx)
+        };
+        let made = match self.scope {
+            Scope::Everywhere => vec![bind(None, action()), bind(terminal, action())],
+            Scope::NotInTerminal => vec![bind(None, action()), bind(terminal, Box::new(NoAction))],
+            Scope::App => vec![bind(None, action())],
+            Scope::Editor => vec![bind(Some("Input"), action())],
+            Scope::Terminal => vec![bind(terminal, action())],
+        };
+        made.into_iter().filter_map(Result::ok).collect()
+    }
+}
+
+/// Every shortcut as Settings has it, for startup.
+pub fn bind_all(cx: &mut App) {
+    for s in SHORTCUTS {
+        let bindings = s.bindings(&s.keys(), false, cx);
+        cx.bind_keys(bindings);
+    }
+}
+
+/// After Settings changed some: the old keys first lose their action, then
+/// the new ones get theirs, so two shortcuts can swap keys.
+pub fn rebind(old: &crate::state::Settings, cx: &mut App) {
+    let before = |s: &Shortcut| old.keys.get(s.id).cloned().unwrap_or_else(|| s.default_keys());
+    let changed: Vec<&Shortcut> = SHORTCUTS.iter().filter(|s| before(s) != s.keys()).collect();
+    for s in &changed {
+        let bindings = s.bindings(&before(s), true, cx);
+        cx.bind_keys(bindings);
+    }
+    for s in &changed {
+        let bindings = s.bindings(&s.keys(), false, cx);
+        cx.bind_keys(bindings);
+    }
+}
+
+/// "Ctrl+Shift+N", or "⌘⇧O" on macOS, for keystrokes like "ctrl-shift-n".
+pub fn display(keystrokes: &str) -> String {
+    let mac = cfg!(target_os = "macos");
+    keystrokes
+        .split(' ')
+        .filter(|c| !c.is_empty())
+        .map(|chord| {
+            // "ctrl--" is Ctrl and the minus key.
+            let mut parts: Vec<&str> = chord.split('-').collect();
+            if chord.ends_with("--") {
+                parts.truncate(parts.len() - 2);
+                parts.push("-");
+            }
+            let (key, mods) = parts.split_last().map_or(("", &[][..]), |(k, m)| (*k, m));
+            let mut out: Vec<String> = mods
+                .iter()
+                .map(|m| {
+                    match (*m, mac) {
+                        ("ctrl", false) => "Ctrl",
+                        ("ctrl", true) => "⌃",
+                        ("cmd" | "super" | "platform", true) => "⌘",
+                        ("cmd" | "super" | "platform", false) => "Super",
+                        ("alt", false) => "Alt",
+                        ("alt", true) => "⌥",
+                        ("shift", false) => "Shift",
+                        ("shift", true) => "⇧",
+                        (other, _) => other,
+                    }
+                    .to_string()
+                })
+                .collect();
+            let key = match key {
+                "pagedown" => "PgDn".to_string(),
+                "pageup" => "PgUp".to_string(),
+                "escape" => "Esc".to_string(),
+                "left" if mac => "←".into(),
+                "right" if mac => "→".into(),
+                "up" if mac => "↑".into(),
+                "down" if mac => "↓".into(),
+                k if k.chars().count() == 1 => k.to_uppercase(),
+                k => {
+                    let mut c = k.chars();
+                    c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+                }
+            };
+            out.push(key);
+            out.join(if mac { "" } else { "+" })
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The label of a shortcut by its id, as in force now; empty when unbound.
+pub fn label(id: &str) -> String {
+    find(id).map(|s| display(&s.keys())).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SHORTCUTS, display};
+
+    #[test]
+    fn ids_are_unique_and_labels_read() {
+        let mut ids: Vec<_> = SHORTCUTS.iter().map(|s| s.id).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), SHORTCUTS.len());
+        if !cfg!(target_os = "macos") {
+            assert_eq!(display("ctrl-shift-n"), "Ctrl+Shift+N");
+            assert_eq!(display("alt-down"), "Alt+Down");
+            assert_eq!(display("ctrl-pagedown"), "Ctrl+PgDn");
+            assert_eq!(display("ctrl--"), "Ctrl+-");
+        }
+    }
+}
