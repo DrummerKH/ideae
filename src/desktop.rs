@@ -173,9 +173,30 @@ fn write_entry() -> Result<(), String> {
     let file = desktop_file().ok_or("no home directory")?;
     crate::state::write_atomic(&file, entry(&exe).as_bytes()).map_err(|e| e.to_string())?;
     if let Some(icon) = icon_file() {
-        let _ = crate::state::write_atomic(&icon, ICON.as_bytes());
+        if crate::state::write_atomic(&icon, ICON.as_bytes()).is_ok() {
+            refresh_icon_cache();
+        }
     }
     Ok(())
+}
+
+/// GTK trusts icon-theme.cache while it is newer than the theme folder
+/// itself, and a file added to scalable/apps leaves that folder's time
+/// alone: without a fresh cache the dash keeps its generic icon.
+fn refresh_icon_cache() {
+    let Some(theme) = data_home().map(|d| d.join("icons/hicolor")) else { return };
+    if !theme.join("icon-theme.cache").exists() {
+        return;
+    }
+    let updated = crate::procs::command("gtk-update-icon-cache")
+        .args(["-q", "-f", "-t"])
+        .arg(&theme)
+        .stdin(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !updated {
+        let _ = std::fs::remove_file(theme.join("icon-theme.cache"));
+    }
 }
 
 /// An entry written earlier points at where the binary was then, and its
