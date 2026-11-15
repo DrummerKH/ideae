@@ -3410,8 +3410,18 @@ impl TaskView {
                     _ => false,
                 };
                 let dragged = DraggedTab { tab_id: tab.id, title: label.clone() };
-                let item = Tab::new()
-                    .label(label)
+                let item = if tab.title == "agent" {
+                    let root = self.root.clone();
+                    Tab::new().child(
+                        div()
+                            .id("agent-usage")
+                            .child(label)
+                            .tooltip(move |_, cx| cx.new(|cx| crate::usage::UsageTooltip::new(root.clone(), cx)).into()),
+                    )
+                } else {
+                    Tab::new().label(label)
+                };
+                let item = item
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |this, _, window, cx| this.move_to_other_pane(ix, window, cx)),

@@ -28,6 +28,7 @@ mod state;
 mod task;
 mod theme;
 mod update;
+mod usage;
 mod workspace;
 mod zoom;
 
