@@ -1325,6 +1325,8 @@ pub struct TaskView {
     pub agent_activity: Option<String>,
     /// The command that starts the agent, for Restart.
     agent: Option<String>,
+    /// Text for the agent's prompt once it is ready to take it.
+    pending_prompt: Option<String>,
     /// Files you were in, the latest first, with where the cursor was.
     recent: Vec<(PathBuf, u32, u32)>,
     hook_socket: Option<String>,
@@ -1504,6 +1506,7 @@ impl TaskView {
             agent_status: crate::agent::AgentStatus::Unknown,
             agent_activity: None,
             agent: agent.clone(),
+            pending_prompt: None,
             recent: Vec::new(),
             hook_socket,
             terminal_seq: 1,
@@ -1879,6 +1882,54 @@ impl TaskView {
         self.activate(ix, window, cx);
         cx.emit(TaskEvent::Changed);
         cx.notify();
+    }
+
+    /// Puts `text` into the agent's prompt once the agent is up: Claude Code
+    /// says so with SessionStart; another agent gets a few seconds after it
+    /// starts. Pasted before, the shell would read it.
+    pub fn queue_prompt(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.agent.is_none() {
+            return;
+        }
+        self.pending_prompt = Some(text);
+        cx.spawn_in(window, async move |this, cx| {
+            let started = std::time::Instant::now();
+            let mut running_since: Option<std::time::Instant> = None;
+            loop {
+                cx.background_executor().timer(Duration::from_millis(250)).await;
+                let ready = this.update(cx, |t, cx| {
+                    if t.pending_prompt.is_none() {
+                        return None;
+                    }
+                    let hooked = !matches!(t.agent_status, crate::agent::AgentStatus::Unknown);
+                    let running = t.tabs.iter().any(|tab| match &tab.kind {
+                        TabKind::Terminal(v) if tab.title == "agent" => {
+                            v.read(cx).state.read(cx).foreground().is_some_and(|p| !p.is_shell())
+                        }
+                        _ => false,
+                    });
+                    Some((hooked, running))
+                });
+                let Ok(Some((hooked, running))) = ready else { return };
+                if running {
+                    running_since.get_or_insert_with(std::time::Instant::now);
+                }
+                let waited = running_since.map_or(Duration::ZERO, |at| at.elapsed());
+                // Its input box takes a moment after the hook.
+                if (hooked && waited > Duration::from_millis(500))
+                    || waited > Duration::from_secs(4)
+                    || started.elapsed() > Duration::from_secs(30)
+                {
+                    break;
+                }
+            }
+            let _ = this.update_in(cx, |t, window, cx| {
+                if let Some(text) = t.pending_prompt.take() {
+                    t.paste_to_agent(text, window, cx);
+                }
+            });
+        })
+        .detach();
     }
 
     /// Text into the agent's prompt, for the user to add to and send.

@@ -771,40 +771,60 @@ impl Workspace {
         }
     }
 
-    /// Asks for a title, then makes the branch and worktree.
+    /// Asks for a title and, if you like, what to tell the agent; then makes
+    /// the branch and worktree.
     pub fn new_task_dialog(&mut self, project: usize, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui_kit::component::input::{Textarea, TextareaState};
         let Some(p) = self.projects.get(project) else { return };
         let name = p.name.clone();
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("What is it about? DEV-123 Fix login, or plain words"));
+        let prompt = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(4, 14)
+                .placeholder("For the agent, optional: put into its prompt for you to finish and send")
+        });
         let this = cx.weak_entity();
         let submit = {
-            let (this, input) = (this.clone(), input.clone());
+            let (this, input, prompt) = (this.clone(), input.clone(), prompt.clone());
             move |window: &mut Window, cx: &mut App| {
                 let title = input.read(cx).value().trim().to_string();
                 if title.is_empty() {
                     return;
                 }
+                let text = prompt.read(cx).value().trim().to_string();
                 window.close_dialog(cx);
-                let _ = this.update(cx, |this, cx| this.create_task(project, title, window, cx));
+                let _ = this.update(cx, |this, cx| this.create_task(project, title, text, window, cx));
             }
         };
         // Runs inside this entity's update, so it cannot go through `submit`.
-        cx.subscribe_in(&input, window, move |this, input, event: &InputEvent, window, cx| {
-            if matches!(event, InputEvent::PressEnter { .. }) {
+        let on_enter = {
+            let (input, prompt) = (input.clone(), prompt.clone());
+            move |this: &mut Self, event: &InputEvent, in_prompt: bool, window: &mut Window, cx: &mut Context<Self>| {
+                // Enter in the title, Ctrl+Enter anywhere.
+                let InputEvent::PressEnter { secondary, .. } = event else { return };
+                if in_prompt && !*secondary {
+                    return;
+                }
                 let title = input.read(cx).value().trim().to_string();
                 if !title.is_empty() {
+                    let text = prompt.read(cx).value().trim().to_string();
                     window.close_dialog(cx);
-                    this.create_task(project, title, window, cx);
+                    this.create_task(project, title, text, window, cx);
                 }
             }
-        })
-        .detach();
+        };
+        let on_title = on_enter.clone();
+        cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, window, cx| on_title(this, event, false, window, cx))
+            .detach();
+        cx.subscribe_in(&prompt, window, move |this, _, event: &InputEvent, window, cx| on_enter(this, event, true, window, cx))
+            .detach();
         let focused = std::rc::Rc::new(std::cell::Cell::new(false));
-        window.open_dialog(cx, move |dialog, _, _| {
-            let (input, submit, focused) = (input.clone(), submit.clone(), focused.clone());
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let (input, prompt, submit, focused) = (input.clone(), prompt.clone(), submit.clone(), focused.clone());
+            let muted = cx.theme().muted_foreground;
             dialog
                 .title(format!("New task in {name}"))
-                .w(px(560.))
+                .w(px(640.))
                 .content(move |content, window, cx| {
                     if !focused.replace(true) {
                         let input = input.clone();
@@ -819,19 +839,23 @@ impl Workspace {
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
                                     .child(branch_hint(&input.read(cx).value())),
-                            ),
+                            )
+                            .child(Textarea::new(&prompt)),
                     )
                 })
                 .footer({
                     let submit = submit.clone();
-                    h_flex().justify_end().gap_2().child(
-                        Button::new("create-task").primary().label("Create").on_click(move |_, window, cx| submit(window, cx)),
-                    )
+                    h_flex()
+                        .justify_end()
+                        .items_center()
+                        .gap_2()
+                        .child(div().text_xs().text_color(muted).child("Ctrl+Enter"))
+                        .child(Button::new("create-task").primary().label("Create").on_click(move |_, window, cx| submit(window, cx)))
                 })
         });
     }
 
-    fn create_task(&mut self, project: usize, title: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn create_task(&mut self, project: usize, title: String, prompt: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(p) = self.projects.get_mut(project) else { return };
         let branch = naming::branch_name(&title);
         let repo = p.path.clone();
@@ -863,6 +887,11 @@ impl Workspace {
                             entry.busy = None;
                         }
                         this.switch(&path, window, cx);
+                        if !prompt.is_empty() {
+                            if let Some(view) = this.active_view() {
+                                view.update(cx, |t, cx| t.queue_prompt(prompt, window, cx));
+                            }
+                        }
                     }
                     Err(e) => {
                         if let Some((pi, ti)) = this.find(&path) {
