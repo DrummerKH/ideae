@@ -385,7 +385,9 @@ mod tests {
         assert!(!is_claude(""));
         let bridge = Bridge { socket: String::new(), socket_file: None, settings: PathBuf::from("/run/h.json") };
         let with_args = bridge.claude_command("claude --model opus");
-        assert!(with_args.starts_with("claude --model opus --settings '/run/h.json' --continue ||"), "{with_args}");
+        // `||` in sh, `if (-not $?)` in PowerShell: the start is the same.
+        assert!(with_args.starts_with("claude --model opus --settings '/run/h.json' --continue"), "{with_args}");
+        assert!(with_args.matches("claude --model opus --settings '/run/h.json'").count() == 2, "{with_args}");
         assert_eq!(bridge.claude_command("claude --resume abc"), "claude --resume abc --settings '/run/h.json'");
         std::mem::forget(bridge);
     }
