@@ -623,8 +623,16 @@ impl TerminalState {
 
     /// Paste the clipboard text.
     pub fn paste(&mut self, cx: &mut Context<Self>) {
-        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.paste_text(text, cx);
+        let Some(item) = cx.read_from_clipboard() else { return };
+        match item.text() {
+            Some(text) => self.paste_text(text, cx),
+            // ideae patch: a picture and no text cannot go through a
+            // terminal. Ctrl+V is what tells a program such as Claude Code
+            // to take the picture from the clipboard itself.
+            None if item.entries.iter().any(|entry| matches!(entry, gpui_kit::ClipboardEntry::Image(_))) => {
+                self.send_text("\u{16}", cx)
+            }
+            None => {}
         }
     }
 
