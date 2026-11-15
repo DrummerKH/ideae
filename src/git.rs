@@ -186,6 +186,9 @@ pub struct Hunk {
     pub patch: String,
     /// The same for `git apply` to the file as it was: they are not.
     pub stage: String,
+    /// Its lines, added and removed: what it is, wherever in the file the
+    /// other changes have moved it.
+    pub changes: String,
 }
 
 /// The changes of a patch `git diff` made. Not those of files that are new
@@ -257,7 +260,7 @@ pub fn hunks(patch: &str) -> Vec<Hunk> {
                 }
             }
             if let Some((line, modified)) = last {
-                found.push(Hunk { path: path.to_string(), line, modified, patch: alone(true), stage: alone(false) });
+                found.push(Hunk { path: path.to_string(), line, modified, patch: alone(true), stage: alone(false), changes: lines[at..end].concat() });
             }
             at = end;
         }
@@ -287,6 +290,15 @@ pub fn hunks(patch: &str) -> Vec<Hunk> {
     }
     close(&mut open, &header, &path, whole_file);
     found
+}
+
+/// Stages one change of a file, or takes it out of the index again. The
+/// change is looked up in what the index has now, so that others of its
+/// file staged before it are no obstacle.
+pub fn stage_change(root: &Path, change: &Hunk, stage: bool) -> Result<String, String> {
+    let against = if stage { git(root, &["diff", "--", &change.path]) } else { git(root, &["diff", "--cached", "--", &change.path]) };
+    let now = hunks(&against.unwrap_or_default()).into_iter().find(|hunk| hunk.changes == change.changes).ok_or("the change is no longer there")?;
+    if stage { apply_hunk(root, &now.stage, false, true) } else { apply_hunk(root, &now.patch, true, true) }
 }
 
 /// Applies one hunk: to the worktree (`reverse` takes the change back),
@@ -463,6 +475,8 @@ pub struct Refreshed {
     /// The branch compared with, and the changes since it forked from it.
     pub base: Option<String>,
     pub branch: String,
+    /// What is staged; asked for only when something is.
+    pub staged: String,
 }
 
 /// `picked`: the branch to compare with when not the one work starts from.
@@ -504,7 +518,8 @@ pub fn refresh(root: &Path, picked: Option<String>, known: &mut Known) -> Refres
         Some(fork) => (base, tracked_patch(root, &fork) + &new_files),
         None => (None, String::new()),
     };
-    Refreshed { files, watch, info, states, working, base, branch }
+    let staged = if states.values().any(|state| state.staged) { git(root, &["diff", "--cached"]).unwrap_or_default() } else { String::new() };
+    Refreshed { files, watch, info, states, working, base, branch, staged }
 }
 
 #[derive(Clone, Debug)]
@@ -1424,6 +1439,15 @@ mod variant_tests {
         assert_eq!(git(&repo, &["diff", "--cached", "--numstat"]).unwrap().trim(), "2\t0\tn.txt", "only the two added lines are staged");
         let left = hunks(&working_patch(&repo));
         assert_eq!(left.len(), 2, "the patch is against the commit: what is staged is still in it");
+        // Its neighbour in the same hunk is staged after it, then the first is taken out again.
+        stage_change(&repo, &left[0], true).unwrap();
+        assert_eq!(git(&repo, &["diff", "--cached", "--numstat"]).unwrap().trim(), "3\t1\tn.txt");
+        assert_eq!(hunks(&refresh(&repo, None, &mut Known::default()).staged).len(), 2);
+        stage_change(&repo, &found[2], false).unwrap();
+        assert_eq!(git(&repo, &["diff", "--cached", "--numstat"]).unwrap().trim(), "1\t1\tn.txt", "the changed line stays staged");
+        assert!(stage_change(&repo, &found[2], false).is_err(), "it is not staged any more");
+        stage_change(&repo, &left[0], false).unwrap();
+        assert_eq!(refresh(&repo, None, &mut Known::default()).staged, "", "nothing staged: not asked for");
         apply_hunk(&repo, &left[0].patch, true, false).unwrap();
         assert_eq!(numbers(&repo), "1 2 3 4 5 6 six and a half 7 8 9 10 11 12 ");
         sh(&repo, "rm untracked.txt");

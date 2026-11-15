@@ -539,7 +539,11 @@ impl Workspace {
                 for key in keys.split_whitespace() {
                     let pause = key.strip_prefix("wait:").and_then(|secs| secs.parse::<f32>().ok());
                     cx.background_executor().timer(std::time::Duration::from_secs_f32(pause.unwrap_or(0.08))).await;
-                    if let (None, Ok(stroke)) = (pause, Keystroke::parse(key)) {
+                    if let (None, Ok(mut stroke)) = (pause, Keystroke::parse(key)) {
+                        // A key alone is also the character it types.
+                        if key.chars().count() == 1 {
+                            stroke.key_char = Some(key.to_string());
+                        }
                         let handled = cx.update(|window, cx| window.dispatch_keystroke(stroke, cx));
                         if std::env::var_os("IDEAE_DEBUG").is_some() {
                             eprintln!("key {key} -> {handled:?}");

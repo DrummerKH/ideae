@@ -1882,15 +1882,20 @@ fn annotation_elements(
     ixs.iter()
         .map(|ix| {
             let annotation = &code.annotations.items[*ix];
+            // ideae patch: the row of a change's own buttons is no note to
+            // read: it takes the height of its buttons and no frame.
+            let slim = matches!(&annotation.id, ElementId::NamedInteger(name, _) if name.as_ref() == "hunk");
             div()
                 .id(annotation.id.clone())
                 .w_full()
                 .px_3()
-                .py_3()
-                .border_t_1()
-                .border_b_1()
-                .border_color(cx.theme().border)
-                .bg(cx.theme().muted.opacity(0.18))
+                .when(!slim, |row| {
+                    row.py_3()
+                        .border_t_1()
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .bg(cx.theme().muted.opacity(0.18))
+                })
                 .child(render(annotation, window, cx))
                 .into_any_element()
         })
