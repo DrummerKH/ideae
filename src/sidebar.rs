@@ -323,14 +323,6 @@ impl Workspace {
         } else if label.as_ref() != t.branch {
             details.push(t.branch.clone());
         }
-        if let Some(view) = &t.view {
-            for (name, port) in view.read(cx).running_services(cx) {
-                details.push(match port {
-                    Some(port) => format!("▶ {name} :{port}"),
-                    None => format!("▶ {name}"),
-                });
-            }
-        }
         if t.starred {
             details.push("★".into());
         }

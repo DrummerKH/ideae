@@ -19,7 +19,6 @@ mod palette;
 mod pr;
 mod procs;
 mod search;
-mod services;
 mod settings_ui;
 mod sidebar;
 mod sysmon;

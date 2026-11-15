@@ -21,7 +21,6 @@ src/daemon/        terminals in a daemon (`ideae --daemon`, unix): they outlive 
                    a window of another build makes the daemon hand its ptys to a new one (SCM_RIGHTS), agents keep running
 src/desktop.rs     launcher entry, dash pin, restart
 src/naming.rs      branch names from task titles
-src/services.rs    `.ideae.toml` services (Run ▾): per-task port slots, IDEAE_PORT_<NAME>
 vendor/            patched gpui-component, gpui-base, gpui-cn; changes marked `ideae patch`
 scripts/           Xvfb driver for UI checks
 ```
