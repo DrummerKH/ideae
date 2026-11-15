@@ -153,6 +153,11 @@ a release build needs a Windows host for `fxc.exe`.
 | Alt+1 / Alt+2 / Alt+3 | Changes / Files / Structure panel |
 | Shift+Esc | Focus mode |
 
+## License
+
+[Mozilla Public License 2.0](LICENSE). Use it, ship it, build on it, in
+closed products too; changes to its files stay open under the same license.
+
 ## Third-party code
 
 `vendor/` holds patched copies of `gpui-component`, `gpui-base` and

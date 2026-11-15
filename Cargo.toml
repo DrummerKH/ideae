@@ -3,6 +3,7 @@ name = "ideae"
 version = "0.1.0"
 edition = "2024"
 repository = "https://github.com/scillarium/ideae"
+license = "MPL-2.0"
 
 [dependencies]
 anyhow = "1.0.104"
