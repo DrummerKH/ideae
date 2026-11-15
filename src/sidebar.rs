@@ -49,7 +49,7 @@ fn section_header(label: &'static str, cx: &App) -> Div {
 }
 
 /// "now", "5m", "3h", "2d", "2w", "4mo".
-fn ago(secs: u64) -> String {
+pub(crate) fn ago(secs: u64) -> String {
     if secs == 0 {
         return String::new();
     }
@@ -175,7 +175,7 @@ impl Workspace {
 
     /// What a task is called in the list: its own title, or for the main
     /// thread (and untitled worktrees) the agent's session title.
-    fn task_title(&self, pi: usize, ti: usize, cx: &App) -> String {
+    pub(crate) fn task_title(&self, pi: usize, ti: usize, cx: &App) -> String {
         let t = &self.projects[pi].tasks[ti];
         if !t.main && !t.title.is_empty() {
             return t.title.clone();

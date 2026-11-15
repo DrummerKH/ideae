@@ -1222,6 +1222,8 @@ pub struct TaskView {
     pub agent_activity: Option<String>,
     /// The command that starts the agent, for Restart.
     agent: Option<String>,
+    /// Files you were in, the latest first, with where the cursor was.
+    recent: Vec<(PathBuf, u32, u32)>,
     hook_socket: Option<String>,
     /// Numbers terminals so each has a unique element id and default title.
     terminal_seq: usize,
@@ -1399,6 +1401,7 @@ impl TaskView {
             agent_status: crate::agent::AgentStatus::Unknown,
             agent_activity: None,
             agent: agent.clone(),
+            recent: Vec::new(),
             hook_socket,
             terminal_seq: 1,
             unseen: false,
@@ -1992,7 +1995,7 @@ impl TaskView {
 
     /// A browser tab in the pane you are in. Playwright MCP can drive the
     /// same page through the endpoint shown in its toolbar.
-    fn new_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn new_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_browser("about:blank", window, cx);
     }
 
@@ -2064,7 +2067,7 @@ impl TaskView {
         }
     }
 
-    fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let at = self.new_terminal_tab(window, cx);
         self.tabs[at].right = self.focus_right && self.is_split();
         self.activate(at, window, cx);
@@ -2191,6 +2194,7 @@ impl TaskView {
         }
         if self.focused_ix() != Some(ix) {
             self.record_nav(cx);
+            self.note_recent(cx);
         }
         let tab = &self.tabs[ix];
         if matches!(tab.kind, TabKind::File(_)) {
@@ -2206,7 +2210,53 @@ impl TaskView {
         self.autosave_unfocused(cx);
         self.sync_visibility(cx);
         self.focus_active(window, cx);
+        self.note_recent(cx);
         cx.notify();
+    }
+
+    /// The focused file goes to the front of the recent ones.
+    fn note_recent(&mut self, cx: &App) {
+        let Some(TabKind::File(file)) = self.focused_ix().map(|ix| &self.tabs[ix].kind) else { return };
+        let f = file.read(cx);
+        let entry = (f.path.clone(), f.cursor_line, f.cursor_col);
+        self.recent.retain(|(p, _, _)| *p != entry.0);
+        self.recent.insert(0, entry);
+        self.recent.truncate(50);
+    }
+
+    /// Recent files for Ctrl+E, the one you are in left out.
+    pub fn recent_files(&self, cx: &App) -> Vec<PathBuf> {
+        let current = match self.focused_ix().map(|ix| &self.tabs[ix].kind) {
+            Some(TabKind::File(f)) => Some(f.read(cx).path.clone()),
+            _ => None,
+        };
+        let mut files: Vec<PathBuf> = self.recent.iter().map(|(p, _, _)| p.clone()).collect();
+        // Open tabs restored from the last run count too, after the ones visited.
+        for tab in &self.tabs {
+            if let TabKind::File(f) = &tab.kind {
+                let path = f.read(cx).path.clone();
+                if !files.contains(&path) {
+                    files.push(path);
+                }
+            }
+        }
+        files.retain(|p| Some(p) != current.as_ref() && p.exists());
+        files
+    }
+
+    /// Back to a recent file: its tab as it is, or opened where the cursor was.
+    pub fn reopen_recent(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let open = self.tabs.iter().position(|t| matches!(&t.kind, TabKind::File(f) if f.read(cx).path == path));
+        match open {
+            Some(ix) => {
+                self.record_nav(cx);
+                self.activate(ix, window, cx);
+            }
+            None => {
+                let (line, col) = self.recent.iter().find(|(p, _, _)| *p == path).map_or((0, 0), |(_, l, c)| (*l, *c));
+                self.open_file_at(path, line, col, window, cx);
+            }
+        }
     }
 
     fn close_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {

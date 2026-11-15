@@ -15,6 +15,7 @@ mod ide;
 mod lsp;
 mod lsp_install;
 mod naming;
+mod palette;
 mod pr;
 mod procs;
 mod search;
@@ -201,6 +202,8 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &FindInFiles, window, cx| this.finder(finder::FinderKind::Grep, window, cx)))
             .on_action(cx.listener(|this, _: &Quit, window, cx| this.request_quit(window, cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)))
+            .on_action(cx.listener(|this, _: &palette::CommandPalette, window, cx| this.command_palette(window, cx)))
+            .on_action(cx.listener(|this, _: &palette::RecentPlaces, window, cx| this.recent_tasks(window, cx)))
             .on_action(cx.listener(|this, _: &NewTask, window, cx| {
                 if let Some(project) = this.active_project().or((!this.projects.is_empty()).then_some(0)) {
                     this.new_task_dialog(project, window, cx);
@@ -473,8 +476,16 @@ fn main() {
                     KeyBinding::new("ctrl-shift-t", NewTask, context),
                     KeyBinding::new("ctrl-q", Quit, context),
                     KeyBinding::new("ctrl-,", OpenSettings, context),
+                    // In a terminal it was Select All, which the mouse and Copy still do.
+                    KeyBinding::new("ctrl-shift-a", palette::CommandPalette, context),
                 ]);
             }
+            // Not in a terminal: Ctrl+E is the end of the line there, in the shell
+            // and in Claude Code's prompt.
+            cx.bind_keys([
+                KeyBinding::new("ctrl-e", palette::RecentPlaces, None),
+                KeyBinding::new("ctrl-e", NoAction, Some(gpui_cn::terminal::KEY_CONTEXT)),
+            ]);
             // Ctrl+Alt+Left/Right switch GNOME workspaces. In a terminal Alt+Left
             // stays the shell's word move.
             cx.bind_keys([

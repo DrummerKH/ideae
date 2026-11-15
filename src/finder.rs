@@ -340,7 +340,7 @@ fn match_files(files: &[String], query: &str) -> Vec<Hit> {
         .collect()
 }
 
-fn score(path: &str, query: &[char]) -> Option<i64> {
+pub(crate) fn score(path: &str, query: &[char]) -> Option<i64> {
     if query.is_empty() {
         return Some(-(path.len() as i64));
     }
