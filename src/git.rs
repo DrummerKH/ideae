@@ -6,6 +6,37 @@ use std::{
 pub struct Worktree {
     pub path: PathBuf,
     pub branch: String,
+    /// `git worktree lock`, with its reason when given.
+    pub locked: Option<String>,
+}
+
+impl Worktree {
+    /// Locked by a process that still runs, such as a Claude Code subagent
+    /// working in it ("claude agent … (pid N start T)"): someone else's
+    /// working copy for now.
+    pub fn in_use(&self) -> bool {
+        self.locked.as_deref().and_then(lock_owner).is_some_and(|(pid, start)| process_alive(pid, start))
+    }
+}
+
+/// The pid and start time named in a lock reason.
+fn lock_owner(reason: &str) -> Option<(u32, Option<u64>)> {
+    let rest = &reason[reason.find("pid ")? + 4..];
+    let pid = rest.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()?;
+    let start = rest
+        .find("start ")
+        .and_then(|i| rest[i + 6..].split(|c: char| !c.is_ascii_digit()).next()?.parse().ok());
+    Some((pid, start))
+}
+
+/// The process exists and, when its start time is known, is the same one
+/// and not a later process given the same pid.
+fn process_alive(pid: u32, start: Option<u64>) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else { return false };
+    let Some(start) = start else { return true };
+    // Field 22, counted after the parenthesized command name.
+    let after = stat.rsplit_once(')').map_or("", |(_, rest)| rest);
+    after.split_whitespace().nth(19).and_then(|s| s.parse::<u64>().ok()) == Some(start)
 }
 
 fn git(root: &Path, args: &[&str]) -> Option<String> {
@@ -28,23 +59,28 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
 /// Every worktree of the repository containing `path`, main one first.
 pub fn worktrees(path: &Path) -> Vec<Worktree> {
     let Some(out) = git(path, &["worktree", "list", "--porcelain"]) else {
-        return vec![Worktree { path: path.to_path_buf(), branch: "(no git)".into() }];
+        return vec![Worktree { path: path.to_path_buf(), branch: "(no git)".into(), locked: None }];
     };
     let mut result = Vec::new();
     for block in out.split("\n\n") {
         let mut wt_path = None;
         let mut branch = String::from("(detached)");
+        let mut locked = None;
         for line in block.lines() {
             if let Some(p) = line.strip_prefix("worktree ") {
                 wt_path = Some(PathBuf::from(p));
             } else if let Some(b) = line.strip_prefix("branch ") {
                 branch = b.trim_start_matches("refs/heads/").to_string();
+            } else if line == "locked" {
+                locked = Some(String::new());
+            } else if let Some(reason) = line.strip_prefix("locked ") {
+                locked = Some(reason.trim_matches('"').to_string());
             } else if line == "bare" {
                 wt_path = None;
             }
         }
         if let Some(path) = wt_path {
-            result.push(Worktree { path, branch });
+            result.push(Worktree { path, branch, locked });
         }
     }
     result
@@ -444,6 +480,21 @@ pub fn pull_safe(root: &Path) -> Result<String, String> {
 }
 
 #[cfg(test)]
+mod lock_tests {
+    use super::*;
+
+    #[test]
+    fn lock_owner_and_liveness() {
+        let me = std::process::id();
+        assert_eq!(lock_owner("claude agent agent-a3 (pid 1532754 start 82664722)"), Some((1532754, Some(82664722))));
+        assert_eq!(lock_owner("moved to usb disk"), None);
+        assert!(process_alive(me, None));
+        assert!(!process_alive(me, Some(1)));
+        assert!(!process_alive(u32::MAX - 1, None));
+    }
+}
+
+#[cfg(test)]
 mod pull_tests {
     use super::pull_safe;
     use std::{path::Path, process::Command};
@@ -594,11 +645,17 @@ pub fn unsaved_work(root: &Path) -> (usize, usize) {
     (dirty, unpushed)
 }
 
-/// Removes a task's worktree and its branch.
-pub fn remove_task_worktree(repo: &Path, path: &Path, branch: &str) -> Result<(), String> {
+/// Removes a task's worktree and its branch; a lock is overridden only
+/// when `unlock`.
+pub fn remove_task_worktree(repo: &Path, path: &Path, branch: &str, unlock: bool) -> Result<(), String> {
     let path_s = path.to_string_lossy().into_owned();
     if path.exists() {
-        git_status(repo, &["worktree", "remove", "--force", &path_s])?;
+        let mut args = vec!["worktree", "remove", "--force"];
+        if unlock {
+            args.push("--force");
+        }
+        args.push(&path_s);
+        git_status(repo, &args)?;
     } else {
         let _ = git_status(repo, &["worktree", "prune"]);
     }

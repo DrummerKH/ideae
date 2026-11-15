@@ -299,6 +299,7 @@ impl Workspace {
                             .child(label.clone()),
                     )
                     .when(t.starred, |s| s.child(div().flex_none().text_xs().text_color(muted).child("★")))
+                    .when(t.locked.is_some(), |s| s.child(div().flex_none().text_xs().text_color(muted).child("locked")))
                     .when(changes > 0, |s| s.child(div().flex_none().text_xs().text_color(muted).child(changes.to_string())))
                     .when_some(t.busy.clone(), |s, busy| s.child(div().flex_none().text_xs().text_color(muted).child(busy))),
             )

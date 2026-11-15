@@ -34,6 +34,8 @@ pub struct TaskEntry {
     pub view: Option<Entity<TaskView>>,
     /// A git operation on it is running (creating, deleting).
     pub busy: Option<SharedString>,
+    /// Locked worktree (`git worktree lock`) whose locker is gone.
+    pub locked: Option<String>,
 }
 
 impl TaskEntry {
@@ -229,6 +231,7 @@ impl Workspace {
                     session: t.session.clone(),
                     view: None,
                     busy: None,
+                    locked: None,
                 })
                 .collect();
             self.projects.push(project);
@@ -430,6 +433,10 @@ impl Workspace {
         if unpushed > 0 {
             description.push_str(&format!("\n{unpushed} commit(s) are on no remote and will be lost."));
         }
+        if let Some(reason) = entry.locked.as_ref() {
+            let reason = if reason.is_empty() { String::new() } else { format!(" ({reason})") };
+            description.push_str(&format!("\nThe worktree is locked{reason}, by nothing running now; the lock is overridden."));
+        }
         let title = format!("Delete \"{}\"?", entry.label());
         let this = cx.weak_entity();
         let path = path.to_path_buf();
@@ -453,12 +460,12 @@ impl Workspace {
         let repo = self.projects[pi].path.clone();
         let entry = &mut self.projects[pi].tasks[ti];
         entry.busy = Some("deleting…".into());
-        let (path, branch) = (path.to_path_buf(), entry.branch.clone());
+        let (path, branch, unlock) = (path.to_path_buf(), entry.branch.clone(), entry.locked.is_some());
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let task_path = path.clone();
             let result = cx
-                .background_spawn(async move { git::remove_task_worktree(&repo, &task_path, &branch) })
+                .background_spawn(async move { git::remove_task_worktree(&repo, &task_path, &branch, unlock) })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 match result {
@@ -504,6 +511,7 @@ impl Workspace {
                     session: TaskSession::default(),
                     view: None,
                     busy: None,
+                    locked: None,
                 },
             );
         }
@@ -591,6 +599,7 @@ impl Workspace {
             session: TaskSession::default(),
             view: None,
             busy: Some("creating…".into()),
+            locked: None,
         });
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
@@ -692,9 +701,15 @@ impl Workspace {
                     if worktrees.first().is_none_or(|w| w.path != repo) {
                         continue;
                     }
+                    // Worktrees locked by a live process (Claude Code subagents)
+                    // are that process's for now: not tasks.
+                    let worktrees: Vec<_> = worktrees.into_iter().enumerate().filter(|(i, w)| *i == 0 || !w.in_use()).map(|(_, w)| w).collect();
                     for wt in worktrees.iter().skip(1) {
                         match p.tasks.iter_mut().find(|t| t.path == wt.path) {
-                            Some(t) => t.branch = wt.branch.clone(),
+                            Some(t) => {
+                                t.branch = wt.branch.clone();
+                                t.locked = wt.locked.clone();
+                            }
                             None => p.tasks.push(TaskEntry {
                                 path: wt.path.clone(),
                                 branch: wt.branch.clone(),
@@ -705,6 +720,7 @@ impl Workspace {
                                 session: TaskSession::default(),
                                 view: None,
                                 busy: None,
+                                locked: wt.locked.clone(),
                             }),
                         }
                     }
