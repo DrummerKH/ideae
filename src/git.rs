@@ -290,6 +290,55 @@ pub fn run(root: &Path, program: &str, args: &[&str]) -> Result<String, String> 
     }
 }
 
+/// A commit message for what would be committed (the staged changes, or
+/// all of them), written by `claude -p` in the style of the latest commits.
+pub fn suggest_message(root: &Path, staged_only: bool) -> Result<String, String> {
+    use std::io::Write as _;
+    const MAX_DIFF: usize = 60_000;
+    let mut diff = if staged_only { git(root, &["diff", "--cached"]).unwrap_or_default() } else { working_patch(root) };
+    if diff.trim().is_empty() {
+        return Err("Nothing to describe".into());
+    }
+    if diff.len() > MAX_DIFF {
+        let mut cut = MAX_DIFF;
+        while !diff.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        diff.truncate(cut);
+        diff.push_str("\n[… the rest of the diff is left out]\n");
+    }
+    let log = git(root, &["log", "-12", "--format=%B%x1e"]).unwrap_or_default();
+    let examples: Vec<&str> = log.split('\x1e').map(str::trim).filter(|m| !m.is_empty()).collect();
+    let prompt = format!(
+        "Write the git commit message for the diff below. Match the recent commits of this \
+         repository: language, length and form of the subject, whether there is a body and how it \
+         reads. Leave out trailers such as Co-Authored-By. Answer with the message only, no quotes, \
+         no code fences.\n\nRecent commits, separated by ---:\n{}\n\nThe diff:\n{diff}",
+        examples.join("\n---\n")
+    );
+    // Quick and on its own: no tools, no MCP servers, no session kept.
+    let mut child = crate::procs::command("claude")
+        .current_dir(root)
+        .args(["-p", "--model", "haiku", "--tools", "", "--strict-mcp-config", "--no-session-persistence"])
+        .env_remove(crate::agent::SOCK_ENV)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("claude: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(prompt.as_bytes());
+    }
+    let out = child.wait_with_output().map_err(|e| format!("claude: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().trim_matches('`').trim().to_string();
+    if out.status.success() && !text.is_empty() {
+        Ok(text)
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        Err(if err.is_empty() { "claude gave no message".into() } else { err })
+    }
+}
+
 pub fn stage(root: &Path, paths: &[String]) -> Result<String, String> {
     let mut args = vec!["add", "--"];
     args.extend(paths.iter().map(String::as_str));

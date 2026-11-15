@@ -3655,7 +3655,25 @@ impl TaskView {
                         ),
                 )
             })
-            .child(gpui_kit::component::input::Textarea::new(&self.commit_input).small())
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_start()
+                    .child(div().flex_1().min_w_0().child(gpui_kit::component::input::Textarea::new(&self.commit_input).small()))
+                    .child(
+                        Button::new("suggest-message")
+                            .small()
+                            .ghost()
+                            .label("Write")
+                            .disabled(busy || self.files.is_empty())
+                            .tooltip(if staged > 0 {
+                                "Claude writes the message for the staged changes"
+                            } else {
+                                "Claude writes the message for all the changes"
+                            })
+                            .on_click(cx.listener(|this, _, window, cx| this.suggest_message(window, cx))),
+                    ),
+            )
             .child(
                 h_flex()
                     .gap_1()
@@ -3955,6 +3973,30 @@ impl TaskView {
             window,
             cx,
         );
+    }
+
+    /// Write: Claude writes the message for what would be committed.
+    fn suggest_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy.is_some() {
+            return;
+        }
+        self.busy = Some("Writing the message");
+        self.action = None;
+        cx.notify();
+        let root = self.root.clone();
+        let staged_only = !self.staged_paths().is_empty();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx.background_spawn(async move { git::suggest_message(&root, staged_only) }).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.busy = None;
+                match result {
+                    Ok(message) => this.commit_input.update(cx, |i, cx| i.set_value(message, window, cx)),
+                    Err(e) => this.action = Some((false, format!("Message: {e}"))),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
