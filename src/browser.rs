@@ -16,7 +16,7 @@ use std::{
 use anyhow::{Context as _, Result, anyhow};
 use base64::Engine as _;
 use gpui_kit::component::{
-    ActiveTheme as _, Sizable as _,
+    ActiveTheme as _, Selectable as _, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
@@ -32,12 +32,14 @@ use tungstenite::{Message, WebSocket, stream::MaybeTlsStream};
 struct Chrome {
     port: u16,
     ws_path: String,
-    _child: Child,
+    child: Child,
     profile: PathBuf,
 }
 
 impl Drop for Chrome {
     fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.profile);
     }
 }
@@ -80,7 +82,8 @@ fn chrome() -> Result<Arc<Chrome>> {
     if let Some(chrome) = slot.as_ref() {
         return Ok(chrome.clone());
     }
-    let program = find_chrome().ok_or_else(|| anyhow!("no Chrome or Chromium found"))?;
+    let program =
+        std::env::var_os("IDEAE_CHROME").map(PathBuf::from).or_else(find_chrome).ok_or_else(|| anyhow!("no Chrome or Chromium found"))?;
     let program = program.as_path();
     let profile = crate::state::runtime_dir().join(format!("chrome-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&profile);
@@ -118,7 +121,7 @@ fn chrome() -> Result<Arc<Chrome>> {
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    let chrome = Arc::new(Chrome { port, ws_path, _child: child, profile });
+    let chrome = Arc::new(Chrome { port, ws_path, child, profile });
     *slot = Some(chrome.clone());
     Ok(chrome)
 }
@@ -272,6 +275,133 @@ fn run_page(url: &str, in_tx: &async_channel::Sender<In>, out_rx: mpsc::Receiver
     }
 }
 
+// ---------------------------------------------------------------- picking
+
+/// Run in the page with a point of its viewport: the element there, through
+/// shadow roots. Its box alone for the highlight; with `full`, what tells
+/// an agent which element it is: a selector that finds it and nothing
+/// else, its tag with attributes, its text, and for React the components
+/// around it and where the nearest is written (development builds).
+const ELEMENT_AT: &str = r##"(function (x, y, full) {
+  let el = document.elementFromPoint(x, y);
+  while (el && el.shadowRoot) {
+    const inner = el.shadowRoot.elementFromPoint(x, y);
+    if (!inner || inner === el) break;
+    el = inner;
+  }
+  if (!el) return "";
+  const r = el.getBoundingClientRect();
+  const box = { x: r.left, y: r.top, width: r.width, height: r.height };
+  if (!full) return JSON.stringify({ box });
+  const step = (e) => {
+    if (e.id && document.querySelectorAll("#" + CSS.escape(e.id)).length === 1) return "#" + CSS.escape(e.id);
+    let s = e.localName + [...e.classList].slice(0, 2).map((c) => "." + CSS.escape(c)).join("");
+    const same = e.parentElement ? [...e.parentElement.children].filter((c) => c.localName === e.localName) : [];
+    if (same.length > 1) s += ":nth-of-type(" + (same.indexOf(e) + 1) + ")";
+    return s;
+  };
+  const parts = [];
+  let selector = "";
+  for (let e = el; e && e.nodeType === 1; e = e.parentElement) {
+    parts.unshift(step(e));
+    selector = parts.join(" > ");
+    if (parts[0].startsWith("#")) break;
+    try {
+      if (document.querySelectorAll(selector).length === 1) break;
+    } catch (_) {}
+  }
+  const components = [];
+  let source = "";
+  try {
+    const key = Object.keys(el).find((k) => k.startsWith("__reactFiber$"));
+    for (let f = key && el[key]; f && components.length < 4; f = f.return) {
+      const name = f.type && typeof f.type !== "string" && (f.type.displayName || f.type.name);
+      if (name) components.push(name);
+      if (!source && f._debugSource) source = f._debugSource.fileName + ":" + f._debugSource.lineNumber;
+    }
+  } catch (_) {}
+  const text = (el.innerText || el.value || el.alt || "").trim().replace(/\s+/g, " ");
+  return JSON.stringify({
+    box,
+    scroll: { x: window.scrollX, y: window.scrollY },
+    url: location.href,
+    selector,
+    html: el.cloneNode(false).outerHTML.slice(0, 400),
+    text: text.slice(0, 200),
+    components,
+    source,
+  });
+})"##;
+
+/// A command's result, waited for: not for the UI thread.
+fn call(out: &mpsc::Sender<Out>, method: &'static str, params: Value) -> Option<Value> {
+    let (tx, rx) = mpsc::channel();
+    out.send(Out::Call(method, params, tx)).ok()?;
+    rx.recv_timeout(Duration::from_secs(5)).ok()
+}
+
+fn element_at(out: &mpsc::Sender<Out>, x: f32, y: f32, full: bool) -> Option<Value> {
+    let expression = format!("{ELEMENT_AT}({x}, {y}, {full})");
+    let result = call(out, "Runtime.evaluate", json!({ "expression": expression, "returnByValue": true }))?;
+    serde_json::from_str(result["result"]["value"].as_str()?).ok()
+}
+
+/// The box of the element at a point, in the viewport.
+fn element_box(out: &mpsc::Sender<Out>, x: f32, y: f32) -> Option<Bounds<Pixels>> {
+    let element = element_at(out, x, y, false)?;
+    let side = |name: &str| element["box"][name].as_f64().map(|v| px(v as f32));
+    Some(Bounds { origin: point(side("x")?, side("y")?), size: size(side("width")?, side("height")?) })
+}
+
+/// The element at a point, written out for an agent, with a picture of it
+/// saved under `dir`.
+fn pick(out: &mpsc::Sender<Out>, x: f32, y: f32, dir: &std::path::Path) -> Option<String> {
+    let element = element_at(out, x, y, true)?;
+    let text = |name: &str| element[name].as_str().unwrap_or_default();
+    let number = |value: &Value| value.as_f64().unwrap_or(0.);
+    let (bounds, scroll) = (&element["box"], &element["scroll"]);
+    // The picture is cut out of the whole page, not the part in view.
+    let clip = json!({
+        "x": number(&bounds["x"]) + number(&scroll["x"]),
+        "y": number(&bounds["y"]) + number(&scroll["y"]),
+        "width": number(&bounds["width"]).max(1.),
+        "height": number(&bounds["height"]).max(1.),
+        "scale": 1,
+    });
+    let picture = call(out, "Page.captureScreenshot", json!({ "format": "png", "clip": clip })).and_then(|shot| {
+        let png = base64::engine::general_purpose::STANDARD.decode(shot["data"].as_str()?).ok()?;
+        std::fs::create_dir_all(dir).ok()?;
+        // Old pictures go when a new one comes: the agent has long seen them.
+        for old in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let age = old.metadata().and_then(|m| m.modified()).ok().and_then(|at| at.elapsed().ok());
+            if age.is_some_and(|age| age > Duration::from_secs(24 * 3600)) {
+                let _ = std::fs::remove_file(old.path());
+            }
+        }
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+        let path = dir.join(format!("element-{stamp}.png"));
+        std::fs::write(&path, png).ok()?;
+        Some(path)
+    });
+
+    let mut message = format!("On {} the element `{}`:\n{}\n", text("url"), text("selector"), text("html"));
+    if !text("text").is_empty() {
+        message.push_str(&format!("text: {:?}\n", text("text")));
+    }
+    let components: Vec<&str> = element["components"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    if !components.is_empty() {
+        message.push_str(&format!("React: {}", components.join(" in ")));
+        if !text("source").is_empty() {
+            message.push_str(&format!(" ({})", text("source")));
+        }
+        message.push('\n');
+    }
+    if let Some(path) = picture {
+        message.push_str(&format!("picture: {}\n", path.display()));
+    }
+    Some(message)
+}
+
 // ---------------------------------------------------------------- view
 
 actions!(
@@ -282,6 +412,8 @@ actions!(
 pub enum BrowserEvent {
     /// The page's URL changed, so the tab title should too.
     Navigated,
+    /// An element was picked: what to tell the agent about it.
+    Picked(String),
 }
 
 impl EventEmitter<BrowserEvent> for BrowserView {}
@@ -297,6 +429,12 @@ pub struct BrowserView {
     /// page was last told, to resize it only on change.
     bounds: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
     sent_size: std::rc::Rc<std::cell::Cell<(u32, u32, u32)>>,
+    /// A click picks an element for the agent instead of going to the page.
+    picking: bool,
+    /// The element under the pointer while picking, in the page area, and
+    /// whether the page is being asked for it.
+    hover: Option<Bounds<Pixels>>,
+    asking: bool,
     _frames: Task<()>,
     /// A sharp PNG of the page once screencast frames stop coming: the JPEG
     /// frames are for motion.
@@ -371,6 +509,9 @@ impl BrowserView {
             focus: cx.focus_handle(),
             bounds: Default::default(),
             sent_size: Default::default(),
+            picking: false,
+            hover: None,
+            asking: false,
             _frames: frames,
             _sharpen: Task::ready(()),
         }
@@ -418,6 +559,47 @@ impl BrowserView {
         result["result"]["value"].as_str().map(str::to_string)
     }
 
+    fn set_picking(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.picking = on;
+        self.hover = None;
+        cx.notify();
+    }
+
+    /// Frames the element under the pointer; one question to the page at a time.
+    fn hover_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.asking {
+            return;
+        }
+        self.asking = true;
+        let (x, y) = self.pointer(position);
+        let out = self.out.clone();
+        cx.spawn(async move |this, cx| {
+            let found = cx.background_spawn(async move { element_box(&out, x, y) }).await;
+            let _ = this.update(cx, |this, cx| {
+                this.asking = false;
+                if this.picking {
+                    this.hover = found;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn pick_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        self.set_picking(false, cx);
+        let (x, y) = self.pointer(position);
+        let out = self.out.clone();
+        let dir = crate::state::runtime_dir().join("picked");
+        cx.spawn(async move |this, cx| {
+            let message = cx.background_spawn(async move { pick(&out, x, y, &dir) }).await;
+            if let Some(message) = message {
+                let _ = this.update(cx, |_, cx| cx.emit(BrowserEvent::Picked(message)));
+            }
+        })
+        .detach();
+    }
+
     fn copy(&mut self, cx: &mut Context<Self>) {
         if let Some(text) = self.eval_string("window.getSelection().toString()").filter(|t| !t.is_empty()) {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -456,6 +638,9 @@ impl BrowserView {
     fn key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
         let m = &keystroke.modifiers;
+        if self.picking && keystroke.key == "escape" {
+            return self.set_picking(false, cx);
+        }
         if m.control && !m.alt && !m.shift {
             match keystroke.key.as_str() {
                 "c" => return self.copy(cx),
@@ -560,6 +745,19 @@ impl Render for BrowserView {
                         this.command("Page.reload", json!({}))
                     })))
                     .child(div().flex_1().child(Input::new(&self.url_input).small()))
+                    .child(
+                        Button::new("pick")
+                            .xsmall()
+                            .ghost()
+                            .label("⌖")
+                            .selected(self.picking)
+                            .tooltip("Pick an element for the agent: its selector, markup and picture go into the prompt")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                // Focused, so Esc gets here to leave picking.
+                                this.focus.focus(window, cx);
+                                this.set_picking(!this.picking, cx);
+                            })),
+                    )
                     .when_some(endpoint(), |this, endpoint| {
                         this.child(
                             div()
@@ -580,23 +778,33 @@ impl Render for BrowserView {
                     .relative()
                     .bg(gpui_kit::white())
                     .track_focus(&self.focus)
+                    .when(self.picking, |page| page.cursor(CursorStyle::Crosshair))
                     .on_mouse_down(MouseButton::Left, cx.listener(|this, e: &MouseDownEvent, window, cx| {
                         this.focus.focus(window, cx);
-                        this.mouse("mousePressed", e.position, Some(e.button), e.click_count, &e.modifiers)
+                        if !this.picking {
+                            this.mouse("mousePressed", e.position, Some(e.button), e.click_count, &e.modifiers)
+                        }
                     }))
                     .on_mouse_down(MouseButton::Right, cx.listener(|this, e: &MouseDownEvent, window, cx| {
                         // Focus first, so the context menu's actions reach this view.
                         this.focus.focus(window, cx);
                         this.mouse("mousePressed", e.position, Some(e.button), e.click_count, &e.modifiers)
                     }))
-                    .on_mouse_up(MouseButton::Left, cx.listener(|this, e: &MouseUpEvent, _, _| {
+                    .on_mouse_up(MouseButton::Left, cx.listener(|this, e: &MouseUpEvent, _, cx| {
+                        if this.picking {
+                            return this.pick_at(e.position, cx);
+                        }
                         this.mouse("mouseReleased", e.position, Some(e.button), e.click_count, &e.modifiers)
                     }))
                     .on_mouse_up(MouseButton::Right, cx.listener(|this, e: &MouseUpEvent, _, _| {
                         this.mouse("mouseReleased", e.position, Some(e.button), e.click_count, &e.modifiers)
                     }))
-                    .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, _| {
-                        this.mouse("mouseMoved", e.position, e.pressed_button, 0, &e.modifiers)
+                    .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, cx| {
+                        // The page still sees the pointer, so what shows on hover can be picked.
+                        this.mouse("mouseMoved", e.position, e.pressed_button, 0, &e.modifiers);
+                        if this.picking {
+                            this.hover_at(e.position, cx);
+                        }
                     }))
                     .on_scroll(cx.listener(|this, e: &ScrollEvent, window, _| {
                         let delta = e.delta.pixel_delta(window.line_height());
@@ -643,6 +851,20 @@ impl Render for BrowserView {
                         let (w, h) = (size.width.0 as f32 / scale, size.height.0 as f32 / scale);
                         this.child(img(frame).absolute().top_0().left_0().w(px(w)).h(px(h)))
                     })
+                    .when_some(self.hover.filter(|_| self.picking), |this, hover| {
+                        let color = cx.theme().primary;
+                        this.child(
+                            div()
+                                .absolute()
+                                .left(hover.origin.x)
+                                .top(hover.origin.y)
+                                .w(hover.size.width)
+                                .h(hover.size.height)
+                                .border_1()
+                                .border_color(color)
+                                .bg(color.opacity(0.2)),
+                        )
+                    })
                     // Headless Chrome has no menu of its own: that is browser UI.
                     .context_menu(|menu, _, _| {
                         menu.menu("Back", Box::new(BrowserBack))
@@ -662,5 +884,71 @@ impl Render for BrowserView {
 impl Focusable for BrowserView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Needs Chrome (or `IDEAE_CHROME`): `cargo test -- --ignored picks`.
+    /// Rust's own `test`: the glob above brings in the kit's.
+    #[core::prelude::v1::test]
+    #[ignore]
+    fn picks_an_element_out_of_a_scrolled_page() {
+        let page = "data:text/html,<body style='margin:0'><div style='height:1500px'></div>\
+            <ul id='users'><li class='row'>Ada</li><li class='row'>\
+            <a class='name' href='/b' style='display:inline-block;width:120px;height:30px;background:rgb(255,0,0);color:rgb(255,0,0)'>Grace Hopper</a>\
+            </li></ul><div style='height:1500px'></div>";
+        /// Ends the test's Chrome, however the test ends: on macOS nothing else does.
+        struct Quit;
+        impl Drop for Quit {
+            fn drop(&mut self) {
+                let Some(mut chrome) = CHROME.get().and_then(|slot| slot.lock().ok()?.take()) else { return };
+                let started = Instant::now();
+                // The page's thread lets go of it once the page is closed.
+                while started.elapsed() < Duration::from_secs(10) {
+                    match Arc::try_unwrap(chrome) {
+                        Ok(owned) => return drop(owned),
+                        Err(shared) => chrome = shared,
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+        let _quit = Quit;
+        let (frames, _kept) = async_channel::bounded(4);
+        let out = spawn_page(page.into(), frames);
+        let eval = |expression: &str| {
+            call(&out, "Runtime.evaluate", json!({ "expression": expression, "returnByValue": true })).map(|r| r["result"]["value"].clone())
+        };
+        call(&out, "Emulation.setDeviceMetricsOverride", json!({ "width": 800, "height": 600, "deviceScaleFactor": 2, "mobile": false }));
+        let started = Instant::now();
+        while eval("!!document.querySelector('a.name')") != Some(json!(true)) {
+            assert!(started.elapsed() < Duration::from_secs(20), "the page loads");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        eval("window.scrollTo(0, 1400)");
+        let at = eval("(() => { const r = document.querySelector('a.name').getBoundingClientRect(); return [r.left + 5, r.top + 5] })()").unwrap();
+        let (x, y) = (at[0].as_f64().unwrap() as f32, at[1].as_f64().unwrap() as f32);
+        assert!(y > 0. && y < 600., "the link is in view at {y}");
+
+        let hover = element_box(&out, x, y).expect("an element there");
+        assert_eq!((hover.size.width, hover.size.height), (px(120.), px(30.)));
+        assert_eq!((hover.origin.x + px(5.), hover.origin.y + px(5.)), (px(x), px(y)));
+
+        let dir = std::env::temp_dir().join(format!("ideae-pick-test-{}", std::process::id()));
+        let message = pick(&out, x, y, &dir).expect("the element, described");
+        assert!(message.contains("the element `a.name`:"), "the shortest selector that finds it alone: {message}");
+        assert!(message.contains("<a class=\"name\" href=\"/b\"") && message.contains("text: \"Grace Hopper\""), "{message}");
+        let picture = message.lines().find_map(|l| l.strip_prefix("picture: ")).expect("a picture");
+        let image = image::open(picture).unwrap().into_rgba8();
+        assert_eq!(image.dimensions(), (240, 60));
+        assert!(image.pixels().all(|p| p.0 == [255, 0, 0, 255]), "the picture is the link and nothing around it");
+
+        let at = eval("(() => { const r = document.querySelector('li').getBoundingClientRect(); return [r.right - 5, r.top + 5] })()").unwrap();
+        let message = pick(&out, at[0].as_f64().unwrap() as f32, at[1].as_f64().unwrap() as f32, &dir).expect("the first row");
+        assert!(message.contains("the element `li.row:nth-of-type(1)`:"), "one of two alike: {message}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

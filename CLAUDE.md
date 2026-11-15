@@ -48,7 +48,7 @@ IDEAE_STATE=/tmp/x/state.json scripts/drive.sh /tmp/x/run.log 7 \
 - Stop test processes by PID, never `pkill -f <pattern>`: patterns match other sessions' shells and the user's own app.
 - The driver gives the app no D-Bus session. Never run the app with the user's session bus in tests: it can change their GNOME dash or send notifications.
 - Use a throwaway git repo for task create/delete tests, never a real project.
-- Debug aids: `IDEAE_LSP_DIR` (where servers get installed), `IDEAE_LSP_IDLE_SECS` (how long a task out of view keeps its language servers, default 900), `IDEAE_OPEN=path:line`, `IDEAE_URL=url`, `IDEAE_TAB=n`, `IDEAE_DEBUG`.
+- Debug aids: `IDEAE_LSP_DIR` (where servers get installed), `IDEAE_LSP_IDLE_SECS` (how long a task out of view keeps its language servers, default 900), `IDEAE_OPEN=path:line`, `IDEAE_URL=url`, `IDEAE_TAB=n`, `IDEAE_DEBUG`, `IDEAE_CHROME` (the browser tabs' Chrome, when none is installed where it is looked for).
 - Before finishing, make sure no Xvfb, test app, language server or test agent you started is still running. The user's own `ideae` instance (DISPLAY=:0) is not yours.
 
 ## Rules

@@ -33,7 +33,9 @@ Windows build exists and is being tried out (see [Windows](#windows)).
   branch against its base, history, safe pull.
 - **Terminals.** Built on libghostty-vt. Ctrl+click on paths, `file:line`,
   class and function names opens them in the editor.
-- **Browser tabs.** Headless Chrome, streamed into a tab.
+- **Browser tabs.** Headless Chrome, streamed into a tab. ⌖ in its
+  toolbar picks an element for the agent: a click puts its selector,
+  markup, text, React components and a picture of it into the prompt.
 
 ## Services
 

@@ -2210,7 +2210,11 @@ impl TaskView {
 
     pub fn open_browser(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.new(|cx| crate::browser::BrowserView::new(url, window, cx));
-        cx.subscribe(&view, |_, _, _: &crate::browser::BrowserEvent, cx| cx.notify()).detach();
+        cx.subscribe_in(&view, window, |this, _, event: &crate::browser::BrowserEvent, window, cx| match event {
+            crate::browser::BrowserEvent::Navigated => cx.notify(),
+            crate::browser::BrowserEvent::Picked(message) => this.paste_to_agent(message.clone(), window, cx),
+        })
+        .detach();
         let mut tab = TabItem::new("web", TabKind::Browser(view));
         tab.right = self.focus_right && self.is_split();
         self.tabs.push(tab);
