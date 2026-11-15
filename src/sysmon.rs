@@ -790,7 +790,14 @@ mod tests {
         while started.elapsed() < std::time::Duration::from_millis(300) {
             std::hint::black_box((0..10_000u64).sum::<u64>());
         }
-        let snap = sampler.sample();
+        let mut snap = sampler.sample();
+        // The shell takes a moment to start what runs under it, whose
+        // environment tells the task where the shell's own is kept back.
+        let told = |snap: &super::Snapshot| snap.procs.iter().any(|p| p.pid == shell.id() as i32 && p.task.is_some());
+        while !told(&snap) && started.elapsed() < std::time::Duration::from_secs(5) {
+            std::hint::black_box((0..1_000_000u64).sum::<u64>());
+            snap = sampler.sample();
+        }
         for p in snap.procs.iter().filter(|p| p.top == shell.id() as i32) {
             assert!(crate::procs::alive(p.pid as u32));
             #[cfg(unix)]
