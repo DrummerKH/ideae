@@ -29,7 +29,7 @@ fn desktop_file() -> Option<PathBuf> {
 
 /// The running binary; after it was replaced on disk Linux reports the old
 /// path with " (deleted)", and the new file is there under the plain name.
-fn exe() -> std::io::Result<PathBuf> {
+pub fn exe() -> std::io::Result<PathBuf> {
     let exe = std::env::current_exe()?;
     let s = exe.to_string_lossy();
     Ok(match s.strip_suffix(" (deleted)") {

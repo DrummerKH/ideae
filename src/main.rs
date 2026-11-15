@@ -3,6 +3,7 @@
 
 mod agent;
 mod browser;
+mod build_watch;
 mod desktop;
 mod finder;
 mod git;
@@ -70,6 +71,7 @@ impl Render for Workspace {
                                 .on_click(|_, _, cx| cx.stop_propagation())
                                 .gap_3()
                                 .when(sysmon::SUPPORTED, |row| row.child(div().mr_2().child(sysmon::SysMon::render_widget(&self.sysmon, cx))))
+                                .children(self.render_new_build(cx))
                                 .child(self.render_power_saving(cx))
                                 .child(
                                     Button::new("go-to-file")
@@ -201,6 +203,29 @@ impl Workspace {
         }
     }
 
+    /// The binary was rebuilt since the app started: a restart runs it.
+    fn render_new_build(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let new = self.build.new.as_ref()?;
+        let running = match self.build.running_built() {
+            Some(built) => format!("{}, built {}", build_watch::version(), build_watch::clock(built)),
+            None => build_watch::version(),
+        };
+        let tip = format!(
+            "Running: {running}\nOn disk: {}, built {}\nClick to restart into it. Agents resume their conversations.",
+            new.version,
+            build_watch::clock(new.built)
+        );
+        Some(
+            Button::new("new-build")
+                .xsmall()
+                .ghost()
+                .label(format!("↻ new build {}", build_watch::clock(new.built)))
+                .text_color(cx.theme().primary)
+                .tooltip(tip)
+                .on_click(cx.listener(|this, _, window, cx| this.restart(window, cx))),
+        )
+    }
+
     fn render_power_saving(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let saving = lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed);
         Button::new("power-saving")
@@ -263,14 +288,7 @@ impl Workspace {
                 },
             )))
             .item(PopupMenuItem::new("Restart").on_click(move |_, window, cx| {
-                let _ = c.update(cx, |w, cx| w.save(cx));
-                match desktop::spawn_again() {
-                    Ok(()) => cx.quit(),
-                    Err(e) => window.push_notification(
-                        gpui_kit::component::notification::Notification::error(e.to_string()).title("Restart"),
-                        cx,
-                    ),
-                }
+                let _ = c.update(cx, |w, cx| w.restart(window, cx));
             }))
             .item(PopupMenuItem::new("Exit").on_click(move |_, _, cx| {
                 let _ = d.update(cx, |w, cx| w.save(cx));
@@ -373,7 +391,7 @@ fn main() {
                 appearance = args.next().and_then(|v| Appearance::parse(&v))
             }
             "--version" | "-V" => {
-                println!("ideae {}", option_env!("IDEAE_VERSION").unwrap_or(concat!(env!("CARGO_PKG_VERSION"), "-local")));
+                println!("ideae {}", build_watch::version());
                 return;
             }
             "--help" | "-h" => {

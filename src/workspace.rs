@@ -81,6 +81,7 @@ pub struct Workspace {
     last_saved: String,
     _subscriptions: Vec<Subscription>,
     _tick: Task<()>,
+    pub build: crate::build_watch::BuildWatch,
 }
 
 impl Workspace {
@@ -164,6 +165,7 @@ impl Workspace {
                 n += 1;
                 let alive = this.update_in(cx, |this, window, cx| {
                     this.save(cx);
+                    this.check_build(window, cx);
                     if n % 10 == 0 {
                         this.sync_worktrees(window, cx);
                         this.sleep_idle_language_servers(cx);
@@ -198,6 +200,7 @@ impl Workspace {
             last_saved: String::new(),
             _subscriptions: subscriptions,
             _tick: tick,
+            build: crate::build_watch::BuildWatch::new(),
         };
         this.restore(&saved, window, cx);
 
@@ -849,6 +852,26 @@ impl Workspace {
             view.update(cx, |t, cx| t.set_language_servers(!on, cx));
         }
         cx.notify();
+    }
+
+    fn check_build(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(exe) = self.build.check() else { return };
+        cx.spawn_in(window, async move |this, cx| {
+            let version = cx.background_spawn(async move { crate::build_watch::probe(exe) }).await;
+            let _ = this.update(cx, |this, cx| {
+                this.build.found(version);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn restart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.save(cx);
+        match crate::desktop::spawn_again() {
+            Ok(()) => cx.quit(),
+            Err(e) => window.push_notification(Notification::error(e.to_string()).title("Restart"), cx),
+        }
     }
 
     pub fn set_appearance(&mut self, appearance: Appearance, window: &mut Window, cx: &mut Context<Self>) {
