@@ -472,11 +472,22 @@ fn main() {
                 KeyBinding::new("alt-right", NoAction, Some(gpui_cn::terminal::KEY_CONTEXT)),
             ]);
 
+            // A saved window larger than the screen it opens on (another
+            // monitor, another scale) shrinks to fit.
+            let screen = cx.primary_display().map(|d| d.bounds());
             let window_bounds = state::load()
                 .window
                 .filter(|w| w.width >= 400. && w.height >= 300.)
                 .map(|w| {
-                    let bounds = Bounds::new(point(px(w.x), px(w.y)), size(px(w.width), px(w.height)));
+                    let (mut width, mut height) = (px(w.width), px(w.height));
+                    let mut origin = point(px(w.x), px(w.y));
+                    if let Some(screen) = screen {
+                        width = width.min(screen.size.width);
+                        height = height.min(screen.size.height);
+                        origin.x = origin.x.max(screen.origin.x).min(screen.origin.x + screen.size.width - width);
+                        origin.y = origin.y.max(screen.origin.y).min(screen.origin.y + screen.size.height - height);
+                    }
+                    let bounds = Bounds::new(origin, size(width, height));
                     if w.fullscreen {
                         WindowBounds::Fullscreen(bounds)
                     } else if w.maximized {

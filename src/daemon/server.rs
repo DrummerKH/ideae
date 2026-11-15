@@ -31,6 +31,8 @@ struct Session {
     /// Input the pty could not take yet.
     pending: Vec<u8>,
     fg: Option<Fg>,
+    /// The grid the windows last asked for.
+    size: Size,
 }
 
 #[derive(Default)]
@@ -164,8 +166,9 @@ fn serve(shared: Shared, stream: UnixStream) {
             }
             Frame::Msg(Msg::Open { id, spec, size }) => open(&shared, client, id, spec, size),
             Frame::Msg(Msg::Resize { id, size }) => {
-                let s = shared.lock().unwrap();
-                if let Some(session) = s.sessions.get(&id) {
+                let mut s = shared.lock().unwrap();
+                if let Some(session) = s.sessions.get_mut(&id) {
+                    session.size = size;
                     let _ = session.handle.lock().unwrap().resize(viewport(size));
                 }
             }
@@ -217,6 +220,7 @@ fn open(shared: &Shared, client: u64, id: String, spec: Spec, size: Size) {
     if let Some(session) = s.sessions.get_mut(&id) {
         // Attach: what it printed so far, then live output.
         session.attached.insert(client);
+        session.size = size;
         let replay: Vec<u8> = session.replay.iter().copied().collect();
         let fg = session.fg.clone();
         let handle = session.handle.clone();
@@ -224,12 +228,18 @@ fn open(shared: &Shared, client: u64, id: String, spec: Spec, size: Size) {
         s.send(client, proto::encode_msg(&Msg::Foreground { id: id.clone(), fg }));
         drop(s);
         // A size change makes full-screen programs (the agent) draw again,
-        // over whatever the replay could not restore.
+        // over whatever the replay could not restore. It ends on the size
+        // the window has by then: a window that maximizes right after it
+        // opens sends a new one meanwhile.
+        let shared = shared.clone();
         std::thread::spawn(move || {
             let shrunk = Size { rows: size.rows.saturating_sub(1).max(2), ..size };
             let _ = handle.lock().unwrap().resize(viewport(shrunk));
             std::thread::sleep(Duration::from_millis(60));
-            let _ = handle.lock().unwrap().resize(viewport(size));
+            let s = shared.lock().unwrap();
+            if let Some(session) = s.sessions.get(&id).filter(|x| Arc::ptr_eq(&x.handle, &handle)) {
+                let _ = handle.lock().unwrap().resize(viewport(session.size));
+            }
         });
         return;
     }
@@ -261,6 +271,7 @@ fn open(shared: &Shared, client: u64, id: String, spec: Spec, size: Size) {
             attached: HashSet::from([client]),
             pending: Vec::new(),
             fg: None,
+            size,
         },
     );
     drop(s);
