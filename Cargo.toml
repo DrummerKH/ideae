@@ -66,6 +66,9 @@ gpui-cn = { path = "vendor/gpui-cn" }
 # input/base/state.rs patched: hover/Ctrl+click hit-test ignored the scroll offset.
 gpui-base = { path = "vendor/gpui-base" }
 
+[dev-dependencies]
+gpui-kit = { version = "0.8.1", features = ["test-support"] }
+
 [build-dependencies]
 cc = "1"
 embed-resource = "3.0.12"

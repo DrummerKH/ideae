@@ -1,4 +1,6 @@
 //! Settings (Ctrl+,): a dialog over the state's settings, applied on Save.
+//! Pages on the left with a filter over them, the page's settings on the
+//! right.
 
 use std::{
     cell::{Cell, RefCell},
@@ -8,250 +10,345 @@ use std::{
 use gpui_kit::component::{
     ActiveTheme as _, Selectable as _, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
-    checkbox::Checkbox,
-    input::{Input, InputState},
-    switch::Switch,
-    h_flex, v_flex,
+    h_flex,
+    setting::{NumberFieldOptions, SelectIndex, SettingField, SettingGroup, SettingItem, SettingPage, Settings},
 };
-use gpui_kit::{prelude::FluentBuilder as _, *};
+use gpui_kit::{TestSupportExt as _, prelude::FluentBuilder as _, *};
 
 use crate::{lsp, state, workspace::Workspace};
 
-fn section(title: &'static str, cx: &App) -> Div {
-    div().pt_2().text_xs().text_color(cx.theme().muted_foreground).child(title)
+type Draft = Rc<RefCell<state::Settings>>;
+
+fn switch(
+    draft: &Draft,
+    title: &'static str,
+    hint: &'static str,
+    get: fn(&state::Settings) -> bool,
+    set: fn(&mut state::Settings, bool),
+) -> SettingItem {
+    let (read, write) = (draft.clone(), draft.clone());
+    let field = SettingField::switch(move |_| get(&read.borrow()), move |value, cx| {
+        set(&mut write.borrow_mut(), value);
+        cx.refresh_windows();
+    })
+    .default_value(get(&state::Settings::default()));
+    SettingItem::new(title, field).description(hint)
 }
 
-fn row(label: &'static str, hint: &'static str, control: impl IntoElement, cx: &App) -> Div {
-    h_flex()
-        .gap_4()
-        .justify_between()
-        .child(
-            v_flex()
-                .min_w_0()
-                .child(div().text_sm().child(label))
-                .child(div().text_xs().text_color(cx.theme().muted_foreground).child(hint)),
+fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc<RefCell<Option<Subscription>>>) -> Vec<SettingPage> {
+    let default = state::Settings::default();
+    let agent = {
+        let (read, write) = (draft.clone(), draft.clone());
+        SettingField::input(move |_| SharedString::from(read.borrow().agent.clone()), move |value: SharedString, _| {
+            write.borrow_mut().agent = value.to_string()
+        })
+        .default_value(default.agent.clone())
+    };
+    let idle = {
+        let (read, write) = (draft.clone(), draft.clone());
+        SettingField::number_input(
+            NumberFieldOptions { min: 1., max: 24. * 60., step: 1. },
+            move |_| f64::from(read.borrow().lsp_idle_minutes),
+            move |value, _| write.borrow_mut().lsp_idle_minutes = value as u32,
         )
-        .child(control)
+        .default_value(f64::from(default.lsp_idle_minutes))
+    };
+    let servers = lsp::SERVERS.iter().map(|def| {
+        let program = def.program;
+        let (read, write) = (draft.clone(), draft.clone());
+        let field = SettingField::checkbox(move |_| !read.borrow().lsp_off.iter().any(|p| p == program), move |on, cx| {
+            let mut d = write.borrow_mut();
+            d.lsp_off.retain(|p| p != program);
+            if !on {
+                d.lsp_off.push(program.to_string());
+            }
+            cx.refresh_windows();
+        })
+        .default_value(true);
+        let missing = if def.available() { "" } else { ", not installed" };
+        SettingItem::new(program, field).description(format!("{}{missing}", def.extensions()))
+    });
+    vec![
+        SettingPage::new("General").group(
+            SettingGroup::new()
+                .item(switch(
+                    draft,
+                    "Notifications",
+                    "A desktop notification when an agent out of view needs you or finishes.",
+                    |s| s.notifications,
+                    |s, v| s.notifications = v,
+                ))
+                .item(switch(
+                    draft,
+                    "Check for updates",
+                    "Release builds ask GitHub for a newer release now and then.",
+                    |s| s.check_updates,
+                    |s, v| s.check_updates = v,
+                )),
+        ),
+        SettingPage::new("Agent").group(
+            SettingGroup::new()
+                .item(
+                    SettingItem::new("Agent command", agent)
+                        .description("Runs in each task's agent tab; empty for a plain shell. New tasks use it."),
+                )
+                .item(switch(
+                    draft,
+                    "Agents' language servers",
+                    "Claude Code's LSP plugins, a rust-analyzer and the like per agent. Off saves much memory; agents lose go-to-definition. For agents started after Save.",
+                    |s| s.agent_lsp,
+                    |s, v| s.agent_lsp = v,
+                )),
+        ),
+        SettingPage::new("Tasks").group(
+            SettingGroup::new()
+                .item(switch(
+                    draft,
+                    "Copy .env files",
+                    "New worktrees get the main checkout's ignored .env* files.",
+                    |s| s.copy_env,
+                    |s, v| s.copy_env = v,
+                ))
+                .item(switch(
+                    draft,
+                    "Pull request status",
+                    "Ask gh about each task's PR and show it on the row.",
+                    |s| s.pr_status,
+                    |s, v| s.pr_status = v,
+                )),
+        ),
+        SettingPage::new("Language servers").default_open(true).groups([
+            SettingGroup::new().title("Servers").items(servers),
+            SettingGroup::new().title("Sleep").item(
+                SettingItem::new("Sleep after (minutes)", idle)
+                    .description("A task out of view this long stops its language servers."),
+            ),
+        ]),
+        SettingPage::new("Keys")
+            .description("Click a shortcut and press the new keys: Esc leaves them, Backspace removes them.")
+            .default_open(true)
+            .groups(key_groups(draft, recording, catcher)),
+    ]
 }
 
 impl Workspace {
     pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let current = state::settings();
-        let draft = Rc::new(RefCell::new(current.clone()));
-        let agent = cx.new(|cx| {
-            let mut input = InputState::new(window, cx).placeholder("claude");
-            input.set_value(current.agent.clone(), window, cx);
-            input
-        });
-        let idle = cx.new(|cx| {
-            let mut input = InputState::new(window, cx);
-            input.set_value(current.lsp_idle_minutes.to_string(), window, cx);
-            input
-        });
         let this = cx.weak_entity();
-        // The shortcut waiting for keys, and what catches them before any
-        // binding does.
-        let recording: Rc<Cell<Option<&'static str>>> = Rc::default();
-        let catcher: Rc<RefCell<Option<Subscription>>> = Rc::default();
-        window.open_dialog(cx, move |dialog, _, _| {
-            let (draft, agent, idle, this) = (draft.clone(), agent.clone(), idle.clone(), this.clone());
-            let (recording, catcher) = (recording.clone(), catcher.clone());
-            let save = {
-                let (draft, agent, idle, this) = (draft.clone(), agent.clone(), idle.clone(), this.clone());
-                move |window: &mut Window, cx: &mut App| {
-                    let mut settings = draft.borrow().clone();
-                    settings.agent = agent.read(cx).value().trim().to_string();
-                    if let Ok(minutes) = idle.read(cx).value().trim().parse::<u32>() {
-                        settings.lsp_idle_minutes = minutes.max(1);
-                    }
-                    let _ = this.update(cx, |w, cx| w.apply_settings(settings, cx));
-                    window.close_dialog(cx);
-                }
-            };
-            dialog
-                .title("Settings")
-                .w(px(620.))
-                .content(move |content, _, cx| {
-                    let d = draft.borrow().clone();
-                    let keys = keys_section(&draft, &recording, &catcher);
-                    let toggle = |id: &'static str, on: bool, set: fn(&mut state::Settings, bool)| {
-                        let draft = draft.clone();
-                        Switch::new(id).checked(on).on_click(move |value: &bool, window, _| {
-                            set(&mut draft.borrow_mut(), *value);
-                            window.refresh();
-                        })
-                    };
-                    let servers = lsp::SERVERS.iter().map(|def| {
-                        let program = def.program;
-                        let draft = draft.clone();
-                        let on = !d.lsp_off.iter().any(|p| p == program);
-                        let missing = if def.available() { "" } else { ", not installed" };
-                        Checkbox::new(SharedString::from(format!("lsp-{program}")))
-                            .label(format!("{program}  ({}{missing})", def.extensions()))
-                            .checked(on)
-                            .on_click(move |value: &bool, window, _| {
-                                let mut d = draft.borrow_mut();
-                                d.lsp_off.retain(|p| p != program);
-                                if !*value {
-                                    d.lsp_off.push(program.to_string());
-                                }
-                                window.refresh();
-                            })
-                    });
-                    content.child(
-                        div().id("settings-body").h(px(560.)).overflow_y_scroll().pr_2().child(v_flex()
-                            .gap_3()
-                            .child(section("AGENT", cx))
-                            .child(row(
-                                "Agent command",
-                                "Runs in each task's agent tab; empty for a plain shell. New tasks use it.",
-                                div().w(px(220.)).child(Input::new(&agent).small()),
-                                cx,
-                            ))
-                            .child(row(
-                                "Agents' language servers",
-                                "Claude Code's LSP plugins, a rust-analyzer and the like per agent. Off saves much memory; agents lose go-to-definition. For agents started after Save.",
-                                toggle("agent-lsp", d.agent_lsp, |s, v| s.agent_lsp = v),
-                                cx,
-                            ))
-                            .child(row(
-                                "Notifications",
-                                "A desktop notification when an agent out of view needs you or finishes.",
-                                toggle("notifications", d.notifications, |s, v| s.notifications = v),
-                                cx,
-                            ))
-                            .child(section("LANGUAGE SERVERS", cx))
-                            .child(v_flex().gap_1().children(servers))
-                            .child(row(
-                                "Sleep after (minutes)",
-                                "A task out of view this long stops its language servers.",
-                                div().w(px(80.)).child(Input::new(&idle).small()),
-                                cx,
-                            ))
-                            .child(section("TASKS", cx))
-                            .child(row(
-                                "Copy .env files",
-                                "New worktrees get the main checkout's ignored .env* files.",
-                                toggle("copy-env", d.copy_env, |s, v| s.copy_env = v),
-                                cx,
-                            ))
-                            .child(row(
-                                "Check for updates",
-                                "Release builds ask GitHub for a newer release now and then.",
-                                toggle("check-updates", d.check_updates, |s, v| s.check_updates = v),
-                                cx,
-                            ))
-                            .child(row(
-                                "Pull request status",
-                                "Ask gh about each task's PR and show it on the row.",
-                                toggle("pr-status", d.pr_status, |s, v| s.pr_status = v),
-                                cx,
-                            ))
-                            .child(section("KEYS", cx))
-                            .child(keys)),
-                    )
-                })
-                .footer({
-                    let save = save.clone();
-                    h_flex()
-                        .justify_end()
-                        .gap_2()
-                        .child(Button::new("settings-cancel").ghost().label("Cancel").on_click(|_, window, cx| window.close_dialog(cx)))
-                        .child(Button::new("settings-save").primary().label("Save").on_click(move |_, window, cx| save(window, cx)))
-                })
+        open(state::settings(), 0, window, cx, move |settings, cx| {
+            let _ = this.update(cx, |w, cx| w.apply_settings(settings, cx));
         });
     }
 }
 
-/// The shortcuts, each with its keys: a click waits for new ones (Esc
-/// leaves them, Backspace removes them), ↺ puts the default back.
-fn keys_section(
-    draft: &Rc<RefCell<state::Settings>>,
+/// The dialog over `current`, at the page `first`; Save hands `save` the result.
+fn open(current: state::Settings, first: usize, window: &mut Window, cx: &mut App, save: impl Fn(state::Settings, &mut App) + 'static) {
+    let draft: Draft = Rc::new(RefCell::new(current));
+    // The shortcut waiting for keys, and what catches them before any
+    // binding does.
+    let recording: Rc<Cell<Option<&'static str>>> = Rc::default();
+    let catcher: Rc<RefCell<Option<Subscription>>> = Rc::default();
+    let save = Rc::new(save);
+    window.open_dialog(cx, move |dialog, _, _| {
+        let (draft, recording, catcher) = (draft.clone(), recording.clone(), catcher.clone());
+        let save = {
+            let (draft, save) = (draft.clone(), save.clone());
+            move |window: &mut Window, cx: &mut App| {
+                let mut settings = draft.borrow().clone();
+                settings.agent = settings.agent.trim().to_string();
+                settings.lsp_idle_minutes = settings.lsp_idle_minutes.max(1);
+                save(settings, cx);
+                window.close_dialog(cx);
+            }
+        };
+        dialog
+            .title("Settings")
+            .w(px(900.))
+            .content(move |content, window, cx| {
+                // The dialog is as tall as the window lets it; the pages scroll inside.
+                let height = (window.viewport_size().height - px(220.)).clamp(px(200.), px(620.));
+                content.child(
+                    div()
+                        .h(height)
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .rounded(cx.theme().radius)
+                        .overflow_hidden()
+                        .child(
+                            Settings::new("settings")
+                                .sidebar_width(px(200.))
+                                .default_selected_index(SelectIndex { page_ix: first, group_ix: None })
+                                .pages(pages(&draft, &recording, &catcher)),
+                        ),
+                )
+            })
+            .footer(
+                h_flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(Button::new("settings-cancel").ghost().label("Cancel").on_click(|_, window, cx| window.close_dialog(cx)))
+                    .child(Button::new("settings-save").primary().label("Save").on_click(move |_, window, cx| save(window, cx))),
+            )
+    });
+}
+
+/// The shortcuts by where they work, each with its keys: a click waits for
+/// new ones (Esc leaves them, Backspace removes them), ↺ puts the default
+/// back.
+fn key_groups(
+    draft: &Draft,
     recording: &Rc<Cell<Option<&'static str>>>,
     catcher: &Rc<RefCell<Option<Subscription>>>,
-) -> impl IntoElement {
+) -> Vec<SettingGroup> {
     use crate::keymap::{SHORTCUTS, display};
     let d = draft.borrow().clone();
     let effective = |id: &str, default: String| d.keys.get(id).cloned().unwrap_or(default);
     let all: Vec<(&'static str, &'static str, String)> =
         SHORTCUTS.iter().map(|s| (s.id, s.name, effective(s.id, s.default_keys()))).collect();
-    v_flex().gap_0p5().children(SHORTCUTS.iter().map(|shortcut| {
+    let item = |shortcut: &'static crate::keymap::Shortcut| {
         let id = shortcut.id;
         let keys = effective(id, shortcut.default_keys());
         let waiting = recording.get() == Some(id);
-        let clash: Vec<&str> =
+        let clash: Vec<&'static str> =
             all.iter().filter(|(other, _, k)| *other != id && !keys.is_empty() && *k == keys).map(|(_, name, _)| *name).collect();
         let (draft, recording, catcher) = (draft.clone(), recording.clone(), catcher.clone());
-        let reset_draft = draft.clone();
         let changed = d.keys.contains_key(id);
-        h_flex()
-            .gap_2()
-            .child(div().flex_1().text_sm().child(shortcut.name))
-            .when(!clash.is_empty(), |row| {
-                row.child(div().text_xs().text_color(gpui_kit::red()).child(format!("also {}", clash.join(", "))))
-            })
-            .child(
-                Button::new(SharedString::from(format!("key-{id}")))
-                    .small()
-                    .outline()
-                    .w(px(150.))
-                    .label(if waiting {
-                        "Press keys… Esc".to_string()
-                    } else if keys.is_empty() {
-                        "none".to_string()
-                    } else {
-                        display(&keys)
-                    })
-                    .selected(waiting)
-                    .on_click(move |_, window, cx| {
-                        recording.set(Some(id));
-                        let (draft, recording, own) = (draft.clone(), recording.clone(), catcher.clone());
-                        let subscription = cx.intercept_keystrokes(move |event, window, cx| {
-                            let Some(id) = recording.get() else { return };
-                            let k = &event.keystroke;
-                            if matches!(k.key.as_str(), "shift" | "control" | "alt" | "platform" | "function" | "") {
-                                return;
-                            }
-                            cx.stop_propagation();
-                            let plain = !k.modifiers.modified();
-                            match k.key.as_str() {
-                                "escape" if plain => {}
-                                "backspace" | "delete" if plain => {
-                                    draft.borrow_mut().keys.insert(id.to_string(), String::new());
+        let shown = display(&keys);
+        let (dirty_draft, reset_all_draft) = (draft.clone(), draft.clone());
+        let field = SettingField::render(move |_, _, _| {
+            let (draft, recording, catcher) = (draft.clone(), recording.clone(), catcher.clone());
+            let reset_draft = draft.clone();
+            let keys = keys.clone();
+            h_flex()
+                .id(SharedString::from(format!("key-row-{id}")))
+                .test_support()
+                .gap_2()
+                .when(!clash.is_empty(), |row| {
+                    row.child(div().text_xs().text_color(gpui_kit::red()).child(format!("also {}", clash.join(", "))))
+                })
+                .child(
+                    Button::new(SharedString::from(format!("key-{id}")))
+                        .small()
+                        .outline()
+                        .w(px(150.))
+                        .label(if waiting {
+                            "Press keys… Esc".to_string()
+                        } else if keys.is_empty() {
+                            "none".to_string()
+                        } else {
+                            display(&keys)
+                        })
+                        .selected(waiting)
+                        .on_click(move |_, window, cx| {
+                            recording.set(Some(id));
+                            let (draft, recording, own) = (draft.clone(), recording.clone(), catcher.clone());
+                            let subscription = cx.intercept_keystrokes(move |event, window, cx| {
+                                let Some(id) = recording.get() else { return };
+                                let k = &event.keystroke;
+                                if matches!(k.key.as_str(), "shift" | "control" | "alt" | "platform" | "function" | "") {
+                                    return;
                                 }
-                                _ => {
-                                    let keys = k.unparse(cx.platform_info().os);
-                                    let default = crate::keymap::find(id).map(|s| s.default_keys()).unwrap_or_default();
-                                    let mut d = draft.borrow_mut();
-                                    if keys == default {
-                                        d.keys.remove(id);
-                                    } else {
-                                        d.keys.insert(id.to_string(), keys);
+                                cx.stop_propagation();
+                                let plain = !k.modifiers.modified();
+                                match k.key.as_str() {
+                                    "escape" if plain => {}
+                                    "backspace" | "delete" if plain => {
+                                        draft.borrow_mut().keys.insert(id.to_string(), String::new());
+                                    }
+                                    _ => {
+                                        let keys = k.unparse(cx.platform_info().os);
+                                        let default = crate::keymap::find(id).map(|s| s.default_keys()).unwrap_or_default();
+                                        let mut d = draft.borrow_mut();
+                                        if keys == default {
+                                            d.keys.remove(id);
+                                        } else {
+                                            d.keys.insert(id.to_string(), keys);
+                                        }
                                     }
                                 }
-                            }
-                            recording.set(None);
-                            let own = own.clone();
-                            window.defer(cx, move |_, _| {
-                                own.borrow_mut().take();
+                                recording.set(None);
+                                let own = own.clone();
+                                window.defer(cx, move |_, _| {
+                                    own.borrow_mut().take();
+                                });
+                                window.refresh();
                             });
+                            *catcher.borrow_mut() = Some(subscription);
                             window.refresh();
-                        });
-                        *catcher.borrow_mut() = Some(subscription);
-                        window.refresh();
-                    }),
-            )
-            .child(
-                Button::new(SharedString::from(format!("key-reset-{id}")))
-                    .small()
-                    .ghost()
-                    .label("↺")
-                    .tooltip("Back to the default")
-                    .when(!changed, |b| b.invisible())
-                    .on_click(move |_, window, _| {
-                        reset_draft.borrow_mut().keys.remove(id);
-                        window.refresh();
-                    }),
-            )
-    }))
+                        }),
+                )
+                .child(
+                    Button::new(SharedString::from(format!("key-reset-{id}")))
+                        .small()
+                        .ghost()
+                        .label("↺")
+                        .tooltip("Back to the default")
+                        .when(!changed, |b| b.invisible())
+                        .on_click(move |_, window, _| {
+                            reset_draft.borrow_mut().keys.remove(id);
+                            window.refresh();
+                        }),
+                )
+            })
+            .on_reset(move |_| dirty_draft.borrow().keys.contains_key(id), move |_, cx| {
+                reset_all_draft.borrow_mut().keys.remove(id);
+                cx.refresh_windows();
+            });
+            SettingItem::new(shortcut.name, field).keywords([shown])
+        };
+        ["Window", "Editor", "Terminal"]
+            .into_iter()
+            .map(|area| SettingGroup::new().title(area).items(SHORTCUTS.iter().filter(|s| s.area() == area).map(&item)))
+            .collect()
+    }
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit::test::TestWindowExt as _;
+    use gpui_kit::{AppContext as _, Bounds, Empty, Point, ScrollDelta, TestAppContext, WindowBounds, WindowOptions, point, px, size};
+
+    use super::{Rc, RefCell, open, state};
+
+    fn window(cx: &mut TestAppContext) -> gpui_kit::AnyWindowHandle {
+        cx.update(|cx| {
+            let bounds = Bounds { origin: Point::default(), size: size(px(1200.), px(800.)) };
+            let options = WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() };
+            gpui_kit::open_window(options, cx, |_, cx| cx.new(|_| Empty)).expect("a test window").0
+        })
+    }
+
+    #[gpui_kit::test]
+    fn every_page_draws(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        for page in 0..5 {
+            let handle = window(cx);
+            cx.update_window(handle, |_, window, cx| {
+                open(state::Settings::default(), page, window, cx, |_, _| {});
+                window.render_frame(cx);
+                assert_eq!(window.try_find("key-row-quit").is_some(), page == 4, "page {page}");
+            })
+            .unwrap();
+        }
+    }
+
+    #[gpui_kit::test]
+    fn keys_scroll_and_save(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = window(cx);
+        let saved: Rc<RefCell<Option<state::Settings>>> = Rc::default();
+        cx.update_window(handle, |_, window, cx| {
+            let mut current = state::Settings::default();
+            current.agent = " mine ".into();
+            let saved = saved.clone();
+            open(current, 4, window, cx, move |settings, _| *saved.borrow_mut() = Some(settings));
+            window.render_frame(cx);
+            let before = window.find("key-row-recent").bounds();
+            assert!(window.try_find("key-row-comment").is_none_or(|row| !row.visible()), "the last keys start below the fold");
+            window.scroll("key-row-recent", ScrollDelta::Pixels(point(px(0.), px(-300.))), cx);
+            let after = window.try_find("key-row-recent").map(|row| row.bounds());
+            assert!(after.is_none_or(|after| after.top() < before.top()), "the page scrolled");
+            window.click("settings-save", cx);
+        })
+        .unwrap();
+        assert_eq!(saved.borrow().as_ref().map(|s| s.agent.as_str()), Some("mine"));
+    }
 }

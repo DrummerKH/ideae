@@ -31,6 +31,7 @@ scripts/           Xvfb driver for UI checks, icons.py, macos-app.sh (a .app aro
 
 - Zig 0.17.x must be on PATH (libghostty-vt). System -dev libraries: see README.
 - `cargo build`, `cargo test`. LSP tests are `#[ignore]` and need gopls / rust-analyzer.
+- UI can be tested without a display: `#[gpui_kit::test]` with `gpui_kit::test` (find, click, scroll by element id; mark elements with `.test_support()`), as `settings_ui.rs` does.
 - A debug build is the separate app `ideae-dev`: own state, sockets, window class, launcher. Keep that split for anything new that has an identity on the system.
 
 ## Checking UI changes

@@ -74,6 +74,15 @@ impl Shortcut {
         (self.action)()
     }
 
+    /// The heading Settings lists it under.
+    pub fn area(&self) -> &'static str {
+        match self.scope {
+            Scope::Editor => "Editor",
+            Scope::Terminal => "Terminal",
+            _ => "Window",
+        }
+    }
+
     /// This platform's default keystrokes ("ctrl-e", "cmd-e").
     pub fn default_keys(&self) -> String {
         keys::key(self.default)
