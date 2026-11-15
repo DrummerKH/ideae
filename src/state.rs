@@ -36,6 +36,8 @@ pub struct Settings {
     /// Copy the main checkout's ignored `.env*` files into new worktrees.
     pub copy_env: bool,
     pub pr_status: bool,
+    /// Release builds ask GitHub for newer releases.
+    pub check_updates: bool,
 }
 
 impl Default for Settings {
@@ -47,6 +49,7 @@ impl Default for Settings {
             notifications: true,
             copy_env: true,
             pr_status: true,
+            check_updates: true,
         }
     }
 }

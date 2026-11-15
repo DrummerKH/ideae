@@ -26,13 +26,14 @@ mod sysmon;
 mod state;
 mod task;
 mod theme;
+mod update;
 mod workspace;
 mod zoom;
 
 use std::path::PathBuf;
 
 use gpui_kit::component::{
-    ActiveTheme as _, Sizable as _, TitleBar, WindowExt as _,
+    ActiveTheme as _, Disableable as _, Sizable as _, TitleBar, WindowExt as _,
     button::{Button, ButtonVariants as _},
     resizable::{h_resizable, resizable_panel},
     h_flex, v_flex,
@@ -84,6 +85,7 @@ impl Render for Workspace {
                                 .on_click(|_, _, cx| cx.stop_propagation())
                                 .gap_3()
                                 .when(sysmon::SUPPORTED, |row| row.child(div().mr_2().child(sysmon::SysMon::render_widget(&self.sysmon, cx))))
+                                .children(self.render_update(cx))
                                 .children(self.render_new_build(cx))
                                 .child(self.render_power_saving(cx))
                                 .child(
@@ -220,6 +222,30 @@ impl Workspace {
         if let Some(task) = self.active_view() {
             task.update(cx, |t, cx| t.open_finder(kind, window, cx));
         }
+    }
+
+    /// A newer release: one click downloads it and restarts.
+    fn render_update(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let release = self.update.as_ref()?;
+        let label = if self.updating {
+            "↑ updating…".to_string()
+        } else {
+            format!("↑ update {}", update::when(&release.tag))
+        };
+        Some(
+            Button::new("update")
+                .xsmall()
+                .ghost()
+                .disabled(self.updating)
+                .label(label)
+                .text_color(cx.theme().primary)
+                .tooltip(format!(
+                    "Release {} is out. Click to download it ({} MB) and restart; the agents go on.",
+                    release.tag,
+                    release.size / (1 << 20)
+                ))
+                .on_click(cx.listener(|this, _, window, cx| this.install_update(window, cx))),
+        )
     }
 
     /// The binary was rebuilt since the app started: a restart runs it.

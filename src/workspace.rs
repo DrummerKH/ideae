@@ -96,6 +96,10 @@ pub struct Workspace {
     /// otherwise add up with every restart.
     requested_origin: Option<(Point<Pixels>, std::time::Instant)>,
     origin_offset: Point<Pixels>,
+    /// A newer release, when this is a release build; and whether it is
+    /// being installed.
+    pub update: Option<crate::update::Release>,
+    pub updating: bool,
     /// Quitting while the agents go on: a restart, or the window's ×.
     keep_terminals: bool,
 }
@@ -250,6 +254,10 @@ impl Workspace {
                 let alive = this.update_in(cx, |this, window, cx| {
                     this.save(cx);
                     this.check_build(window, cx);
+                    // Every six hours, the first time soon after start.
+                    if n % 7200 == 3 {
+                        this.check_update(window, cx);
+                    }
                     if n % 10 == 0 {
                         this.sync_worktrees(window, cx);
                         this.sleep_idle_language_servers(cx);
@@ -289,6 +297,8 @@ impl Workspace {
             requested_origin: None,
             origin_offset: Point::default(),
             window_place: saved.window.clone(),
+            update: None,
+            updating: false,
             keep_terminals: false,
             build: crate::build_watch::BuildWatch::new(),
         };
@@ -1204,6 +1214,42 @@ impl Workspace {
                 true
             })
         });
+    }
+
+    fn check_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !crate::update::enabled() || !state::settings().check_updates {
+            return;
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            let found = cx.background_spawn(async { crate::update::newer() }).await;
+            let _ = this.update(cx, |this, cx| {
+                this.update = found;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Downloads the newer release over this binary and restarts into it.
+    pub fn install_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(release) = self.update.clone() else { return };
+        if self.updating {
+            return;
+        }
+        self.updating = true;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx.background_spawn(async move { crate::update::install(&release) }).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.updating = false;
+                match result {
+                    Ok(_) => this.restart(window, cx),
+                    Err(e) => window.push_notification(Notification::error(e).title("Update"), cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub fn restart(&mut self, window: &mut Window, cx: &mut Context<Self>) {

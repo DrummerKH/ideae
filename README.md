@@ -56,6 +56,14 @@ its arguments. A task's terminals, the agent's included, get
 `IDEAE_PORT_<NAME>`. A service runs in its own terminal tab and survives a
 window restart; a taken port is reported with the process holding it.
 
+## Updates
+
+Release builds ask the GitHub API for this repository's latest release at
+start and every six hours (Settings → Check for updates turns that off).
+A newer one shows "↑ update" in the title bar: it downloads that release's
+binary next to the running one, puts it in its place and restarts; on
+Linux the agents keep running through the restart.
+
 ## Build
 
 Requirements:

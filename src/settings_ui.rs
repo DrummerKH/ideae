@@ -121,6 +121,12 @@ impl Workspace {
                                 cx,
                             ))
                             .child(row(
+                                "Check for updates",
+                                "Release builds ask GitHub for a newer release now and then.",
+                                toggle("check-updates", d.check_updates, |s, v| s.check_updates = v),
+                                cx,
+                            ))
+                            .child(row(
                                 "Pull request status",
                                 "Ask gh about each task's PR and show it on the row.",
                                 toggle("pr-status", d.pr_status, |s, v| s.pr_status = v),
