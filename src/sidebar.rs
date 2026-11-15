@@ -217,12 +217,15 @@ impl Workspace {
         let muted = cx.theme().muted_foreground;
         let this = cx.weak_entity();
         let menu = move |menu: PopupMenu, this: WeakEntity<Workspace>| {
-            let (a, b, c) = (this.clone(), this.clone(), this);
+            let (a, b, c, d) = (this.clone(), this.clone(), this.clone(), this);
             menu.item(PopupMenuItem::new("Open main thread").on_click(move |_, window, cx| {
                 let _ = a.update(cx, |w, cx| w.open_main(pi, window, cx));
             }))
             .item(PopupMenuItem::new("New task…").on_click(move |_, window, cx| {
                 let _ = b.update(cx, |w, cx| w.new_task_dialog(pi, window, cx));
+            }))
+            .item(PopupMenuItem::new("Clean up merged tasks…").on_click(move |_, window, cx| {
+                let _ = d.update(cx, |w, cx| w.clean_up_merged(pi, window, cx));
             }))
             .separator()
             .item(PopupMenuItem::new("Remove from list…").on_click(move |_, window, cx| {
@@ -323,6 +326,7 @@ impl Workspace {
             details.push(busy.to_string());
         }
         let needs = if in_active { None } else { needs };
+        let pr = t.pr.clone();
 
         let this = cx.weak_entity();
         let (starred, main) = (t.starred, t.main);
@@ -388,8 +392,41 @@ impl Workspace {
                     )
                     .when(changes > 0, |s| s.child(div().flex_none().text_xs().text_color(muted).child(changes.to_string()))),
             )
-            .when(!details.is_empty(), |s| {
-                s.child(div().pl(px(18.)).text_xs().truncate().text_color(muted).child(details.join(" · ")))
+            .when(!details.is_empty() || pr.is_some(), |s| {
+                s.child(
+                    h_flex()
+                        .pl(px(18.))
+                        .gap_1p5()
+                        .min_w_0()
+                        .text_xs()
+                        .when_some(pr, |row, pr| {
+                            use crate::pr::{Checks, PrState};
+                            let color = match (pr.state, pr.checks) {
+                                (PrState::Merged, _) => hsla(0.75, 0.5, 0.62, 1.),
+                                (PrState::Open, Checks::Passed) => hsla(0.36, 0.6, 0.45, 1.),
+                                (PrState::Open, Checks::Failed) => hsla(0.0, 0.7, 0.55, 1.),
+                                (PrState::Open, _) => hsla(0.11, 0.8, 0.5, 1.),
+                                _ => muted,
+                            };
+                            let url = pr.url.clone();
+                            row.child(
+                                div()
+                                    .id(SharedString::from(format!("pr-{}", pr.url)))
+                                    .flex_none()
+                                    .text_color(color)
+                                    .hover(|s| s.underline())
+                                    .child(pr.label())
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                    .on_click(move |_, _, cx| {
+                                        cx.stop_propagation();
+                                        cx.open_url(&url);
+                                    }),
+                            )
+                        })
+                        .when(!details.is_empty(), |row| {
+                            row.child(div().min_w_0().truncate().text_color(muted).child(details.join(" · ")))
+                        }),
+                )
             })
             .when_some(needs, |s, message| {
                 s.child(div().pl(px(18.)).text_xs().truncate().text_color(hsla(0.08, 0.9, 0.55, 1.)).child(message))

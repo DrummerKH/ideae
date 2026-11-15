@@ -37,6 +37,9 @@ pub struct TaskEntry {
     /// When it was last in view, this run; its language servers sleep after
     /// a while out of view.
     pub left_view: Option<std::time::Instant>,
+    /// Its pull request, and when `gh` was last asked.
+    pub pr: Option<crate::pr::Pr>,
+    pub pr_checked: Option<std::time::Instant>,
     /// Locked worktree (`git worktree lock`) whose locker is gone.
     pub locked: Option<String>,
 }
@@ -216,6 +219,7 @@ impl Workspace {
                     if n % 10 == 0 {
                         this.sync_worktrees(window, cx);
                         this.sleep_idle_language_servers(cx);
+                        this.refresh_prs(false, window, cx);
                     }
                 });
                 if alive.is_err() {
@@ -314,6 +318,8 @@ impl Workspace {
                     busy: None,
                     locked: None,
                     left_view: None,
+                    pr: None,
+                    pr_checked: None,
                 })
                 .collect();
             self.projects.push(project);
@@ -460,7 +466,92 @@ impl Workspace {
             t.wake_language_servers(cx);
             t.set_visible(true, window, cx)
         });
+        self.refresh_prs(true, window, cx);
         cx.notify();
+    }
+
+    /// Asks `gh` about the PRs of tasks: running ones every two minutes,
+    /// the rest every ten, merged and closed ones hourly; `now` for the
+    /// task just shown.
+    fn refresh_prs(&mut self, now: bool, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::pr::PrState;
+        use std::time::Duration;
+        let mut due = Vec::new();
+        for p in &mut self.projects {
+            for t in &mut p.tasks {
+                if t.main || t.busy.is_some() {
+                    continue;
+                }
+                let every = match &t.pr {
+                    Some(pr) if matches!(pr.state, PrState::Merged | PrState::Closed) => Duration::from_secs(3600),
+                    _ if t.view.is_some() => Duration::from_secs(120),
+                    _ => Duration::from_secs(600),
+                };
+                let active = self.active.as_deref() == Some(t.path.as_path());
+                let stale = t.pr_checked.is_none_or(|at| at.elapsed() >= every || (now && active && at.elapsed() > Duration::from_secs(20)));
+                if stale && (!now || active) {
+                    t.pr_checked = Some(std::time::Instant::now());
+                    due.push((t.path.clone(), t.branch.clone()));
+                }
+            }
+        }
+        if due.is_empty() {
+            return;
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            let found = cx
+                .background_spawn(async move {
+                    due.into_iter().map(|(path, branch)| {
+                        let pr = crate::pr::lookup(&path, &branch);
+                        (path, pr)
+                    }).collect::<Vec<_>>()
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                for (path, pr) in found {
+                    if let Some(entry) = this.entry_mut(&path) {
+                        entry.pr = pr;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Deletes every task of the project whose PR was merged, after a list.
+    pub fn clean_up_merged(&mut self, project: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(p) = self.projects.get(project) else { return };
+        let merged: Vec<(PathBuf, String)> = p
+            .tasks
+            .iter()
+            .filter(|t| !t.main && t.pr.as_ref().is_some_and(|pr| pr.state == crate::pr::PrState::Merged))
+            .map(|t| (t.path.clone(), t.label()))
+            .collect();
+        if merged.is_empty() {
+            window.push_notification(Notification::info("No task of this project has a merged PR."), cx);
+            return;
+        }
+        let names = merged.iter().map(|(_, l)| format!("• {l}")).collect::<Vec<_>>().join("\n");
+        let description = format!("Removes their worktrees and branches:\n{names}");
+        let this = cx.weak_entity();
+        let paths: Vec<PathBuf> = merged.into_iter().map(|(p, _)| p).collect();
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            let (this, paths) = (this.clone(), paths.clone());
+            dialog
+                .confirm()
+                .title(format!("Delete {} merged task{}?", paths.len(), if paths.len() == 1 { "" } else { "s" }))
+                .description(description.clone())
+                .ok_text("Delete")
+                .on_ok(move |_, window, cx| {
+                    let _ = this.update(cx, |w, cx| {
+                        for path in &paths {
+                            w.remove_task(path, window, cx);
+                        }
+                    });
+                    true
+                })
+        });
     }
 
     /// Language servers of tasks out of view this long go to sleep;
@@ -623,6 +714,8 @@ impl Workspace {
                     busy: None,
                     locked: None,
                     left_view: None,
+                    pr: None,
+                    pr_checked: None,
                 },
             );
         }
@@ -712,6 +805,8 @@ impl Workspace {
             busy: Some("creating…".into()),
             locked: None,
             left_view: None,
+            pr: None,
+            pr_checked: None,
         });
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
@@ -834,6 +929,8 @@ impl Workspace {
                                 busy: None,
                                 locked: wt.locked.clone(),
                                 left_view: None,
+                                pr: None,
+                                pr_checked: None,
                             }),
                         }
                     }

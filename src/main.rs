@@ -15,6 +15,7 @@ mod ide;
 mod lsp;
 mod lsp_install;
 mod naming;
+mod pr;
 mod procs;
 mod search;
 mod sidebar;
