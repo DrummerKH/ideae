@@ -275,6 +275,54 @@ fn run_page(url: &str, in_tx: &async_channel::Sender<In>, out_rx: mpsc::Receiver
     }
 }
 
+// ---------------------------------------------------------------- pictures
+
+/// A picture of the page at `url` as a window of this size shows it, into
+/// `out` (PNG). In a page of its own, closed after; waits for the page to
+/// load and a moment more, for what it draws once loaded. Not for the UI
+/// thread.
+pub fn shot(url: &str, width: u32, height: u32, out: &std::path::Path) -> Result<()> {
+    let chrome = chrome()?;
+    let (ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{}{}", chrome.port, chrome.ws_path))?;
+    let mut socket = Socket { ws, next_id: 0, session: None };
+    let mut aside = Vec::new();
+    let target = socket.call("Target.createTarget", json!({ "url": "about:blank" }), &mut aside)?;
+    let target_id = target["targetId"].as_str().unwrap_or_default().to_string();
+    let taken = (|| -> Result<Vec<u8>> {
+        let attached = socket.call("Target.attachToTarget", json!({ "targetId": target_id, "flatten": true }), &mut aside)?;
+        socket.session = attached["sessionId"].as_str().map(str::to_string);
+        socket.call("Page.enable", json!({}), &mut aside)?;
+        socket.call("Emulation.setDeviceMetricsOverride", json!({ "width": width, "height": height, "deviceScaleFactor": 1, "mobile": false }), &mut aside)?;
+        if let MaybeTlsStream::Plain(stream) = socket.ws.get_mut() {
+            stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+        }
+        aside.clear();
+        let gone = socket.call("Page.navigate", json!({ "url": url }), &mut aside)?;
+        if let Some(error) = gone["errorText"].as_str().filter(|e| !e.is_empty()) {
+            return Err(anyhow!("{url}: {error}"));
+        }
+        // Loaded, or as far as it got in a while: a page that keeps a
+        // request open never says so.
+        let started = Instant::now();
+        let loaded = |msg: &Value| msg["method"] == "Page.loadEventFired";
+        let mut done = aside.iter().any(loaded);
+        while !done && started.elapsed() < Duration::from_secs(15) {
+            done = socket.read()?.is_some_and(|msg| loaded(&msg));
+        }
+        std::thread::sleep(Duration::from_millis(1200));
+        let picture = socket.call("Page.captureScreenshot", json!({ "format": "png" }), &mut aside)?;
+        Ok(base64::engine::general_purpose::STANDARD.decode(picture["data"].as_str().unwrap_or_default())?)
+    })();
+    socket.session = None;
+    let _ = socket.send("Target.closeTarget", json!({ "targetId": target_id }));
+    let png = taken?;
+    if let Some(folder) = out.parent() {
+        std::fs::create_dir_all(folder)?;
+    }
+    std::fs::write(out, png)?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------- picking
 
 /// Run in the page with a point of its viewport: the element there, through
@@ -450,6 +498,11 @@ impl Drop for BrowserView {
 impl BrowserView {
     pub fn url(&self) -> String {
         self.url.to_string()
+    }
+
+    /// To another address.
+    pub fn go(&self, url: &str) {
+        self.command("Page.navigate", json!({ "url": url }));
     }
 
     pub fn new(url: &str, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -890,6 +943,23 @@ impl Focusable for BrowserView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Needs Chrome (or `IDEAE_CHROME`): `cargo test -- --ignored pictures`.
+    #[core::prelude::v1::test]
+    #[ignore]
+    fn pictures_a_page_at_the_size_asked() {
+        let out = std::env::temp_dir().join(format!("ideae-shot-test-{}.png", std::process::id()));
+        shot("data:text/html,<body style='margin:0;background:rgb(0,128,0)'>", 640, 400, &out).unwrap();
+        let image = image::open(&out).unwrap().into_rgba8();
+        assert_eq!(image.dimensions(), (640, 400));
+        assert!(image.pixels().all(|p| p.0 == [0, 128, 0, 255]), "the page, all of the picture");
+        assert!(shot("http://127.0.0.1:9/", 640, 400, &out).is_err(), "nothing serves there");
+        let _ = std::fs::remove_file(&out);
+        // The picture's Chrome ends with the test: on macOS nothing else ends it.
+        if let Some(chrome) = CHROME.get().and_then(|slot| slot.lock().ok()?.take()) {
+            drop(Arc::try_unwrap(chrome));
+        }
+    }
 
     /// Needs Chrome (or `IDEAE_CHROME`): `cargo test -- --ignored picks`.
     /// Rust's own `test`: the glob above brings in the kit's.

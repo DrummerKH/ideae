@@ -18,6 +18,28 @@ Windows build exists and is being tried out (see [Windows](#windows)).
   `<repo>.worktrees/<branch>`, branched from the remote's default branch,
   with the main checkout's ignored `.env*` files copied in. Worktrees made
   outside the app show up as tasks too.
+- **Variants.** A hard task can be started as up to four variants: the
+  same prompt to as many agents, each in a worktree of its own from the
+  same commit, with a line for each one alone if you like (a click
+  fills one in: the smallest patch, a failing test first…). Their
+  agents run in Claude Code's auto mode, so that the same question is
+  not asked in each. They show
+  as one group. Its screen has, for each variant, what its agent says it
+  did, what it changed and what it cost, and which variant changed which
+  file; a message goes to all of them at once. A command typed there
+  (tests, a benchmark) runs in every variant, one after another so that
+  their times compare; with Auto it runs by itself when all of them
+  have finished. Then a judge, one more Claude Code run that can only
+  read, gives its opinion on which to keep and what to take from the
+  others, and that can be sent on to the agent of the one it picks.
+  What it said and how the command went are kept over a restart.
+  For a site, "Start servers" runs every variant's services on ports of
+  its own and Site on a card opens it; the judge, asked while they run,
+  gets a picture of each and the cards show it. A, B, C above a variant switch
+  between them with the same view in front, the same page of the site
+  too. Keep one, or discard all: what is removed stays under
+  `refs/ideae/variants` for two weeks. "Another variant…" on any task
+  gives it a second try.
 - **Agent status.** Claude Code runs with hooks passed through
   `--settings`. Nothing is written to `~/.claude` or the repository. The
   sidebar shows working / needs input / done, and a desktop notification

@@ -88,8 +88,16 @@ impl Workspace {
                         })),
                 );
                 if !collapsed {
+                    // A group that is done is one row, not one per variant.
+                    let mut groups = std::collections::HashSet::new();
                     for (pi, ti) in active {
-                        list = list.child(self.render_task(pi, ti, true, cx));
+                        let t = &self.projects[pi].tasks[ti];
+                        let asks = t.view.as_ref().is_some_and(|v| matches!(v.read(cx).agent_status, AgentStatus::NeedsInput(_)));
+                        if t.group.is_empty() || asks {
+                            list = list.child(self.render_task(pi, ti, true, cx));
+                        } else if groups.insert(t.group.clone()) {
+                            list = list.child(self.render_group_row(pi, &t.group, true, cx));
+                        }
                     }
                 }
             }
@@ -120,8 +128,20 @@ impl Workspace {
             shown += 1;
             // A search shows its hits even in folded projects.
             if !p.collapsed || !query.is_empty() {
+                let mut groups = std::collections::HashSet::new();
                 for ti in tasks {
-                    list = list.child(self.render_task(pi, ti, false, cx));
+                    let group = &p.tasks[ti].group;
+                    // A search lists its hits one by one.
+                    if group.is_empty() || !query.is_empty() {
+                        list = list.child(self.render_task(pi, ti, false, cx));
+                    } else if groups.insert(group.clone()) {
+                        list = list.child(self.render_group_row(pi, group, false, cx));
+                        if !self.collapsed_groups.contains(group) {
+                            for (_, ti) in self.members(group).into_iter().filter(|m| m.0 == pi) {
+                                list = list.child(self.render_task(pi, ti, false, cx));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -177,6 +197,9 @@ impl Workspace {
     /// thread (and untitled worktrees) the agent's session title.
     pub(crate) fn task_title(&self, pi: usize, ti: usize, cx: &App) -> String {
         let t = &self.projects[pi].tasks[ti];
+        if !t.group.is_empty() {
+            return format!("{} · {}", t.label(), crate::workspace::variants::letter(t.variant));
+        }
         if !t.main && !t.title.is_empty() {
             return t.title.clone();
         }
@@ -198,9 +221,14 @@ impl Workspace {
             for (ti, t) in p.tasks.iter().enumerate() {
                 let waiting = t.view.as_ref().is_some_and(|v| {
                     let v = v.read(cx);
-                    v.unseen || matches!(v.agent_status, AgentStatus::NeedsInput(_))
+                    let asks = matches!(v.agent_status, AgentStatus::NeedsInput(_));
+                    // A variant that is done waits for the others: the group
+                    // is looked at once, when all of it is ready.
+                    asks || v.unseen && (t.group.is_empty() || self.group_settled(&t.group, cx))
                 });
-                if waiting && self.active.as_deref() != Some(t.path.as_path()) {
+                let in_view = self.active.as_deref() == Some(t.path.as_path())
+                    || (!t.group.is_empty() && self.active_group.as_deref() == Some(t.group.as_str()));
+                if waiting && !in_view {
                     rows.push((pi, ti));
                 }
             }
@@ -305,11 +333,95 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// The variants of one task as one row: its title, a glyph per
+    /// variant, and how far they are. A click opens the group's screen.
+    fn render_group_row(&self, pi: usize, group: &str, in_active: bool, cx: &mut Context<Self>) -> AnyElement {
+        let members = self.members(group);
+        let Some(&(_, first)) = members.first() else { return div().into_any_element() };
+        let project = &self.projects[pi];
+        let head = &project.tasks[first];
+        let muted = cx.theme().muted_foreground;
+        let folded = self.collapsed_groups.contains(group);
+        let is_active = self.active_group.as_deref() == Some(group);
+        // A variant in view keeps its group in sight.
+        let holds_active = members.iter().any(|&(pi, ti)| self.active.as_deref() == Some(self.projects[pi].tasks[ti].path.as_path()));
+        let (summary, asks) = self.group_summary(group, cx);
+        let mut details = vec![summary];
+        if in_active {
+            details.push(project.name.clone());
+        }
+        let (open, fold, another, stop) = (group.to_string(), group.to_string(), head.path.clone(), group.to_string());
+        let this = cx.weak_entity();
+        let menu = move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
+            let (a, b, another, stop) = (this.clone(), this.clone(), another.clone(), stop.clone());
+            menu.item(PopupMenuItem::new("Another variant…").on_click(move |_, window, cx| {
+                let _ = a.update(cx, |w, cx| w.another_variant_dialog(&another, window, cx));
+            }))
+            .item(PopupMenuItem::new("Stop all").on_click(move |_, window, cx| {
+                let _ = b.update(cx, |w, cx| w.stop_group(&stop, window, cx));
+            }))
+        };
+        v_flex()
+            .id(SharedString::from(format!("{}group-{group}", if in_active { "active-" } else { "" })))
+            .pl_3()
+            .pr_3()
+            .py_1()
+            .cursor_pointer()
+            .border_l_2()
+            .border_color(transparent_black())
+            .when(is_active, |s| s.bg(cx.theme().accent).border_color(cx.theme().primary))
+            .when(holds_active && folded, |s| s.border_color(cx.theme().primary))
+            .hover(|s| s.bg(cx.theme().accent.opacity(0.6)))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("fold-{group}-{in_active}")))
+                            .flex_none()
+                            .w(px(10.))
+                            .text_xs()
+                            .text_color(muted)
+                            .child(if in_active { "" } else if folded { "▸" } else { "▾" })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                if !this.collapsed_groups.remove(&fold) {
+                                    this.collapsed_groups.insert(fold.clone());
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(div().flex_1().min_w_0().text_sm().truncate().child(head.label()))
+                    .child(h_flex().flex_none().gap_1().text_xs().children(
+                        self.group_glyphs(group, cx).into_iter().map(|(glyph, color)| div().text_color(color).child(glyph)),
+                    )),
+            )
+            .child(
+                div()
+                    .pl(px(18.))
+                    .text_xs()
+                    .truncate()
+                    .text_color(if asks { hsla(0.08, 0.9, 0.55, 1.) } else { muted })
+                    .child(details.join(" · ")),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| this.open_group(&open, window, cx)))
+            .context_menu(menu)
+            .into_any_element()
+    }
+
     fn render_task(&self, pi: usize, ti: usize, in_active: bool, cx: &mut Context<Self>) -> AnyElement {
         let project = &self.projects[pi];
         let t = &project.tasks[ti];
         let path = t.path.clone();
-        let label: SharedString = self.task_title(pi, ti, cx).into();
+        // Under its group a variant is its letter and what sets it apart.
+        let listed = !t.group.is_empty() && !in_active && self.search.read(cx).value().trim().is_empty();
+        let label: SharedString = if listed {
+            let letter = crate::workspace::variants::letter(t.variant);
+            if t.note.is_empty() { letter } else { format!("{letter} · {}", t.note) }.into()
+        } else {
+            self.task_title(pi, ti, cx).into()
+        };
         let is_active = self.active.as_deref() == Some(path.as_path());
         let running = t.view.is_some();
 
@@ -343,8 +455,11 @@ impl Workspace {
             details.push(project.name.clone());
         } else if t.main {
             details.push(format!("⌂ {}", t.branch));
-        } else if label.as_ref() != t.branch {
+        } else if label.as_ref() != t.branch && !listed {
             details.push(t.branch.clone());
+        }
+        if let Some(info) = self.variant_info.get(&path).filter(|i| listed && i.files > 0) {
+            details.push(format!("+{} −{}", info.additions, info.deletions));
         }
         if let Some(view) = &t.view {
             for (name, port) in view.read(cx).running_services(cx) {
@@ -372,11 +487,13 @@ impl Workspace {
 
         let this = cx.weak_entity();
         let (starred, main) = (t.starred, t.main);
+        let (grouped, ready) = (!t.group.is_empty(), t.busy.is_none());
         let menu_path = path.clone();
         let branch = t.branch.clone();
         let menu = move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
             let (a, b, c, d) = (this.clone(), this.clone(), this.clone(), this.clone());
             let (pa, pb, pc, pd) = (menu_path.clone(), menu_path.clone(), menu_path.clone(), menu_path.clone());
+            let (e, f, pe, pf) = (this.clone(), this.clone(), menu_path.clone(), menu_path.clone());
             let branch = branch.clone();
             menu.item(PopupMenuItem::new(if starred { "Unstar" } else { "Star" }).on_click(move |_, _, cx| {
                 let _ = a.update(cx, |w, cx| w.toggle_star(&pa, cx));
@@ -396,6 +513,17 @@ impl Workspace {
             .item(PopupMenuItem::new("Copy branch name").on_click(move |_, _, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(branch.clone()));
             }))
+            .when(!main && ready, |m| {
+                m.separator()
+                    .item(PopupMenuItem::new("Another variant…").on_click(move |_, window, cx| {
+                        let _ = e.update(cx, |w, cx| w.another_variant_dialog(&pe, window, cx));
+                    }))
+                    .when(grouped, |m| {
+                        m.item(PopupMenuItem::new("Keep this variant…").on_click(move |_, window, cx| {
+                            let _ = f.update(cx, |w, cx| w.keep_variant_dialog(&pf, window, cx));
+                        }))
+                    })
+            })
             .when(!main, |m| {
                 m.separator().item(PopupMenuItem::new("Delete…").on_click(move |_, window, cx| {
                     let _ = c.update(cx, |w, cx| w.delete_task(&pc, window, cx));
@@ -408,7 +536,7 @@ impl Workspace {
         let id = SharedString::from(format!("{}task-{}", if in_active { "active-" } else { "" }, path.display()));
         let mut row = v_flex()
             .id(id)
-            .pl_3()
+            .pl(if listed { px(26.) } else { px(12.) })
             .pr_3()
             .py_1()
             .cursor_pointer()
@@ -537,7 +665,8 @@ impl Workspace {
                     view.update(cx, |t, cx| t.show_view(0, window, cx));
                 }
             }));
-        if !in_active {
+        // A variant keeps its place in its group.
+        if !in_active && !grouped {
             row = row
                 .on_drag(DraggedRow::Task { project: pi, path: path.clone(), name: label }, |row, _, _, cx| {
                     cx.new(|_| row.clone())

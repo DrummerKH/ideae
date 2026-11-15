@@ -1402,8 +1402,11 @@ pub struct TaskView {
     agent_touched: HashSet<SharedString>,
     /// The command that starts the agent, for Restart.
     agent: Option<String>,
-    /// Text for the agent's prompt once it is ready to take it.
-    pending_prompt: Option<String>,
+    /// Text for the agent's prompt once it is ready to take it, and whether
+    /// it is sent too.
+    pending_prompt: Option<(String, bool)>,
+    /// A message for an agent that was busy: sent when its turn ends.
+    queued_message: Option<String>,
     /// Changed files you marked viewed, with their diff's hash then: a new
     /// change to one unmarks it.
     viewed: BTreeMap<String, u64>,
@@ -1606,6 +1609,7 @@ impl TaskView {
             agent_touched: HashSet::new(),
             agent: agent.clone(),
             pending_prompt: None,
+            queued_message: None,
             recent: Vec::new(),
             pr: None,
             viewed: BTreeMap::new(),
@@ -2014,11 +2018,13 @@ impl TaskView {
     /// Puts `text` into the agent's prompt once the agent is up: Claude Code
     /// says so with SessionStart; another agent gets a few seconds after it
     /// starts. Pasted before, the shell would read it.
-    pub fn queue_prompt(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+    ///
+    /// With `send` it is sent as well, not left for the user to finish.
+    pub fn queue_prompt(&mut self, text: String, send: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.agent.is_none() {
             return;
         }
-        self.pending_prompt = Some(text);
+        self.pending_prompt = Some((text, send));
         cx.spawn_in(window, async move |this, cx| {
             let started = std::time::Instant::now();
             let mut running_since: Option<std::time::Instant> = None;
@@ -2043,16 +2049,26 @@ impl TaskView {
                 }
                 let waited = running_since.map_or(Duration::ZERO, |at| at.elapsed());
                 // Its input box takes a moment after the hook.
+                // An agent that reports is waited for: until it says it
+                // is up it may be asking something (to trust the folder),
+                // and the prompt would go into that.
+                let patient = this.read_with(cx, |t, _| t.agent_reports()).unwrap_or(false);
                 if (hooked && waited > Duration::from_millis(500))
-                    || waited > Duration::from_secs(4)
-                    || started.elapsed() > Duration::from_secs(30)
+                    || (!patient && (waited > Duration::from_secs(4) || started.elapsed() > Duration::from_secs(30)))
+                    || started.elapsed() > Duration::from_secs(1800)
                 {
                     break;
                 }
             }
             let _ = this.update_in(cx, |t, window, cx| {
-                if let Some(text) = t.pending_prompt.take() {
-                    t.paste_to_agent(text, window, cx);
+                // Sent only to an agent that said it is up. One that did not
+                // may be asking something first (to trust the folder), and
+                // Enter would answer that.
+                let up = !matches!(t.agent_status, crate::agent::AgentStatus::Unknown) || !t.agent_reports();
+                match t.pending_prompt.take() {
+                    Some((text, true)) if up => t.submit_to_agent(text, window, cx),
+                    Some((text, _)) => t.paste_to_agent(text, window, cx),
+                    None => {}
                 }
             });
         })
@@ -2069,6 +2085,79 @@ impl TaskView {
         // Bracketed paste: Claude Code shows it as pasted text, not a prompt sent.
         state.update(cx, |s, cx| s.paste_text(text, cx));
         self.activate(ix, window, cx);
+    }
+
+    /// Text into the agent's prompt, and sent: Enter a moment after the
+    /// paste, which the agent would otherwise take for a line of it.
+    pub fn submit_to_agent(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.paste_to_agent(text, window, cx);
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(400)).await;
+            let _ = this.update(cx, |t, cx| {
+                let state = t.tabs.iter().find_map(|tab| match &tab.kind {
+                    TabKind::Terminal(view) if tab.title == "agent" => Some(view.read(cx).state.clone()),
+                    _ => None,
+                });
+                if let Some(state) = state {
+                    state.update(cx, |s, cx| s.send_text("\r", cx));
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// A message to the agent that does not land in the middle of its
+    /// work or in a question it asks: a busy agent gets it when its turn
+    /// ends, after what waits for that already. An agent that is not up
+    /// gets nothing: typed there, it would run in a shell or answer a
+    /// dialog.
+    pub fn message_agent(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) -> Told {
+        use crate::agent::AgentStatus::*;
+        match self.agent_status {
+            Working | NeedsInput(_) => {
+                self.queued_message = Some(match self.queued_message.take() {
+                    Some(waiting) => format!("{waiting}\n\n{text}"),
+                    None => text,
+                });
+                Told::Later
+            }
+            Idle | Done => {
+                self.submit_to_agent(text, window, cx);
+                Told::Now
+            }
+            Unknown | Exited => Told::Not,
+        }
+    }
+
+    /// Whether the agent is one that says when it is up: Claude Code,
+    /// started with the hooks.
+    fn agent_reports(&self) -> bool {
+        self.agent.as_deref().is_some_and(|command| command.contains(" --settings "))
+    }
+
+    pub fn has_queued_message(&self) -> bool {
+        self.queued_message.is_some()
+    }
+
+    /// The agent's turn ended: what waited for that goes out.
+    pub fn deliver_queued(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = self.queued_message.take() {
+            self.submit_to_agent(text, window, cx);
+        }
+    }
+
+    /// Which of the views `show_view` knows is in front: the agent, the
+    /// changes, the history or a shell.
+    pub fn shown_view(&self) -> usize {
+        match self.focused_ix().and_then(|ix| self.tabs.get(ix)) {
+            Some(tab) => match &tab.kind {
+                TabKind::Changes => 1,
+                TabKind::History => 2,
+                TabKind::Terminal(_) if tab.title != "agent" => 3,
+                _ => 0,
+            },
+            None => 0,
+        }
     }
 
     fn send_editor_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4372,6 +4461,23 @@ fn file_patch_hashes(patch: &str) -> HashMap<String, u64> {
 }
 
 /// A glyph and its color for the agent status, if it has one to show.
+/// `http://localhost:3100` of `http://localhost:3100/users?page=2`.
+fn origin(url: &str) -> &str {
+    let after_scheme = url.find("://").map_or(0, |at| at + 3);
+    let end = url[after_scheme..].find(['/', '?', '#']).map_or(url.len(), |at| after_scheme + at);
+    &url[..end]
+}
+
+/// What became of a message to an agent.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Told {
+    Now,
+    /// When its turn ends.
+    Later,
+    /// It is not up.
+    Not,
+}
+
 pub fn status_glyph(status: &crate::agent::AgentStatus) -> Option<(&'static str, Hsla)> {
     use crate::agent::AgentStatus::*;
     Some(match status {
@@ -5511,6 +5617,78 @@ impl TaskView {
             self.activate(ix, window, cx);
         }
         cx.emit(TaskEvent::Changed);
+    }
+
+    /// Every service of the task, started behind what is in front. One
+    /// whose port something listens on already is left: the agent may have
+    /// started it itself. How many were started.
+    pub fn start_services(&mut self, window: &mut Window, cx: &mut Context<Self>) -> usize {
+        if self.reload_services().is_err() {
+            return 0;
+        }
+        let waiting: Vec<String> = self
+            .services
+            .iter()
+            .filter(|s| self.service_ix(&s.name, cx).is_none() && s.port(self.port_slot).and_then(crate::services::port_taken).is_none())
+            .map(|s| s.name.clone())
+            .collect();
+        let started = waiting.into_iter().filter(|name| self.service_tab(name, window, cx).is_some()).count();
+        cx.emit(TaskEvent::Changed);
+        cx.notify();
+        started
+    }
+
+    pub fn stop_services(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for (name, _) in self.running_services(cx) {
+            self.stop_service(&name, window, cx);
+        }
+    }
+
+    pub fn has_services(&self) -> bool {
+        !self.services.is_empty()
+    }
+
+    /// The task's ports as its terminals have them, for what else runs in it.
+    pub fn service_env(&self) -> Vec<(String, String)> {
+        crate::services::task_env(&self.services, self.port_slot)
+    }
+
+    /// Where the task's site is: the first service that has an address.
+    pub fn site(&self) -> Option<String> {
+        self.services.iter().find_map(|s| s.url(&self.services, self.port_slot))
+    }
+
+    /// The page in front, when it is one of the task's own site: what
+    /// follows its address, to show the same page of another variant.
+    pub fn shown_page(&self, cx: &App) -> Option<String> {
+        let TabKind::Browser(view) = &self.tabs.get(self.focused_ix()?)?.kind else { return None };
+        let (url, site) = (view.read(cx).url(), self.site()?);
+        url.strip_prefix(origin(&site)).map(str::to_string)
+    }
+
+    /// The task's site in a browser tab, at `page` of it when given: the
+    /// tab that is on the site already, or a new one.
+    pub fn show_site(&mut self, page: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(site) = self.site() else { return };
+        let url = match page {
+            Some(page) => format!("{}{page}", origin(&site)),
+            None => site.clone(),
+        };
+        let open = self.tabs.iter().position(|t| match &t.kind {
+            TabKind::Browser(view) => view.read(cx).url().starts_with(origin(&site)),
+            _ => false,
+        });
+        match open {
+            Some(ix) => {
+                if let TabKind::Browser(view) = &self.tabs[ix].kind {
+                    if view.read(cx).url() != url {
+                        view.update(cx, |v, _| v.go(&url));
+                    }
+                }
+                self.activate(ix, window, cx);
+            }
+            None => self.open_browser(&url, window, cx),
+        }
     }
 
     fn stop_service(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {

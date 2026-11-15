@@ -101,6 +101,14 @@ pub struct ProjectState {
     pub path: PathBuf,
     pub collapsed: bool,
     pub tasks: Vec<TaskState>,
+    /// The command last run in every variant of a task, and whether it
+    /// runs by itself when they have finished.
+    pub check: String,
+    pub check_auto: bool,
+    /// What the judge said of each group of variants, and the groups that
+    /// changed since it spoke.
+    pub verdicts: std::collections::BTreeMap<String, crate::workspace::variants::Run>,
+    pub stale_verdicts: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq)]
@@ -119,6 +127,21 @@ pub struct TaskState {
     /// Its share of the services' ports: 0 for the main checkout.
     pub port_slot: u32,
     pub session: TaskSession,
+    /// One of several tries at the same task: the group they share (empty
+    /// for a task on its own), its number there, and what its agent alone
+    /// was told on top of the prompt.
+    pub group: String,
+    pub variant: u32,
+    pub note: String,
+    /// What the agent was told to start with, and when: Unix seconds.
+    pub prompt: String,
+    pub created: u64,
+    /// When its agent's latest turn ended.
+    pub done_at: u64,
+    /// The commit a variant was made from: what its diff is counted against.
+    pub base: String,
+    /// How the command last run in every variant went in this one.
+    pub check: Option<crate::workspace::variants::Run>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq)]

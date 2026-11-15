@@ -134,9 +134,15 @@ impl Render for Workspace {
                                 .fixed()
                                 .child(self.render_sidebar(cx)),
                         )
-                        .child(resizable_panel().child(match self.active_view() {
-                            Some(view) => div().size_full().child(view).into_any_element(),
-                            None => self.render_empty(cx).into_any_element(),
+                        .child(resizable_panel().child(match (self.active_group.clone(), self.active_view()) {
+                            (Some(group), _) => self.render_group(&group, cx),
+                            // A variant has its siblings above it.
+                            (None, Some(view)) => v_flex()
+                                .size_full()
+                                .children(self.render_variant_strip(cx))
+                                .child(div().flex_1().min_h_0().child(view))
+                                .into_any_element(),
+                            (None, None) => self.render_empty(cx).into_any_element(),
                         })),
                 )
             .when_some(zoomed_pane, |body, pane| {

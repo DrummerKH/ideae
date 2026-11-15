@@ -11,6 +11,29 @@ use gpui_kit::component::{ActiveTheme as _, v_flex};
 use gpui_kit::*;
 use serde_json::Value;
 
+/// The agent's latest answer, in its own words: what it says it did.
+pub fn last_answer(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut last = None;
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        if !line.contains("\"assistant\"") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+        // Not what a subagent told the agent.
+        if v["type"] != "assistant" || v["isSidechain"] == true {
+            continue;
+        }
+        let text: Vec<&str> =
+            v["message"]["content"].as_array().into_iter().flatten().filter(|c| c["type"] == "text").filter_map(|c| c["text"].as_str()).collect();
+        let text = text.join("\n").trim().to_string();
+        if !text.is_empty() {
+            last = Some(text);
+        }
+    }
+    last
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Usage {
     pub model: String,
@@ -142,7 +165,22 @@ impl Render for UsageTooltip {
 mod tests {
     use std::path::Path;
 
-    use super::{read, sessions_dir};
+    use super::{last_answer, read, sessions_dir};
+
+    #[test]
+    fn the_last_answer_is_the_agents_own_last_words() {
+        let path = std::env::temp_dir().join(format!("ideae-answer-{}.jsonl", std::process::id()));
+        let lines = [
+            r#"{"type":"user","message":{"content":"Fix it"}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Looking."},{"type":"tool_use","name":"Read"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Fixed the login.\nTests pass."}]}}"#,
+            r#"{"type":"assistant","isSidechain":true,"message":{"content":[{"type":"text","text":"A subagent's report."}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]}}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        assert_eq!(last_answer(&path).as_deref(), Some("Fixed the login.\nTests pass."));
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn counts_each_answer_once_and_keeps_the_latest_context() {

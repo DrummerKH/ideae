@@ -23,6 +23,7 @@ use crate::{
     theme::{self, Appearance},
 };
 
+#[derive(Default)]
 pub struct TaskEntry {
     pub path: PathBuf,
     pub branch: String,
@@ -48,7 +49,23 @@ pub struct TaskEntry {
     pub port_slot: u32,
     /// Locked worktree (`git worktree lock`) whose locker is gone.
     pub locked: Option<String>,
+    /// One of several tries at the same task (variants.rs): the group
+    /// they share (empty for a task on its own), its number there, and
+    /// what its agent alone was told on top of the prompt.
+    pub group: String,
+    pub variant: u32,
+    pub note: String,
+    /// What the agent was told to start with, and when: Unix seconds.
+    pub prompt: String,
+    pub created: u64,
+    /// When its agent's latest turn ended. Not `last_active`, which a
+    /// look at the task moves too.
+    pub done_at: u64,
+    /// The commit a variant was made from: what its diff is counted against.
+    pub base: String,
 }
+
+pub mod variants;
 
 impl TaskEntry {
     pub fn label(&self) -> String {
@@ -61,12 +78,16 @@ pub struct Project {
     pub name: String,
     pub collapsed: bool,
     pub tasks: Vec<TaskEntry>,
+    /// The command last run in every variant of a task: tests, a benchmark;
+    /// and whether it runs by itself when the variants have finished.
+    pub check: String,
+    pub check_auto: bool,
 }
 
 impl Project {
     fn new(path: PathBuf) -> Self {
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
-        Self { path, name, collapsed: false, tasks: Vec::new() }
+        Self { path, name, collapsed: false, tasks: Vec::new(), check: String::new(), check_auto: false }
     }
 }
 
@@ -113,6 +134,36 @@ pub struct Workspace {
     pub touched: std::collections::HashMap<PathBuf, std::collections::BTreeSet<String>>,
     /// When each project's base branch was last fetched in the background.
     fetched: std::collections::HashMap<PathBuf, std::time::Instant>,
+    /// The group of variants whose screen is in view, in place of a task.
+    pub active_group: Option<String>,
+    /// Groups folded in the sidebar.
+    pub collapsed_groups: std::collections::HashSet<String>,
+    /// What the group's screen shows of each variant, by worktree path.
+    pub variant_info: std::collections::HashMap<PathBuf, variants::VariantInfo>,
+    /// Variants whose agent's answer is shown whole on the group's screen.
+    whole_answers: std::collections::HashSet<PathBuf>,
+    /// The command run in every variant of the group in view, how it went
+    /// in each, and what runs it.
+    pub check_command: Entity<InputState>,
+    checks: std::collections::HashMap<PathBuf, variants::Run>,
+    check: Option<variants::Check>,
+    /// Groups whose check waits for the one that runs: (group, command,
+    /// whether the judge follows).
+    check_queue: Vec<(String, String, bool)>,
+    /// What the judge said of each group; the judges that run; the groups
+    /// it was asked about by itself already; and those that changed since
+    /// it spoke.
+    judges: std::collections::HashMap<String, variants::Run>,
+    judging: std::collections::HashMap<String, (variants::RunSlot, Task<()>)>,
+    judged: std::collections::HashSet<String>,
+    stale_verdicts: std::collections::HashSet<String>,
+    read_variants_again: bool,
+    /// A picture of each variant's site, taken when the judge looked: by
+    /// worktree path.
+    shots: std::collections::HashMap<PathBuf, PathBuf>,
+    reading_variants: bool,
+    /// What to tell every agent of the group in view.
+    pub group_message: Entity<InputState>,
 }
 
 impl Workspace {
@@ -285,6 +336,10 @@ impl Workspace {
                 let alive = this.update_in(cx, |this, window, cx| {
                     this.save(cx);
                     this.check_build(window, cx);
+                    // While an agent of the group in view works; a turn's end reads it too.
+                    if this.active_group.clone().is_some_and(|group| !this.group_settled(&group, cx)) {
+                        this.refresh_variant_info(window, cx);
+                    }
                     // Every six hours, the first time soon after start.
                     if n % 7200 == 3 {
                         this.check_update(window, cx);
@@ -323,6 +378,48 @@ impl Workspace {
                 cx.subscribe(&search, |_, _, _: &InputEvent, cx| cx.notify()).detach();
                 search
             },
+            group_message: {
+                let message = cx.new(|cx| InputState::new(window, cx).placeholder("To every variant: \"also cover it with a test\""));
+                cx.subscribe_in(&message, window, |this, message, event: &InputEvent, window, cx| {
+                    let (InputEvent::PressEnter { .. }, Some(group)) = (event, this.active_group.clone()) else { return };
+                    let text = message.read(cx).value().trim().to_string();
+                    if !text.is_empty() {
+                        message.update(cx, |input, cx| input.set_value("", window, cx));
+                        this.message_group(&group, text, window, cx);
+                    }
+                })
+                .detach();
+                message
+            },
+            active_group: None,
+            collapsed_groups: Default::default(),
+            variant_info: Default::default(),
+            whole_answers: Default::default(),
+            check_command: {
+                let command = cx.new(|cx| InputState::new(window, cx).placeholder("Run in every variant: cargo test, npm run bench…"));
+                cx.subscribe_in(&command, window, |this, command, event: &InputEvent, window, cx| {
+                    let (InputEvent::PressEnter { .. }, Some(group)) = (event, this.active_group.clone()) else { return };
+                    let line = command.read(cx).value().trim().to_string();
+                    if !line.is_empty() {
+                        if let Some(&(pi, _)) = this.members(&group).first() {
+                            this.projects[pi].check = line.clone();
+                        }
+                        this.run_in_group(&group, line, false, window, cx);
+                    }
+                })
+                .detach();
+                command
+            },
+            checks: Default::default(),
+            check: None,
+            check_queue: Vec::new(),
+            judges: Default::default(),
+            judging: Default::default(),
+            judged: Default::default(),
+            stale_verdicts: Default::default(),
+            read_variants_again: false,
+            shots: Default::default(),
+            reading_variants: false,
             sysmon: {
                 let mon = cx.new(crate::sysmon::SysMon::new);
                 cx.observe(&mon, |_, _, cx| cx.notify()).detach();
@@ -384,6 +481,13 @@ impl Workspace {
                 }
             });
         }
+        // Debug aid for runs nobody clicks in: IDEAE_NEW_TASK="title\nprompt"
+        // starts a task in the first project, in IDEAE_VARIANTS variants.
+        if let (Ok(task), false) = (std::env::var("IDEAE_NEW_TASK"), this.projects.is_empty()) {
+            let (title, prompt) = task.split_once('\n').unwrap_or((task.as_str(), ""));
+            let variants = std::env::var("IDEAE_VARIANTS").ok().and_then(|n| n.parse::<usize>().ok()).unwrap_or(1).clamp(1, variants::MOST);
+            this.create_task(0, title.trim().to_string(), prompt.trim().to_string(), vec![String::new(); variants], window, cx);
+        }
         this
     }
 
@@ -391,6 +495,19 @@ impl Workspace {
         for p in &saved.projects {
             let mut project = Project::new(p.path.clone());
             project.collapsed = p.collapsed;
+            project.check = p.check.clone();
+            project.check_auto = p.check_auto;
+            // What the judge said and how the checks went: paid for, kept.
+            for (group, verdict) in &p.verdicts {
+                self.judges.insert(group.clone(), verdict.clone());
+                self.judged.insert(group.clone());
+            }
+            self.stale_verdicts.extend(p.stale_verdicts.iter().cloned());
+            for t in &p.tasks {
+                if let Some(check) = &t.check {
+                    self.checks.insert(t.path.clone(), check.clone());
+                }
+            }
             project.tasks = p
                 .tasks
                 .iter()
@@ -409,6 +526,13 @@ impl Workspace {
                     pr: None,
                     pr_checked: None,
                     port_slot: t.port_slot,
+                    group: t.group.clone(),
+                    variant: t.variant,
+                    note: t.note.clone(),
+                    prompt: t.prompt.clone(),
+                    created: t.created,
+                    done_at: t.done_at,
+                    base: t.base.clone(),
                 })
                 .collect();
             self.projects.push(project);
@@ -473,10 +597,19 @@ impl Workspace {
                 .map(|p| ProjectState {
                     path: p.path.clone(),
                     collapsed: p.collapsed,
+                    check: p.check.clone(),
+                    check_auto: p.check_auto,
+                    verdicts: self
+                        .judges
+                        .iter()
+                        .filter(|(group, run)| run.is_over() && p.tasks.iter().any(|t| &t.group == *group))
+                        .map(|(group, run)| (group.clone(), run.clone()))
+                        .collect(),
+                    stale_verdicts: self.stale_verdicts.iter().filter(|group| p.tasks.iter().any(|t| &t.group == *group)).cloned().collect(),
                     tasks: p
                         .tasks
                         .iter()
-                        .filter(|t| t.busy.is_none() || t.view.is_some())
+                        .filter(|t| t.busy.is_none() || t.view.is_some() || !t.group.is_empty())
                         .map(|t| TaskState {
                             path: t.path.clone(),
                             branch: t.branch.clone(),
@@ -490,6 +623,14 @@ impl Workspace {
                                 Some(view) => view.read(cx).session(cx),
                                 None => t.session.clone(),
                             },
+                            group: t.group.clone(),
+                            variant: t.variant,
+                            note: t.note.clone(),
+                            prompt: t.prompt.clone(),
+                            created: t.created,
+                            done_at: t.done_at,
+                            base: t.base.clone(),
+                            check: self.checks.get(&t.path).filter(|run| run.is_over()).cloned(),
                         })
                         .collect(),
                 })
@@ -515,7 +656,9 @@ impl Workspace {
 
     /// Starts a task: its terminals, agent and watchers.
     fn load(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) -> Option<Entity<TaskView>> {
-        let (agent, socket) = (self.agent.clone(), self.hook_socket.clone());
+        let socket = self.hook_socket.clone();
+        let variant = self.find(path).is_some_and(|(pi, ti)| !self.projects[pi].tasks[ti].group.is_empty());
+        let agent = if variant { Self::agent_command_for(&self.agent_override, self._bridge.as_ref(), true) } else { self.agent.clone() };
         let entry = self.entry_mut(path)?;
         if let Some(view) = &entry.view {
             return Some(view.clone());
@@ -554,6 +697,7 @@ impl Workspace {
     }
 
     pub fn switch(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        self.active_group = None;
         if self.active.as_deref() != Some(path) {
             if let Some(old) = self.active_view() {
                 old.update(cx, |t, cx| {
@@ -706,10 +850,12 @@ impl Workspace {
         let Some(mine) = self.touched.get(path).filter(|m| !m.is_empty()) else {
             return Vec::new();
         };
+        // Variants of one task change the same files by design.
+        let group = project.tasks.iter().find(|t| t.path == path).map(|t| t.group.as_str()).filter(|g| !g.is_empty());
         project
             .tasks
             .iter()
-            .filter(|t| t.path != path)
+            .filter(|t| t.path != path && Some(t.group.as_str()) != group)
             .filter_map(|t| {
                 let shared: Vec<String> = self.touched.get(&t.path)?.intersection(mine).cloned().collect();
                 (!shared.is_empty()).then(|| (t.label(), shared))
@@ -805,6 +951,12 @@ impl Workspace {
         let entry = &mut self.projects[pi].tasks[ti];
         let Some(view) = entry.view.take() else { return };
         entry.session = view.read(cx).session(cx);
+        // What runs for its group ends with it: a check in it, a judge reading it.
+        let group = entry.group.clone();
+        if !group.is_empty() {
+            self.stop_runs(&group, window, cx);
+        }
+        let entry = &mut self.projects[pi].tasks[ti];
         view.update(cx, |t, cx| t.shut_down(cx));
         // The main thread shows only while it runs.
         if entry.main {
@@ -875,6 +1027,9 @@ impl Workspace {
                         if let Some((pi, ti)) = this.find(&path) {
                             this.projects[pi].tasks.remove(ti);
                         }
+                        if let Some(left) = this.dissolve_lonely_groups() {
+                            this.switch(&left, window, cx);
+                        }
                     }
                     Err(e) => {
                         if let Some(entry) = this.entry_mut(&path) {
@@ -906,8 +1061,12 @@ impl Workspace {
                 if title.is_empty() {
                     return;
                 }
-                if let Some(entry) = this.entry_mut(&path) {
-                    entry.title = title;
+                // The variants of a task are one task by name.
+                let group = this.entry_mut(&path).map(|entry| entry.group.clone()).unwrap_or_default();
+                for entry in this.projects.iter_mut().flat_map(|p| &mut p.tasks) {
+                    if entry.path == path || (!group.is_empty() && entry.group == group) {
+                        entry.title = title.clone();
+                    }
                 }
                 window.close_dialog(cx);
                 cx.notify();
@@ -977,6 +1136,7 @@ impl Workspace {
                     pr: None,
                     pr_checked: None,
                     port_slot: 0,
+                    ..Default::default()
                 },
             );
         }
@@ -1000,33 +1160,50 @@ impl Workspace {
                 .auto_grow(4, 14)
                 .placeholder("For the agent, optional: put into its prompt for you to finish and send")
         });
+        // How many variants of the task, and what each one's agent alone is told.
+        let count = Rc::new(std::cell::Cell::new(1usize));
+        let notes: Vec<Entity<InputState>> = (1..=variants::MOST as u32)
+            .map(|v| {
+                let hint = match v {
+                    1 => "optional, for this agent alone: \"the smallest patch that works\"",
+                    2 => "optional: \"refactor what is in the way\"",
+                    _ => "optional",
+                };
+                cx.new(|cx| InputState::new(window, cx).placeholder(format!("{}: {hint}", variants::letter(v))))
+            })
+            .collect();
+        // The title, the prompt and the variants' notes, when it can be made.
+        let filled_in = {
+            let (input, prompt, count, notes) = (input.clone(), prompt.clone(), count.clone(), notes.clone());
+            move |cx: &App| {
+                let title = input.read(cx).value().trim().to_string();
+                let text = prompt.read(cx).value().trim().to_string();
+                let notes: Vec<String> = notes.iter().take(count.get()).map(|n| n.read(cx).value().trim().to_string()).collect();
+                // Variants are sent their prompt: there has to be one.
+                (!title.is_empty() && (notes.len() < 2 || !text.is_empty())).then_some((title, text, notes))
+            }
+        };
         let this = cx.weak_entity();
         let submit = {
-            let (this, input, prompt) = (this.clone(), input.clone(), prompt.clone());
+            let (this, filled_in) = (this.clone(), filled_in.clone());
             move |window: &mut Window, cx: &mut App| {
-                let title = input.read(cx).value().trim().to_string();
-                if title.is_empty() {
-                    return;
-                }
-                let text = prompt.read(cx).value().trim().to_string();
+                let Some((title, text, notes)) = filled_in(cx) else { return };
                 window.close_dialog(cx);
-                let _ = this.update(cx, |this, cx| this.create_task(project, title, text, window, cx));
+                let _ = this.update(cx, |this, cx| this.create_task(project, title, text, notes, window, cx));
             }
         };
         // Runs inside this entity's update, so it cannot go through `submit`.
         let on_enter = {
-            let (input, prompt) = (input.clone(), prompt.clone());
+            let filled_in = filled_in.clone();
             move |this: &mut Self, event: &InputEvent, in_prompt: bool, window: &mut Window, cx: &mut Context<Self>| {
                 // Enter in the title, Ctrl+Enter anywhere.
                 let InputEvent::PressEnter { secondary, .. } = event else { return };
                 if in_prompt && !*secondary {
                     return;
                 }
-                let title = input.read(cx).value().trim().to_string();
-                if !title.is_empty() {
-                    let text = prompt.read(cx).value().trim().to_string();
+                if let Some((title, text, notes)) = filled_in(cx) {
                     window.close_dialog(cx);
-                    this.create_task(project, title, text, window, cx);
+                    this.create_task(project, title, text, notes, window, cx);
                 }
             }
         };
@@ -1088,6 +1265,8 @@ impl Workspace {
         let focused = std::rc::Rc::new(std::cell::Cell::new(false));
         window.open_dialog(cx, move |dialog, _, cx| {
             let (input, prompt, submit, focused) = (input.clone(), prompt.clone(), submit.clone(), focused.clone());
+            let (count, notes) = (count.clone(), notes.clone());
+            let many = count.get();
             let muted = cx.theme().muted_foreground;
             dialog
                 .title(format!("New task in {name}"))
@@ -1107,7 +1286,56 @@ impl Workspace {
                                     .text_color(cx.theme().muted_foreground)
                                     .child(branch_hint(&input.read(cx).value())),
                             )
-                            .child(Textarea::new(&prompt)),
+                            .child(Textarea::new(&prompt))
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .items_center()
+                                    .child(div().mr_1().text_sm().child("Variants"))
+                                    .children((1..=variants::MOST).map(|n| {
+                                        let count = count.clone();
+                                        Button::new(("variants", n)).xsmall().ghost().label(n.to_string()).selected(many == n).on_click(
+                                            move |_, window, _| {
+                                                count.set(n);
+                                                window.refresh();
+                                            },
+                                        )
+                                    }))
+                                    .child(div().ml_2().min_w_0().text_xs().text_color(cx.theme().muted_foreground).child(if many > 1 {
+                                        format!("{many} agents get the prompt right away and try it at once, each in a worktree of its own; you keep one.")
+                                    } else {
+                                        "More than one: several agents try it at once, and you keep the best.".to_string()
+                                    })),
+                            )
+                            .when(many > 1, |form| {
+                                // Ways to tell them apart, a click each: into the first line that is empty.
+                                let ways = [
+                                    ("Smallest patch", "Do it with the smallest patch that works."),
+                                    ("Failing test first", "Write a failing test first, then make it pass."),
+                                    ("Refactor on the way", "Refactor what is in the way before making the change."),
+                                    ("Question the premise", "First question whether the task is the right fix; say so if another is better, and do that."),
+                                ];
+                                form.children(notes.iter().take(many).map(|note| Input::new(note).small())).child(
+                                    h_flex().gap_1().children(ways.into_iter().enumerate().map(|(ix, (name, text))| {
+                                        let notes: Vec<Entity<InputState>> = notes.iter().take(many).cloned().collect();
+                                        Button::new(("way", ix)).xsmall().ghost().label(name).tooltip(text).on_click(move |_, window, cx| {
+                                            if let Some(empty) = notes.iter().find(|note| note.read(cx).value().trim().is_empty()) {
+                                                empty.update(cx, |input, cx| input.set_value(text, window, cx));
+                                            }
+                                        })
+                                    })),
+                                ).when(
+                                    prompt.read(cx).value().trim().is_empty(),
+                                    |form| {
+                                        form.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(hsla(0.08, 0.9, 0.55, 1.))
+                                                .child("Variants need a prompt: it is sent to every agent as it is."),
+                                        )
+                                    },
+                                )
+                            }),
                     )
                 })
                 .footer({
@@ -1117,12 +1345,22 @@ impl Workspace {
                         .items_center()
                         .gap_2()
                         .child(div().text_xs().text_color(muted).child(crate::keys::label("Ctrl+Enter")))
-                        .child(Button::new("create-task").primary().label("Create").on_click(move |_, window, cx| submit(window, cx)))
+                        .child(
+                            Button::new("create-task")
+                                .primary()
+                                .label(if many > 1 { format!("Create {many} variants") } else { "Create".to_string() })
+                                .on_click(move |_, window, cx| submit(window, cx)),
+                        )
                 })
         });
     }
 
-    fn create_task(&mut self, project: usize, title: String, prompt: String, window: &mut Window, cx: &mut Context<Self>) {
+    /// `notes` has what each variant's agent alone is told: two or more
+    /// make as many variants of the task (variants.rs).
+    fn create_task(&mut self, project: usize, title: String, prompt: String, notes: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+        if notes.len() > 1 {
+            return self.create_variants(project, title, prompt, notes, window, cx);
+        }
         let Some(p) = self.projects.get_mut(project) else { return };
         let branch = naming::branch_name(&title);
         let repo = p.path.clone();
@@ -1132,17 +1370,11 @@ impl Workspace {
             path: path.clone(),
             branch: branch.clone(),
             title,
-            main: false,
-            starred: false,
             last_active: state::now(),
-            session: TaskSession::default(),
-            view: None,
             busy: Some("creating…".into()),
-            locked: None,
-            left_view: None,
-            pr: None,
-            pr_checked: None,
-            port_slot: 0,
+            prompt: prompt.clone(),
+            created: state::now(),
+            ..Default::default()
         });
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
@@ -1157,7 +1389,7 @@ impl Workspace {
                         this.switch(&path, window, cx);
                         if !prompt.is_empty() {
                             if let Some(view) = this.active_view() {
-                                view.update(cx, |t, cx| t.queue_prompt(prompt, window, cx));
+                                view.update(cx, |t, cx| t.queue_prompt(prompt, false, window, cx));
                             }
                         }
                     }
@@ -1274,6 +1506,7 @@ impl Workspace {
                                 pr: None,
                                 pr_checked: None,
                                 port_slot: 0,
+                                ..Default::default()
                             }),
                         }
                     }
@@ -1284,6 +1517,7 @@ impl Workspace {
                         t.main || t.busy.is_some() || t.view.is_some() || worktrees.iter().any(|w| w.path == t.path)
                     });
                 }
+                this.dissolve_lonely_groups();
                 cx.notify();
             });
         })
@@ -1322,9 +1556,17 @@ impl Workspace {
         let Some((pi, ti)) = self.find(&event.task) else { return };
         let entry = &self.projects[pi].tasks[ti];
         let Some(view) = entry.view.clone() else { return };
-        let label = format!("{} · {}", self.projects[pi].name, entry.label());
-        let seen = self.active.as_deref() == Some(event.task.as_path()) && window.is_window_active();
+        let group = (!entry.group.is_empty()).then(|| entry.group.clone());
+        let mut label = format!("{} · {}", self.projects[pi].name, entry.label());
+        let variant = variants::letter(entry.variant);
+        // A group on its screen is in view with all its variants.
+        let in_view = self.active.as_deref() == Some(event.task.as_path()) || (group.is_some() && self.active_group == group);
+        let seen = in_view && window.is_window_active();
         let was = view.read(cx).agent_status.clone();
+        // A turn's end, not the reminder a minute later or a session's start.
+        let turn_over = status == agent::AgentStatus::Done && matches!(was, agent::AgentStatus::Working | agent::AgentStatus::NeedsInput(_));
+        // A message that waited for this goes out now: the agent is not done yet.
+        let more_coming = turn_over && view.read(cx).has_queued_message();
         view.update(cx, |t, cx| {
             t.set_agent_status(status.clone(), seen, cx);
             t.follow_agent(&event.event, event.file.as_deref());
@@ -1333,17 +1575,45 @@ impl Workspace {
                 "UserPromptSubmit" => t.agent_activity = Some("Thinking".into()),
                 _ => {}
             }
+            if turn_over && !event.replayed {
+                t.deliver_queued(window, cx);
+            }
         });
+        // A variant at work again: what the judge said is of before.
+        if let (Some(group), "UserPromptSubmit") = (&group, event.event.as_str()) {
+            if self.judges.contains_key(group) {
+                self.group_changed(group);
+            }
+        }
         self.projects[pi].tasks[ti].last_active = state::now();
+        if turn_over {
+            self.projects[pi].tasks[ti].done_at = state::now();
+            self.refresh_variant_info(window, cx);
+            if let Some(group) = &group {
+                self.refresh_touched(window, cx);
+                if !event.replayed && !more_coming && self.group_settled(group, cx) {
+                    self.group_came_through(group, window, cx);
+                }
+            }
+        }
         if status.is_attention() && !seen && status != was && !event.replayed && state::settings().notifications {
-            let body = match &status {
-                agent::AgentStatus::NeedsInput(message) => message.clone(),
-                _ => "Finished".to_string(),
+            let body = match (&status, &group) {
+                (agent::AgentStatus::NeedsInput(message), Some(_)) => {
+                    label = format!("{label} · {variant}");
+                    Some(message.clone())
+                }
+                (agent::AgentStatus::NeedsInput(message), None) => Some(message.clone()),
+                // One word for the group, when its last variant is done.
+                // A group tells when it is ready to look at: after the judge (variants.rs).
+                (_, Some(_)) => None,
+                (_, None) => Some("Finished".to_string()),
             };
-            let (tx, path) = (self.open_task_tx.clone(), event.task.clone());
-            crate::desktop::notify_with(&label, &body, move || {
-                let _ = tx.send_blocking(path);
-            });
+            if let Some(body) = body {
+                let (tx, path) = (self.open_task_tx.clone(), event.task.clone());
+                crate::desktop::notify_with(&label, &body, move || {
+                    let _ = tx.send_blocking(path);
+                });
+            }
         }
         cx.notify();
     }
@@ -1374,10 +1644,21 @@ impl Workspace {
     /// The agent tab's command line: the command line's choice, else the
     /// Settings one; Claude gets the hooks.
     fn agent_command(over: &Option<Option<String>>, bridge: Option<&agent::Bridge>) -> Option<String> {
+        Self::agent_command_for(over, bridge, false)
+    }
+
+    /// `unasked`: Claude Code in its auto mode, unless the command picks a
+    /// mode itself. For the variants of a task: the same question in every
+    /// one of them is what nobody sits through.
+    fn agent_command_for(over: &Option<Option<String>>, bridge: Option<&agent::Bridge>, unasked: bool) -> Option<String> {
         let cmd = match over {
             Some(cmd) => cmd.clone(),
             None => Some(state::settings().agent).filter(|a| !a.trim().is_empty()),
         };
+        let cmd = cmd.map(|cmd| {
+            let picks_mode = cmd.contains("--permission-mode") || cmd.contains("--dangerously-skip-permissions");
+            if unasked && agent::is_claude(&cmd) && !picks_mode { format!("{} --permission-mode auto", cmd.trim()) } else { cmd }
+        });
         match (cmd, bridge) {
             (Some(cmd), Some(bridge)) if agent::is_claude(&cmd) => Some(bridge.claude_command(cmd.trim())),
             (cmd, _) => cmd,
@@ -1414,8 +1695,14 @@ impl Workspace {
 
     /// Shows the task at `path` with its agent in front.
     pub fn focus_task(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
-        if self.find(path).is_none() {
-            return;
+        let Some((pi, ti)) = self.find(path) else { return };
+        // A group that is done is looked at as a whole; a variant that asks
+        // something is answered in its own agent.
+        let entry = &self.projects[pi].tasks[ti];
+        let asks = entry.view.as_ref().is_some_and(|v| matches!(v.read(cx).agent_status, agent::AgentStatus::NeedsInput(_)));
+        if !entry.group.is_empty() && !asks {
+            let group = entry.group.clone();
+            return self.open_group(&group, window, cx);
         }
         self.switch(path, window, cx);
         if let Some(view) = self.active_view() {
@@ -1569,4 +1856,5 @@ fn branch_hint(title: &str) -> String {
     }
 }
 
-use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::{ActiveTheme as _, Selectable as _, Sizable as _};
+use gpui_kit::prelude::FluentBuilder as _;

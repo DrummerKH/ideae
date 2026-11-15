@@ -870,17 +870,135 @@ pub fn task_worktree_dir(repo: &Path, branch: &str) -> PathBuf {
 /// `<repo>.worktrees/<branch>`, and copies the main worktree's untracked
 /// `.env*` files into it.
 pub fn create_task_worktree(repo: &Path, branch: &str, copy_env: bool) -> Result<PathBuf, String> {
+    worktree_at(repo, branch, &new_task_base(repo), copy_env)
+}
+
+fn worktree_at(repo: &Path, branch: &str, base: &str, copy_env: bool) -> Result<PathBuf, String> {
     let dir = task_worktree_dir(repo, branch);
     if dir.exists() {
         return Err(format!("{} already exists", dir.display()));
     }
-    let base = new_task_base(repo);
     let dir_s = dir.to_string_lossy().into_owned();
-    git_status(repo, &["worktree", "add", "--no-track", "-b", branch, &dir_s, &base])?;
+    git_status(repo, &["worktree", "add", "--no-track", "-b", branch, &dir_s, base])?;
     if copy_env {
         copy_env_files(repo, &dir);
     }
     Ok(dir)
+}
+
+/// Worktrees for several tries at one task, all from one commit so their
+/// diffs compare: `from`, or where a new task would start, looked up once.
+///
+/// With the commit they are from: what their diffs are counted against.
+pub fn create_variant_worktrees(repo: &Path, branches: &[String], from: Option<&str>, copy_env: bool) -> Result<(String, Vec<Result<PathBuf, String>>), String> {
+    let base = from.map_or_else(|| new_task_base(repo), str::to_string);
+    let commit = git(repo, &["rev-parse", "--verify", "-q", &format!("{base}^{{commit}}")])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("{base} is no commit"))?;
+    let made = branches.iter().map(|branch| worktree_at(repo, branch, &commit, copy_env)).collect();
+    Ok((commit, made))
+}
+
+/// Whether a new task of this branch name would run into something: the
+/// branch, or the directory its worktree goes to.
+pub fn task_name_taken(repo: &Path, branch: &str) -> bool {
+    task_worktree_dir(repo, branch).exists() || branch_exists(repo, branch)
+}
+
+/// Where a task's branch left its base.
+pub fn fork_point(root: &Path) -> Option<String> {
+    let base = base_ref(root)?;
+    git(root, &["merge-base", "HEAD", &base]).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// What a task changed since `base` (the commit it was made from; where
+/// it forked when that is not known), uncommitted work included: files,
+/// lines added, lines removed. New files not yet added count with theirs.
+pub fn change_size(root: &Path, base: Option<&str>) -> Option<(usize, usize, usize)> {
+    let fork = base.filter(|b| !b.is_empty()).map(str::to_string).or_else(|| fork_point(root))?;
+    let (files, mut added, removed) = shortstat(&git(root, &["diff", "--shortstat", &fork])?);
+    let untracked = git(root, &["ls-files", "--others", "--exclude-standard", "-z"]).unwrap_or_default();
+    let new: Vec<&str> = untracked.split('\0').filter(|f| !f.is_empty()).collect();
+    for file in &new {
+        // Text of a sensible size; a binary or a dump adds no lines.
+        let path = root.join(file);
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() < 1_000_000) {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                added += text.lines().count();
+            }
+        }
+    }
+    Some((files + new.len(), added, removed))
+}
+
+/// " 3 files changed, 84 insertions(+), 12 deletions(-)".
+fn shortstat(line: &str) -> (usize, usize, usize) {
+    let number = |word: &str| {
+        line.split(',').find(|part| part.contains(word)).and_then(|part| part.split_whitespace().next()?.parse().ok()).unwrap_or(0)
+    };
+    (number("file"), number("insertion"), number("deletion"))
+}
+
+/// What a worktree changed since `base` as one text, uncommitted work
+/// included: the diff, then the new files not yet added, as they are.
+pub fn diff_with_new_files(root: &Path, base: &str) -> String {
+    const MOST: usize = 1_500_000;
+    let mut text = git(root, &["diff", base]).unwrap_or_default();
+    let untracked = git(root, &["ls-files", "--others", "--exclude-standard", "-z"]).unwrap_or_default();
+    for file in untracked.split('\0').filter(|f| !f.is_empty()) {
+        let path = root.join(file);
+        if text.len() > MOST || !std::fs::metadata(&path).is_ok_and(|m| m.len() < 200_000) {
+            text.push_str(&format!("\nnew file {file} (not shown)\n"));
+        } else if let Ok(content) = std::fs::read_to_string(&path) {
+            text.push_str(&format!("\nnew file {file}:\n{content}\n"));
+        }
+    }
+    if text.len() > MOST {
+        let mut end = MOST;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push_str("\n… (cut)\n");
+    }
+    text
+}
+
+/// Where tries that were not kept are parked: refs no branch list shows.
+pub const PARKED: &str = "refs/ideae/variants";
+
+/// Removes a try's worktree and branch, and keeps what it had, uncommitted
+/// work too, under `keep_ref`.
+pub fn park_and_remove(repo: &Path, path: &Path, branch: &str, keep_ref: &str) -> Result<(), String> {
+    if path.exists() {
+        if git(path, &["status", "--porcelain"]).is_some_and(|s| !s.trim().is_empty()) {
+            git_status(path, &["add", "-A"])?;
+            // An identity of its own and no signing: the user's may not be
+            // set, or ask for a key. Not committed is not removed.
+            let own = ["-c", "user.name=ideae", "-c", "user.email=ideae@localhost", "-c", "commit.gpgsign=false"];
+            git_status(path, &[&own[..], &["commit", "--no-verify", "-q", "-m", "As it was left"]].concat())?;
+        }
+        // A name of its own: never over what was parked before.
+        let free = std::iter::once(keep_ref.to_string())
+            .chain((2..).map(|n| format!("{keep_ref}-{n}")))
+            .find(|name| git_status(repo, &["rev-parse", "--verify", "-q", name]).is_err())
+            .unwrap_or_else(|| keep_ref.to_string());
+        git_status(path, &["update-ref", &free, "HEAD"])?;
+    }
+    remove_task_worktree(repo, path, branch, false)
+}
+
+/// Drops the parked tries whose ref, `…/<unix seconds>-<group>/<letter>`,
+/// is older than `seconds`.
+pub fn prune_parked(repo: &Path, now: u64, seconds: u64) {
+    let Some(refs) = git(repo, &["for-each-ref", "--format=%(refname)", PARKED]) else { return };
+    for name in refs.lines() {
+        let parked = name.strip_prefix(PARKED).and_then(|rest| rest.trim_start_matches('/').split('-').next()?.parse::<u64>().ok());
+        if parked.is_some_and(|at| now.saturating_sub(at) > seconds) {
+            let _ = git_status(repo, &["update-ref", "-d", name]);
+        }
+    }
 }
 
 fn copy_env_files(from: &Path, to: &Path) {
@@ -910,6 +1028,26 @@ pub fn unsaved_work(root: &Path) -> (usize, usize) {
     (dirty, unpushed)
 }
 
+/// A new name for the branch a worktree is on.
+pub fn rename_branch(root: &Path, from: &str, to: &str) -> Result<(), String> {
+    git_status(root, &["branch", "-m", from, to]).map(|_| ())
+}
+
+/// Whether the repository has a branch of this name.
+pub fn branch_exists(repo: &Path, branch: &str) -> bool {
+    git_status(repo, &["rev-parse", "--verify", "-q", &format!("refs/heads/{branch}")]).is_ok()
+}
+
+/// Whether the branch was pushed: it follows a branch of a remote, or the
+/// remote has one of its name (a push without `-u`).
+pub fn has_upstream(root: &Path) -> bool {
+    if git_status(root, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]).is_ok() {
+        return true;
+    }
+    git(root, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .is_some_and(|branch| git_status(root, &["rev-parse", "--verify", "-q", &format!("refs/remotes/origin/{}", branch.trim())]).is_ok())
+}
+
 /// Removes a task's worktree and its branch; a lock is overridden only
 /// when `unlock`.
 pub fn remove_task_worktree(repo: &Path, path: &Path, branch: &str, unlock: bool) -> Result<(), String> {
@@ -928,4 +1066,66 @@ pub fn remove_task_worktree(repo: &Path, path: &Path, branch: &str, unlock: bool
         let _ = git_status(repo, &["branch", "-D", branch]);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod variant_tests {
+    use super::*;
+    use std::process::Command;
+
+    fn sh(dir: &Path, script: &str) {
+        let ok = Command::new("bash").arg("-ec").arg(script).current_dir(dir).status().unwrap().success();
+        assert!(ok, "{script}");
+    }
+
+    #[test]
+    fn variants_fork_from_one_commit_and_the_ones_not_kept_are_parked() {
+        let base = std::env::temp_dir().join(format!("ideae-variants-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        sh(&base, "git init -q -b main repo; cd repo; git config user.email t@t; git config user.name t
+            printf 'one\\n' > f.txt; git add f.txt; git commit -qm base");
+        let repo = base.join("repo");
+        let branches = ["fix-a".to_string(), "fix-b".to_string()];
+        let (from, made) = create_variant_worktrees(&repo, &branches, None, false).unwrap();
+        let made: Vec<PathBuf> = made.into_iter().map(Result::unwrap).collect();
+        assert!(task_name_taken(&repo, "fix-a") && !task_name_taken(&repo, "fix-c"));
+        let head = |dir: &Path| git(dir, &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(head(&made[0]), head(&made[1]));
+        assert_eq!((head(&made[0]), from.clone()), (head(&repo), head(&repo).trim().to_string()));
+
+        // A commits, B leaves its work uncommitted, with a new file.
+        sh(&made[0], "printf 'one\\ntwo\\n' > f.txt; git commit -qam more");
+        sh(&made[1], "printf 'ONE\\n' > f.txt; echo new > g.txt");
+        // No remote here: the base is main itself.
+        assert_eq!(change_size(&made[0], Some(&from)), Some((1, 1, 0)));
+        assert_eq!(change_size(&made[1], None), Some((2, 2, 1)), "the new file's line too");
+        // A later try at the task starts where the first did.
+        let later = create_variant_worktrees(&repo, &["fix-c".to_string()], fork_point(&made[0]).as_deref(), false).unwrap().1.remove(0).unwrap();
+        assert_eq!(head(&later), head(&repo));
+
+        assert!(!has_upstream(&made[0]));
+        let parked = format!("{PARKED}/1000-fix/b");
+        park_and_remove(&repo, &made[1], "fix-b", &parked).unwrap();
+        assert!(!made[1].exists() && !branch_exists(&repo, "fix-b"));
+        let kept = git(&repo, &["show", "--stat", "--format=", &parked]).unwrap();
+        assert!(kept.contains("f.txt") && kept.contains("g.txt"), "what it had, uncommitted work too: {kept}");
+
+        assert!(!branch_exists(&repo, "fix"));
+        rename_branch(&made[0], "fix-a", "fix").unwrap();
+        assert!(branch_exists(&repo, "fix") && !branch_exists(&repo, "fix-a"));
+
+        prune_parked(&repo, 1000 + 10, 100);
+        assert!(git(&repo, &["rev-parse", "--verify", "-q", &parked]).is_some(), "still young");
+        prune_parked(&repo, 1000 + 200, 100);
+        assert!(git(&repo, &["rev-parse", "--verify", "-q", &parked]).is_none_or(|s| s.trim().is_empty()), "gone when old");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn shortstat_reads_what_is_there() {
+        assert_eq!(shortstat(" 3 files changed, 84 insertions(+), 12 deletions(-)\n"), (3, 84, 12));
+        assert_eq!(shortstat(" 1 file changed, 1 deletion(-)\n"), (1, 0, 1));
+        assert_eq!(shortstat(""), (0, 0, 0));
+    }
 }
