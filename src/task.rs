@@ -907,6 +907,8 @@ pub struct TaskView {
     /// The same list for definition lookups running off the UI thread.
     shared_files: Arc<std::sync::RwLock<Vec<String>>>,
     expanded: HashSet<SharedString>,
+    /// Folders folded in the Changes tree, as "staged:dir" / "changes:dir".
+    folded_changes: HashSet<String>,
     file_states: HashMap<String, git::FileState>,
     commit_input: Entity<gpui_kit::component::input::TextareaState>,
     /// The git/gh action running, and the outcome of the last one.
@@ -1057,6 +1059,7 @@ impl TaskView {
             tree_files: Vec::new(),
             shared_files: Arc::default(),
             expanded: HashSet::new(),
+            folded_changes: HashSet::new(),
             file_states: HashMap::new(),
             commit_input,
             busy: None,
@@ -2815,28 +2818,92 @@ impl TaskView {
         let mut list = v_flex().id("changed-files-list").flex_1().min_h_0();
         if !staged.is_empty() {
             list = list.child(section("unstage-all", format!("STAGED ({})", staged.len()), "unstage all", false, cx));
-            for &ix in &staged {
-                list = list.child(self.render_change_row(ix, true, cx));
-            }
+            list = self.render_change_tree(list, &staged, true, cx);
         }
         list = list.child(section("stage-all", format!("CHANGES ({})", unstaged.len()), "stage all", true, cx));
-        for &ix in &unstaged {
-            list = list.child(self.render_change_row(ix, false, cx));
-        }
+        list = self.render_change_tree(list, &unstaged, false, cx);
         list.overflow_y_scrollbar()
     }
 
-    fn render_change_row(&self, ix: usize, in_staged: bool, cx: &mut Context<Self>) -> AnyElement {
+    /// The files as a folder tree; a folded folder hides what is under it.
+    fn render_change_tree(&self, mut list: Stateful<Div>, files: &[usize], in_staged: bool, cx: &mut Context<Self>) -> Stateful<Div> {
+        let section = if in_staged { "staged" } else { "changes" };
+        let paths: Vec<(usize, &str)> = files.iter().map(|&ix| (ix, self.files[ix].path.as_ref())).collect();
+        let mut hidden_under: Option<String> = None;
+        for node in change_tree(&paths) {
+            let path = match &node {
+                ChangeNode::Dir { path, .. } => path.clone(),
+                ChangeNode::File { ix, .. } => self.files[*ix].path.to_string(),
+            };
+            if let Some(prefix) = &hidden_under {
+                if path.starts_with(prefix.as_str()) {
+                    continue;
+                }
+                hidden_under = None;
+            }
+            match node {
+                ChangeNode::File { ix, depth } => list = list.child(self.render_change_row(ix, depth, in_staged, cx)),
+                ChangeNode::Dir { path, label, depth } => {
+                    let key = format!("{section}:{path}");
+                    let folded = self.folded_changes.contains(&key);
+                    if folded {
+                        hidden_under = Some(format!("{path}/"));
+                    }
+                    let dir_files: Vec<String> = files
+                        .iter()
+                        .map(|&ix| self.files[ix].path.to_string())
+                        .filter(|f| f.starts_with(&format!("{path}/")))
+                        .collect();
+                    let group = SharedString::from(format!("change-dir-{key}"));
+                    list = list.child(
+                        h_flex()
+                            .id(SharedString::from(format!("dir-{key}")))
+                            .group(group.clone())
+                            .pl(px(12. + 14. * depth as f32))
+                            .pr_3()
+                            .py_0p5()
+                            .gap_1()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(cx.theme().accent))
+                            .child(div().w(px(12.)).text_xs().child(if folded { "▸" } else { "▾" }))
+                            .child(div().flex_1().min_w_0().truncate().child(label))
+                            .child(
+                                div().opacity(0.).group_hover(group, |s| s.opacity(1.)).child(
+                                    Button::new(SharedString::from(format!("dir-stage-{key}")))
+                                        .xsmall()
+                                        .ghost()
+                                        .label(if in_staged { "−" } else { "+" })
+                                        .tooltip(if in_staged { "Unstage the folder" } else { "Stage the folder" })
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.stage_paths(dir_files.clone(), !in_staged, window, cx)
+                                        })),
+                                ),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if !this.folded_changes.remove(&key) {
+                                    this.folded_changes.insert(key.clone());
+                                }
+                                cx.notify();
+                            })),
+                    );
+                }
+            }
+        }
+        list
+    }
+
+    fn render_change_row(&self, ix: usize, depth: usize, in_staged: bool, cx: &mut Context<Self>) -> AnyElement {
         let file = &self.files[ix];
         let path = file.path.clone();
         let stage_path = file.path.to_string();
         let open_path = self.root.join(file.path.as_ref());
         let open_line = file.first_line.saturating_sub(1);
         let deleted = matches!(file.status, DiffFileStatus::Deleted);
-        let (name, dir) = match file.path.rsplit_once('/') {
-            Some((dir, name)) => (name.to_string(), dir.to_string()),
-            None => (file.path.to_string(), String::new()),
-        };
+        // The tree shows the folders.
+        let name = file.path.rsplit_once('/').map_or(file.path.to_string(), |(_, name)| name.to_string());
         let status = match file.status {
             DiffFileStatus::Added => "A",
             DiffFileStatus::Deleted => "D",
@@ -2849,20 +2916,15 @@ impl TaskView {
             .id(("file", id))
             .when(keyboard, |row| row.border_l_2().border_color(cx.theme().primary))
             .group("change-row")
-            .px_3()
-            .py_1()
+            .pl(px(12. + 14. * depth as f32))
+            .pr_3()
+            .py_0p5()
             .gap_2()
             .text_sm()
             .cursor_pointer()
             .hover(|s| s.bg(cx.theme().accent))
             .child(div().w(px(12.)).text_color(cx.theme().muted_foreground).child(status))
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .child(div().truncate().child(name))
-                    .child(div().truncate().text_xs().text_color(cx.theme().muted_foreground).child(dir)),
-            )
+            .child(div().flex_1().min_w_0().truncate().child(name))
             .child(div().text_xs().text_color(gpui_kit::green()).child(format!("+{}", file.additions)))
             .child(div().text_xs().text_color(gpui_kit::red()).child(format!("-{}", file.deletions)))
             .when(!deleted, |row| {
@@ -4005,5 +4067,79 @@ impl TaskView {
             }
         }
         cx.notify();
+    }
+}
+
+// ---------------------------------------------------------------- changes tree
+
+#[derive(Debug, PartialEq)]
+enum ChangeNode {
+    /// A folder; chains of folders holding one folder and no files show as
+    /// one ("src/main/kotlin").
+    Dir { path: String, label: String, depth: usize },
+    File { ix: usize, depth: usize },
+}
+
+/// Sorted paths as rows of a folder tree, folders first.
+fn change_tree(paths: &[(usize, &str)]) -> Vec<ChangeNode> {
+    #[derive(Default)]
+    struct Node {
+        dirs: BTreeMap<String, Node>,
+        files: Vec<(String, usize)>,
+    }
+    let mut root = Node::default();
+    for &(ix, path) in paths {
+        let mut node = &mut root;
+        let mut parts: Vec<&str> = path.split('/').collect();
+        let name = parts.pop().unwrap_or_default();
+        for part in parts {
+            node = node.dirs.entry(part.to_string()).or_default();
+        }
+        node.files.push((name.to_string(), ix));
+    }
+    fn walk(node: &Node, prefix: &str, depth: usize, out: &mut Vec<ChangeNode>) {
+        for (name, child) in &node.dirs {
+            let (mut label, mut path, mut child) = (name.clone(), format!("{prefix}{name}"), child);
+            while child.files.is_empty() && child.dirs.len() == 1 {
+                let (next, grandchild) = child.dirs.iter().next().unwrap();
+                label = format!("{label}/{next}");
+                path = format!("{path}/{next}");
+                child = grandchild;
+            }
+            out.push(ChangeNode::Dir { path: path.clone(), label, depth });
+            walk(child, &format!("{path}/"), depth + 1, out);
+        }
+        let mut files = node.files.clone();
+        files.sort();
+        for (_, ix) in files {
+            out.push(ChangeNode::File { ix, depth });
+        }
+    }
+    let mut out = Vec::new();
+    walk(&root, "", 0, &mut out);
+    out
+}
+
+#[cfg(test)]
+mod change_tree_tests {
+    use super::{ChangeNode, change_tree};
+
+    #[test]
+    fn folders_compact_and_nest() {
+        let paths = [(0, "README.md"), (1, "src/main/kotlin/App.kt"), (2, "src/main/kotlin/ui/View.kt"), (3, "src/test/T.kt")];
+        let dir = |path: &str, label: &str, depth| ChangeNode::Dir { path: path.into(), label: label.into(), depth };
+        assert_eq!(
+            change_tree(&paths),
+            vec![
+                dir("src", "src", 0),
+                dir("src/main/kotlin", "main/kotlin", 1),
+                dir("src/main/kotlin/ui", "ui", 2),
+                ChangeNode::File { ix: 2, depth: 3 },
+                ChangeNode::File { ix: 1, depth: 2 },
+                dir("src/test", "test", 1),
+                ChangeNode::File { ix: 3, depth: 2 },
+                ChangeNode::File { ix: 0, depth: 0 },
+            ]
+        );
     }
 }
