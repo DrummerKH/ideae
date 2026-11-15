@@ -95,7 +95,8 @@ impl Render for Workspace {
                                     Button::new("go-to-file")
                                         .xsmall()
                                         .ghost()
-                                        .label(format!("Go to file  {}", keymap::label("go_to_file")))
+                                        .label("Go to file")
+                                        .tooltip(format!("Go to file  {}", keymap::label("go_to_file")))
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.finder(finder::FinderKind::Files, window, cx)
                                         })),
@@ -104,7 +105,8 @@ impl Render for Workspace {
                                     Button::new("find-in-files")
                                         .xsmall()
                                         .ghost()
-                                        .label(format!("Find  {}", keymap::label("find_in_files")))
+                                        .label("Find")
+                                        .tooltip(format!("Find in files  {}", keymap::label("find_in_files")))
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.finder(finder::FinderKind::Grep, window, cx)
                                         })),
@@ -280,10 +282,11 @@ impl Workspace {
         Button::new("power-saving")
             .xsmall()
             .ghost()
-            .label(if saving { "LSP off" } else { "LSP" })
+            .icon(gpui_kit::component::IconName::Battery)
             .when(saving, |b| b.text_color(hsla(0.11, 0.9, 0.55, 1.)))
+            .when(!saving, |b| b.text_color(cx.theme().muted_foreground))
             .tooltip(if saving {
-                "Power saving: language servers are off. Click to start them for the open files."
+                "Power saving is on: language servers are off. Click to start them for the open files."
             } else {
                 "Power saving: click to stop all language servers and start none."
             })
