@@ -3898,57 +3898,63 @@ impl TaskView {
             .hover(|s| s.bg(cx.theme().accent))
             .child(div().w(px(12.)).text_color(cx.theme().muted_foreground).child(status))
             .child(div().flex_1().min_w_0().truncate().when(viewed, |d| d.text_color(cx.theme().muted_foreground)).child(name))
-            .child(
-                Button::new(("viewed", id))
-                    .xsmall()
-                    .ghost()
-                    .label(if viewed { "✓" } else { "○" })
-                    .when(viewed, |b| b.text_color(gpui_kit::green()))
-                    .tooltip(if viewed { "Viewed; click to unmark" } else { "Mark as viewed until it changes again" })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.toggle_viewed(&view_path, cx)
-                    })),
-            )
+            .when(viewed, |row| row.child(div().text_xs().text_color(gpui_kit::green()).child("✓")))
             .child(div().text_xs().text_color(gpui_kit::green()).child(format!("+{}", file.additions)))
             .child(div().text_xs().text_color(gpui_kit::red()).child(format!("-{}", file.deletions)))
-            .when(!deleted, |row| {
-                row.child(
-                    Button::new(("open", id))
-                        .xsmall()
-                        .ghost()
-                        .label("open")
-                        .tooltip("Open the file at its first change")
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            this.open_file(open_path.clone(), open_line, window, cx)
-                        })),
-                )
-            })
-            .when(!in_staged, |row| {
-                let discard_path = file.path.to_string();
-                row.child(
-                    Button::new(("discard", id))
-                        .xsmall()
-                        .ghost()
-                        .label("↺")
-                        .tooltip("Discard the changes to this file")
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            this.confirm_discard(discard_path.clone(), window, cx)
-                        })),
-                )
-            })
+            // The actions show on the row under the pointer or the keyboard.
             .child(
-                Button::new(("stage", id))
-                    .xsmall()
-                    .ghost()
-                    .label(if in_staged { "−" } else { "+" })
-                    .tooltip(if in_staged { "Unstage" } else { "Stage" })
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.stage_paths(vec![stage_path.clone()], !in_staged, window, cx)
-                    })),
+                h_flex()
+                    .gap_0p5()
+                    .when(!keyboard, |actions| actions.invisible().group_hover("change-row", |s| s.visible()))
+                    .child(
+                        Button::new(("viewed", id))
+                            .xsmall()
+                            .ghost()
+                            .label(if viewed { "✓" } else { "○" })
+                            .tooltip(if viewed { "Viewed; click to unmark" } else { "Mark as viewed until it changes again" })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_viewed(&view_path, cx)
+                            })),
+                    )
+                    .when(!deleted, |row| {
+                        row.child(
+                            Button::new(("open", id))
+                                .xsmall()
+                                .ghost()
+                                .label("open")
+                                .tooltip("Open the file at its first change")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.open_file(open_path.clone(), open_line, window, cx)
+                                })),
+                        )
+                    })
+                    .when(!in_staged, |row| {
+                        let discard_path = file.path.to_string();
+                        row.child(
+                            Button::new(("discard", id))
+                                .xsmall()
+                                .ghost()
+                                .label("↺")
+                                .tooltip("Discard the changes to this file (Undo follows)")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.confirm_discard(discard_path.clone(), window, cx)
+                                })),
+                        )
+                    })
+                    .child(
+                        Button::new(("stage", id))
+                            .xsmall()
+                            .ghost()
+                            .label(if in_staged { "−" } else { "+" })
+                            .tooltip(if in_staged { "Unstage" } else { "Stage" })
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.stage_paths(vec![stage_path.clone()], !in_staged, window, cx)
+                            })),
+                    ),
             )
             .on_click(cx.listener(move |this, _, window, cx| this.show_changed_file(path.clone(), window, cx)))
             .into_any_element()
