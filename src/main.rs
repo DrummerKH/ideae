@@ -7,6 +7,7 @@ mod grammars;
 mod history;
 mod ide;
 mod lsp;
+mod lsp_install;
 mod naming;
 mod procs;
 mod search;

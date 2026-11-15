@@ -25,7 +25,8 @@ Status: early, Linux only (Ubuntu 24.04 or newer is what it is tested on).
   survive a restart (`~/.local/share/ideae/state.json`).
 - **Editor.** Tree-sitter highlighting, go to definition, usages and
   implementations (LSP when the language server is installed, else a
-  search-based fallback), file structure, blame of the cursor
+  search-based fallback; a missing server can be installed from the editor
+  header into `~/.local/share/ideae/lsp`), file structure, blame of the cursor
   line, syntax-aware selection, autosave when you leave a file.
 - **Git.** Changes with stage/unstage/discard, commit, push, PR (`gh`), the
   branch against its base, history, safe pull.

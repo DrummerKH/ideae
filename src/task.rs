@@ -139,6 +139,8 @@ pub struct FileView {
     lsp_ok: Option<bool>,
     lsp_client: Option<Arc<lsp::LspClient>>,
     lsp_program: String,
+    /// The server this file would have if it were installed.
+    lsp_missing: Option<&'static str>,
     _poll: Task<()>,
 }
 
@@ -407,8 +409,22 @@ impl Render for FileView {
                             .when(self.lsp_ok == Some(false) && self.lsp_status.contains("failed"), |s| {
                                 s.text_color(gpui_kit::red())
                             })
-                            .child(self.status_text()),
-                    ),
+                            .child(if self.lsp_missing.is_some_and(crate::lsp_install::is_installing) {
+                                format!("installing {}…", self.lsp_missing.unwrap_or_default())
+                            } else {
+                                self.status_text()
+                            }),
+                    )
+                    .when_some(self.lsp_missing.filter(|p| !crate::lsp_install::is_installing(p)), |header, program| {
+                        let task = self.task.clone();
+                        header.when(crate::lsp_install::recipe(program).is_some(), |header| {
+                            header.child(Button::new("lsp-install").xsmall().ghost().label("Install…").on_click(
+                                move |_, window, cx| {
+                                    let _ = task.update(cx, |t, cx| t.confirm_lsp_install(program, window, cx));
+                                },
+                            ))
+                        })
+                    }),
             )
             .when(self.conflict, |this| {
                 this.child(
@@ -1429,6 +1445,87 @@ impl TaskView {
         }
     }
 
+    /// "Install…" next to "kotlin-lsp not installed": asks first, as it
+    /// downloads or builds; a copy another task installed is just used.
+    fn confirm_lsp_install(&mut self, program: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui_kit::component::notification::Notification;
+        if crate::lsp_install::installed(program).is_some() {
+            return self.reattach_lsp(program, cx);
+        }
+        let Some(recipe) = crate::lsp_install::recipe(program) else { return };
+        if let Some(tool) = crate::lsp_install::missing_tool(&recipe) {
+            let message = format!("Installing {program} needs {tool} on PATH.");
+            return window.push_notification(Notification::warning(message).title(format!("Install {program}")), cx);
+        }
+        let description = format!("{}\n\nInto {}.", recipe.summary, crate::lsp_install::root().join(program).display());
+        let this = cx.weak_entity();
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            let this = this.clone();
+            dialog
+                .confirm()
+                .title(format!("Install {program}?"))
+                .description(description.clone())
+                .ok_text("Install")
+                .on_ok(move |_, window, cx| {
+                    let _ = this.update(cx, |this, cx| this.install_lsp(program, window, cx));
+                    true
+                })
+        });
+    }
+
+    fn install_lsp(&mut self, program: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui_kit::component::notification::Notification;
+        let install = cx.background_spawn(async move { crate::lsp_install::install(program) });
+        cx.spawn_in(window, async move |this, cx| {
+            // The headers say "installing" once the install has begun.
+            cx.background_executor().timer(Duration::from_millis(50)).await;
+            let _ = this.update(cx, |this, cx| this.notify_files(cx));
+            let result = install.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok(_) => {
+                        window.push_notification(Notification::success(format!("{program} installed")), cx);
+                        this.reattach_lsp(program, cx);
+                    }
+                    Err(e) => window.push_notification(
+                        Notification::error(format!("{e:#}")).title(format!("Installing {program} failed")),
+                        cx,
+                    ),
+                }
+                this.notify_files(cx);
+            });
+        })
+        .detach();
+    }
+
+    fn notify_files(&self, cx: &mut Context<Self>) {
+        for tab in &self.tabs {
+            if let TabKind::File(file) = &tab.kind {
+                file.update(cx, |_, cx| cx.notify());
+            }
+        }
+    }
+
+    /// Starts the newly installed server for the open files waiting for it.
+    fn reattach_lsp(&mut self, program: &'static str, cx: &mut Context<Self>) {
+        let waiting: Vec<_> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| match &tab.kind {
+                TabKind::File(file) if file.read(cx).lsp_missing == Some(program) => Some(file.clone()),
+                _ => None,
+            })
+            .collect();
+        for file in waiting {
+            let (path, editor) = {
+                let f = file.read(cx);
+                (f.path.clone(), f.editor.clone())
+            };
+            let content = editor.read(cx).text().to_string();
+            self.attach_lsp(&path, content, &editor, &file, cx);
+        }
+    }
+
     /// Opens History on one commit (from a blame line).
     pub fn show_commit(&mut self, hash: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.show_tab(|k| matches!(k, TabKind::History), window, cx);
@@ -2242,6 +2339,7 @@ impl TaskView {
             lsp_ok: Some(false),
             lsp_client: None,
             lsp_program: String::new(),
+            lsp_missing: None,
             // Re-render while the server reports progress, so the header can
             // say "indexing" instead of a misleading "ready".
             _poll: cx.spawn(async move |this: WeakEntity<FileView>, cx| {
@@ -2288,7 +2386,9 @@ impl TaskView {
                 cx.notify();
             });
         };
-        let (language_id, program, args) = match lsp::server_for(path) {
+        let missing = lsp::missing_server(path);
+        file.update(cx, |f, _| f.lsp_missing = missing);
+        let lsp::Server { language_id, program, command, args } = match lsp::server_for(path) {
             Ok(server) => server,
             Err(reason) => return set_status(file, Some(false), reason, cx),
         };
@@ -2296,7 +2396,7 @@ impl TaskView {
         let key = (program, project.clone());
         let client = match self.lsp.get(&key) {
             Some(client) => client.clone(),
-            None => match lsp::LspClient::spawn(program, args, &project) {
+            None => match lsp::LspClient::spawn(program, &command, args, &project, crate::lsp_install::init_options(program, &command)) {
                 Ok(client) => {
                     self.lsp.insert(key, client.clone());
                     client
@@ -3303,7 +3403,7 @@ mod places_tests {
         ]);
         let file = root.join("shape.go");
         let text = std::fs::read_to_string(&file).unwrap();
-        let client = crate::lsp::LspClient::spawn("gopls", &[], &root).unwrap();
+        let client = crate::lsp::LspClient::spawn("gopls", std::path::Path::new("gopls"), &[], &root, serde_json::Value::Null).unwrap();
         client.did_open(&file, "go", &text).unwrap();
         let query = PlacesQuery { path: file.clone(), pos: Position::new(2, 6), word: "Shape".into(), implementations: true };
         // Ctrl+B on the declaration turns into its usages only if the server
@@ -3508,6 +3608,10 @@ fn find_places(
         list.sort_by(|a, b| (&a.path, a.line, a.col).cmp(&(&b.path, b.line, b.col)));
         list.dedup_by(|a, b| a.path == b.path && a.line == b.line && a.col == b.col);
     }
+    // The place asked about is no answer, even when the server lists it.
+    let origin = (query.path.strip_prefix(root).unwrap_or(&query.path).display().to_string(), query.pos.line + 1);
+    places.implementations.retain(|h| (h.path.clone(), h.line) != origin);
+    places.usages.retain(|h| (h.path.clone(), h.line) != origin);
     // Some servers list an implementation among the references too.
     let implemented: HashSet<(String, u32)> = places.implementations.iter().map(|h| (h.path.clone(), h.line)).collect();
     places.usages.retain(|h| !implemented.contains(&(h.path.clone(), h.line)));
@@ -3893,6 +3997,7 @@ impl TaskView {
                 file.update(cx, |f, cx| {
                     f.lsp_client = None;
                     f.lsp_ok = Some(false);
+                    f.lsp_missing = None;
                     f.lsp_status = "language servers off (power saving)".into();
                     cx.notify();
                 });

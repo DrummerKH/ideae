@@ -34,34 +34,60 @@ pub struct LspClient {
     child: Mutex<Child>,
 }
 
-/// Which server handles a file, by extension: (language id, program, args),
-/// or why there is none, for the editor's status line.
 /// Power saving: no language servers run, none start.
 pub static POWER_SAVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-pub fn server_for(
-    path: &Path,
-) -> Result<(&'static str, &'static str, &'static [&'static str]), String> {
-    if POWER_SAVING.load(Ordering::Relaxed) {
-        return Err("language servers off (power saving)".into());
-    }
+/// The server for a file: its language id, its name, the executable to run
+/// (a name on PATH or a path ideae installed it at) and its arguments.
+pub struct Server {
+    pub language_id: &'static str,
+    pub program: &'static str,
+    pub command: PathBuf,
+    pub args: &'static [&'static str],
+}
+
+fn known(path: &Path) -> Option<(&'static str, &'static str, &'static [&'static str])> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
-    let entry: (&str, &str, &[&str]) = match ext {
+    Some(match ext {
         "go" => ("go", "gopls", &[]),
         "rs" => ("rust", "rust-analyzer", &[]),
         "ts" | "tsx" => ("typescript", "typescript-language-server", &["--stdio"]),
         "js" | "jsx" => ("javascript", "typescript-language-server", &["--stdio"]),
         "php" => ("php", "intelephense", &["--stdio"]),
         "kt" | "kts" => ("kotlin", "kotlin-lsp", &["--stdio"]),
-        _ => return Err(format!("no language server for .{ext}")),
-    };
-    if !runs(entry.1) {
-        return Err(format!("{} not installed", entry.1));
-    }
-    Ok(entry)
+        _ => return None,
+    })
 }
 
-/// Whether the server is there. Found on PATH is enough, except for
+/// Which server handles a file, by extension, or why there is none, for the
+/// editor's status line.
+pub fn server_for(path: &Path) -> Result<Server, String> {
+    if POWER_SAVING.load(Ordering::Relaxed) {
+        return Err("language servers off (power saving)".into());
+    }
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
+    let (language_id, program, args) = known(path).ok_or_else(|| format!("no language server for .{ext}"))?;
+    let command = locate(program).ok_or_else(|| format!("{program} not installed"))?;
+    Ok(Server { language_id, program, command, args })
+}
+
+/// The server a file would have, when it is neither on PATH nor installed.
+pub fn missing_server(path: &Path) -> Option<&'static str> {
+    if POWER_SAVING.load(Ordering::Relaxed) {
+        return None;
+    }
+    known(path).map(|(_, program, _)| program).filter(|program| locate(program).is_none())
+}
+
+/// PATH first, then ideae's own copy.
+fn locate(program: &str) -> Option<PathBuf> {
+    if runs(program) {
+        return Some(PathBuf::from(program));
+    }
+    crate::lsp_install::installed(program)
+}
+
+/// Whether the server is on PATH. Found there is enough, except for
 /// rust-analyzer: rustup puts a proxy on PATH that fails when the component
 /// is missing, so that one has to answer `--version`. Others cannot be asked
 /// (intelephense crashes without a transport flag).
@@ -72,17 +98,18 @@ fn runs(program: &str) -> bool {
         if program != "rust-analyzer" {
             return on_path(program);
         }
-        Command::new(program)
-            .arg("--version")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
+        on_path(program)
+            && Command::new(program)
+                .arg("--version")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
     })
 }
 
-fn on_path(program: &str) -> bool {
+pub fn on_path(program: &str) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
     std::env::var_os("PATH").is_some_and(|path| {
         std::env::split_paths(&path).any(|dir| {
@@ -209,8 +236,8 @@ pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
 impl LspClient {
     /// Starts the server; initialization runs on its own thread, and every
     /// call waits for it.
-    pub fn spawn(program: &str, args: &[&str], root: &Path) -> Result<Arc<Self>> {
-        let mut command = Command::new(program);
+    pub fn spawn(program: &str, executable: &Path, args: &[&str], root: &Path, init_options: Value) -> Result<Arc<Self>> {
+        let mut command = Command::new(executable);
         command.args(args).current_dir(root).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
         // Dies with the app even when it exits without running destructors.
         // SAFETY: prctl only sets a flag of the child.
@@ -252,7 +279,7 @@ impl LspClient {
         thread::Builder::new()
             .name(format!("lsp-init-{program}"))
             .spawn(move || {
-                let result = init.initialize(&root).map_err(|e| e.to_string());
+                let result = init.initialize(&root, init_options).map_err(|e| e.to_string());
                 let (lock, cvar) = &init.ready;
                 *lock.lock().unwrap() = Some(result);
                 cvar.notify_all();
@@ -260,7 +287,7 @@ impl LspClient {
         Ok(client)
     }
 
-    fn initialize(&self, root: &Path) -> Result<()> {
+    fn initialize(&self, root: &Path, init_options: Value) -> Result<()> {
         let uri = path_to_uri(root);
         let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let answer = self.raw_request(
@@ -269,6 +296,7 @@ impl LspClient {
                 "processId": std::process::id(),
                 "rootUri": uri,
                 "workspaceFolders": [{ "uri": uri, "name": name }],
+                "initializationOptions": init_options,
                 "capabilities": {
                     // The editor counts columns in characters.
                     "general": { "positionEncodings": ["utf-32", "utf-16"] },
@@ -529,7 +557,7 @@ mod tests {
         let (line, row) = text.lines().enumerate().find(|(_, l)| l.contains("greet.Hello(")).unwrap();
         let col = row.find("Hello").unwrap() as u32;
 
-        let client = LspClient::spawn("gopls", &[], &root).unwrap();
+        let client = LspClient::spawn("gopls", Path::new("gopls"), &[], &root, Value::Null).unwrap();
         client.did_open(&file, "go", text).unwrap();
         let links = client
             .definition(&path_to_uri(&file), lsp_types::Position::new(line as u32, col + 2))
@@ -558,7 +586,7 @@ mod tests {
         let col = row.find("line.").unwrap() as u32 + 1;
         let (decl_line, _) = text.lines().enumerate().find(|(_, l)| l.trim_start().starts_with("for line in patch.lines()")).unwrap();
 
-        let client = LspClient::spawn("rust-analyzer", &[], &root).unwrap();
+        let client = LspClient::spawn("rust-analyzer", Path::new("rust-analyzer"), &[], &root, Value::Null).unwrap();
         client.did_open(&file, "rust", &text).unwrap();
         let uri = path_to_uri(&file);
         let started = std::time::Instant::now();
