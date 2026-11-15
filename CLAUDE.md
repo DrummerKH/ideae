@@ -17,6 +17,7 @@ src/git.rs         git CLI wrappers, worktrees
 src/lsp.rs         language server client
 src/lsp_install.rs language servers installed on request, ~/.local/share/ideae/lsp
 src/procs.rs       starting helper programs (no console on Windows), ending child sessions on quit
+src/daemon/        terminals in a daemon (`ideae --daemon`, unix): they survive a window restart; Exit ends them
 src/desktop.rs     launcher entry, dash pin, restart
 src/naming.rs      branch names from task titles
 vendor/            patched gpui-component, gpui-base, gpui-cn; changes marked `ideae patch`
@@ -39,7 +40,8 @@ IDEAE_STATE=/tmp/x/state.json scripts/drive.sh /tmp/x/run.log 7 \
   "move:73,57 click wait:0.7 shot:/tmp/x/menu.png" -- --no-agent /path/to/test/repo
 ```
 
-- Always set `IDEAE_STATE` to a scratch file; the real state belongs to the user's running app.
+- Always set `IDEAE_STATE` to a scratch file; the real state belongs to the user's running app. It also gives the run its own daemon (socket named after the state file), so a test never attaches to or prunes the user's agents. `IDEAE_NO_DAEMON=1` keeps terminals in the window.
+- Stop test processes by PID, never `pkill -f <pattern>`: patterns match other sessions' shells and the user's own app.
 - The driver gives the app no D-Bus session. Never run the app with the user's session bus in tests: it can change their GNOME dash or send notifications.
 - Use a throwaway git repo for task create/delete tests, never a real project.
 - Debug aids: `IDEAE_LSP_DIR` (where servers get installed), `IDEAE_LSP_IDLE_SECS` (how long a task out of view keeps its language servers, default 900), `IDEAE_OPEN=path:line`, `IDEAE_URL=url`, `IDEAE_TAB=n`, `IDEAE_DEBUG`.

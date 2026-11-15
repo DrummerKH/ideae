@@ -4,6 +4,8 @@
 mod agent;
 mod browser;
 mod build_watch;
+#[cfg(unix)]
+mod daemon;
 mod desktop;
 mod finder;
 mod git;
@@ -375,6 +377,11 @@ fn visible_scrollbars(cx: &mut App) {
 fn main() {
     // Run by Claude Code hooks: forward the event and exit before any UI setup.
     let argv: Vec<String> = std::env::args().collect();
+    #[cfg(unix)]
+    if argv.get(1).map(String::as_str) == Some("--daemon") {
+        daemon::server::run();
+        return;
+    }
     if argv.get(1).map(String::as_str) == Some("--hook") {
         agent::run_hook(argv.get(2).map(String::as_str).unwrap_or_default());
         return;

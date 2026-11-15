@@ -377,6 +377,66 @@ impl ByteSink {
     }
 }
 
+/// ideae patch: the receiving end of a [`ByteSink`] that feeds no engine,
+/// so a [`ByteSource`] such as [`LocalPty`](super::LocalPty) can run
+/// without a window, in a process that relays its bytes elsewhere.
+#[derive(Debug)]
+pub struct DetachedSink {
+    shared: Arc<Shared>,
+}
+
+/// What a [`DetachedSink`] took since it was last asked.
+#[derive(Debug, Default)]
+pub struct SinkBatch {
+    /// Output in the order it came.
+    pub output: Vec<Vec<u8>>,
+    /// The source can take input again after a short write.
+    pub writable: bool,
+    /// The source reached end of file.
+    pub finished: bool,
+}
+
+impl ByteSink {
+    /// A sink and its receiving end, with no engine behind them.
+    pub fn detached() -> (ByteSink, DetachedSink) {
+        let shared = Arc::new(Shared {
+            mailbox: Mutex::new(Mailbox::default()),
+            wake: Condvar::new(),
+            room: Condvar::new(),
+            closing: AtomicBool::new(false),
+        });
+        (ByteSink { shared: shared.clone() }, DetachedSink { shared })
+    }
+}
+
+impl DetachedSink {
+    /// Waits up to `timeout` for anything new, then takes it all.
+    pub fn next(&self, timeout: Duration) -> SinkBatch {
+        let mut mail = self.shared.lock();
+        if mail.reads.is_empty() && !mail.writable && !mail.reader_exited {
+            mail = self
+                .shared
+                .wake
+                .wait_timeout(mail, timeout)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+        let batch = SinkBatch {
+            output: mail.reads.drain(..).collect(),
+            writable: std::mem::take(&mut mail.writable),
+            finished: mail.reader_exited,
+        };
+        mail.read_bytes = 0;
+        self.shared.room.notify_all();
+        batch
+    }
+
+    /// Stops the source's reader.
+    pub fn close(&self) {
+        self.shared.set_closing();
+    }
+}
+
 /// Why an input was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InputRejected {

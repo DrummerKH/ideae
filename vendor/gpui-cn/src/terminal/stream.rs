@@ -42,7 +42,7 @@ use std::sync::{Arc, Mutex};
 
 use gpui_kit::base::async_util;
 
-use crate::terminal::engine::{ByteHandle, ByteSink, ByteSource, ExitStatus};
+use crate::terminal::engine::{ByteHandle, ByteSink, ByteSource, ExitStatus, ForegroundProcess};
 use crate::terminal::frame::Viewport;
 
 /// What the terminal sends to the application's side of a
@@ -86,6 +86,9 @@ struct State {
     sink: Option<ByteSink>,
     pending: Vec<u8>,
     exit: Option<ExitStatus>,
+    /// ideae patch: the program's foreground process, as the far side
+    /// reports it, for the terminal's title and close confirmation.
+    foreground: Option<ForegroundProcess>,
 }
 
 impl Shared {
@@ -138,6 +141,11 @@ impl StreamPeer {
         if let Some(sink) = &state.sink {
             sink.finished();
         }
+    }
+
+    /// ideae patch: the process in the foreground on the far side.
+    pub fn set_foreground(&self, process: Option<ForegroundProcess>) {
+        self.shared.lock().foreground = process;
     }
 
     /// The terminal's input, grid sizes and close, in order. Await
@@ -197,5 +205,9 @@ impl ByteHandle for Handle {
     fn close(&self) {
         let _ = self.shared.events.try_send(StreamEvent::Closed);
         self.shared.lock().sink = None;
+    }
+
+    fn foreground(&self) -> Option<ForegroundProcess> {
+        self.shared.lock().foreground.clone()
     }
 }

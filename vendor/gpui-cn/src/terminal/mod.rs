@@ -212,7 +212,7 @@ pub use appearance::TerminalAppearance;
 pub use links::add_known_names;
 pub use element::{KEY_CONTEXT, Terminal};
 pub use engine::{
-    ByteHandle, ByteSink, ByteSource, Engine, ExitStatus, ForegroundProcess, InputRejected,
+    ByteHandle, ByteSink, ByteSource, DetachedSink, Engine, ExitStatus, ForegroundProcess, InputRejected, SinkBatch,
     TerminalSnapshot, TerminalStatus,
 };
 pub use frame::{

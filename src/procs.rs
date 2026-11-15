@@ -199,7 +199,13 @@ pub fn end_child_sessions() {}
 #[cfg(unix)]
 pub fn end_child_sessions() {
     let me = std::process::id() as i32;
-    let leaders: Vec<i32> = pids().into_iter().filter(|&p| ppid(p) == Some(me) && sid(p) == p).collect();
+    // The daemon leads a session too, and its terminals outlive the window
+    // by design; it ends them itself when told to.
+    let daemon = |p: i32| {
+        std::fs::read(format!("/proc/{p}/cmdline")).is_ok_and(|c| c.split(|&b| b == 0).any(|arg| arg == b"--daemon"))
+    };
+    let leaders: Vec<i32> =
+        pids().into_iter().filter(|&p| ppid(p) == Some(me) && sid(p) == p && !daemon(p)).collect();
     if leaders.is_empty() {
         return;
     }

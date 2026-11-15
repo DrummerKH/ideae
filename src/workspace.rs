@@ -82,6 +82,8 @@ pub struct Workspace {
     _subscriptions: Vec<Subscription>,
     _tick: Task<()>,
     pub build: crate::build_watch::BuildWatch,
+    /// Quitting to start again: the daemon's terminals stay.
+    restarting: bool,
 }
 
 impl Workspace {
@@ -104,8 +106,9 @@ impl Workspace {
         crate::zoom::init(saved.zoom, cx);
 
         let (hook_tx, hook_rx) = async_channel::unbounded::<agent::HookEvent>();
+        let bridge_tx = hook_tx.clone();
         let bridge = agent::Bridge::start(move |event| {
-            let _ = hook_tx.send_blocking(event);
+            let _ = bridge_tx.send_blocking(event);
         })
         .inspect_err(|e| eprintln!("agent hooks off: {e}"))
         .ok();
@@ -114,7 +117,32 @@ impl Workspace {
             (Some(cmd), Some(bridge)) if cmd == "claude" => Some(bridge.claude_command("claude")),
             (agent, _) => agent,
         };
-        let hook_socket = bridge.as_ref().map(|b| b.socket.clone());
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut hook_socket = bridge.as_ref().map(|b| b.socket.clone());
+        // Terminals run in the daemon, which also takes the hooks. Without
+        // one (Windows, or it would not start) they run in the window.
+        #[cfg(unix)]
+        if std::env::var_os("IDEAE_NO_DAEMON").is_none() {
+            let live = hook_tx.clone();
+            let to_event = |h: crate::daemon::proto::Hook, replayed: bool| agent::HookEvent {
+                task: h.task.into(),
+                event: h.event,
+                message: h.message,
+                kind: h.kind,
+                replayed,
+            };
+            match crate::daemon::client::connect(move |h| {
+                let _ = live.send_blocking(to_event(h, false));
+            }) {
+                Some((_, earlier)) => {
+                    hook_socket = Some(crate::daemon::proto::socket_path().display().to_string());
+                    for h in earlier {
+                        let _ = hook_tx.send_blocking(to_event(h, true));
+                    }
+                }
+                None => eprintln!("daemon unavailable: terminals run in the window"),
+            }
+        }
         cx.spawn_in(window, async move |this, cx| {
             while let Ok(event) = hook_rx.recv().await {
                 if this.update_in(cx, |this, window, cx| this.on_hook(event, window, cx)).is_err() {
@@ -147,10 +175,22 @@ impl Workspace {
             }),
             // Terminals end their whole session (the agent and whatever it
             // started in the background); nothing of a task outlives the app.
+            // A restart leaves the daemon's terminals running for the next
+            // window; any other quit ends them with everything else.
             cx.on_app_quit(|this: &mut Self, cx| {
                 this.save(cx);
-                for view in this.views() {
-                    view.update(cx, |t, cx| t.shut_down(cx));
+                if this.restarting {
+                    for view in this.views() {
+                        view.update(cx, |t, cx| t.autosave_all(cx));
+                    }
+                } else {
+                    for view in this.views() {
+                        view.update(cx, |t, cx| t.shut_down(cx));
+                    }
+                    #[cfg(unix)]
+                    if let Some(daemon) = crate::daemon::client::get() {
+                        daemon.shutdown();
+                    }
                 }
                 crate::procs::end_child_sessions();
                 async {}
@@ -200,6 +240,7 @@ impl Workspace {
             last_saved: String::new(),
             _subscriptions: subscriptions,
             _tick: tick,
+            restarting: false,
             build: crate::build_watch::BuildWatch::new(),
         };
         this.restore(&saved, window, cx);
@@ -223,6 +264,12 @@ impl Workspace {
             }
         }
         this.sync_worktrees(window, cx);
+        // Sessions no task shows any more (closed while the window was gone).
+        #[cfg(unix)]
+        if let Some(daemon) = crate::daemon::client::get() {
+            let keep = this.views().iter().flat_map(|v| v.read(cx).sessions(cx)).collect();
+            daemon.prune(keep);
+        }
 
         if let Some(view) = this.active_view() {
             view.update(cx, |t, cx| {
@@ -833,7 +880,7 @@ impl Workspace {
         let was = view.read(cx).agent_status.clone();
         view.update(cx, |t, cx| t.set_agent_status(status.clone(), seen, cx));
         self.projects[pi].tasks[ti].last_active = state::now();
-        if status.is_attention() && !seen && status != was {
+        if status.is_attention() && !seen && status != was && !event.replayed {
             let body = match &status {
                 agent::AgentStatus::NeedsInput(message) => message.clone(),
                 _ => "Finished".to_string(),
@@ -868,9 +915,13 @@ impl Workspace {
 
     pub fn restart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.save(cx);
+        self.restarting = true;
         match crate::desktop::spawn_again() {
             Ok(()) => cx.quit(),
-            Err(e) => window.push_notification(Notification::error(e.to_string()).title("Restart"), cx),
+            Err(e) => {
+                self.restarting = false;
+                window.push_notification(Notification::error(e.to_string()).title("Restart"), cx)
+            }
         }
     }
 

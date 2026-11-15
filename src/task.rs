@@ -34,10 +34,14 @@ use crate::{git, history::HistoryView, lsp};
 pub struct TermView {
     id: SharedString,
     pub state: Entity<TerminalState>,
+    /// Its session in the daemon, when the program runs there.
+    session: Option<String>,
+    /// Numbers shells within the task, for their session after a restart.
+    seq: usize,
 }
 
 impl TermView {
-    fn new(id: SharedString, state: Entity<TerminalState>, cx: &mut Context<Self>) -> Self {
+    fn new(id: SharedString, state: Entity<TerminalState>, session: Option<String>, seq: usize, cx: &mut Context<Self>) -> Self {
         cx.observe(&state, |_, _, cx| cx.notify()).detach();
         // One size for every terminal: the shared one when this one starts and
         // whenever it changes, and this one's own zoom keys (Ctrl+=) set it.
@@ -50,7 +54,27 @@ impl TermView {
             }
         })
         .detach();
-        Self { id, state }
+        Self { id, state, session, seq }
+    }
+
+    /// Stops the terminal's program, and with it everything in its session.
+    pub fn end(view: &Entity<TermView>, cx: &mut App) {
+        let (state, session) = {
+            let v = view.read(cx);
+            (v.state.clone(), v.session.clone())
+        };
+        state.update(cx, |s, cx| s.close(cx));
+        #[cfg(unix)]
+        if let (Some(session), Some(daemon)) = (session, crate::daemon::client::get()) {
+            daemon.kill(&session);
+        }
+        #[cfg(not(unix))]
+        let _ = session;
+    }
+
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub fn session(&self) -> Option<&str> {
+        self.session.as_deref()
     }
 
     fn follow_zoom(state: &Entity<TerminalState>, cx: &mut App) {
@@ -1122,22 +1146,48 @@ impl TaskView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> TabItem {
-        let mut options = LocalTerminalOptions::default().with_cwd(WorkingDirectory::Path(root.clone()));
-        // Every terminal of the task can reach the app's hook socket, so a
-        // claude started by hand reports too once given the settings file.
+        let mut env: Vec<(String, String)> = Vec::new();
+        // Every terminal of the task can reach the hook socket, so a claude
+        // started by hand reports too once given the settings file.
         if let Some(socket) = hook_socket {
-            options = options
-                .with_env(crate::agent::SOCK_ENV, socket.clone())
-                .with_env(crate::agent::TASK_ENV, root.display().to_string());
+            env.push((crate::agent::SOCK_ENV.into(), socket.clone()));
+            env.push((crate::agent::TASK_ENV.into(), root.display().to_string()));
         }
         // Set either way: an ideae started from an agent's terminal inherits "agent".
         let role = if input.is_some() { "agent" } else { "terminal" };
-        options = options.with_env(crate::agent::ROLE_ENV, role);
-        if let Some(input) = input {
-            options = options.with_input(format!("{input}\n"));
-        }
+        env.push((crate::agent::ROLE_ENV.into(), role.into()));
+        // Enter is a carriage return; PowerShell's line editor takes a bare
+        // newline for a line break inside the command and waits for more.
+        let enter = if cfg!(windows) { "\r" } else { "\n" };
+        let input = input.map(|input| format!("{input}{enter}"));
         let config = TerminalConfig::default().with_colors(crate::theme::terminal_colors(cx));
-        let state = cx.new(|cx| TerminalState::local(options, config, window, cx));
+        // In the daemon the program outlives the window; a restart attaches
+        // to it again under the same session name.
+        let session = format!("{}#{}", root.display(), if role == "agent" { "agent".to_string() } else { format!("shell-{seq}") });
+        #[cfg(unix)]
+        let daemon = crate::daemon::client::get();
+        #[cfg(not(unix))]
+        let daemon: Option<()> = None;
+        #[cfg(not(unix))]
+        let _ = &session;
+        let (state, session) = match daemon {
+            #[cfg(unix)]
+            Some(daemon) => {
+                let spec = crate::daemon::proto::Spec { cwd: root.clone(), env, input };
+                let id = session.clone();
+                (cx.new(|cx| daemon.terminal(id, spec, config, window, cx)), Some(session))
+            }
+            _ => {
+                let mut options = LocalTerminalOptions::default().with_cwd(WorkingDirectory::Path(root.clone()));
+                for (name, value) in env {
+                    options = options.with_env(name, value);
+                }
+                if let Some(input) = input {
+                    options = options.with_input(input);
+                }
+                (cx.new(|cx| TerminalState::local(options, config, window, cx)), None)
+            }
+        };
         cx.subscribe_in(&state, window, |this: &mut Self, state, event: &TerminalEvent, window, cx| match event {
             // A shell that exits (Ctrl+D, `exit`) takes its tab with it, as in a
             // terminal app; the agent's tab stays and shows the exit.
@@ -1164,7 +1214,7 @@ impl TaskView {
         })
         .detach();
         let id = SharedString::from(format!("{}-term-{seq}", root.display()));
-        let view = cx.new(|cx| TermView::new(id, state, cx));
+        let view = cx.new(|cx| TermView::new(id, state, session, seq, cx));
         TabItem::new(title.to_string(), TabKind::Terminal(view))
     }
 
@@ -1664,7 +1714,12 @@ impl TaskView {
     /// Adds a shell tab after the last terminal and returns its index.
     fn new_terminal_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) -> usize {
         self.terminal_seq += 1;
-        let seq = self.terminal_seq;
+        self.terminal_tab(self.terminal_seq, window, cx)
+    }
+
+    /// A shell tab numbered `seq`: a restored one gets its old session back.
+    fn terminal_tab(&mut self, seq: usize, window: &mut Window, cx: &mut Context<Self>) -> usize {
+        self.terminal_seq = self.terminal_seq.max(seq);
         let tab = Self::make_terminal(&self.root, self.hook_socket.as_ref(), &format!("shell {seq}"), seq, None, window, cx);
         // After the last terminal, so terminals stay together left of the views.
         let at = self.tabs.iter().rposition(|t| matches!(t.kind, TabKind::Terminal(_))).map_or(0, |ix| ix + 1);
@@ -1819,7 +1874,7 @@ impl TaskView {
             Some(TabKind::Terminal(view)) => {
                 let state = view.read(cx).state.clone();
                 if !state.read(cx).needs_confirm_close() {
-                    state.update(cx, |s, cx| s.close(cx));
+                    TermView::end(&view, cx);
                     self.remove_tab(ix, window, cx);
                     return;
                 }
@@ -1832,16 +1887,17 @@ impl TaskView {
                 let title = self.tabs[ix].title.clone();
                 let task = cx.weak_entity();
                 let view_id = view.entity_id();
+                let view = view.clone();
                 window.open_alert_dialog(cx, move |dialog, _, _| {
                     let task = task.clone();
-                    let state = state.clone();
+                    let view = view.clone();
                     dialog
                         .confirm()
                         .title(format!("Close \"{title}\"?"))
                         .description(format!("It is still running {program}, which will be stopped."))
                         .ok_text("Close")
                         .on_ok(move |_, window, cx| {
-                            state.update(cx, |s, cx| s.close(cx));
+                            TermView::end(&view, cx);
                             let _ = task.update(cx, |t, cx| {
                                 if let Some(ix) = t.tabs.iter().position(|tab| match &tab.kind {
                                     TabKind::Terminal(v) => v.entity_id() == view_id,
@@ -4062,7 +4118,10 @@ impl TaskView {
                 match &tab.kind {
                     // The task's first terminal: the agent, or the shell without one.
                     TabKind::Terminal(_) if tab.title == "agent" || tab.title == "shell" => s.kind = "agent".into(),
-                    TabKind::Terminal(_) => s.kind = "shell".into(),
+                    TabKind::Terminal(view) => {
+                        s.kind = "shell".into();
+                        s.line = view.read(cx).seq as u32;
+                    }
                     TabKind::Changes => s.kind = "changes".into(),
                     TabKind::History => s.kind = "history".into(),
                     TabKind::File(file) => {
@@ -4108,6 +4167,10 @@ impl TaskView {
                     ids.push(self.tabs.iter().find(|t| t.title == "agent" || t.title == "shell").map(|t| t.id));
                     continue;
                 }
+                // `line` holds the shell's number, for its session.
+                "shell" if saved.line > 0 => {
+                    self.terminal_tab(saved.line as usize, window, cx);
+                }
                 "shell" => {
                     self.new_terminal_tab(window, cx);
                 }
@@ -4148,6 +4211,18 @@ impl TaskView {
         cx.notify();
     }
 
+    /// The daemon sessions of this task's terminals.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub fn sessions(&self, cx: &App) -> Vec<String> {
+        self.tabs
+            .iter()
+            .filter_map(|t| match &t.kind {
+                TabKind::Terminal(view) => view.read(cx).session().map(str::to_string),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The agent is in the middle of a turn.
     pub fn agent_busy(&self) -> bool {
         self.agent_status == crate::agent::AgentStatus::Working
@@ -4158,8 +4233,7 @@ impl TaskView {
         self.autosave_all(cx);
         for tab in &self.tabs {
             if let TabKind::Terminal(view) = &tab.kind {
-                let state = view.read(cx).state.clone();
-                state.update(cx, |s, cx| s.close(cx));
+                TermView::end(&view, cx);
             }
         }
     }

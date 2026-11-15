@@ -59,6 +59,9 @@ pub struct HookEvent {
     pub message: Option<String>,
     /// Of a Notification: permission_prompt, idle_prompt, …
     pub kind: Option<String>,
+    /// The daemon's record of an earlier event, handed over on connect: it
+    /// sets the status but notifies nobody again.
+    pub replayed: bool,
 }
 
 impl HookEvent {
@@ -152,7 +155,9 @@ impl Bridge {
         std::fs::create_dir_all(&dir)?;
         remove_stale(&dir);
         let pid = std::process::id();
-        let settings = dir.join(format!("hooks-{pid}.json"));
+        // Agents in the daemon outlive this window, and Claude reads the
+        // file again later: on unix it stays, at a path every run shares.
+        let settings = if cfg!(unix) { dir.join("hooks.json") } else { dir.join(format!("hooks-{pid}.json")) };
         let (socket, socket_file, incoming) = listen(&dir, pid)?;
 
         std::thread::Builder::new().name("hook-listener".into()).spawn(move || {
@@ -189,7 +194,9 @@ impl Drop for Bridge {
         if let Some(file) = &self.socket_file {
             let _ = std::fs::remove_file(file);
         }
-        let _ = std::fs::remove_file(&self.settings);
+        if cfg!(windows) {
+            let _ = std::fs::remove_file(&self.settings);
+        }
     }
 }
 
@@ -245,6 +252,7 @@ fn parse_line(line: &str) -> Option<HookEvent> {
         event: v["event"].as_str()?.to_string(),
         message: v["message"].as_str().map(str::to_string),
         kind: v["kind"].as_str().map(str::to_string),
+        replayed: false,
     })
 }
 
@@ -268,6 +276,16 @@ pub fn run_hook(event: &str) {
         "message": payload["message"].as_str(),
         "kind": payload["notification_type"].as_str(),
     });
+    #[cfg(unix)]
+    if Path::new(&socket).file_name().is_some_and(|name| name.to_string_lossy().starts_with("daemon")) {
+        crate::daemon::client::send_hook(&socket, crate::daemon::proto::Hook {
+            task,
+            event: event.to_string(),
+            message: line["message"].as_str().map(str::to_string),
+            kind: line["kind"].as_str().map(str::to_string),
+        });
+        return;
+    }
     send(&socket, &line.to_string());
 }
 
@@ -276,7 +294,7 @@ mod tests {
     use super::*;
 
     fn note(message: &str, kind: Option<&str>) -> Option<AgentStatus> {
-        HookEvent { task: PathBuf::new(), event: "Notification".into(), message: Some(message.into()), kind: kind.map(Into::into) }
+        HookEvent { task: PathBuf::new(), event: "Notification".into(), message: Some(message.into()), kind: kind.map(Into::into), replayed: false }
             .status()
     }
 
