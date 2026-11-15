@@ -17,7 +17,8 @@ src/git.rs         git CLI wrappers, worktrees
 src/lsp.rs         language server client
 src/lsp_install.rs language servers installed on request, ~/.local/share/ideae/lsp
 src/procs.rs       starting helper programs (no console on Windows), ending child sessions on quit
-src/daemon/        terminals in a daemon (`ideae --daemon`, unix): they outlive the window (×, Restart); Exit/Ctrl+Q ends them
+src/daemon/        terminals in a daemon (`ideae --daemon`, unix): they outlive the window (×, Restart); Exit/Ctrl+Q ends them;
+                   a window of another build makes the daemon hand its ptys to a new one (SCM_RIGHTS), agents keep running
 src/desktop.rs     launcher entry, dash pin, restart
 src/naming.rs      branch names from task titles
 vendor/            patched gpui-component, gpui-base, gpui-cn; changes marked `ideae patch`

@@ -235,6 +235,13 @@ impl ByteHandle for Handle {
     }
 
     #[cfg(unix)]
+    fn pty(&self) -> Option<(std::os::fd::RawFd, u32)> {
+        let fd = self.master.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_raw_fd()?;
+        let pid = self.child.lock().unwrap_or_else(std::sync::PoisonError::into_inner).process_id()?;
+        Some((fd, pid))
+    }
+
+    #[cfg(unix)]
     fn resize(&self, viewport: Viewport) -> io::Result<()> {
         self.master
             .lock()
@@ -444,6 +451,135 @@ impl ByteSource for LocalPty {
             #[cfg(unix)]
             foreground: Mutex::new(None),
         }))
+    }
+}
+
+/// ideae patch: takes over a program running in a pty another process
+/// started: its master descriptor and its pid. The program is no child of
+/// this process, so its exit status is unknown; it counts as ended once the
+/// pid is gone.
+#[cfg(unix)]
+pub fn adopt(
+    master: std::os::fd::OwnedFd,
+    pid: u32,
+    program: Option<String>,
+    sink: ByteSink,
+) -> io::Result<Box<dyn ByteHandle>> {
+    use std::os::fd::AsRawFd as _;
+    let io = crate::terminal::pty_io::PollIo::start(master.as_raw_fd(), sink)?;
+    Ok(Box::new(Handle {
+        io,
+        master: Mutex::new(Box::new(adopted::Master { fd: master })),
+        child: Mutex::new(Box::new(adopted::Child { pid })),
+        program,
+        foreground: Mutex::new(None),
+    }))
+}
+
+#[cfg(unix)]
+mod adopted {
+    use std::io;
+    use std::os::fd::{AsRawFd as _, OwnedFd, RawFd};
+
+    use portable_pty::{ChildKiller, ExitStatus, PtySize};
+
+    #[derive(Debug)]
+    pub(super) struct Master {
+        pub(super) fd: OwnedFd,
+    }
+
+    fn file(fd: &OwnedFd) -> Result<std::fs::File, anyhow::Error> {
+        Ok(std::fs::File::from(fd.try_clone()?))
+    }
+
+    impl portable_pty::MasterPty for Master {
+        fn resize(&self, size: PtySize) -> Result<(), anyhow::Error> {
+            let ws = libc::winsize {
+                ws_row: size.rows,
+                ws_col: size.cols,
+                ws_xpixel: size.pixel_width,
+                ws_ypixel: size.pixel_height,
+            };
+            // SAFETY: TIOCSWINSZ reads the winsize it is given.
+            if unsafe { libc::ioctl(self.fd.as_raw_fd(), libc::TIOCSWINSZ, &ws) } != 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+            Ok(())
+        }
+
+        fn get_size(&self) -> Result<PtySize, anyhow::Error> {
+            // SAFETY: TIOCGWINSZ writes into the winsize it is given.
+            let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+            if unsafe { libc::ioctl(self.fd.as_raw_fd(), libc::TIOCGWINSZ, &mut ws) } != 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+            Ok(PtySize { rows: ws.ws_row, cols: ws.ws_col, pixel_width: ws.ws_xpixel, pixel_height: ws.ws_ypixel })
+        }
+
+        fn try_clone_reader(&self) -> Result<Box<dyn io::Read + Send>, anyhow::Error> {
+            Ok(Box::new(file(&self.fd)?))
+        }
+
+        fn take_writer(&self) -> Result<Box<dyn io::Write + Send>, anyhow::Error> {
+            Ok(Box::new(file(&self.fd)?))
+        }
+
+        fn process_group_leader(&self) -> Option<libc::pid_t> {
+            // SAFETY: tcgetpgrp only reads the terminal's state.
+            match unsafe { libc::tcgetpgrp(self.fd.as_raw_fd()) } {
+                pid if pid > 0 => Some(pid),
+                _ => None,
+            }
+        }
+
+        fn as_raw_fd(&self) -> Option<RawFd> {
+            Some(self.fd.as_raw_fd())
+        }
+
+        fn tty_name(&self) -> Option<std::path::PathBuf> {
+            None
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    pub(super) struct Child {
+        pub(super) pid: u32,
+    }
+
+    impl Child {
+        fn alive(&self) -> bool {
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{}/stat", self.pid)) else { return false };
+            stat.rsplit_once(')').is_some_and(|(_, rest)| !rest.trim_start().starts_with('Z'))
+        }
+    }
+
+    impl ChildKiller for Child {
+        fn kill(&mut self) -> io::Result<()> {
+            // SAFETY: kill only sends a signal.
+            unsafe { libc::kill(self.pid as libc::pid_t, libc::SIGHUP) };
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(self.clone())
+        }
+    }
+
+    impl portable_pty::Child for Child {
+        fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+            Ok((!self.alive()).then(|| ExitStatus::with_exit_code(0)))
+        }
+
+        fn wait(&mut self) -> io::Result<ExitStatus> {
+            while self.alive() {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Ok(ExitStatus::with_exit_code(0))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            Some(self.pid)
+        }
     }
 }
 

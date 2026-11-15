@@ -11,6 +11,22 @@ pub fn version() -> String {
     }
 }
 
+/// This binary as it was when the process started: the version and the
+/// file's time. A daemon and a window with different ids run different
+/// builds, even of one commit.
+pub fn build_id() -> String {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        let built = crate::desktop::exe()
+            .ok()
+            .and_then(|exe| std::fs::metadata(exe).ok()?.modified().ok())
+            .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs());
+        format!("{} {built}", version())
+    })
+    .clone()
+}
+
 #[derive(Clone, PartialEq)]
 struct Stamp {
     modified: SystemTime,

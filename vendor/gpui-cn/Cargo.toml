@@ -306,6 +306,10 @@ path = "tests/touch_selection.rs"
 name = "webview"
 path = "tests/webview.rs"
 
+# ideae patch: the error type of portable_pty, for the adopted pty.
+[dependencies.anyhow]
+version = "1"
+
 [dependencies.damascene-fonts-jetbrains-mono]
 version = "0.1"
 optional = true

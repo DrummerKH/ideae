@@ -319,6 +319,13 @@ pub trait ByteHandle: Send {
     fn foreground(&self) -> Option<ForegroundProcess> {
         None
     }
+
+    /// ideae patch: the pty's master descriptor and the program's pid, for
+    /// a process that hands the running program to another one.
+    #[cfg(unix)]
+    fn pty(&self) -> Option<(std::os::fd::RawFd, u32)> {
+        None
+    }
 }
 
 /// Where a [`ByteSource`] writes its output.

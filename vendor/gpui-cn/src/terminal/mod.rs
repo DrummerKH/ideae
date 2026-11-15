@@ -223,6 +223,8 @@ pub use input::TerminalInput;
 pub use options::{EngineOptions, LocalTerminalOptions, ShellIntegration, WorkingDirectory};
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub use pty::LocalPty;
+#[cfg(unix)]
+pub use pty::adopt;
 pub use source::{FixtureSource, FrameHandle, FrameSink, FrameSource, StartOptions};
 pub use state::{TerminalConfig, TerminalEvent, TerminalState};
 pub use stream::{StreamEvent, StreamPeer, StreamSource};

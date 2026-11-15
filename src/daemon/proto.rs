@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 /// Bumped when the frames change; a daemon speaking another one is replaced.
-pub const PROTOCOL: u32 = 1;
+pub const PROTOCOL: u32 = 2;
 
 pub const KIND_MSG: u8 = 0;
 /// Client: input for a session. Daemon: a session's output.
@@ -63,6 +63,9 @@ pub enum Msg {
     Prune { keep: Vec<String> },
     /// Ends every session and the daemon.
     Shutdown,
+    /// Hands every session to a daemon started from `exe`, the build the
+    /// window runs, and exits; the programs go on.
+    Upgrade { exe: PathBuf },
     // `ideae --hook` → daemon → windows
     Hook(Hook),
     // daemon → window
@@ -138,6 +141,23 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Frame> {
 
 /// One daemon per state: a test run with its own IDEAE_STATE must not
 /// attach to (or prune) the terminals of the app in use.
+/// What an old daemon hands to its successor about one session; the pty's
+/// master descriptor travels beside it, in the same order.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Handover {
+    pub id: String,
+    pub pid: u32,
+    pub size: Size,
+    pub fg: Option<Fg>,
+    pub replay: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct Handovers {
+    pub sessions: Vec<Handover>,
+    pub hooks: Vec<Hook>,
+}
+
 pub fn socket_path() -> PathBuf {
     let dir = crate::state::runtime_dir();
     match std::env::var_os("IDEAE_STATE") {

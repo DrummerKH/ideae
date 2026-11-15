@@ -22,6 +22,10 @@ const REPLAY_MUTE: Duration = Duration::from_millis(800);
 struct Peer {
     peer: StreamPeer,
     mute_until: Option<Instant>,
+    /// To open the session again on another daemon: how to start it, and
+    /// the grid it last had.
+    spec: Spec,
+    size: Option<Size>,
 }
 
 pub struct Daemon {
@@ -36,51 +40,32 @@ pub fn get() -> Option<Arc<Daemon>> {
     DAEMON.get().cloned().flatten()
 }
 
-/// Connects, starting the daemon when none runs. Hook reports and the
+/// Connects, starting the daemon when none runs, and moving its sessions
+/// to a daemon of this build when it runs another. Hook reports and the
 /// latest ones the daemon kept go to `on_hook`.
-pub fn connect(on_hook: impl Fn(Hook) + Send + 'static) -> Option<(Arc<Daemon>, Vec<Hook>)> {
-    let path = proto::socket_path();
-    let stream = match UnixStream::connect(&path) {
-        Ok(stream) => stream,
-        Err(_) => {
-            start_daemon().ok()?;
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                if let Ok(stream) = UnixStream::connect(&path) {
-                    break stream;
-                }
-                if Instant::now() > deadline {
-                    return None;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        }
-    };
-    let mut reader = stream.try_clone().ok()?;
-    let mut writer = stream;
-    proto::write_msg(&mut writer, &Msg::Hello { protocol: proto::PROTOCOL, version: crate::build_watch::version() }).ok()?;
-    let _ = reader.set_read_timeout(Some(Duration::from_secs(5)));
-    let Ok(Frame::Msg(Msg::Welcome { protocol, hooks, .. })) = proto::read_frame(&mut reader) else {
-        return None;
-    };
-    let _ = reader.set_read_timeout(None);
-    if protocol != proto::PROTOCOL {
-        // An older daemon speaks other frames: replace it. Its agents end and
-        // continue their conversations when started again.
-        let _ = proto::write_msg(&mut writer, &Msg::Shutdown);
-        drop(writer);
-        std::thread::sleep(Duration::from_millis(1500));
-        return connect(on_hook);
-    }
+pub fn connect(on_hook: impl Fn(Hook) + Send + Sync + 'static) -> Option<(Arc<Daemon>, Vec<Hook>)> {
+    let (writer, reader, hooks) = dial(true)?;
     let daemon = Arc::new(Daemon { writer: Mutex::new(writer), peers: Mutex::default() });
     let reading = daemon.clone();
     std::thread::Builder::new()
         .name("daemon-reader".into())
         .spawn(move || {
-            while let Ok(frame) = proto::read_frame(&mut reader) {
-                reading.on_frame(frame, &on_hook);
+            let mut reader = reader;
+            loop {
+                while let Ok(frame) = proto::read_frame(&mut reader) {
+                    reading.on_frame(frame, &on_hook);
+                }
+                // The daemon went away: handed over to a newer one, or died.
+                // Attach again where it serves now.
+                match dial(false) {
+                    Some((writer, next, _)) => {
+                        *reading.writer.lock().unwrap() = writer;
+                        reader = next;
+                        reading.reopen();
+                    }
+                    None => break,
+                }
             }
-            // The daemon went away: terminals show it.
             for (_, p) in reading.peers.lock().unwrap().drain() {
                 p.peer.output(b"\r\n[ideae: lost the daemon]\r\n");
                 p.peer.exit(ExitStatus::new(None, Some("daemon gone")));
@@ -89,6 +74,69 @@ pub fn connect(on_hook: impl Fn(Hook) + Send + 'static) -> Option<(Arc<Daemon>, 
         .ok()?;
     let _ = DAEMON.set(Some(daemon.clone()));
     Some((daemon, hooks))
+}
+
+/// A connection that said hello: the writer, the reader, the kept hooks.
+fn dial(upgrade: bool) -> Option<(UnixStream, UnixStream, Vec<Hook>)> {
+    let path = proto::socket_path();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut started = false;
+    let mut upgraded = !upgrade;
+    loop {
+        let stream = match UnixStream::connect(&path) {
+            Ok(stream) => stream,
+            Err(_) if Instant::now() > deadline => return None,
+            Err(_) => {
+                // After a handover the successor binds within moments: give
+                // it those before starting one.
+                if !upgrade && !started && Instant::now() + Duration::from_secs(8) < deadline {
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                if !started {
+                    started = true;
+                    start_daemon().ok()?;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+        };
+        let mut reader = stream.try_clone().ok()?;
+        let mut writer = stream;
+        proto::write_msg(&mut writer, &Msg::Hello { protocol: proto::PROTOCOL, version: crate::build_watch::build_id() }).ok()?;
+        let _ = reader.set_read_timeout(Some(Duration::from_secs(5)));
+        let welcome = proto::read_frame(&mut reader);
+        let _ = reader.set_read_timeout(None);
+        match welcome {
+            Ok(Frame::Msg(Msg::Welcome { protocol, version, hooks, .. })) => {
+                if protocol == proto::PROTOCOL && (version == crate::build_watch::build_id() || upgraded) {
+                    return Some((writer, reader, hooks));
+                }
+                upgraded = true;
+                if protocol == proto::PROTOCOL {
+                    // Another build: it hands its sessions to one of ours.
+                    let exe = crate::desktop::exe().ok()?;
+                    proto::write_msg(&mut writer, &Msg::Upgrade { exe }).ok()?;
+                } else {
+                    // It speaks other frames and cannot hand over: replace it.
+                    // Its agents end and continue their conversations when
+                    // started again.
+                    let _ = proto::write_msg(&mut writer, &Msg::Shutdown);
+                }
+                // It exits once done; wait for that, then connect again.
+                let _ = reader.set_read_timeout(Some(Duration::from_secs(15)));
+                while proto::read_frame(&mut reader).is_ok() {}
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            // An old daemon that does not understand: replace it.
+            _ if !upgraded => {
+                upgraded = true;
+                let _ = proto::write_msg(&mut writer, &Msg::Shutdown);
+                std::thread::sleep(Duration::from_millis(1500));
+            }
+            _ => return None,
+        }
+    }
 }
 
 /// Starts `ideae --daemon` in a session of its own, so it stays when the
@@ -115,6 +163,17 @@ fn size_of(viewport: Viewport) -> Size {
 impl Daemon {
     fn send(&self, frame: Vec<u8>) {
         let _ = self.writer.lock().unwrap().write_all(&frame);
+    }
+
+    /// After a reconnect: every terminal attaches again, its screen cleared
+    /// for the replay that follows.
+    fn reopen(&self) {
+        let peers = self.peers.lock().unwrap();
+        for (id, p) in peers.iter() {
+            let Some(size) = p.size else { continue };
+            p.peer.output(b"\x1b[H\x1b[2J\x1b[3J\x1bc");
+            self.send(proto::encode_msg(&Msg::Open { id: id.clone(), spec: p.spec.clone(), size }));
+        }
     }
 
     fn on_frame(&self, frame: Frame, on_hook: &impl Fn(Hook)) {
@@ -162,7 +221,7 @@ impl Daemon {
     ) -> TerminalState {
         let (source, peer) = StreamSource::new();
         let events = peer.clone();
-        self.peers.lock().unwrap().insert(id.clone(), Peer { peer, mute_until: None });
+        self.peers.lock().unwrap().insert(id.clone(), Peer { peer, mute_until: None, spec: spec.clone(), size: None });
         let daemon = self.clone();
         cx.background_spawn(async move {
             let mut opened = false;
@@ -182,6 +241,9 @@ impl Daemon {
                     }
                     StreamEvent::Resize(viewport) => {
                         let size = size_of(viewport);
+                        if let Some(p) = daemon.peers.lock().unwrap().get_mut(&id) {
+                            p.size = Some(size);
+                        }
                         let msg = if opened {
                             Msg::Resize { id: id.clone(), size }
                         } else {

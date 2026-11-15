@@ -77,17 +77,32 @@ fn fg_of(handle: &Mutex<Box<dyn ByteHandle>>) -> Option<Fg> {
     })
 }
 
-pub fn run() {
+/// `adopt`: started by the daemon this one replaces, which waits on fd 3
+/// to hand over its sessions.
+pub fn run(adopt: bool) {
     let path = proto::socket_path();
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if UnixStream::connect(&path).is_ok() {
+    let shared: Shared = Arc::new(Mutex::new(Server { alone_since: Some(Instant::now()), ..Default::default() }));
+    let mut handover = None;
+    if adopt {
+        match handover::receive(&shared) {
+            Ok(channel) => handover = Some(channel),
+            Err(e) => {
+                eprintln!("ideae daemon: taking over failed: {e}");
+                return;
+            }
+        }
+    } else if UnixStream::connect(&path).is_ok() {
         return; // another daemon serves
     }
+    // The old daemon's socket file goes; windows connect here from now on.
     let _ = std::fs::remove_file(&path);
     let Ok(listener) = UnixListener::bind(&path) else { return };
-    let shared: Shared = Arc::new(Mutex::new(Server { alone_since: Some(Instant::now()), ..Default::default() }));
+    if let Some(mut channel) = handover {
+        let _ = channel.write_all(b"k");
+    }
 
     let house = shared.clone();
     std::thread::spawn(move || housekeeping(house));
@@ -158,7 +173,7 @@ fn serve(shared: Shared, stream: UnixStream) {
                 registered = true;
                 let welcome = Msg::Welcome {
                     protocol: proto::PROTOCOL,
-                    version: crate::build_watch::version(),
+                    version: crate::build_watch::build_id(),
                     sessions: s.sessions.keys().cloned().collect(),
                     hooks: s.hooks.values().cloned().collect(),
                 };
@@ -180,6 +195,7 @@ fn serve(shared: Shared, stream: UnixStream) {
                 }
             }
             Frame::Msg(Msg::Shutdown) => shutdown(&shared),
+            Frame::Msg(Msg::Upgrade { exe }) => handover::give(&shared, &exe),
             Frame::Msg(Msg::Hook(hook)) => {
                 let mut s = shared.lock().unwrap();
                 if s.clients.is_empty() {
@@ -365,5 +381,194 @@ fn notify(hook: &Hook) {
     let task = std::path::Path::new(&hook.task).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     if let Ok(mut child) = std::process::Command::new("notify-send").args(["-a", crate::state::APP_ID, &task, &body]).spawn() {
         std::thread::spawn(move || child.wait());
+    }
+}
+
+/// Moving the sessions to a daemon of a newer build without stopping their
+/// programs: the pty masters pass over a socket pair (SCM_RIGHTS), the
+/// programs never notice.
+mod handover {
+    use std::io::{Read, Write};
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
+    use std::os::unix::net::UnixStream;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use gpui_cn::terminal::ByteSink;
+
+    use super::{Session, Shared, pump};
+    use crate::daemon::proto::{Handover, Handovers};
+
+    const FD: RawFd = 3;
+
+    /// Old side: sends everything to a new daemon from `exe` and exits once
+    /// it took over; on any failure it keeps serving.
+    pub(super) fn give(shared: &Shared, exe: &Path) {
+        let s = shared.lock().unwrap();
+        let mut state = Handovers { hooks: s.hooks.values().cloned().collect(), ..Default::default() };
+        let mut fds: Vec<OwnedFd> = Vec::new();
+        for (id, session) in &s.sessions {
+            let Some((fd, pid)) = session.handle.lock().unwrap().pty() else { continue };
+            // SAFETY: dup returns a new descriptor this side owns.
+            let copy = unsafe { libc::dup(fd) };
+            if copy < 0 {
+                continue;
+            }
+            fds.push(unsafe { OwnedFd::from_raw_fd(copy) });
+            state.sessions.push(Handover {
+                id: id.clone(),
+                pid,
+                size: session.size,
+                fg: session.fg.clone(),
+                replay: session.replay.iter().copied().collect(),
+            });
+        }
+        let Ok(result) = send(exe, &state, &fds) else { return };
+        if result {
+            // The successor holds the ptys now: leave without ending anything.
+            std::process::exit(0);
+        }
+    }
+
+    fn send(exe: &Path, state: &Handovers, fds: &[OwnedFd]) -> std::io::Result<bool> {
+        use std::os::unix::process::CommandExt as _;
+        let (mut ours, theirs) = UnixStream::pair()?;
+        let their_fd = theirs.as_raw_fd();
+        let mut command = std::process::Command::new(exe);
+        command
+            .args(["--daemon", "--adopt"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // SAFETY: dup2 and setsid only rearrange the child's descriptors and session.
+        unsafe {
+            command.pre_exec(move || {
+                if their_fd == FD {
+                    // dup2 onto itself keeps close-on-exec; clear it instead.
+                    libc::fcntl(FD, libc::F_SETFD, 0);
+                } else if libc::dup2(their_fd, FD) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let mut child = command.spawn()?;
+        drop(theirs);
+        let body = serde_json::to_vec(state).map_err(std::io::Error::other)?;
+        ours.write_all(&(body.len() as u32).to_be_bytes())?;
+        ours.write_all(&body)?;
+        send_fds(&ours, fds)?;
+        ours.set_read_timeout(Some(Duration::from_secs(15)))?;
+        let mut ack = [0u8; 1];
+        let taken = ours.read_exact(&mut ack).is_ok() && ack[0] == b'k';
+        if !taken {
+            let _ = child.kill();
+        }
+        std::thread::spawn(move || child.wait());
+        Ok(taken)
+    }
+
+    fn send_fds(stream: &UnixStream, fds: &[OwnedFd]) -> std::io::Result<()> {
+        let raw: Vec<RawFd> = fds.iter().map(|f| f.as_raw_fd()).collect();
+        let mut byte = [b'f'];
+        let mut iov = libc::iovec { iov_base: byte.as_mut_ptr().cast(), iov_len: 1 };
+        let bytes = std::mem::size_of_val(raw.as_slice()) as u32;
+        // SAFETY: the control buffer is sized by CMSG_SPACE for `raw`, and the
+        // header is filled within it.
+        unsafe {
+            let space = libc::CMSG_SPACE(bytes) as usize;
+            let mut control = vec![0u8; space.max(1)];
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            if !raw.is_empty() {
+                msg.msg_control = control.as_mut_ptr().cast();
+                msg.msg_controllen = space as _;
+                let cmsg = libc::CMSG_FIRSTHDR(&msg);
+                (*cmsg).cmsg_level = libc::SOL_SOCKET;
+                (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+                (*cmsg).cmsg_len = libc::CMSG_LEN(bytes) as _;
+                std::ptr::copy_nonoverlapping(raw.as_ptr(), libc::CMSG_DATA(cmsg).cast::<RawFd>(), raw.len());
+            }
+            if libc::sendmsg(stream.as_raw_fd(), &msg, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    fn receive_fds(stream: &UnixStream, count: usize) -> std::io::Result<Vec<OwnedFd>> {
+        let mut byte = [0u8; 1];
+        let mut iov = libc::iovec { iov_base: byte.as_mut_ptr().cast(), iov_len: 1 };
+        let bytes = (count.max(1) * std::mem::size_of::<RawFd>()) as u32;
+        let mut fds = Vec::new();
+        // SAFETY: as in send_fds; descriptors the kernel installed are taken
+        // into OwnedFd once each.
+        unsafe {
+            let space = libc::CMSG_SPACE(bytes) as usize;
+            let mut control = vec![0u8; space];
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = control.as_mut_ptr().cast();
+            msg.msg_controllen = space as _;
+            if libc::recvmsg(stream.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+            while !cmsg.is_null() {
+                if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                    let n = ((*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize) / std::mem::size_of::<RawFd>();
+                    let data = libc::CMSG_DATA(cmsg).cast::<RawFd>();
+                    for i in 0..n {
+                        fds.push(OwnedFd::from_raw_fd(*data.add(i)));
+                    }
+                }
+                cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+            }
+        }
+        Ok(fds)
+    }
+
+    /// New side: takes the sessions from fd 3 and returns the channel for
+    /// the acknowledgement, sent once the socket is ours.
+    pub(super) fn receive(shared: &Shared) -> std::io::Result<UnixStream> {
+        // SAFETY: the old daemon put the socket pair's other end at fd 3.
+        let mut channel = unsafe { UnixStream::from_raw_fd(FD) };
+        let mut len = [0u8; 4];
+        channel.read_exact(&mut len)?;
+        let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
+        channel.read_exact(&mut body)?;
+        let state: Handovers = serde_json::from_slice(&body).map_err(std::io::Error::other)?;
+        let fds = receive_fds(&channel, state.sessions.len())?;
+        let mut s = shared.lock().unwrap();
+        for hook in state.hooks {
+            s.hooks.insert(hook.task.clone(), hook);
+        }
+        for (session, fd) in state.sessions.into_iter().zip(fds) {
+            let program = std::fs::read_to_string(format!("/proc/{}/comm", session.pid)).ok().map(|n| n.trim().to_string());
+            let (sink, detached) = ByteSink::detached();
+            let Ok(handle) = gpui_cn::terminal::adopt(fd, session.pid, program, sink) else { continue };
+            let handle = Arc::new(Mutex::new(handle));
+            let detached = Arc::new(detached);
+            s.sessions.insert(
+                session.id.clone(),
+                Session {
+                    handle: handle.clone(),
+                    sink: detached.clone(),
+                    replay: session.replay.into_iter().collect(),
+                    attached: Default::default(),
+                    pending: Vec::new(),
+                    fg: session.fg,
+                    size: session.size,
+                },
+            );
+            let shared = shared.clone();
+            let id = session.id;
+            std::thread::spawn(move || pump(shared, id, handle, detached));
+        }
+        Ok(channel)
     }
 }
