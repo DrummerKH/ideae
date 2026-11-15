@@ -1419,11 +1419,16 @@ impl Workspace {
         use gpui_kit::component::diff::DiffFile;
         let name = |path: &Path| self.find(path).map(|(pi, ti)| letter(self.projects[pi].tasks[ti].variant)).unwrap_or_default();
         let (a, b) = (name(ours), name(theirs));
-        let files: Vec<String> = [ours, theirs].iter().filter_map(|path| self.touched.get(*path)).flatten().cloned().collect::<std::collections::BTreeSet<_>>().into_iter().collect();
-        let (ours, theirs) = (ours.to_path_buf(), theirs.to_path_buf());
+        // Each with the commit it started from: what it changed is asked of git now, not taken as last listed.
+        let side = |path: &Path| (path.to_path_buf(), self.find(path).map(|(pi, ti)| self.projects[pi].tasks[ti].base.clone()).unwrap_or_default());
+        let ((ours, our_base), (theirs, their_base)) = (side(ours), side(theirs));
         cx.spawn_in(window, async move |_, cx| {
             let found = cx
                 .background_spawn(async move {
+                    let changed = |path: &Path, base: &str| git::touched_files(path, base).unwrap_or_default();
+                    let mut files = changed(&ours, &our_base);
+                    files.extend(changed(&theirs, &their_base));
+                    let files: Vec<String> = files.into_iter().collect();
                     let patch = git::between(&ours, &theirs, &files);
                     DiffFile::parse(&patch).map(task::with_languages).map_err(|error| error.to_string())
                 })
@@ -1452,7 +1457,7 @@ impl Workspace {
             })
             .collect();
         let files: std::collections::BTreeSet<&String> = touched.iter().filter_map(|(_, files)| *files).flatten().collect();
-        if files.is_empty() {
+        if files.is_empty() && members.len() < 2 {
             return None;
         }
         let more = files.len().saturating_sub(MOST_FILES);
@@ -1463,7 +1468,7 @@ impl Workspace {
             v_flex()
                 .gap_0p5()
                 .child(
-                    h_flex().gap_2().child(div().text_xs().text_color(muted).child("FILES CHANGED")).children(pairs.map(|((a, ours), (b, theirs))| {
+                    h_flex().gap_2().child(div().text_xs().text_color(muted).child(if files.is_empty() { "COMPARE" } else { "FILES CHANGED" })).children(pairs.map(|((a, ours), (b, theirs))| {
                         Button::new(SharedString::from(format!("compare-{a}-{b}")))
                             .xsmall()
                             .ghost()
