@@ -49,15 +49,11 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-Wl,--allow-shlib-undefined
         run: cargo zigbuild --release --locked --target x86_64-unknown-linux-gnu.2.31
       - name: Package
-        run: |
-          name=ideae-$IDEAE_VERSION-linux-x86_64
-          mkdir "$name"
-          cp target/x86_64-unknown-linux-gnu/release/ideae README.md "$name/"
-          tar czf "$name.tar.gz" "$name"
+        run: cp target/x86_64-unknown-linux-gnu/release/ideae "ideae-$IDEAE_VERSION-linux-x86_64"
       - uses: actions/upload-artifact@v4
         with:
           name: linux
-          path: ideae-*-linux-x86_64.tar.gz
+          path: ideae-*-linux-x86_64
 
   windows:
     needs: version

@@ -67,8 +67,8 @@ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-Wl,--allow-shlib-u
 ### Releases
 
 Every push to `main` builds a release tagged with its UTC time
-(`yyyymmddhhmmss`): a Linux tarball and a single Windows `.exe`
-(`.github/workflows/release.yml`). `ideae --version` names the release.
+(`yyyymmddhhmmss`): a Linux binary (`chmod +x` it after download) and a
+Windows `.exe` (`.github/workflows/release.yml`). `ideae --version` names the release.
 
 ### Windows
 
