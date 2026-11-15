@@ -145,7 +145,13 @@ impl StreamPeer {
 
     /// ideae patch: the process in the foreground on the far side.
     pub fn set_foreground(&self, process: Option<ForegroundProcess>) {
-        self.shared.lock().foreground = process;
+        let mut state = self.shared.lock();
+        state.foreground = process;
+        // The engine asks for the foreground only after output: an empty
+        // read makes it ask, for a change that came with no output.
+        if let Some(sink) = &state.sink {
+            sink.write(&[]);
+        }
     }
 
     /// The terminal's input, grid sizes and close, in order. Await

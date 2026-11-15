@@ -38,23 +38,86 @@ pub struct TermView {
     session: Option<String>,
     /// Numbers shells within the task, for their session after a restart.
     seq: usize,
+    /// The agent's terminal: a program other than the shell has run in it,
+    /// so the shell at its prompt means the agent ended.
+    agent: bool,
+    ran: bool,
+    task: Option<WeakEntity<TaskView>>,
 }
 
 impl TermView {
-    fn new(id: SharedString, state: Entity<TerminalState>, session: Option<String>, seq: usize, cx: &mut Context<Self>) -> Self {
+    fn new(
+        id: SharedString,
+        state: Entity<TerminalState>,
+        session: Option<String>,
+        seq: usize,
+        task: Option<WeakEntity<TaskView>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         cx.observe(&state, |_, _, cx| cx.notify()).detach();
         // One size for every terminal: the shared one when this one starts and
         // whenever it changes, and this one's own zoom keys (Ctrl+=) set it.
         Self::follow_zoom(&state, cx);
         cx.observe_global::<crate::zoom::Zoom>(|this, cx| Self::follow_zoom(&this.state, cx)).detach();
-        cx.subscribe(&state, |_, state, event: &TerminalEvent, cx| {
-            if let TerminalEvent::FontSizeChanged = event {
+        cx.subscribe(&state, |this, state, event: &TerminalEvent, cx| match event {
+            TerminalEvent::FontSizeChanged => {
                 let size = f32::from(state.read(cx).font_size(cx));
                 crate::zoom::set(crate::zoom::Kind::Terminal, Some(size), cx);
             }
+            TerminalEvent::ForegroundChanged => {
+                if state.read(cx).foreground().is_some_and(|p| !p.is_shell()) {
+                    this.ran = true;
+                }
+                cx.notify();
+            }
+            _ => {}
         })
         .detach();
-        Self { id, state, session, seq }
+        let agent = task.is_some();
+        let ran = state.read(cx).foreground().is_some_and(|p| !p.is_shell());
+        Self { id, state, session, seq, agent, ran, task }
+    }
+
+    /// The agent's program is gone: its shell is back at the prompt, or the
+    /// terminal itself ended.
+    pub fn agent_ended(&self, cx: &App) -> bool {
+        if !self.agent {
+            return false;
+        }
+        let state = self.state.read(cx);
+        Self::gone(state) || (self.ran && state.foreground().is_some_and(|p| p.is_shell()))
+    }
+
+    /// The terminal's own program, the shell, is no more.
+    fn gone(state: &TerminalState) -> bool {
+        use gpui_cn::terminal::TerminalStatus;
+        state.is_closed() || matches!(state.status(), TerminalStatus::Exited(_) | TerminalStatus::Failed(_))
+    }
+
+    fn render_agent_ended(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let task = self.task.clone();
+        h_flex()
+            .flex_none()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .text_xs()
+            .bg(cx.theme().muted)
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(div().text_color(cx.theme().muted_foreground).child("The agent has ended"))
+            .child(
+                Button::new("restart-agent")
+                    .xsmall()
+                    .outline()
+                    .label("Restart")
+                    .tooltip("Start the agent again, continuing its last conversation")
+                    .on_click(move |_, window, cx| {
+                        if let Some(task) = task.as_ref().and_then(|t| t.upgrade()) {
+                            task.update(cx, |t, cx| t.restart_agent(window, cx));
+                        }
+                    }),
+            )
     }
 
     /// Stops the terminal's program, and with it everything in its session.
@@ -89,10 +152,14 @@ impl TermView {
 impl Render for TermView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let highlight = cx.theme().primary.opacity(0.15);
+        let ended = self.agent_ended(cx).then(|| self.render_agent_ended(cx));
+        v_flex().size_full().children(ended).child(
         div()
             .id("terminal-drop")
             .relative()
-            .size_full()
+            .flex_1()
+            .min_h_0()
+            .w_full()
             // Files dropped from a file manager: their paths, typed in as text.
             .drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(highlight))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
@@ -102,7 +169,8 @@ impl Render for TermView {
                 this.state.read(cx).focus_handle().clone().focus(window, cx);
             }))
             .child(crate::zoom::wheel(crate::zoom::Kind::Terminal))
-            .child(Terminal::new(self.id.clone(), &self.state))
+            .child(Terminal::new(self.id.clone(), &self.state)),
+        )
     }
 }
 
@@ -1152,6 +1220,8 @@ pub struct TaskView {
     pub agent_status: crate::agent::AgentStatus,
     /// What the working agent does now: its latest tool call, in words.
     pub agent_activity: Option<String>,
+    /// The command that starts the agent, for Restart.
+    agent: Option<String>,
     hook_socket: Option<String>,
     /// Numbers terminals so each has a unique element id and default title.
     terminal_seq: usize,
@@ -1247,8 +1317,8 @@ impl TaskView {
         let mut tabs = Vec::new();
         // The agent's terminal, or a shell when there is no agent; more shells
         // are a "+" away.
-        match agent {
-            Some(agent) => tabs.push(Self::make_terminal(&root, hook_socket.as_ref(), "agent", 0, Some(agent), window, cx)),
+        match &agent {
+            Some(agent) => tabs.push(Self::make_terminal(&root, hook_socket.as_ref(), "agent", 0, Some(agent.clone()), window, cx)),
             None => tabs.push(Self::make_terminal(&root, hook_socket.as_ref(), "shell", 1, None, window, cx)),
         }
         // Changes and History open on demand: the Log button, a changed file,
@@ -1328,6 +1398,7 @@ impl TaskView {
             branch: branch.into(),
             agent_status: crate::agent::AgentStatus::Unknown,
             agent_activity: None,
+            agent: agent.clone(),
             hook_socket,
             terminal_seq: 1,
             unseen: false,
@@ -1439,11 +1510,25 @@ impl TaskView {
                     TabKind::Terminal(v) => v.read(cx).state == *state,
                     _ => false,
                 });
-                if let Some(ix) = ix.filter(|&ix| this.tabs[ix].title != "agent") {
-                    this.remove_tab(ix, window, cx);
+                match ix {
+                    Some(ix) if this.tabs[ix].title != "agent" => this.remove_tab(ix, window, cx),
+                    Some(_) => this.agent_status = crate::agent::AgentStatus::Exited,
+                    None => {}
                 }
                 cx.emit(TaskEvent::Changed);
                 cx.notify();
+            }
+            // Claude Code that crashed or was killed sends no SessionEnd.
+            TerminalEvent::ForegroundChanged => {
+                let ended = this.tabs.iter().any(|t| match &t.kind {
+                    TabKind::Terminal(v) if t.title == "agent" && v.read(cx).state == *state => v.read(cx).agent_ended(cx),
+                    _ => false,
+                });
+                if ended && this.agent_status != crate::agent::AgentStatus::Exited {
+                    this.agent_status = crate::agent::AgentStatus::Exited;
+                    cx.emit(TaskEvent::Changed);
+                    cx.notify();
+                }
             }
             TerminalEvent::TitleChanged | TerminalEvent::Bell => {
                 cx.emit(TaskEvent::Changed);
@@ -1457,7 +1542,8 @@ impl TaskView {
         })
         .detach();
         let id = SharedString::from(format!("{}-term-{seq}", root.display()));
-        let view = cx.new(|cx| TermView::new(id, state, session, seq, cx));
+        let task = (role == "agent").then(|| cx.weak_entity());
+        let view = cx.new(|cx| TermView::new(id, state, session, seq, task, cx));
         TabItem::new(title.to_string(), TabKind::Terminal(view))
     }
 
@@ -1662,6 +1748,31 @@ impl TaskView {
     pub fn send_to_agent(&mut self, location: String, code: String, language: &str, window: &mut Window, cx: &mut Context<Self>) {
         let text = format!("{location}\n```{language}\n{}\n```\n", code.trim_end_matches('\n'));
         self.paste_to_agent(text, window, cx);
+    }
+
+    /// Starts the agent again in its tab: typed into its shell, or in a new
+    /// terminal when the shell is gone too.
+    pub fn restart_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(command) = self.agent.clone() else { return };
+        let Some(ix) = self.tabs.iter().position(|t| t.title == "agent" && matches!(t.kind, TabKind::Terminal(_))) else {
+            return;
+        };
+        let TabKind::Terminal(view) = &self.tabs[ix].kind else { return };
+        let view = view.clone();
+        let state = view.read(cx).state.clone();
+        if TermView::gone(state.read(cx)) {
+            TermView::end(&view, cx);
+            let tab = Self::make_terminal(&self.root, self.hook_socket.as_ref(), "agent", 0, Some(command), window, cx);
+            self.tabs[ix].kind = tab.kind;
+        } else {
+            let enter = if cfg!(windows) { "\r" } else { "\n" };
+            view.update(cx, |v, _| v.ran = false);
+            state.update(cx, |s, cx| s.send_text(format!("{command}{enter}"), cx));
+        }
+        self.agent_status = crate::agent::AgentStatus::Unknown;
+        self.activate(ix, window, cx);
+        cx.emit(TaskEvent::Changed);
+        cx.notify();
     }
 
     /// Text into the agent's prompt, for the user to add to and send.
