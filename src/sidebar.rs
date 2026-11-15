@@ -230,7 +230,8 @@ impl Workspace {
             }
             None => (None, 0, false, None, None),
         };
-        let agent_title = agent_title.filter(|s| !s.is_empty());
+        // Until the agent names itself the terminal shows the command line.
+        let agent_title = agent_title.filter(|s| !s.is_empty() && !s.contains(" --settings "));
         let muted = cx.theme().muted_foreground;
         // Inbox rows are one line, with the project in place of the details.
         let subtitle = (!in_active && !t.main && !t.title.is_empty()).then(|| t.branch.clone());
