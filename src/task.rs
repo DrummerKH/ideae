@@ -4380,10 +4380,23 @@ impl TaskView {
                         .tooltip(if b.pull_conflicts.is_empty() {
                             "Fast-forward, or rebase local commits; not tried when it would conflict".to_string()
                         } else {
-                            format!("Would conflict with your work in {}: commit, or let the agent merge it first", b.pull_conflicts.join(", "))
+                            format!("Would conflict with your work in {}: not tried, a click asks the agent to take it in", b.pull_conflicts.join(", "))
                         })
                         .on_click(cx.listener(|this, _, window, cx| {
                             cx.stop_propagation();
+                            // Known to conflict: not tried, the agent is asked to merge it.
+                            let files = this.branch_info.pull_conflicts.clone();
+                            if !files.is_empty() {
+                                let list = files.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n");
+                                let upstream = this.branch_info.upstream.clone().unwrap_or_else(|| "the upstream".into());
+                                this.paste_to_agent(
+                                    format!("Take in {upstream} (fetch, then rebase or merge as this branch does). With the work here, committed or not, it conflicts in:\n{list}\n\nResolve the conflicts keeping what both sides meant, and check that it builds and the tests pass."),
+                                    window,
+                                    cx,
+                                );
+                                this.action = Some((false, format!("Pull: {} file(s) would conflict, nothing changed; the agent's prompt has a request", files.len())));
+                                return cx.notify();
+                            }
                             this.run_action("Pull", |root| git::pull_safe(&root), false, window, cx)
                         })),
                 )
@@ -5594,6 +5607,66 @@ impl TaskView {
 
     /// Runs a git/gh job off the UI thread, shows its outcome under the
     /// buttons, and refreshes. A successful commit clears the message.
+    /// What History does with a commit: 0 takes it into this branch, 1
+    /// commits its opposite, 2 starts a task from it. A conflict changes
+    /// nothing and goes to the agent as a request.
+    pub fn commit_action(&mut self, what: u8, hash: String, window: &mut Window, cx: &mut Context<Self>) {
+        let short = hash[..hash.len().min(8)].to_string();
+        match what {
+            2 => {
+                let copy_env = crate::state::settings().copy_env;
+                self.run_action("Open", move |root| git::commit_worktree(&root, &hash, copy_env).map(|dir| format!("Opened in {}", dir.display())), false, window, cx)
+            }
+            revert => {
+                let revert = revert == 1;
+                let (label, asked) = if revert { ("Revert", format!("Revert commit {short} (`git revert --no-edit {short}`).")) } else { ("Cherry-pick", format!("Cherry-pick commit {short} into this branch (`git cherry-pick {short}`).")) };
+                self.run_or_ask_agent(label, move |root| git::replay_commit(&root, &hash, revert), asked, window, cx)
+            }
+        }
+    }
+
+    /// Runs a git job that can meet a conflict. On one, what it did is
+    /// undone and the agent's prompt gets the request to do it and resolve
+    /// the conflicts: `asked` says what, the files that conflict are added.
+    fn run_or_ask_agent(
+        &mut self,
+        label: &'static str,
+        job: impl FnOnce(PathBuf) -> Result<String, git::RebaseError> + Send + 'static,
+        asked: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy.is_some() {
+            return;
+        }
+        self.busy = Some(label);
+        self.action = None;
+        cx.notify();
+        let root = self.root.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx.background_spawn(crate::procs::on_thread(move || job(root))).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.busy = None;
+                this.action = Some(match result {
+                    Ok(out) => (true, out),
+                    Err(git::RebaseError::Failed(e)) => (false, format!("{label}: {e}")),
+                    Err(git::RebaseError::Conflicts(files)) => {
+                        let list = files.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n");
+                        this.paste_to_agent(
+                            format!("{asked} It conflicts in:\n{list}\n\nResolve the conflicts keeping what both sides meant, check that it builds and the tests pass, then finish it."),
+                            window,
+                            cx,
+                        );
+                        (false, format!("{label}: {} conflicting file(s), nothing changed; the agent's prompt has a request", files.len()))
+                    }
+                });
+                let _ = this.refresh_tx.try_send(());
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Rebase onto the base; conflicts go to the agent as a request.
     fn rebase_onto_base(&mut self, base: String, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy.is_some() {

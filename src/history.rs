@@ -3,6 +3,7 @@ use std::{path::PathBuf, rc::Rc};
 use gpui_kit::component::{
     ActiveTheme as _, Sizable as _, StyledExt as _,
     button::{Button, ButtonVariants as _},
+    input::{Input, InputEvent, InputState},
     diff::{Diff, DiffFile, DiffMode, DiffState},
     h_flex,
     list::ListItem,
@@ -29,6 +30,12 @@ pub struct HistoryView {
     stale: bool,
     /// How many commits are asked for.
     limit: usize,
+    /// The branch whose history is shown when not the task's own, and
+    /// what narrows it, as typed.
+    rev: String,
+    typed: String,
+    filter: Option<Entity<InputState>>,
+    _typing: Task<()>,
     _load: Task<()>,
     _show: Task<()>,
 }
@@ -54,6 +61,10 @@ impl HistoryView {
             task,
             stale: false,
             limit: FIRST,
+            rev: String::new(),
+            typed: String::new(),
+            filter: None,
+            _typing: Task::ready(()),
             _load: Task::ready(()),
             _show: Task::ready(()),
         }
@@ -72,9 +83,9 @@ impl HistoryView {
 
     fn load(&mut self, cx: &mut Context<Self>) {
         self.stale = false;
-        let (root, limit) = (self.root.clone(), self.limit);
+        let (root, limit, query) = (self.root.clone(), self.limit, git::HistoryQuery::typed(&self.rev, &self.typed));
         self._load = cx.spawn(async move |this, cx| {
-            let commits = cx.background_spawn(async move { git::history(&root, limit) }).await;
+            let commits = cx.background_spawn(async move { git::history(&root, limit, &query) }).await;
             let _ = this.update(cx, |this, cx| {
                 // Keep the selection on the same commit when it is still listed.
                 let selected_hash = this.selected.and_then(|ix| this.commits.get(ix)).map(|c| c.hash.clone());
@@ -138,7 +149,73 @@ impl HistoryView {
         cx.notify();
     }
 
-    fn render_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Another branch's history, or back to the task's own.
+    fn pick_branch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        const OWN: &str = "\u{1}own";
+        let (root, task, this) = (self.root.clone(), self.task.clone(), cx.weak_entity());
+        cx.spawn_in(window, async move |_, cx| {
+            let from = root.clone();
+            let rows = cx.background_spawn(async move { git::branch_rows(&from) }).await;
+            let detail = crate::finder::DETAIL;
+            let mut items = vec![crate::finder::Hit { text: format!("This task's branch{detail}what is checked out here"), path: OWN.into(), line: 0, col: 0, ranges: Vec::new() }];
+            items.extend(rows.into_iter().map(|row| crate::finder::Hit {
+                text: format!("{}{detail}{} · {} · {}", row.name, if row.remote { "remote" } else { "local" }, row.when, row.subject),
+                path: row.name,
+                line: 0,
+                col: 0,
+                ranges: Vec::new(),
+            }));
+            let _ = cx.update(|window, cx| {
+                crate::finder::Finder::open_pick(
+                    "History of…".into(),
+                    root,
+                    items,
+                    Rc::new(move |name, _, cx| {
+                        let _ = this.update(cx, |history, cx| {
+                            history.rev = if name == OWN { String::new() } else { name };
+                            history.stale = true;
+                            cx.notify();
+                        });
+                    }),
+                    task,
+                    window,
+                    cx,
+                )
+            });
+        })
+        .detach();
+    }
+
+    /// The field that narrows the list, made when first drawn: typing
+    /// reads the history again once it pauses.
+    fn filter_input(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
+        if let Some(input) = &self.filter {
+            return input.clone();
+        }
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("words  @author  file:path"));
+        cx.subscribe(&input, |this, input, event: &InputEvent, cx| {
+            if !matches!(event, InputEvent::Change) {
+                return;
+            }
+            let typed = input.read(cx).value().trim().to_string();
+            if typed == this.typed {
+                return;
+            }
+            this._typing = cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(std::time::Duration::from_millis(250)).await;
+                let _ = this.update(cx, |this, cx| {
+                    this.typed = typed;
+                    this.stale = true;
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+        self.filter = Some(input.clone());
+        input
+    }
+
+    fn render_list(&self, filter: Entity<InputState>, cx: &mut Context<Self>) -> impl IntoElement {
         let commits = self.commits.clone();
         let selected = self.selected;
         let owner = cx.weak_entity();
@@ -158,6 +235,20 @@ impl HistoryView {
                     .text_color(cx.theme().muted_foreground)
                     .border_b_1()
                     .border_color(cx.theme().border)
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .pb_1()
+                            .child(
+                                Button::new("history-branch")
+                                    .xsmall()
+                                    .ghost()
+                                    .label(if self.rev.is_empty() { "⎇ this branch ▾".to_string() } else { format!("⎇ {} ▾", self.rev) })
+                                    .tooltip("The history of another branch")
+                                    .on_click(cx.listener(|this, _, window, cx| this.pick_branch(window, cx))),
+                            )
+                            .child(div().flex_1().min_w_0().child(Input::new(&filter).xsmall())),
+                    )
                     .child(
                         h_flex()
                             .justify_between()
@@ -194,7 +285,24 @@ impl HistoryView {
                                                 .gap_0p5()
                                                 .min_w_0()
                                                 .flex_1()
-                                                .child(div().text_sm().truncate().child(commit.subject.clone()))
+                                                .child(
+                                                    h_flex()
+                                                        .gap_1p5()
+                                                        .min_w_0()
+                                                        .child(div().text_sm().min_w_0().truncate().child(commit.subject.clone()))
+                                                        // The branches and tags at this commit.
+                                                        .children(commit.refs.split(", ").filter(|name| !name.is_empty()).take(3).map(|name| {
+                                                            let tag = name.starts_with("tag: ");
+                                                            div()
+                                                                .flex_none()
+                                                                .px_1()
+                                                                .rounded_sm()
+                                                                .text_xs()
+                                                                .bg(cx.theme().accent)
+                                                                .text_color(if tag { gpui_kit::yellow() } else { cx.theme().primary })
+                                                                .child(name.trim_start_matches("tag: ").to_string())
+                                                        })),
+                                                )
                                                 .child(
                                                     h_flex()
                                                         .gap_2()
@@ -225,16 +333,17 @@ impl HistoryView {
 }
 
 impl Render for HistoryView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.stale {
             self.load(cx);
         }
+        let filter = self.filter_input(window, cx);
         let commit = self.selected.and_then(|ix| self.commits.get(ix)).cloned();
         let root = self.root.clone();
         let task = self.task.clone();
         h_flex()
             .size_full()
-            .child(self.render_list(cx))
+            .child(self.render_list(filter, cx))
             .child(
                 v_flex()
                     .flex_1()
@@ -261,6 +370,15 @@ impl Render for HistoryView {
                                                 .text_color(cx.theme().muted_foreground)
                                                 .child(format!("{} · {} · {}", c.short, c.author, c.date)),
                                         )
+                                        .children([("commit-pick", "Cherry-pick", "Take this commit into the task's branch", 0), ("commit-revert", "Revert", "Commit the opposite of this commit", 1), ("commit-task", "New task from here", "A task in a worktree of its own, starting at this commit", 2)].map(
+                                            |(id, label, tip, what)| {
+                                                let (task, hash) = (self.task.clone(), c.hash.clone());
+                                                Button::new(id).xsmall().ghost().label(label).tooltip(tip).on_click(move |_, window, cx| {
+                                                    let hash = hash.clone();
+                                                    let _ = task.update(cx, |t, cx| t.commit_action(what, hash, window, cx));
+                                                })
+                                            },
+                                        ))
                                         .child({
                                             let (task, hash) = (self.task.clone(), c.hash.clone());
                                             Button::new("commit-compare")

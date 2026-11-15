@@ -780,12 +780,62 @@ pub struct Commit {
     pub author: String,
     pub date: String,
     pub subject: String,
+    /// The branches and tags that point at it: "main, origin/main, tag: v1".
+    pub refs: String,
+}
+
+/// Whose history is read and which commits of it: all fields empty, the
+/// task's own branch, all of it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HistoryQuery {
+    /// A branch, tag or commit other than HEAD.
+    pub rev: String,
+    /// In the message, whatever the case.
+    pub text: String,
+    pub author: String,
+    /// Commits that touched this file or folder.
+    pub path: String,
+}
+
+impl HistoryQuery {
+    /// As typed into one field: words are looked for in the message,
+    /// `@ann` is the author, `file:src/a.rs` what the commit touched.
+    pub fn typed(rev: &str, typed: &str) -> Self {
+        let mut query = Self { rev: rev.to_string(), ..Self::default() };
+        let mut words = Vec::new();
+        for word in typed.split_whitespace() {
+            if let Some(author) = word.strip_prefix('@') {
+                query.author = author.to_string();
+            } else if let Some(path) = word.strip_prefix("file:") {
+                query.path = path.to_string();
+            } else {
+                words.push(word);
+            }
+        }
+        query.text = words.join(" ");
+        query
+    }
 }
 
 /// The newest `limit` commits reachable from HEAD.
-pub fn history(root: &Path, limit: usize) -> Vec<Commit> {
+pub fn history(root: &Path, limit: usize, query: &HistoryQuery) -> Vec<Commit> {
     let limit = format!("-n{limit}");
-    let out = git(root, &["log", &limit, "--format=%H%x1f%h%x1f%an%x1f%ar%x1f%s%x1e"]).unwrap_or_default();
+    let (text, author) = (format!("--grep={}", query.text), format!("--author={}", query.author));
+    let mut args = vec!["log", limit.as_str(), "--format=%H%x1f%h%x1f%an%x1f%ar%x1f%s%x1f%D%x1e"];
+    if !query.text.is_empty() {
+        args.extend([text.as_str(), "-i", "--fixed-strings"]);
+    }
+    if !query.author.is_empty() {
+        args.push(author.as_str());
+    }
+    if !query.rev.is_empty() {
+        args.push(query.rev.as_str());
+    }
+    args.push("--");
+    if !query.path.is_empty() {
+        args.push(query.path.as_str());
+    }
+    let out = git(root, &args).unwrap_or_default();
     out.split('\x1e')
         .filter_map(|record| {
             let mut fields = record.trim_start_matches('\n').split('\x1f');
@@ -795,6 +845,8 @@ pub fn history(root: &Path, limit: usize) -> Vec<Commit> {
                 author: fields.next()?.to_string(),
                 date: fields.next()?.to_string(),
                 subject: fields.next().unwrap_or_default().to_string(),
+                // HEAD's own arrow says nothing the list does not.
+                refs: fields.next().unwrap_or_default().split(", ").map(|name| name.trim_start_matches("HEAD -> ")).filter(|name| !name.is_empty() && *name != "HEAD" && !name.ends_with("/HEAD")).collect::<Vec<_>>().join(", "),
             })
         })
         .collect()
@@ -1030,6 +1082,7 @@ pub fn commit_info(root: &Path, hash: &str) -> Option<Commit> {
         author: fields.next()?.to_string(),
         date: fields.next()?.to_string(),
         subject: fields.next().unwrap_or_default().to_string(),
+        refs: String::new(),
     })
 }
 
@@ -1107,10 +1160,38 @@ pub fn fetch(root: &Path) -> Result<String, String> {
 /// there is nothing local, else a rebase that is aborted on any conflict.
 /// Uncommitted work is stashed around it either way.
 /// Why a rebase onto the base did not happen.
+#[derive(Debug)]
 pub enum RebaseError {
     /// These files conflict; the rebase was undone.
     Conflicts(Vec<String>),
     Failed(String),
+}
+
+/// Takes a commit of elsewhere into this branch (`revert` false), or
+/// commits its opposite. On a conflict nothing changes and the files that
+/// conflict are told.
+pub fn replay_commit(root: &Path, hash: &str, revert: bool) -> Result<String, RebaseError> {
+    let (verb, args): (&str, &[&str]) = if revert { ("revert", &["revert", "--no-edit"]) } else { ("cherry-pick", &["cherry-pick"]) };
+    let mut all = args.to_vec();
+    all.push(hash);
+    match run(root, "git", &all) {
+        Ok(_) => Ok(if revert { format!("Reverted {}", &hash[..hash.len().min(8)]) } else { format!("Picked {}", &hash[..hash.len().min(8)]) }),
+        Err(e) => {
+            let conflicts: Vec<String> = git(root, &["diff", "--name-only", "--diff-filter=U"]).unwrap_or_default().lines().map(str::to_string).collect();
+            let _ = run(root, "git", &[verb, "--abort"]);
+            match conflicts.is_empty() {
+                true => Err(RebaseError::Failed(e.lines().find(|line| line.starts_with("error") || line.starts_with("fatal")).unwrap_or(e.lines().next().unwrap_or_default()).to_string())),
+                false => Err(RebaseError::Conflicts(conflicts)),
+            }
+        }
+    }
+}
+
+/// A worktree with a new branch at a commit, where a new task's would be:
+/// the app then shows it as a task.
+pub fn commit_worktree(root: &Path, hash: &str, copy_env: bool) -> Result<PathBuf, String> {
+    let repo = main_worktree(root).ok_or("not a git repository")?;
+    worktree_at(&repo, &format!("from-{}", &hash[..hash.len().min(8)]), hash, copy_env)
 }
 
 /// Fetches the base and rebases the branch onto it, uncommitted changes
@@ -1302,7 +1383,7 @@ mod lock_tests {
 // They script repositories with bash, which Windows lacks or has as WSL's.
 #[cfg(all(test, unix))]
 mod pull_tests {
-    use super::{branch_rows, branch_worktree, delete_branch, between, conflict_marked, diff_against, hunks, pull_conflicts, pull_safe, refresh, refs, stash, stash_apply, stash_drop, stash_patch, working_patch, Known};
+    use super::{commit_worktree, history, replay_commit, HistoryQuery, RebaseError, branch_rows, branch_worktree, delete_branch, between, conflict_marked, diff_against, hunks, pull_conflicts, pull_safe, refresh, refs, stash, stash_apply, stash_drop, stash_patch, working_patch, Known};
     use std::{path::Path, process::Command};
 
     fn sh(dir: &Path, script: &str) {
@@ -1464,6 +1545,46 @@ mod pull_tests {
         let left: Vec<String> = branch_rows(&b).into_iter().map(|r| r.name).collect();
         assert!(!left.iter().any(|n| ["done", "wip", "origin/wip", "loose"].contains(&n.as_str())), "{left:?}");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// History is read of any branch and narrowed by message, author and
+    /// file; a commit of another branch is taken in, one is reverted, and
+    /// one that would conflict changes nothing and names the files.
+    #[test]
+    fn history_is_filtered_and_commits_are_picked_and_reverted() {
+        let base = setup("history");
+        let b = base.join("b");
+        sh(&b, "git checkout -q -b side; echo s > side.txt; git add side.txt; git commit -qm 'Add the side file'
+            printf 'one\\nSIDE\\nthree\\n' > f.txt; git -c user.name=ann commit -qam 'Change two on the side'; git tag v2
+            git checkout -q main; printf 'one\\nMAIN\\nthree\\n' > f.txt; git commit -qam 'Change two on main'");
+        let subjects = |typed: &str, rev: &str| history(&b, 50, &HistoryQuery::typed(rev, typed)).into_iter().map(|c| c.subject).collect::<Vec<_>>();
+        assert_eq!(subjects("", ""), ["Change two on main", "base"]);
+        assert_eq!(subjects("", "side"), ["Change two on the side", "Add the side file", "base"], "another branch's");
+        assert_eq!(subjects("SIDE FILE", "side"), ["Add the side file"], "in the message, whatever the case");
+        assert_eq!(subjects("@ann", "side"), ["Change two on the side"]);
+        assert_eq!(subjects("file:side.txt", "side"), ["Add the side file"]);
+        assert_eq!(subjects("change @ann file:f.txt", "side"), ["Change two on the side"], "all of them at once");
+        let side = history(&b, 50, &HistoryQuery::typed("side", ""));
+        assert_eq!((side[0].refs.as_str(), side[2].refs.as_str()), ("tag: v2, side", "origin/main"), "what points at each");
+
+        assert!(replay_commit(&b, &side[1].hash, false).unwrap().starts_with("Picked"));
+        assert!(b.join("side.txt").is_file() && subjects("", "")[0] == "Add the side file");
+        let Err(RebaseError::Conflicts(files)) = replay_commit(&b, &side[0].hash, false) else { panic!("the same line changed on both") };
+        assert_eq!(files, ["f.txt"]);
+        assert_eq!(std::fs::read_to_string(b.join("f.txt")).unwrap(), "one\nMAIN\nthree\n", "nothing changed");
+        assert!(git_clean(&b), "and no pick left halfway");
+        let picked = history(&b, 1, &HistoryQuery::default())[0].hash.clone();
+        assert!(replay_commit(&b, &picked, true).unwrap().starts_with("Reverted"));
+        assert!(!b.join("side.txt").exists() && subjects("", "")[0].starts_with("Revert"));
+
+        let made = commit_worktree(&b, &side[1].hash, false).unwrap();
+        assert!(made.join("side.txt").is_file() && made.file_name().unwrap().to_string_lossy().starts_with("from-"), "a task of its own, at that commit");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn git_clean(dir: &Path) -> bool {
+        let state = Command::new("git").args(["status", "--porcelain"]).current_dir(dir).output().unwrap().stdout;
+        state.is_empty()
     }
 
     #[test]

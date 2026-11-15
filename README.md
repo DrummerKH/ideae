@@ -83,6 +83,12 @@ Windows build exists and is being tried out (see [Windows](#windows)).
   branch's name (Ctrl+Shift+`) lists the repository's branches: one opens
   as a task in a worktree of its own, compares with the working tree, or
   is deleted, here or on the remote, the merged ones all at once.
+  History reads any branch, narrowed by words of the message, `@author`
+  and `file:path`, with the branches and tags at each commit; a commit
+  is cherry-picked into the task's branch, reverted, or made the start
+  of a new task. Where a pull, a rebase, a pick or a revert would
+  conflict, nothing is changed and the agent's prompt gets the request
+  to do it and resolve the conflicts.
   Stash puts what is not committed away; the repository's
   stashes are listed under the changes, to look into, bring back or drop. Each hunk of a diff can be
   reverted on its own, and staged.

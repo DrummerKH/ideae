@@ -2284,6 +2284,23 @@ pub(crate) mod tests {
         });
         workspace.update(cx, |w, cx| assert_eq!(w.active_view().unwrap().read(cx).shown_view(), 1, "A's changes"));
 
+        // A's history draws, with what narrows it and what can be done with a commit.
+        step(cx, &mut |w, window, cx| w.active_view().unwrap().update(cx, |t, cx| t.show_view(2, window, cx)));
+        for _ in 0..300 {
+            cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx)).unwrap();
+            cx.run_until_parked();
+            if cx.update_window(handle.into(), |_, window, _| window.try_find("commit-pick").is_some()).unwrap() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        cx.update_window(handle.into(), |_, window, _| {
+            for id in ["history-branch", "commit-pick", "commit-revert", "commit-task", "commit-compare"] {
+                assert!(window.find(id).visible(), "{id}");
+            }
+        })
+        .unwrap();
+
         // B is kept: A goes, parked; B gets the clean branch name.
         step(cx, &mut |w, window, cx| w.settle_group(&group, Some(&paths[1]), &super::pushed_of(&w.member_paths(&group)), window, cx));
         workspace.update(cx, |w, _| {
