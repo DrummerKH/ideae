@@ -1,9 +1,13 @@
 name: Release
 
-# Every push to main is a release, tagged with its UTC time (yyyymmddhhmmss),
-# with a binary for each supported system.
+# A push to main whose CI passed on every system is a release, tagged with
+# its UTC time (yyyymmddhhmmss), with a binary for each supported system.
+# CI cancels a run when a newer push comes, so a burst of pushes makes one
+# release, of the last one. By hand (workflow_dispatch) it skips CI.
 on:
-  push:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
     branches: [main]
   workflow_dispatch:
 
@@ -12,8 +16,12 @@ concurrency:
   group: release
   cancel-in-progress: false
 
+env:
+  SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+
 jobs:
   version:
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push') }}
     runs-on: ubuntu-24.04
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
@@ -28,6 +36,8 @@ jobs:
       IDEAE_VERSION: ${{ needs.version.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SHA }}
       - name: System libraries
         run: |
           sudo apt-get update
@@ -62,6 +72,8 @@ jobs:
       IDEAE_VERSION: ${{ needs.version.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SHA }}
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.1
@@ -96,6 +108,8 @@ jobs:
       IDEAE_VERSION: ${{ needs.version.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SHA }}
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.1
@@ -150,5 +164,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.version.outputs.tag }}
         run: |
-          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$SHA" \
             --title "$TAG" --generate-notes ideae-*
