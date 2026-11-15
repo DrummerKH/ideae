@@ -1413,7 +1413,50 @@ impl Workspace {
 
     /// Which variant changed which file: how far each one reached, at a
     /// glance. From what the sidebar's "same files" mark is made of.
-    fn render_files_of(&self, members: &[(usize, usize)], cx: &App) -> Option<AnyElement> {
+    /// What one variant has that another has not, in the files either
+    /// changed: the two worktrees as they are, in a diff of its own.
+    pub fn compare_variants(&mut self, ours: &Path, theirs: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui_kit::component::diff::{Diff, DiffFile, DiffMode, DiffState};
+        let name = |path: &Path| self.find(path).map(|(pi, ti)| letter(self.projects[pi].tasks[ti].variant)).unwrap_or_default();
+        let (a, b) = (name(ours), name(theirs));
+        let files: Vec<String> = [ours, theirs].iter().filter_map(|path| self.touched.get(*path)).flatten().cloned().collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+        let (ours, theirs) = (ours.to_path_buf(), theirs.to_path_buf());
+        cx.spawn_in(window, async move |_, cx| {
+            let found = cx
+                .background_spawn(async move {
+                    let patch = git::between(&ours, &theirs, &files);
+                    DiffFile::parse(&patch).map(task::with_languages).map_err(|error| error.to_string())
+                })
+                .await;
+            let _ = cx.update(|window, cx| {
+                let files = match found {
+                    Ok(files) if !files.is_empty() => files,
+                    Ok(_) => return window.push_notification(Notification::info(format!("{a} and {b} have the same in every file they changed.")), cx),
+                    Err(error) => return window.push_notification(Notification::error(error).title("Compare"), cx),
+                };
+                let count = files.len();
+                let diff = cx.new(|cx| DiffState::new(files, cx).with_mode(DiffMode::Split));
+                let room = window.viewport_size();
+                let (width, height) = (room.width * 0.92, room.height * 0.72);
+                window.open_dialog(cx, move |dialog, _, _| {
+                    let diff = diff.clone();
+                    dialog
+                        .title(format!("{a} ↔ {b}: {a} on the left, {b} on the right · {count} file{}", if count == 1 { "" } else { "s" }))
+                        .w(width)
+                        .content(move |content, _, cx| {
+                            content.child(
+                                div()
+                                    .h(height)
+                                    .child(Diff::new(&diff).line_number(true).code_font_size(crate::zoom::size(crate::zoom::Kind::Changes, cx))),
+                            )
+                        })
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn render_files_of(&self, members: &[(usize, usize)], cx: &Context<Self>) -> Option<AnyElement> {
         const MOST_FILES: usize = 40;
         let muted = cx.theme().muted_foreground;
         let touched: Vec<(String, Option<&std::collections::BTreeSet<String>>)> = members
@@ -1428,10 +1471,22 @@ impl Workspace {
             return None;
         }
         let more = files.len().saturating_sub(MOST_FILES);
+        // Every pair of variants, to see what one has that the other has not.
+        let paths: Vec<(String, PathBuf)> = members.iter().map(|&(pi, ti)| (letter(self.projects[pi].tasks[ti].variant), self.projects[pi].tasks[ti].path.clone())).collect();
+        let pairs = paths.iter().enumerate().flat_map(|(i, left)| paths[i + 1..].iter().map(move |right| (left.clone(), right.clone())));
         Some(
             v_flex()
                 .gap_0p5()
-                .child(div().text_xs().text_color(muted).child("FILES CHANGED"))
+                .child(
+                    h_flex().gap_2().child(div().text_xs().text_color(muted).child("FILES CHANGED")).children(pairs.map(|((a, ours), (b, theirs))| {
+                        Button::new(SharedString::from(format!("compare-{a}-{b}")))
+                            .xsmall()
+                            .ghost()
+                            .label(format!("{a} ↔ {b}"))
+                            .tooltip(format!("What {b} has that {a} has not, file by file"))
+                            .on_click(cx.listener(move |this, _, window, cx| this.compare_variants(&ours, &theirs, window, cx)))
+                    })),
+                )
                 .children(files.iter().take(MOST_FILES).map(|file| {
                     h_flex()
                         .gap_3()
@@ -2165,8 +2220,26 @@ pub(crate) mod tests {
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             assert!(window.find("group-judge").visible());
+            assert!(window.find("compare-A-B").visible(), "the pair, by the files changed");
         })
         .unwrap();
+        use gpui_kit::component::WindowExt as _;
+        // A against B: they differ in what they made, and the diff of that opens.
+        step(cx, &mut |w, window, cx| w.compare_variants(&paths[0], &paths[1], window, cx));
+        for _ in 0..500 {
+            if cx.update_window(handle.into(), |_, window, cx| window.has_active_dialog(cx)).unwrap() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            cx.run_until_parked();
+        }
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert!(window.has_active_dialog(cx), "the comparison is shown");
+            window.render_frame(cx);
+            window.close_all_dialogs(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
 
         // From A to B on a chip: the file open in A is the one B shows, and the changes stay the changes.
         step(cx, &mut |w, window, cx| {
