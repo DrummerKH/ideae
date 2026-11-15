@@ -29,6 +29,8 @@ struct Peer {
 }
 
 pub struct Daemon {
+    /// The daemon process, as the socket's peer: changes with a handover.
+    pid: std::sync::atomic::AtomicI32,
     writer: Mutex<UnixStream>,
     peers: Mutex<HashMap<String, Peer>>,
 }
@@ -45,7 +47,7 @@ pub fn get() -> Option<Arc<Daemon>> {
 /// latest ones the daemon kept go to `on_hook`.
 pub fn connect(on_hook: impl Fn(Hook) + Send + Sync + 'static) -> Option<(Arc<Daemon>, Vec<Hook>)> {
     let (writer, reader, hooks) = dial(true)?;
-    let daemon = Arc::new(Daemon { writer: Mutex::new(writer), peers: Mutex::default() });
+    let daemon = Arc::new(Daemon { pid: peer_pid(&writer).into(), writer: Mutex::new(writer), peers: Mutex::default() });
     let reading = daemon.clone();
     std::thread::Builder::new()
         .name("daemon-reader".into())
@@ -59,6 +61,7 @@ pub fn connect(on_hook: impl Fn(Hook) + Send + Sync + 'static) -> Option<(Arc<Da
                 // Attach again where it serves now.
                 match dial(false) {
                     Some((writer, next, _)) => {
+                        reading.pid.store(peer_pid(&writer), std::sync::atomic::Ordering::Relaxed);
                         *reading.writer.lock().unwrap() = writer;
                         reader = next;
                         reading.reopen();
@@ -160,7 +163,23 @@ fn size_of(viewport: Viewport) -> Size {
     Size { cols: viewport.columns(), rows: viewport.rows(), cell_w: viewport.cell_width(), cell_h: viewport.cell_height() }
 }
 
+/// The pid of the process at the other end, 0 when unknown.
+fn peer_pid(stream: &UnixStream) -> i32 {
+    use std::os::fd::AsRawFd as _;
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: SO_PEERCRED writes a ucred of the given length.
+    let ok = unsafe {
+        libc::getsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, (&raw mut cred).cast(), &mut len)
+    } == 0;
+    if ok { cred.pid } else { 0 }
+}
+
 impl Daemon {
+    pub fn pid(&self) -> Option<i32> {
+        Some(self.pid.load(std::sync::atomic::Ordering::Relaxed)).filter(|&p| p > 0)
+    }
+
     fn send(&self, frame: Vec<u8>) {
         let _ = self.writer.lock().unwrap().write_all(&frame);
     }

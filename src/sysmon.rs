@@ -16,6 +16,7 @@ use gpui_kit::{prelude::FluentBuilder as _, *};
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Kind {
     Editor,
+    Daemon,
     Agent,
     Terminal,
     LanguageServer,
@@ -27,6 +28,7 @@ impl Kind {
     fn label(self) -> &'static str {
         match self {
             Kind::Editor => "editor",
+            Kind::Daemon => "daemon",
             Kind::Agent => "agents",
             Kind::Terminal => "terminals",
             Kind::LanguageServer => "language servers",
@@ -165,12 +167,37 @@ impl Sampler {
         let me = std::process::id() as i32;
         let (tck, pages) = (clk_tck(), page_size());
         let mut ticks = HashMap::new();
-        let mut stack = vec![(me, 0usize, Kind::Editor, None::<String>, me)];
+        // The app, its daemon, and the daemon's terminal sessions: found by
+        // the socket in their environment, since a session handed to a newer
+        // daemon is nobody's child any more.
+        let (daemon, socket) = daemon_of_app();
+        let mut roots: Vec<(i32, usize)> = vec![(me, 0)];
+        if let Some(d) = daemon.filter(|d| all.contains_key(d)) {
+            roots.push((d, 0));
+        }
+        if let Some(socket) = &socket {
+            let mut sessions: Vec<i32> = all
+                .iter()
+                .filter(|(pid, raw)| raw.sid == **pid && raw.ppid != me && Some(**pid) != daemon)
+                .filter(|(pid, _)| session_env(**pid).2.as_deref() == Some(socket.as_str()))
+                .map(|(pid, _)| *pid)
+                .collect();
+            sessions.sort();
+            roots.extend(sessions.into_iter().map(|pid| (pid, 1)));
+        }
+        let root_pids: std::collections::HashSet<i32> = roots.iter().map(|r| r.0).collect();
+        let mut stack: Vec<(i32, usize, Kind, Option<String>, i32)> =
+            roots.iter().rev().map(|&(pid, depth)| (pid, depth, Kind::Terminal, None, pid)).collect();
         while let Some((pid, depth, inherited, task, top)) = stack.pop() {
             let top = if depth == 1 { pid } else { top };
             let Some(raw) = all.get(&pid) else { continue };
+            let session_root = root_pids.contains(&pid) && pid != me && Some(pid) != daemon;
             let kind = if pid == me {
                 Kind::Editor
+            } else if Some(pid) == daemon {
+                Kind::Daemon
+            } else if session_root {
+                Kind::Terminal
             } else if raw.name == "claude" {
                 Kind::Agent
             } else if raw.ppid == me {
@@ -188,8 +215,13 @@ impl Sampler {
             } else {
                 inherited
             };
-            let leader = raw.ppid == me && raw.sid == pid;
-            let (task, agent_tab) = if leader { session_env(pid) } else { (task, false) };
+            let leader = Some(pid) != daemon && (session_root || (raw.ppid == me && raw.sid == pid));
+            let (task, agent_tab) = if leader {
+                let (task, agent, _) = session_env(pid);
+                (task, agent)
+            } else {
+                (task, false)
+            };
             let kind = if agent_tab { Kind::Agent } else { kind };
             let prev = self.ticks.get(&pid).copied();
             ticks.insert(pid, raw.ticks);
@@ -208,8 +240,9 @@ impl Sampler {
                 mem: memory(pid, pages),
             });
             if let Some(kids) = children.get(&pid) {
-                // Reversed, so the stack pops them in pid order.
-                for &kid in kids.iter().rev() {
+                // Reversed, so the stack pops them in pid order. Sessions
+                // are roots of their own, under the daemon's row.
+                for &kid in kids.iter().rev().filter(|k| !root_pids.contains(k)) {
                     stack.push((kid, depth + 1, kind, task.clone(), top));
                 }
             }
@@ -253,20 +286,31 @@ fn memory(pid: i32, page: u64) -> u64 {
 #[cfg(target_os = "linux")]
 /// The task a terminal's shell was started for, and whether it is the
 /// agent's tab, from its environment.
-fn session_env(pid: i32) -> (Option<String>, bool) {
-    let Ok(env) = std::fs::read(format!("/proc/{pid}/environ")) else { return (None, false) };
+fn session_env(pid: i32) -> (Option<String>, bool, Option<String>) {
+    let Ok(env) = std::fs::read(format!("/proc/{pid}/environ")) else { return (None, false, None) };
     let task_key = format!("{}=", crate::agent::TASK_ENV);
+    let sock_key = format!("{}=", crate::agent::SOCK_ENV);
     let role = format!("{}=agent", crate::agent::ROLE_ENV);
-    let mut task = None;
-    let mut agent = false;
+    let (mut task, mut agent, mut sock) = (None, false, None);
     for var in env.split(|&b| b == 0).filter_map(|v| std::str::from_utf8(v).ok()) {
         if let Some(path) = var.strip_prefix(&task_key) {
             task = PathBuf::from(path).file_name().map(|n| n.to_string_lossy().into_owned());
+        } else if let Some(s) = var.strip_prefix(&sock_key) {
+            sock = Some(s.to_string());
         } else if var == role {
             agent = true;
         }
     }
-    (task, agent)
+    (task, agent, sock)
+}
+
+#[cfg(target_os = "linux")]
+/// The daemon's pid and socket, when terminals run there.
+fn daemon_of_app() -> (Option<i32>, Option<String>) {
+    match crate::daemon::client::get() {
+        Some(d) => (d.pid(), Some(crate::daemon::proto::socket_path().display().to_string())),
+        None => (None, None),
+    }
 }
 
 pub fn bytes(n: u64) -> String {
@@ -400,6 +444,7 @@ impl Render for SysTooltip {
                         .pl(px(10. * p.depth as f32))
                         .child(p.name.clone())
                         .child(div().text_color(muted).child(p.pid.to_string()))
+                        .when(p.kind == Kind::Daemon, |s| s.child(div().text_color(muted).child("[daemon]")))
                         .when_some(p.task.clone(), |s, task| {
                             let role = if p.kind == Kind::Agent { "agent" } else { "terminal" };
                             s.child(div().text_color(muted).child(format!("[{task} · {role}]")))
