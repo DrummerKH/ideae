@@ -1332,6 +1332,8 @@ pub struct TaskView {
     pending_prompt: Option<String>,
     /// Files you were in, the latest first, with where the cursor was.
     recent: Vec<(PathBuf, u32, u32)>,
+    /// Its pull request, as last seen on GitHub.
+    pub pr: Option<crate::pr::Pr>,
     /// Its share of the ports of `.ideae.toml`'s services, and those services.
     pub port_slot: u32,
     services: Vec<crate::services::Service>,
@@ -1517,6 +1519,7 @@ impl TaskView {
             agent: agent.clone(),
             pending_prompt: None,
             recent: Vec::new(),
+            pr: None,
             port_slot,
             services,
             hook_socket,
@@ -2964,6 +2967,7 @@ impl TaskView {
                     .cursor_pointer()
                     .child(format!("· {} {}", b.last_hash, b.last_subject)),
             )
+            .children(self.render_pr_feedback(cx))
             .child(self.render_run(cx))
             .child(
                 Button::new("log")
@@ -5285,5 +5289,54 @@ impl TaskView {
                 let _ = task.update(cx, |t, cx| t.create_services_file(window, cx));
             }))
         })
+    }
+}
+
+// ---------------------------------------------------------------- PR feedback
+
+impl TaskView {
+    /// "PR #12: 3 comments → agent", while reviewers left something open.
+    fn render_pr_feedback(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let pr = self.pr.clone().filter(|p| p.open_feedback > 0)?;
+        let n = pr.open_feedback;
+        Some(
+            Button::new("pr-feedback")
+                .xsmall()
+                .ghost()
+                .disabled(self.busy.is_some())
+                .label(format!("PR #{}: {n} comment{} → agent", pr.number, if n == 1 { "" } else { "s" }))
+                .tooltip("Put the unresolved review threads and change requests into the agent's prompt")
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.send_pr_feedback(pr.clone(), window, cx)
+                }))
+                .into_any_element(),
+        )
+    }
+
+    fn send_pr_feedback(&mut self, pr: crate::pr::Pr, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy.is_some() {
+            return;
+        }
+        self.busy = Some("PR feedback");
+        cx.notify();
+        let root = self.root.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let job_pr = pr.clone();
+            let feedback = cx.background_spawn(async move { crate::pr::feedback(&root, &job_pr) }).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.busy = None;
+                match feedback {
+                    Some(f) if f.len() > 0 => {
+                        this.paste_to_agent(f.message(&pr), window, cx);
+                        this.action = Some((true, format!("{} review point(s) in the agent's prompt", f.len())));
+                    }
+                    Some(_) => this.action = Some((true, "No open review comments".into())),
+                    None => this.action = Some((false, "PR feedback: gh could not read the review".into())),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 }

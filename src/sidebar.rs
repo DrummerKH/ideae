@@ -331,6 +331,9 @@ impl Workspace {
                 });
             }
         }
+        if let Some(pr) = t.pr.as_ref().filter(|p| p.open_feedback > 0 && crate::state::settings().pr_status) {
+            details.push(format!("{} review comment{}", pr.open_feedback, if pr.open_feedback == 1 { "" } else { "s" }));
+        }
         if t.starred {
             details.push("★".into());
         }

@@ -475,12 +475,13 @@ impl Workspace {
         }
         let slot = self.port_slot_for(path);
         let entry = self.entry_mut(path)?;
-        let (root, branch, session) = (entry.path.clone(), entry.branch.clone(), entry.session.clone());
+        let (root, branch, session, pr) = (entry.path.clone(), entry.branch.clone(), entry.session.clone(), entry.pr.clone());
         let view = cx.new(|cx| {
             let mut t = TaskView::new(root, branch, agent, socket, slot, window, cx);
             // Servers start when the task comes into view (switch).
             t.lsp_asleep = true;
             t.restore(&session, window, cx);
+            t.pr = pr;
             t
         });
         cx.subscribe(&view, |_, _, _: &TaskEvent, cx| cx.notify()).detach();
@@ -571,6 +572,12 @@ impl Workspace {
             let _ = this.update(cx, |this, cx| {
                 for (path, pr) in found {
                     if let Some(entry) = this.entry_mut(&path) {
+                        if let Some(view) = &entry.view {
+                            view.update(cx, |t, cx| {
+                                t.pr = pr.clone();
+                                cx.notify();
+                            });
+                        }
                         entry.pr = pr;
                     }
                 }
