@@ -91,7 +91,7 @@ jobs:
   # the first start needs right click, Open.
   macos:
     needs: version
-    runs-on: macos-14
+    runs-on: macos-latest
     env:
       IDEAE_VERSION: ${{ needs.version.outputs.tag }}
     steps:

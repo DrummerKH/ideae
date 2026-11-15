@@ -35,7 +35,6 @@ fn grammars() -> Vec<(&'static str, tree_sitter::Language, &'static str)> {
         ("nginx", tree_sitter_nginx::LANGUAGE.into(), NGINX_HIGHLIGHTS),
         ("powershell", tree_sitter_powershell::LANGUAGE.into(), tree_sitter_powershell::HIGHLIGHTS_QUERY),
         ("twig", twig(), TWIG_HIGHLIGHTS),
-        ("scss", tree_sitter_scss::language(), tree_sitter_scss::HIGHLIGHTS_QUERY),
         ("less", tree_sitter_less::language(), tree_sitter_less::HIGHLIGHTS_QUERY),
         ("dart", tree_sitter_dart::LANGUAGE.into(), tree_sitter_dart::HIGHLIGHTS_QUERY),
         ("nix", tree_sitter_nix::LANGUAGE.into(), tree_sitter_nix::HIGHLIGHTS_QUERY),

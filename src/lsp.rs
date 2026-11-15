@@ -227,7 +227,9 @@ pub fn language_for(path: &Path) -> &'static str {
         "proto" => "proto",
         "sh" | "bash" | "zsh" => "bash",
         "css" => "css",
-        "scss" | "sass" => "scss",
+        // tree-sitter-scss passes MSVC a flag it rejects; CSS's grammar
+        // reads most of SCSS.
+        "scss" | "sass" => "css",
         "less" => "less",
         "twig" => "twig",
         "dart" => "dart",
