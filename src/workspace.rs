@@ -91,6 +91,7 @@ impl Workspace {
             .or_else(|| saved.appearance.as_deref().and_then(Appearance::parse))
             .unwrap_or(Appearance::Auto);
         theme::apply(appearance, window, cx);
+        crate::lsp::POWER_SAVING.store(saved.power_saving, std::sync::atomic::Ordering::Relaxed);
         if let Some(width) = saved.side_panel_width {
             cx.set_global(SidePanelWidth(px(width)));
         }
@@ -297,6 +298,7 @@ impl Workspace {
             sidebar_width: Some(f32::from(self.sidebar_width)),
             side_panel_width: cx.try_global::<SidePanelWidth>().map(|w| f32::from(w.0)),
             active_collapsed: self.active_collapsed,
+            power_saving: crate::lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed),
             active_task: self.active.clone(),
             zoom: crate::zoom::current(cx),
             projects: self
@@ -795,6 +797,17 @@ impl Workspace {
             if let Ok(mut child) = std::process::Command::new("notify-send").args(["-a", state::APP_ID, &label, &body]).spawn() {
                 std::thread::spawn(move || child.wait());
             }
+        }
+        cx.notify();
+    }
+
+    /// Power saving: stops every language server and starts none until
+    /// turned off, when the open files get theirs again.
+    pub fn toggle_power_saving(&mut self, cx: &mut Context<Self>) {
+        let on = !crate::lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed);
+        crate::lsp::POWER_SAVING.store(on, std::sync::atomic::Ordering::Relaxed);
+        for view in self.views() {
+            view.update(cx, |t, cx| t.set_language_servers(!on, cx));
         }
         cx.notify();
     }

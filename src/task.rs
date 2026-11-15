@@ -1077,8 +1077,11 @@ impl TaskView {
                 .with_env(crate::agent::SOCK_ENV, socket.display().to_string())
                 .with_env(crate::agent::TASK_ENV, root.display().to_string());
         }
+        // Set either way: an ideae started from an agent's terminal inherits "agent".
+        let role = if input.is_some() { "agent" } else { "terminal" };
+        options = options.with_env(crate::agent::ROLE_ENV, role);
         if let Some(input) = input {
-            options = options.with_input(format!("{input}\n")).with_env(crate::agent::ROLE_ENV, "agent");
+            options = options.with_input(format!("{input}\n"));
         }
         let config = TerminalConfig::default().with_colors(crate::theme::terminal_colors(cx));
         let state = cx.new(|cx| TerminalState::local(options, config, window, cx));
@@ -2261,20 +2264,7 @@ impl TaskView {
         cx.observe(&file, |_, _, cx| cx.notify()).detach();
         file.update(cx, |f, cx| f.load_blame(cx));
         self.attach_lsp(&path, content, &editor, &file, cx);
-        // No language server: definitions by search, so Ctrl+click and Ctrl+B still work.
-        let search = UsagesAtDeclaration::wrap(
-            Rc::new(SearchDefinitionProvider { root: self.root.clone(), files: self.shared_files.clone() }),
-            &path,
-        );
-        let task_weak = cx.weak_entity();
-        let this_path = path.clone();
-        editor.update(cx, |state, _| {
-            let lsp = state.lsp_mut();
-            if lsp.definition_provider.is_none() {
-                lsp.definition_provider = Some(search);
-                lsp.show_document = Some(show_document_handler(task_weak, this_path));
-            }
-        });
+        self.use_search_definitions(&path, &editor, false, cx);
 
         let title = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let mut tab = TabItem::new(title, TabKind::File(file));
@@ -3845,5 +3835,70 @@ impl TaskView {
                 state.update(cx, |s, cx| s.close(cx));
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------- power saving
+
+impl TaskView {
+    /// Definitions by search, so Ctrl+click and Ctrl+B work without a
+    /// language server; `replace` drops the server's providers first.
+    fn use_search_definitions(&self, path: &PathBuf, editor: &Entity<EditorState>, replace: bool, cx: &mut Context<Self>) {
+        let search = UsagesAtDeclaration::wrap(
+            Rc::new(SearchDefinitionProvider { root: self.root.clone(), files: self.shared_files.clone() }),
+            path,
+        );
+        let task_weak = cx.weak_entity();
+        let this_path = path.clone();
+        editor.update(cx, |state, cx| {
+            let lsp = state.lsp_mut();
+            if replace {
+                lsp.hover_provider = None;
+                lsp.definition_provider = None;
+            }
+            if lsp.definition_provider.is_none() {
+                lsp.definition_provider = Some(search);
+                lsp.show_document = Some(show_document_handler(task_weak, this_path));
+            }
+            cx.notify();
+        });
+    }
+
+    /// Stops this task's language servers, or starts them again for the
+    /// open files.
+    pub fn set_language_servers(&mut self, on: bool, cx: &mut Context<Self>) {
+        let files: Vec<Entity<FileView>> = self
+            .tabs
+            .iter()
+            .filter_map(|t| match &t.kind {
+                TabKind::File(f) => Some(f.clone()),
+                _ => None,
+            })
+            .collect();
+        if !on {
+            for client in self.lsp.values() {
+                client.shut_down();
+            }
+            self.lsp.clear();
+        }
+        for file in files {
+            let (path, editor) = {
+                let f = file.read(cx);
+                (f.path.clone(), f.editor.clone())
+            };
+            if on {
+                let content = editor.read(cx).value().to_string();
+                self.attach_lsp(&path, content, &editor, &file, cx);
+            } else {
+                file.update(cx, |f, cx| {
+                    f.lsp_client = None;
+                    f.lsp_ok = Some(false);
+                    f.lsp_status = "language servers off (power saving)".into();
+                    cx.notify();
+                });
+                self.use_search_definitions(&path, &editor, true, cx);
+            }
+        }
+        cx.notify();
     }
 }

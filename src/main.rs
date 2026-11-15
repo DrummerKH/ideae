@@ -66,6 +66,7 @@ impl Render for Workspace {
                                 .on_click(|_, _, cx| cx.stop_propagation())
                                 .gap_3()
                                 .child(div().mr_2().child(sysmon::SysMon::render_widget(&self.sysmon, cx)))
+                                .child(self.render_power_saving(cx))
                                 .child(
                                     Button::new("go-to-file")
                                         .xsmall()
@@ -184,6 +185,21 @@ impl Workspace {
         if let Some(task) = self.active_view() {
             task.update(cx, |t, cx| t.open_finder(kind, window, cx));
         }
+    }
+
+    fn render_power_saving(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let saving = lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed);
+        Button::new("power-saving")
+            .xsmall()
+            .ghost()
+            .label(if saving { "LSP off" } else { "LSP" })
+            .when(saving, |b| b.text_color(hsla(0.11, 0.9, 0.55, 1.)))
+            .tooltip(if saving {
+                "Power saving: language servers are off. Click to start them for the open files."
+            } else {
+                "Power saving: click to stop all language servers and start none."
+            })
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_power_saving(cx)))
     }
 
     /// One button: the current mode's icon, a click moves to the next.

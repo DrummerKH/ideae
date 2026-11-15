@@ -36,9 +36,15 @@ pub struct LspClient {
 
 /// Which server handles a file, by extension: (language id, program, args),
 /// or why there is none, for the editor's status line.
+/// Power saving: no language servers run, none start.
+pub static POWER_SAVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn server_for(
     path: &Path,
 ) -> Result<(&'static str, &'static str, &'static [&'static str]), String> {
+    if POWER_SAVING.load(Ordering::Relaxed) {
+        return Err("language servers off (power saving)".into());
+    }
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
     let entry: (&str, &str, &[&str]) = match ext {
         "go" => ("go", "gopls", &[]),
@@ -412,11 +418,18 @@ impl LspClient {
     }
 }
 
-impl Drop for LspClient {
-    fn drop(&mut self) {
+impl LspClient {
+    /// Ends the server now, even while files still hold the client.
+    pub fn shut_down(&self) {
         let mut child = self.child.lock().unwrap();
         let _ = child.kill();
         let _ = child.wait();
+    }
+}
+
+impl Drop for LspClient {
+    fn drop(&mut self) {
+        self.shut_down();
     }
 }
 

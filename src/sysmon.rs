@@ -356,6 +356,8 @@ impl Render for SysTooltip {
             .gap_2()
             .text_xs()
             .bg(cx.theme().popover)
+            // Drawn outside the window's root, so nothing above sets the text color.
+            .text_color(cx.theme().popover_foreground)
             .border_1()
             .border_color(cx.theme().border)
             .rounded_md()

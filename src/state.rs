@@ -12,6 +12,7 @@ pub struct State {
     pub sidebar_width: Option<f32>,
     pub side_panel_width: Option<f32>,
     pub active_collapsed: bool,
+    pub power_saving: bool,
     pub active_task: Option<PathBuf>,
     /// Text size per kind of view.
     pub zoom: crate::zoom::Zoom,
