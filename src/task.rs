@@ -2063,6 +2063,10 @@ pub struct TaskView {
     branch_lines: Rc<HashMap<String, u32>>,
     /// The single changes of each, to take back or stage one alone.
     uncommitted_hunks: Rc<Vec<git::Hunk>>,
+    /// Files with conflict markers left in them, and whether committing
+    /// them as they are was asked for a second time.
+    conflict_marked: Vec<(String, u32)>,
+    markers_accepted: bool,
     branch_hunks: Rc<Vec<git::Hunk>>,
     /// The Changes tab shows an older diff than the one read last.
     diff_stale: bool,
@@ -2300,6 +2304,8 @@ impl TaskView {
             uncommitted_lines: Rc::default(),
             branch_lines: Rc::default(),
             uncommitted_hunks: Rc::default(),
+            conflict_marked: Vec::new(),
+            markers_accepted: false,
             branch_hunks: Rc::default(),
             diff_stale: false,
             branch_info: git::BranchInfo::default(),
@@ -3491,8 +3497,12 @@ impl TaskView {
     }
 
     fn apply_patch(&mut self, parsed: ParsedPatch, cx: &mut Context<Self>) {
-        let ParsedPatch { files, first_lines, hashes, hunks } = parsed;
+        let ParsedPatch { files, first_lines, hashes, hunks, marked } = parsed;
         self.uncommitted_hunks = Rc::new(hunks);
+        if self.conflict_marked != marked {
+            self.conflict_marked = marked;
+            self.markers_accepted = false;
+        }
         self.files = files
             .iter()
             .map(|f| ChangedFile {
@@ -4005,8 +4015,17 @@ impl TaskView {
                         .xsmall()
                         .ghost()
                         .disabled(busy)
-                        .label(if b.behind > 0 { format!("Pull ↓{}", b.behind) } else { "Pull".to_string() })
-                        .tooltip("Fast-forward, or rebase local commits; undone on any conflict")
+                        .label(match (b.behind, b.pull_conflicts.is_empty()) {
+                            (0, _) => "Pull".to_string(),
+                            (behind, true) => format!("Pull ↓{behind}"),
+                            (behind, false) => format!("Pull ↓{behind} ⚠"),
+                        })
+                        .when(!b.pull_conflicts.is_empty(), |button| button.text_color(gpui_kit::yellow()))
+                        .tooltip(if b.pull_conflicts.is_empty() {
+                            "Fast-forward, or rebase local commits; not tried when it would conflict".to_string()
+                        } else {
+                            format!("Would conflict with your work in {}: commit, or let the agent merge it first", b.pull_conflicts.join(", "))
+                        })
                         .on_click(cx.listener(|this, _, window, cx| {
                             cx.stop_propagation();
                             this.run_action("Pull", |root| git::pull_safe(&root), false, window, cx)
@@ -4664,6 +4683,16 @@ impl TaskView {
             .p_2()
             .border_t_1()
             .border_color(cx.theme().border)
+            .children(self.conflict_marked.iter().map(|(path, line)| {
+                let (open, line) = (self.root.join(path), line.saturating_sub(1));
+                div()
+                    .id(SharedString::from(format!("marked-{path}")))
+                    .text_xs()
+                    .text_color(gpui_kit::red())
+                    .cursor_pointer()
+                    .child(format!("⚠ conflict left in {path}:{}", line + 1))
+                    .on_click(cx.listener(move |this, _, window, cx| this.open_file(open.clone(), line, window, cx)))
+            }))
             .when_some(self.busy, |this, label| {
                 this.child(div().text_xs().text_color(cx.theme().muted_foreground).child(format!("{label}…")))
             })
@@ -5103,6 +5132,11 @@ impl TaskView {
             cx.notify();
             return;
         }
+        if !self.conflict_marked.is_empty() && !std::mem::replace(&mut self.markers_accepted, true) {
+            self.action = Some((false, "Conflict markers are left in the files above. Commit again to commit them as they are.".into()));
+            cx.notify();
+            return;
+        }
         let all = self.staged_paths().is_empty();
         self.run_action("Commit", move |root| git::commit(&root, &message, all), false, window, cx);
     }
@@ -5308,6 +5342,8 @@ struct ParsedPatch {
     first_lines: HashMap<String, u32>,
     hashes: HashMap<String, u64>,
     hunks: Vec<git::Hunk>,
+    /// Files with a conflict left in them, and its line.
+    marked: Vec<(String, u32)>,
 }
 
 fn text_hash(text: &str) -> u64 {
@@ -5328,6 +5364,7 @@ fn parse_patch(patch: String, seen: &mut u64) -> Option<ParsedPatch> {
         first_lines: git::first_changed_lines(&patch),
         hashes: file_patch_hashes(&patch),
         hunks: git::hunks(&patch),
+        marked: git::conflict_marked(&patch),
         files: with_languages(files),
     })
 }

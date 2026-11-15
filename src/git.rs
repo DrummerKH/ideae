@@ -376,6 +376,9 @@ pub struct BranchInfo {
     pub behind_base: u32,
     pub last_hash: String,
     pub last_subject: String,
+    /// The files a pull would leave in conflict, with what is committed
+    /// here or only written; empty when none, or when it cannot be told.
+    pub pull_conflicts: Vec<String>,
 }
 
 /// `git status` read once for all it tells: the branch, how far it is from
@@ -443,6 +446,8 @@ fn parse_status(out: &str) -> Status {
 /// again now and then, since a remote can be added and a default changed.
 #[derive(Default)]
 pub struct Known {
+    /// What a pull was last tried on in the mind, and how it came out.
+    pull: (String, Vec<String>),
     age: u32,
     git_dir: Option<PathBuf>,
     refs: Option<PathBuf>,
@@ -518,6 +523,15 @@ pub fn refresh(root: &Path, picked: Option<String>, known: &mut Known) -> Refres
         Some(fork) => (base, tracked_patch(root, &fork) + &new_files),
         None => (None, String::new()),
     };
+    if info.upstream.is_some() && info.behind > 0 {
+        // Asked again only when a side of it has moved.
+        let theirs = git(root, &["rev-parse", "@{u}"]).unwrap_or_default();
+        let key = format!("{oid} {} {}", theirs.trim(), working.len() ^ working.bytes().fold(0usize, |sum, byte| sum.wrapping_mul(31).wrapping_add(byte as usize)));
+        if known.pull.0 != key {
+            known.pull = (key, pull_conflicts(root).unwrap_or_default());
+        }
+        info.pull_conflicts = known.pull.1.clone();
+    }
     let staged = if states.values().any(|state| state.staged) { git(root, &["diff", "--cached"]).unwrap_or_default() } else { String::new() };
     Refreshed { files, watch, info, states, working, base, branch, staged }
 }
@@ -886,12 +900,68 @@ pub fn rebase_onto(root: &Path, base: &str) -> Result<String, RebaseError> {
     }
 }
 
+/// The files that would be left in conflict by taking in the upstream:
+/// the merge is made of trees only, nothing in the worktree or the index
+/// moves. What is not committed counts as it is on disk. None when git is
+/// too old to tell (before 2.38) or there is no upstream.
+pub fn pull_conflicts(root: &Path) -> Option<Vec<String>> {
+    // A commit of the worktree as it is, kept nowhere; nothing when it is clean.
+    // Git refuses to make one of some states of the index: then it is not known.
+    let made = crate::procs::command("git").current_dir(root).args(["stash", "create"]).output().ok().filter(|made| made.status.success())?;
+    let written = String::from_utf8_lossy(&made.stdout).trim().to_string();
+    let mine = if written.is_empty() { "HEAD" } else { written.as_str() };
+    let merged = crate::procs::command("git")
+        .current_dir(root)
+        .args(["merge-tree", "--write-tree", "--name-only", "--no-messages", mine, "@{u}"])
+        .output()
+        .ok()?;
+    match merged.status.code() {
+        Some(0) => Some(Vec::new()),
+        // The tree it made, then the files it could not merge.
+        Some(1) => Some(String::from_utf8_lossy(&merged.stdout).lines().skip(1).filter(|line| !line.is_empty()).map(str::to_string).collect()),
+        _ => None,
+    }
+}
+
+/// The files of a patch that have a conflict left in them, as markers at
+/// the start of added lines, and the line of the first.
+pub fn conflict_marked(patch: &str) -> Vec<(String, u32)> {
+    let mut found: Vec<(String, u32)> = Vec::new();
+    let (mut path, mut line, mut opened) = (String::new(), 0u32, None);
+    for text in patch.lines() {
+        if text.starts_with("diff --git ") {
+            (path, opened) = (String::new(), None);
+        } else if let Some(name) = text.strip_prefix("+++ b/") {
+            path = name.to_string();
+        } else if let Some(at) = text.strip_prefix("@@ -") {
+            line = at.split(" +").nth(1).and_then(|new| new.split([',', ' ']).next()).and_then(|n| n.parse().ok()).unwrap_or(0);
+        } else if text.starts_with('+') {
+            if text.starts_with("+<<<<<<< ") {
+                opened = Some(line);
+            } else if text.starts_with("+>>>>>>> ") {
+                if let Some(at) = opened.take().filter(|_| !path.is_empty() && found.last().is_none_or(|(last, _)| *last != path)) {
+                    found.push((path.clone(), at));
+                }
+            }
+            line += 1;
+        } else if text.starts_with(' ') {
+            line += 1;
+        }
+    }
+    found
+}
+
 pub fn pull_safe(root: &Path) -> Result<String, String> {
     run(root, "git", &["fetch", "--prune"])?;
     let ahead = run(root, "git", &["rev-list", "--count", "@{u}..HEAD"])?.trim().parse::<u32>().unwrap_or(0);
     let behind = run(root, "git", &["rev-list", "--count", "HEAD..@{u}"])?.trim().parse::<u32>().unwrap_or(0);
     if behind == 0 {
         return Ok("Already up to date".into());
+    }
+    // Not tried at all then: what is written but not committed would come
+    // back out of the stash with the conflict in it, and nothing undoes that.
+    if let Some(files) = pull_conflicts(root).filter(|files| !files.is_empty()) {
+        return Err(format!("would conflict in {}, nothing changed", files.join(", ")));
     }
     if ahead == 0 {
         run(root, "git", &["merge", "--ff-only", "--autostash", "@{u}"])?;
@@ -960,7 +1030,7 @@ mod lock_tests {
 // They script repositories with bash, which Windows lacks or has as WSL's.
 #[cfg(all(test, unix))]
 mod pull_tests {
-    use super::pull_safe;
+    use super::{conflict_marked, pull_conflicts, pull_safe, working_patch};
     use std::{path::Path, process::Command};
 
     fn sh(dir: &Path, script: &str) {
@@ -984,6 +1054,7 @@ mod pull_tests {
         let base = setup("ff");
         sh(&base, "cd a; printf 'one\\ntwo\\nthree\\nfour\\n' > f.txt; git commit -qam up; git push -q origin main
             cd ../b; echo note > untracked.txt; printf 'ONE\\ntwo\\nthree\\n' > f.txt");
+        assert_eq!(pull_conflicts(&base.join("b")), Some(Vec::new()), "the lines written here are not the ones that come");
         let out = pull_safe(&base.join("b")).unwrap();
         assert!(out.starts_with("Fast-forwarded"), "{out}");
         let text = std::fs::read_to_string(base.join("b/f.txt")).unwrap();
@@ -991,14 +1062,38 @@ mod pull_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// What is only written, not committed, and what comes change the
+    /// same line: the pull is told beforehand and not tried, where a stash
+    /// coming back would have left its conflict in the file.
+    #[test]
+    fn a_pull_over_unsaved_work_it_would_break_is_not_tried() {
+        let base = setup("unsaved");
+        sh(&base, "cd a; printf 'one\\nTWO-remote\\nthree\\n' > f.txt; git commit -qam remote; git push -q origin main
+            cd ../b; printf 'one\\nTWO-written\\nthree\\n' > f.txt; git fetch -q");
+        let b = base.join("b");
+        assert_eq!(pull_conflicts(&b), Some(vec!["f.txt".to_string()]));
+        assert!(pull_safe(&b).unwrap_err().starts_with("would conflict in f.txt"));
+        assert_eq!(std::fs::read_to_string(b.join("f.txt")).unwrap(), "one\nTWO-written\nthree\n", "as it was written");
+        let stashes = Command::new("git").args(["stash", "list"]).current_dir(&b).output().unwrap().stdout;
+        assert!(stashes.is_empty(), "nothing put away and left there");
+        assert!(conflict_marked(&working_patch(&b)).is_empty());
+        // The conflict as a stash would have left it is seen for what it is.
+        std::fs::write(b.join("f.txt"), "one\n<<<<<<< Updated upstream\nTWO-remote\n=======\nTWO-written\n>>>>>>> Stashed changes\nthree\n").unwrap();
+        assert_eq!(conflict_marked(&working_patch(&b)), [("f.txt".to_string(), 2)]);
+        std::fs::write(b.join("f.txt"), "one\n    let marker = \"<<<<<<< \";\n>>>>>>> alone\nthree\n").unwrap();
+        assert!(conflict_marked(&working_patch(&b)).is_empty(), "a marker in code, or one without its pair, is no conflict");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn conflict_is_undone() {
         let base = setup("conflict");
         sh(&base, "cd a; printf 'one\\nTWO-remote\\nthree\\n' > f.txt; git commit -qam remote; git push -q origin main
-            cd ../b; printf 'one\\nTWO-local\\nthree\\n' > f.txt; git commit -qam local");
+            cd ../b; printf 'one\\nTWO-local\\nthree\\n' > f.txt; git commit -qam local; git fetch -q");
         let head_before = Command::new("git").args(["rev-parse", "HEAD"]).current_dir(base.join("b")).output().unwrap().stdout;
+        assert_eq!(pull_conflicts(&base.join("b")), Some(vec!["f.txt".to_string()]));
         let err = pull_safe(&base.join("b")).unwrap_err();
-        assert!(err.starts_with("conflicts"), "{err}");
+        assert!(err.starts_with("would conflict in f.txt"), "{err}");
         let head_after = Command::new("git").args(["rev-parse", "HEAD"]).current_dir(base.join("b")).output().unwrap().stdout;
         assert_eq!(head_before, head_after);
         assert!(!base.join("b/.git/rebase-merge").exists());
