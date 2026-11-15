@@ -4345,6 +4345,7 @@ impl TaskView {
             } else {
                 file.update(cx, |f, cx| {
                     f.lsp_client = None;
+                    f.lsp_program.clear();
                     f.lsp_ok = Some(false);
                     f.lsp_missing = None;
                     f.lsp_status = status.into();

@@ -46,6 +46,9 @@ pub struct Server {
     pub args: &'static [&'static str],
 }
 
+/// Every language server ideae knows, for Settings.
+pub const SERVERS: &[&str] = &["gopls", "rust-analyzer", "typescript-language-server", "intelephense", "kotlin-lsp"];
+
 fn known(path: &Path) -> Option<(&'static str, &'static str, &'static [&'static str])> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
     Some(match ext {
@@ -67,6 +70,9 @@ pub fn server_for(path: &Path) -> Result<Server, String> {
     }
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
     let (language_id, program, args) = known(path).ok_or_else(|| format!("no language server for .{ext}"))?;
+    if crate::state::settings().lsp_off.iter().any(|p| p == program) {
+        return Err(format!("{program} off in Settings"));
+    }
     let command = locate(program).ok_or_else(|| format!("{program} not installed"))?;
     Ok(Server { language_id, program, command, args })
 }

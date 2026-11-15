@@ -70,6 +70,8 @@ pub struct Workspace {
     pub active: Option<PathBuf>,
     pub active_collapsed: bool,
     agent: Option<String>,
+    /// The agent given on the command line, over Settings.
+    agent_override: Option<Option<String>>,
     hook_socket: Option<String>,
     /// Kept alive for the app's lifetime: dropping it removes the socket.
     _bridge: Option<agent::Bridge>,
@@ -94,7 +96,7 @@ pub struct Workspace {
 impl Workspace {
     pub fn new(
         repos: Vec<PathBuf>,
-        agent: Option<String>,
+        agent: Option<Option<String>>,
         appearance: Option<Appearance>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -118,10 +120,8 @@ impl Workspace {
         .inspect_err(|e| eprintln!("agent hooks off: {e}"))
         .ok();
         // Claude gets the hooks; any other agent command runs as given.
-        let agent = match (agent, &bridge) {
-            (Some(cmd), Some(bridge)) if cmd == "claude" => Some(bridge.claude_command("claude")),
-            (agent, _) => agent,
-        };
+        let agent_override = agent;
+        let agent = Self::agent_command(&agent_override, bridge.as_ref());
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut hook_socket = bridge.as_ref().map(|b| b.socket.clone());
         // Terminals run in the daemon, which also takes the hooks. Without
@@ -252,6 +252,7 @@ impl Workspace {
             active: None,
             active_collapsed: saved.active_collapsed,
             agent,
+            agent_override,
             hook_socket,
             _bridge: bridge,
             appearance,
@@ -395,6 +396,7 @@ impl Workspace {
             active_collapsed: self.active_collapsed,
             power_saving: crate::lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed),
             window: self.window_place.clone(),
+            settings: state::settings(),
             active_task: self.active.clone(),
             zoom: crate::zoom::current(cx),
             projects: self
@@ -496,6 +498,9 @@ impl Workspace {
     /// task just shown.
     fn refresh_prs(&mut self, now: bool, window: &mut Window, cx: &mut Context<Self>) {
         use crate::pr::PrState;
+        if !state::settings().pr_status {
+            return;
+        }
         use std::time::Duration;
         let mut due = Vec::new();
         for p in &mut self.projects {
@@ -578,7 +583,10 @@ impl Workspace {
     /// Language servers of tasks out of view this long go to sleep;
     /// IDEAE_LSP_IDLE_SECS shortens it for tests.
     fn lsp_idle() -> std::time::Duration {
-        let secs = std::env::var("IDEAE_LSP_IDLE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(15 * 60);
+        let secs = std::env::var("IDEAE_LSP_IDLE_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(u64::from(state::settings().lsp_idle_minutes.max(1)) * 60);
         std::time::Duration::from_secs(secs)
     }
 
@@ -831,7 +839,8 @@ impl Workspace {
         });
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
-            let result = cx.background_spawn(async move { git::create_task_worktree(&repo, &branch) }).await;
+            let copy_env = state::settings().copy_env;
+            let result = cx.background_spawn(async move { git::create_task_worktree(&repo, &branch, copy_env) }).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 match result {
                     Ok(_) => {
@@ -1005,7 +1014,7 @@ impl Workspace {
         let was = view.read(cx).agent_status.clone();
         view.update(cx, |t, cx| t.set_agent_status(status.clone(), seen, cx));
         self.projects[pi].tasks[ti].last_active = state::now();
-        if status.is_attention() && !seen && status != was && !event.replayed {
+        if status.is_attention() && !seen && status != was && !event.replayed && state::settings().notifications {
             let body = match &status {
                 agent::AgentStatus::NeedsInput(message) => message.clone(),
                 _ => "Finished".to_string(),
@@ -1036,6 +1045,39 @@ impl Workspace {
             });
         })
         .detach();
+    }
+
+    /// The agent tab's command line: the command line's choice, else the
+    /// Settings one; Claude gets the hooks.
+    fn agent_command(over: &Option<Option<String>>, bridge: Option<&agent::Bridge>) -> Option<String> {
+        let cmd = match over {
+            Some(cmd) => cmd.clone(),
+            None => Some(state::settings().agent).filter(|a| !a.trim().is_empty()),
+        };
+        match (cmd, bridge) {
+            (Some(cmd), Some(bridge)) if cmd.trim() == "claude" => Some(bridge.claude_command("claude")),
+            (cmd, _) => cmd,
+        }
+    }
+
+    /// New settings: they go to the state, and what they change now
+    /// changes (new tasks' agent, language servers of open files).
+    pub fn apply_settings(&mut self, new: state::Settings, cx: &mut Context<Self>) {
+        let old = state::settings();
+        state::set_settings(new.clone());
+        self.agent = Self::agent_command(&self.agent_override, self._bridge.as_ref());
+        if old.lsp_off != new.lsp_off {
+            for view in self.views() {
+                view.update(cx, |t, cx| {
+                    t.set_language_servers(false, cx);
+                    if !crate::lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed) {
+                        t.set_language_servers(true, cx);
+                    }
+                });
+            }
+        }
+        self.save(cx);
+        cx.notify();
     }
 
     /// The window's ×: the window goes, the daemon's agents and terminals

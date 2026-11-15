@@ -14,10 +14,57 @@ pub struct State {
     pub active_collapsed: bool,
     pub power_saving: bool,
     pub window: Option<WindowPlace>,
+    pub settings: Settings,
     pub active_task: Option<PathBuf>,
     /// Text size per kind of view.
     pub zoom: crate::zoom::Zoom,
     pub projects: Vec<ProjectState>,
+}
+
+/// What the user set in Settings (Ctrl+,).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(default)]
+pub struct Settings {
+    /// The agent tab's command; empty for a plain shell. `--agent` and
+    /// `--no-agent` on the command line win.
+    pub agent: String,
+    /// Language servers (program names) never started.
+    pub lsp_off: Vec<String>,
+    /// Minutes a task out of view keeps its language servers.
+    pub lsp_idle_minutes: u32,
+    pub notifications: bool,
+    /// Copy the main checkout's ignored `.env*` files into new worktrees.
+    pub copy_env: bool,
+    pub pr_status: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            agent: "claude".into(),
+            lsp_off: Vec::new(),
+            lsp_idle_minutes: 15,
+            notifications: true,
+            copy_env: true,
+            pr_status: true,
+        }
+    }
+}
+
+static SETTINGS: std::sync::RwLock<Option<Settings>> = std::sync::RwLock::new(None);
+
+/// The settings in force, readable from any thread.
+pub fn settings() -> Settings {
+    if let Some(s) = SETTINGS.read().unwrap().as_ref() {
+        return s.clone();
+    }
+    let loaded = load().settings;
+    *SETTINGS.write().unwrap() = Some(loaded.clone());
+    loaded
+}
+
+pub fn set_settings(settings: Settings) {
+    *SETTINGS.write().unwrap() = Some(settings);
 }
 
 /// The window's size and place. Wayland lets no app choose its position;

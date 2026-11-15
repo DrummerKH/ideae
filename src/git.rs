@@ -615,7 +615,7 @@ pub fn task_worktree_dir(repo: &Path, branch: &str) -> PathBuf {
 /// Creates the worktree of a new task next to the repository, in
 /// `<repo>.worktrees/<branch>`, and copies the main worktree's untracked
 /// `.env*` files into it.
-pub fn create_task_worktree(repo: &Path, branch: &str) -> Result<PathBuf, String> {
+pub fn create_task_worktree(repo: &Path, branch: &str, copy_env: bool) -> Result<PathBuf, String> {
     let dir = task_worktree_dir(repo, branch);
     if dir.exists() {
         return Err(format!("{} already exists", dir.display()));
@@ -623,7 +623,9 @@ pub fn create_task_worktree(repo: &Path, branch: &str) -> Result<PathBuf, String
     let base = new_task_base(repo);
     let dir_s = dir.to_string_lossy().into_owned();
     git_status(repo, &["worktree", "add", "--no-track", "-b", branch, &dir_s, &base])?;
-    copy_env_files(repo, &dir);
+    if copy_env {
+        copy_env_files(repo, &dir);
+    }
     Ok(dir)
 }
 

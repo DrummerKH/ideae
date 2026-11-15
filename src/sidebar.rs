@@ -326,7 +326,7 @@ impl Workspace {
             details.push(busy.to_string());
         }
         let needs = if in_active { None } else { needs };
-        let pr = t.pr.clone();
+        let pr = t.pr.clone().filter(|_| crate::state::settings().pr_status);
 
         let this = cx.weak_entity();
         let (starred, main) = (t.starred, t.main);

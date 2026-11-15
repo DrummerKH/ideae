@@ -18,6 +18,7 @@ mod naming;
 mod pr;
 mod procs;
 mod search;
+mod settings_ui;
 mod sidebar;
 mod sysmon;
 mod state;
@@ -199,6 +200,7 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &FindInFiles, window, cx| this.finder(finder::FinderKind::Grep, window, cx)))
             .on_action(cx.listener(|this, _: &Quit, window, cx| this.request_quit(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)))
             .on_action(cx.listener(|this, _: &NewTask, window, cx| {
                 if let Some(project) = this.active_project().or((!this.projects.is_empty()).then_some(0)) {
                     this.new_task_dialog(project, window, cx);
@@ -207,7 +209,7 @@ impl Render for Workspace {
     }
 }
 
-actions!(ideae, [GoToFile, FindInFiles, NewTask, Quit]);
+actions!(ideae, [GoToFile, FindInFiles, NewTask, Quit, OpenSettings]);
 
 impl Workspace {
     fn finder(&mut self, kind: finder::FinderKind, window: &mut Window, cx: &mut Context<Self>) {
@@ -283,6 +285,12 @@ impl Workspace {
                 }))
             })
             .separator()
+            .item(PopupMenuItem::new("Settings…  Ctrl+,").on_click({
+                let s = this.clone();
+                move |_, window, cx| {
+                    let _ = s.update(cx, |w, cx| w.open_settings(window, cx));
+                }
+            }))
             .when(desktop::can_pin(), |menu| menu.item(PopupMenuItem::new(if pinned { "Unpin from dash" } else { "Pin to dash" }).on_click(
                 move |_, window, cx| {
                     let result = if pinned { Ok(desktop::unpin()) } else { desktop::pin() };
@@ -399,13 +407,14 @@ fn main() {
         return;
     }
     let mut repos = Vec::new();
-    let mut agent = Some("claude".to_string());
+    // None: as Settings say; Some(None): --no-agent.
+    let mut agent: Option<Option<String>> = None;
     let mut appearance: Option<Appearance> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--agent" => agent = args.next(),
-            "--no-agent" => agent = None,
+            "--agent" => agent = Some(args.next()),
+            "--no-agent" => agent = Some(None),
             "--theme" => {
                 appearance = args.next().and_then(|v| Appearance::parse(&v))
             }
@@ -463,6 +472,7 @@ fn main() {
                     KeyBinding::new("ctrl-shift-f", FindInFiles, context),
                     KeyBinding::new("ctrl-shift-t", NewTask, context),
                     KeyBinding::new("ctrl-q", Quit, context),
+                    KeyBinding::new("ctrl-,", OpenSettings, context),
                 ]);
             }
             // Ctrl+Alt+Left/Right switch GNOME workspaces. In a terminal Alt+Left
