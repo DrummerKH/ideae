@@ -932,6 +932,9 @@ pub struct TaskView {
     expanded: HashSet<SharedString>,
     /// Folders folded in the Changes tree, as "staged:dir" / "changes:dir".
     folded_changes: HashSet<String>,
+    /// Out of view long enough (or never shown): no language servers run;
+    /// they start when the task comes into view.
+    pub lsp_asleep: bool,
     file_states: HashMap<String, git::FileState>,
     commit_input: Entity<gpui_kit::component::input::TextareaState>,
     /// The git/gh action running, and the outcome of the last one.
@@ -1087,6 +1090,7 @@ impl TaskView {
             shared_files: Arc::default(),
             expanded: HashSet::new(),
             folded_changes: HashSet::new(),
+            lsp_asleep: false,
             file_states: HashMap::new(),
             commit_input,
             busy: None,
@@ -2526,6 +2530,9 @@ impl TaskView {
         };
         let missing = lsp::missing_server(path);
         file.update(cx, |f, _| f.lsp_missing = missing);
+        if self.lsp_asleep && lsp::server_for(path).is_ok() {
+            return set_status(file, Some(false), ASLEEP.to_string(), cx);
+        }
         let lsp::Server { language_id, program, command, args } = match lsp::server_for(path) {
             Ok(server) => server,
             Err(reason) => return set_status(file, Some(false), reason, cx),
@@ -4187,6 +4194,11 @@ impl TaskView {
     /// Stops this task's language servers, or starts them again for the
     /// open files.
     pub fn set_language_servers(&mut self, on: bool, cx: &mut Context<Self>) {
+        let status = if on || !self.lsp_asleep { "language servers off (power saving)" } else { ASLEEP };
+        // Asleep, a task starts its servers when it comes into view, not now.
+        if on && self.lsp_asleep {
+            return;
+        }
         let files: Vec<Entity<FileView>> = self
             .tabs
             .iter()
@@ -4214,13 +4226,41 @@ impl TaskView {
                     f.lsp_client = None;
                     f.lsp_ok = Some(false);
                     f.lsp_missing = None;
-                    f.lsp_status = "language servers off (power saving)".into();
+                    f.lsp_status = status.into();
                     cx.notify();
                 });
                 self.use_search_definitions(&path, &editor, true, cx);
             }
         }
         cx.notify();
+    }
+}
+
+const ASLEEP: &str = "language server asleep: task out of view";
+
+impl TaskView {
+    /// Stops the language servers of a task out of view; they cost
+    /// gigabytes each, and reindexing on the way back takes a minute or two.
+    pub fn put_language_servers_to_sleep(&mut self, cx: &mut Context<Self>) {
+        if self.lsp_asleep {
+            return;
+        }
+        self.lsp_asleep = true;
+        self.set_language_servers(false, cx);
+    }
+
+    pub fn wake_language_servers(&mut self, cx: &mut Context<Self>) {
+        if !self.lsp_asleep {
+            return;
+        }
+        self.lsp_asleep = false;
+        // Under power saving the files say so rather than "asleep".
+        let on = !lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed);
+        self.set_language_servers(on, cx);
+    }
+
+    pub fn has_language_servers(&self) -> bool {
+        !self.lsp.is_empty()
     }
 }
 

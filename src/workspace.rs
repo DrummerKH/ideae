@@ -34,6 +34,9 @@ pub struct TaskEntry {
     pub view: Option<Entity<TaskView>>,
     /// A git operation on it is running (creating, deleting).
     pub busy: Option<SharedString>,
+    /// When it was last in view, this run; its language servers sleep after
+    /// a while out of view.
+    pub left_view: Option<std::time::Instant>,
     /// Locked worktree (`git worktree lock`) whose locker is gone.
     pub locked: Option<String>,
 }
@@ -163,6 +166,7 @@ impl Workspace {
                     this.save(cx);
                     if n % 10 == 0 {
                         this.sync_worktrees(window, cx);
+                        this.sleep_idle_language_servers(cx);
                     }
                 });
                 if alive.is_err() {
@@ -252,6 +256,7 @@ impl Workspace {
                     view: None,
                     busy: None,
                     locked: None,
+                    left_view: None,
                 })
                 .collect();
             self.projects.push(project);
@@ -366,6 +371,8 @@ impl Workspace {
         let (root, branch, session) = (entry.path.clone(), entry.branch.clone(), entry.session.clone());
         let view = cx.new(|cx| {
             let mut t = TaskView::new(root, branch, agent, socket, window, cx);
+            // Servers start when the task comes into view (switch).
+            t.lsp_asleep = true;
             t.restore(&session, window, cx);
             t
         });
@@ -382,6 +389,9 @@ impl Workspace {
                     t.set_visible(false, window, cx)
                 });
             }
+            if let Some(old) = self.active.clone().and_then(|a| self.entry_mut(&a)) {
+                old.left_view = Some(std::time::Instant::now());
+            }
         }
         let Some(view) = self.load(path, window, cx) else { return };
         self.active = Some(path.to_path_buf());
@@ -390,9 +400,30 @@ impl Workspace {
         }
         view.update(cx, |t, cx| {
             t.unseen = false;
+            t.wake_language_servers(cx);
             t.set_visible(true, window, cx)
         });
         cx.notify();
+    }
+
+    /// Language servers of tasks out of view this long go to sleep;
+    /// IDEAE_LSP_IDLE_SECS shortens it for tests.
+    fn lsp_idle() -> std::time::Duration {
+        let secs = std::env::var("IDEAE_LSP_IDLE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(15 * 60);
+        std::time::Duration::from_secs(secs)
+    }
+
+    fn sleep_idle_language_servers(&mut self, cx: &mut Context<Self>) {
+        for p in &self.projects {
+            for t in &p.tasks {
+                let (Some(view), Some(left)) = (&t.view, t.left_view) else { continue };
+                if self.active.as_deref() != Some(t.path.as_path()) && left.elapsed() >= Self::lsp_idle() {
+                    if view.read(cx).has_language_servers() {
+                        view.update(cx, |t, cx| t.put_language_servers_to_sleep(cx));
+                    }
+                }
+            }
+        }
     }
 
     /// Stops a task; its worktree and tabs stay for the next start.
@@ -534,6 +565,7 @@ impl Workspace {
                     view: None,
                     busy: None,
                     locked: None,
+                    left_view: None,
                 },
             );
         }
@@ -622,6 +654,7 @@ impl Workspace {
             view: None,
             busy: Some("creating…".into()),
             locked: None,
+            left_view: None,
         });
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
@@ -743,6 +776,7 @@ impl Workspace {
                                 view: None,
                                 busy: None,
                                 locked: wt.locked.clone(),
+                                left_view: None,
                             }),
                         }
                     }
