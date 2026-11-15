@@ -69,11 +69,14 @@ opt-level = 2
 
 # window_border.rs patched: no 20px client-side shadow inset (see the file).
 # diff/mod.rs patched: Diff::code_font_size, a per-view code size for zoom.
+# diff/mod.rs + state.rs patched: room past the last file; scroll_to_file puts a header a third down.
 [patch.crates-io]
 gpui-component = { path = "vendor/gpui-component" }
 # terminal/core.rs + engine.rs patched: report light/dark (CSI ? 996 n, mode 2031).
 gpui-cn = { path = "vendor/gpui-cn" }
 # input/base/state.rs patched: hover/Ctrl+click hit-test ignored the scroll offset.
+# input/base/state.rs + element.rs + editor/lsp/definitions.rs patched: jump_to_position,
+# a jump lands a third down the viewport unless already in view.
 gpui-base = { path = "vendor/gpui-base" }
 
 [dev-dependencies]

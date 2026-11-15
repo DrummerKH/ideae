@@ -510,6 +510,9 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(super) overscroll: Overscroll,
     /// The deferred scroll offset to apply on next layout.
     pub(crate) deferred_scroll_offset: Option<Point<Pixels>>,
+    /// ideae patch: on next layout, a cursor out of comfortable view lands
+    /// this far down the viewport (0.0 top, 1.0 bottom).
+    pub(crate) reveal_at: Option<f32>,
     /// The size of the scrollable content.
     pub(crate) scroll_size: gpui::Size<Pixels>,
     pub(super) editor_scrollbar_snapshot: Cell<Option<EditorScrollbarSnapshot>>,
@@ -1004,6 +1007,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             longest_line_width: Cell::new(None),
             editor_paddings: Edges::default(),
             deferred_scroll_offset: None,
+            reveal_at: None,
             placeholder: SharedString::default(),
             mask_pattern: MaskPattern::default(),
             mask_pattern_set: false,
@@ -1645,6 +1649,21 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.move_to(offset, None, cx);
         self.update_preferred_column();
         self.focus(window, cx);
+    }
+
+    /// ideae patch: [`Self::set_cursor_position`] for a jump (go to
+    /// definition, a search hit): unless the line is already well in view,
+    /// it lands `fraction` of the way down the viewport rather than at an edge.
+    pub fn jump_to_position(
+        &mut self,
+        position: impl Into<Position>,
+        fraction: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.reveal_at = Some(fraction.clamp(0., 1.));
+        self.set_cursor_position(position, window, cx);
+        cx.notify();
     }
 
     /// Focus the input field.

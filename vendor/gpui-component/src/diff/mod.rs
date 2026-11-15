@@ -559,6 +559,9 @@ fn render_diff(
     });
     let rows = state.rows().clone();
     let scrollbar = state.list().clone();
+    // ideae patch: room past the end, so the last file can come up to where
+    // scroll_to_file puts a header.
+    let tail = state.viewport().height * (2. / 3.);
     let horizontal = state.horizontal_scroll().clone();
     let has_rows = !rows.is_empty();
     let label = match state.files() {
@@ -591,7 +594,8 @@ fn render_diff(
                             .into_any_element()
                     })
                     .w(content_width)
-                    .h_full(),
+                    .h_full()
+                    .pb(tail),
                 ))
                 .into_any_element(),
             scrollbar.clone(),

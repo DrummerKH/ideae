@@ -729,7 +729,8 @@ impl<M: InputModeKind> TextElement<M> {
 
                     // Vertical cursor-follow is suppressed while auto-scroll manages the y axis,
                     // to prevent fighting the background scroll task.
-                    if !auto_scrolling {
+                    if !auto_scrolling && state.reveal_at.is_some() {
+                    } else if !auto_scrolling {
                         scroll_offset.y = reveal_row(
                             scroll_offset.y,
                             cursor_pos.y,
@@ -761,6 +762,19 @@ impl<M: InputModeKind> TextElement<M> {
                             // selection end is out of top
                             scroll_offset.y = -cursor_end.y;
                         }
+                    }
+                }
+            }
+
+            // ideae patch: a jump puts its line `reveal_at` down the viewport,
+            // unless it is already between the top margin and the last quarter.
+            if is_active && !state.auto_scroll.is_active() {
+                if let Some(fraction) = state.reveal_at.filter(|_| bounds.size.height > line_height) {
+                    let top = scroll_offset.y + cursor_pos.y;
+                    let height = bounds.size.height;
+                    let comfortable = top >= top_bottom_margin && top + line_height <= height * 0.75;
+                    if !comfortable {
+                        scroll_offset.y = -(cursor_pos.y - (height * fraction).round());
                     }
                 }
             }
@@ -3531,6 +3545,10 @@ impl<M: InputModeKind> Element for TextElement<M> {
             state.scroll_size = prepaint.scroll_size;
             state.update_scroll_offset(Some(prepaint.cursor_scroll_offset), cx);
             state.deferred_scroll_offset = None;
+            // ideae patch: a jump reveals once, on the layout that knows its line.
+            if bounds.size.height > px(0.) {
+                state.reveal_at = None;
+            }
 
             // Layout consumers need changed geometry, not another notification
             // for every paint of an unchanged input.

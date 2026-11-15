@@ -542,7 +542,7 @@ impl FileView {
 
     fn go_to_line(&mut self, line: u32, col: u32, window: &mut Window, cx: &mut Context<Self>) {
         self.editor.update(cx, |state, cx| {
-            state.set_cursor_position(Position::new(line, col), window, cx);
+            state.jump_to_position(Position::new(line, col), JUMP_AT, window, cx);
         });
         self.editor.read(cx).focus_handle(cx).focus(window, cx);
     }
@@ -1336,6 +1336,8 @@ enum RightPane {
 }
 
 const NAV_LIMIT: usize = 100;
+/// How far down the viewport a jump puts its line, unless already in view.
+const JUMP_AT: f32 = 1. / 3.;
 
 /// A place in the navigation history. Files go by path, so a closed one
 /// opens again; other tabs by id, and are skipped once closed.
@@ -3263,7 +3265,7 @@ impl TaskView {
         });
         editor.update(cx, |state, cx| {
             state.set_value(content.clone(), window, cx);
-            state.set_cursor_position(Position::new(line, col), window, cx);
+            state.jump_to_position(Position::new(line, col), JUMP_AT, window, cx);
         });
 
         let saved: SharedString = content.clone().into();

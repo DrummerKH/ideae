@@ -838,6 +838,8 @@ impl DiffState {
             item_ix,
             offset_in_item: px(0.),
         });
+        // ideae patch: the header a third down rather than at the very top.
+        self.list.scroll_by(-(self.viewport.height / 3.).round());
         cx.notify();
     }
 
