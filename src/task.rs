@@ -1053,7 +1053,7 @@ impl TaskView {
                 .with_env(crate::agent::TASK_ENV, root.display().to_string());
         }
         if let Some(input) = input {
-            options = options.with_input(format!("{input}\n"));
+            options = options.with_input(format!("{input}\n")).with_env(crate::agent::ROLE_ENV, "agent");
         }
         let config = TerminalConfig::default().with_colors(crate::theme::terminal_colors(cx));
         let state = cx.new(|cx| TerminalState::local(options, config, window, cx));

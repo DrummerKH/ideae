@@ -17,6 +17,8 @@ use serde_json::{Value, json};
 
 pub const SOCK_ENV: &str = "IDEAE_SOCK";
 pub const TASK_ENV: &str = "IDEAE_TASK";
+/// Set to `agent` in the agent tab's terminal, for the process monitor.
+pub const ROLE_ENV: &str = "IDEAE_ROLE";
 
 /// Hook events we listen to.
 const EVENTS: &[&str] = &[

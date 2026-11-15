@@ -11,6 +11,7 @@ mod naming;
 mod procs;
 mod search;
 mod sidebar;
+mod sysmon;
 mod state;
 mod task;
 mod theme;
@@ -63,6 +64,7 @@ impl Render for Workspace {
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .on_click(|_, _, cx| cx.stop_propagation())
                                 .gap_3()
+                                .child(div().mr_2().child(sysmon::SysMon::render_widget(&self.sysmon, cx)))
                                 .child(
                                     Button::new("go-to-file")
                                         .xsmall()

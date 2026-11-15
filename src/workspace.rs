@@ -71,6 +71,7 @@ pub struct Workspace {
     pub sidebar_width: Pixels,
     /// In the GNOME dash; asked once, not while the menu opens.
     pub pinned: bool,
+    pub sysmon: Entity<crate::sysmon::SysMon>,
     /// The state as last written, to write only changes.
     last_saved: String,
     _subscriptions: Vec<Subscription>,
@@ -176,6 +177,11 @@ impl Workspace {
             appearance,
             sidebar_width: px(saved.sidebar_width.unwrap_or(260.)),
             pinned: crate::desktop::is_pinned(),
+            sysmon: {
+                let mon = cx.new(crate::sysmon::SysMon::new);
+                cx.observe(&mon, |_, _, cx| cx.notify()).detach();
+                mon
+            },
             last_saved: String::new(),
             _subscriptions: subscriptions,
             _tick: tick,
@@ -783,7 +789,10 @@ impl Workspace {
                 agent::AgentStatus::NeedsInput(message) => message.clone(),
                 _ => "Finished".to_string(),
             };
-            let _ = std::process::Command::new("notify-send").args(["-a", state::APP_ID, &label, &body]).spawn();
+            // Waited for off the UI thread, or each one stays a zombie.
+            if let Ok(mut child) = std::process::Command::new("notify-send").args(["-a", state::APP_ID, &label, &body]).spawn() {
+                std::thread::spawn(move || child.wait());
+            }
         }
         cx.notify();
     }
