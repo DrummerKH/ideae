@@ -53,6 +53,17 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
         )
         .default_value(f64::from(default.lsp_idle_minutes))
     };
+    let fetch = {
+        let (read, write) = (draft.clone(), draft.clone());
+        let options = [(1, "Every minute"), (2, "Every 2 minutes"), (5, "Every 5 minutes"), (10, "Every 10 minutes"), (15, "Every 15 minutes"), (30, "Every 30 minutes"), (0, "Never")]
+            .into_iter()
+            .map(|(m, label)| (SharedString::from(m.to_string()), SharedString::from(label)))
+            .collect();
+        SettingField::dropdown(options, move |_| read.borrow().fetch_minutes.to_string().into(), move |value, _| {
+            write.borrow_mut().fetch_minutes = value.parse().unwrap_or(0)
+        })
+        .default_value(SharedString::from(default.fetch_minutes.to_string()))
+    };
     let servers = lsp::SERVERS.iter().map(|def| {
         let program = def.program;
         let (read, write) = (draft.clone(), draft.clone());
@@ -108,6 +119,9 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
                     "New worktrees get the main checkout's ignored .env* files.",
                     |s| s.copy_env,
                     |s, v| s.copy_env = v,
+                ))
+                .item(SettingItem::new("Fetch the base branch", fetch).description(
+                    "Brings origin's main branch up to date in the background, so tasks show how far behind they are and what they share.",
                 ))
                 .item(switch(
                     draft,

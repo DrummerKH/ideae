@@ -111,6 +111,8 @@ pub struct Workspace {
     /// What each task changed since its fork, by worktree path: tasks of
     /// a project that touch the same files are marked before they clash.
     pub touched: std::collections::HashMap<PathBuf, std::collections::BTreeSet<String>>,
+    /// When each project's base branch was last fetched in the background.
+    fetched: std::collections::HashMap<PathBuf, std::time::Instant>,
 }
 
 impl Workspace {
@@ -293,6 +295,9 @@ impl Workspace {
                     if n % 10 == 1 {
                         this.refresh_touched(window, cx);
                     }
+                    if n % 5 == 2 {
+                        this.fetch_bases(cx);
+                    }
                 });
                 if alive.is_err() {
                     break;
@@ -332,6 +337,7 @@ impl Workspace {
             updating: false,
             keep_terminals: false,
             touched: Default::default(),
+            fetched: Default::default(),
             build: crate::build_watch::BuildWatch::new(),
         };
         this.restore(&saved, window, cx);
@@ -625,6 +631,39 @@ impl Workspace {
                 }
                 cx.notify();
             });
+        })
+        .detach();
+    }
+
+    /// Fetches the base branch of projects with a remote, each as often as
+    /// Settings say; the task views see the new refs on their next poll.
+    fn fetch_bases(&mut self, cx: &mut Context<Self>) {
+        let minutes = state::settings().fetch_minutes;
+        if minutes == 0 {
+            return;
+        }
+        let every = std::time::Duration::from_secs(u64::from(minutes) * 60);
+        let now = std::time::Instant::now();
+        let due: Vec<PathBuf> = self
+            .projects
+            .iter()
+            .map(|p| p.path.clone())
+            .filter(|path| self.fetched.get(path).is_none_or(|at| now.duration_since(*at) >= every))
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+        for path in &due {
+            self.fetched.insert(path.clone(), now);
+        }
+        cx.background_spawn(async move {
+            for repo in due {
+                if let Err(e) = git::fetch_base(&repo) {
+                    if std::env::var_os("IDEAE_DEBUG").is_some() {
+                        eprintln!("fetch {}: {e}", repo.display());
+                    }
+                }
+            }
         })
         .detach();
     }

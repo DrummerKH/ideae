@@ -36,6 +36,9 @@ pub struct Settings {
     /// Copy the main checkout's ignored `.env*` files into new worktrees.
     pub copy_env: bool,
     pub pr_status: bool,
+    /// Minutes between background fetches of each project's base branch;
+    /// 0 for never.
+    pub fetch_minutes: u32,
     /// Release builds ask GitHub for newer releases.
     pub check_updates: bool,
     /// Agents keep Claude Code's LSP plugins (a rust-analyzer per agent…).
@@ -54,6 +57,7 @@ impl Default for Settings {
             notifications: true,
             copy_env: true,
             pr_status: true,
+            fetch_minutes: 5,
             check_updates: true,
             agent_lsp: true,
             keys: std::collections::BTreeMap::new(),

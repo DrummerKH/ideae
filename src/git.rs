@@ -752,6 +752,19 @@ mod pull_tests {
     }
 
     #[test]
+    fn fetch_base_brings_the_default_branch() {
+        let base = setup("fetchbase");
+        sh(&base, "cd a; echo later > h.txt; git add h.txt; git commit -qm later; git push -q origin main");
+        let b = base.join("b");
+        let before = super::git(&b, &["rev-parse", "origin/main"]).unwrap();
+        super::fetch_base(&b).unwrap();
+        let after = super::git(&b, &["rev-parse", "origin/main"]).unwrap();
+        assert_ne!(before, after);
+        assert_eq!(after, super::git(&base.join("a"), &["rev-parse", "HEAD"]).unwrap());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn touched_files_since_the_fork() {
         let base = setup("touched");
         sh(&base, "cd a; echo later > h.txt; git add h.txt; git commit -qm later; git push -q origin main
@@ -794,6 +807,45 @@ fn git_status(root: &Path, args: &[&str]) -> Result<String, String> {
 pub fn main_worktree(path: &Path) -> Option<PathBuf> {
     git(path, &["rev-parse", "--git-dir"])?;
     worktrees(path).into_iter().next().map(|w| w.path)
+}
+
+/// Fetches the remote's default branch, quietly: no prompt for a password
+/// or key (it fails instead), no gc afterwards, given up after a minute.
+pub fn fetch_base(repo: &Path) -> Result<(), String> {
+    let head = git(repo, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]).map(|s| s.trim().to_string());
+    let branch = match head.as_deref().and_then(|h| h.strip_prefix("origin/")) {
+        Some(branch) => branch.to_string(),
+        None => ["main", "master"]
+            .into_iter()
+            .find(|b| git(repo, &["rev-parse", "--verify", "-q", &format!("refs/remotes/origin/{b}")]).is_some_and(|s| !s.trim().is_empty()))
+            .ok_or("no origin/main or origin/master")?
+            .to_string(),
+    };
+    let mut child = crate::procs::command("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["fetch", "--quiet", "--no-auto-maintenance", "origin", &branch])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("SSH_ASKPASS_REQUIRE", "never")
+        .env("GCM_INTERACTIVE", "never")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        match child.try_wait().map_err(|e| e.to_string())? {
+            Some(status) if status.success() => return Ok(()),
+            Some(status) => return Err(format!("git fetch: {status}")),
+            None if std::time::Instant::now() > deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("git fetch: timed out".into());
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(200)),
+        }
+    }
 }
 
 /// Where a new task branches from: the remote's default branch, fetched
