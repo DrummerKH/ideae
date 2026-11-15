@@ -1071,13 +1071,15 @@ pub fn remove_task_worktree(repo: &Path, path: &Path, branch: &str, unlock: bool
 #[cfg(test)]
 mod variant_tests {
     use super::*;
-    use std::process::Command;
 
+    // Scripted with bash, which Windows lacks or has as WSL's.
+    #[cfg(unix)]
     fn sh(dir: &Path, script: &str) {
-        let ok = Command::new("bash").arg("-ec").arg(script).current_dir(dir).status().unwrap().success();
+        let ok = std::process::Command::new("bash").arg("-ec").arg(script).current_dir(dir).status().unwrap().success();
         assert!(ok, "{script}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn variants_fork_from_one_commit_and_the_ones_not_kept_are_parked() {
         let base = std::env::temp_dir().join(format!("ideae-variants-{}", std::process::id()));
