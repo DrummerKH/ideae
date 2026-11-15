@@ -406,7 +406,13 @@ impl Render for FileView {
                     .text_color(cx.theme().muted_foreground)
                     .border_b_1()
                     .border_color(cx.theme().border)
-                    .child(div().flex_none().max_w(relative(0.45)).truncate().child(self.path.display().to_string()))
+                    .child(
+                        div()
+                            .flex_none()
+                            .max_w(relative(0.45))
+                            .truncate()
+                            .child(self.path.strip_prefix(&self.root).unwrap_or(&self.path).display().to_string()),
+                    )
                     .children(self.render_blame(cx))
                     .when(!crate::ide::installed().is_empty(), |header| {
                         let path = self.path.clone();
@@ -1048,10 +1054,12 @@ impl TaskView {
                     .background_spawn(async move {
                         let files = git::files(&root);
                         let watch = git::watch_dirs(&root, &files);
+                        let info = git::branch_info(&root);
+                        // On the base branch itself the comparison is the uncommitted diff again.
                         let branch = picked
-                            .or_else(|| git::base_ref(&root))
+                            .or_else(|| git::base_ref(&root).filter(|base| *base != info.head))
                             .and_then(|base| git::branch_patch(&root, &base).map(|p| (base, p)));
-                        (git::working_patch(&root), files, git::branch_info(&root), git::file_states(&root), watch, branch)
+                        (git::working_patch(&root), files, info, git::file_states(&root), watch, branch)
                     })
                     .await;
                 let applied = this.update_in(cx, |this, window, cx| {
@@ -2348,7 +2356,7 @@ impl TaskView {
                 Button::new("log")
                     .xsmall()
                     .ghost()
-                    .label("Log")
+                    .label("History")
                     .tooltip("The branch's history (Ctrl+3)")
                     .on_click(cx.listener(|this, _, window, cx| {
                         cx.stop_propagation();
@@ -2937,12 +2945,52 @@ impl TaskView {
         let staged = self.staged_paths().len();
         let b = &self.branch_info;
         let busy = self.busy.is_some();
+        let (push_label, push_tip) = if !b.has_origin {
+            ("Push".to_string(), "No remote named origin")
+        } else if b.upstream.is_none() {
+            ("Publish".to_string(), "Push the branch to origin and track it")
+        } else if b.ahead > 0 {
+            (format!("Push ↑{}", b.ahead), "Push the commits to the upstream")
+        } else {
+            ("Push".to_string(), "Nothing to push")
+        };
+        let can_push = b.has_origin && (b.upstream.is_none() || b.ahead > 0);
+        // Status above the message box: the box is pinned to the bottom, so
+        // nothing below it moves when a status shows up.
         v_flex()
             .flex_none()
             .gap_1p5()
             .p_2()
             .border_t_1()
             .border_color(cx.theme().border)
+            .when_some(self.busy, |this, label| {
+                this.child(div().text_xs().text_color(cx.theme().muted_foreground).child(format!("{label}…")))
+            })
+            .when_some(self.action.clone().filter(|_| !busy), |this, (ok, message)| {
+                this.child(
+                    h_flex()
+                        .gap_1()
+                        .items_start()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_xs()
+                                .text_color(if ok { gpui_kit::green() } else { gpui_kit::red() })
+                                .child(message.lines().find(|l| !l.trim().is_empty()).unwrap_or_default().to_string()),
+                        )
+                        .child(
+                            Button::new("dismiss-action")
+                                .xsmall()
+                                .ghost()
+                                .label("×")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.action = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
             .child(gpui_kit::component::input::Textarea::new(&self.commit_input).small())
             .child(
                 h_flex()
@@ -2959,8 +3007,9 @@ impl TaskView {
                         Button::new("push")
                             .small()
                             .ghost()
-                            .disabled(busy)
-                            .label(if b.ahead > 0 { format!("Push ↑{}", b.ahead) } else { "Push".to_string() })
+                            .disabled(busy || !can_push)
+                            .label(push_label)
+                            .tooltip(push_tip)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 let upstream = this.branch_info.upstream.is_some();
                                 this.run_action("Push", move |root| git::push(&root, upstream), false, window, cx)
@@ -2970,26 +3019,19 @@ impl TaskView {
                         Button::new("pr")
                             .small()
                             .ghost()
-                            .disabled(busy)
+                            .disabled(busy || !b.has_origin)
                             .label("PR")
-                            .tooltip("Open this branch's pull request, creating it if needed")
+                            .tooltip(if b.has_origin {
+                                "Open this branch's pull request, creating it if needed"
+                            } else {
+                                "No remote named origin"
+                            })
                             .on_click(cx.listener(|this, _, window, cx| {
                                 let upstream = this.branch_info.upstream.is_some();
                                 this.run_action("PR", move |root| git::pull_request(&root, upstream), true, window, cx)
                             })),
                     ),
             )
-            .when_some(self.busy, |this, label| {
-                this.child(div().text_xs().text_color(cx.theme().muted_foreground).child(format!("{label}…")))
-            })
-            .when_some(self.action.clone().filter(|_| !busy), |this, (ok, message)| {
-                this.child(
-                    div()
-                        .text_xs()
-                        .text_color(if ok { gpui_kit::green() } else { gpui_kit::red() })
-                        .child(message.lines().find(|l| !l.trim().is_empty()).unwrap_or_default().to_string()),
-                )
-            })
     }
 
     fn render_change_lists(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3028,8 +3070,12 @@ impl TaskView {
             list = list.child(section("unstage-all", format!("STAGED ({})", staged.len()), "unstage all", false, cx));
             list = self.render_change_tree(list, &staged, true, cx);
         }
-        list = list.child(section("stage-all", format!("CHANGES ({})", unstaged.len()), "stage all", true, cx));
-        list = self.render_change_tree(list, &unstaged, false, cx);
+        if self.files.is_empty() {
+            list = list.child(div().p_3().text_sm().text_color(cx.theme().muted_foreground).child("No uncommitted changes"));
+        } else if !unstaged.is_empty() {
+            list = list.child(section("stage-all", format!("CHANGES ({})", unstaged.len()), "stage all", true, cx));
+            list = self.render_change_tree(list, &unstaged, false, cx);
+        }
         list.overflow_y_scrollbar()
     }
 

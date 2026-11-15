@@ -477,8 +477,10 @@ impl WindowState {
                         .iter()
                         .filter(|dialog| !dialog.closing)
                         .count();
-                    // Only restore focus if no new dialogs were opened during animation
-                    if current_open_dialogs == open_dialogs {
+                    // Only restore focus if no new dialogs were opened during animation.
+                    // ideae patch: nor when something took focus meanwhile (a task
+                    // the dialog created focuses its terminal).
+                    if current_open_dialogs == open_dialogs && window.focused(cx).is_none() {
                         window.focus(&handle, cx);
                     }
                     this.pending_focus_restore = None;

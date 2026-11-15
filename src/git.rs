@@ -156,6 +156,8 @@ pub fn files(root: &Path) -> Vec<String> {
 pub struct BranchInfo {
     pub head: String,
     pub upstream: Option<String>,
+    /// Push and PR go to `origin`.
+    pub has_origin: bool,
     pub ahead: u32,
     pub behind: u32,
     pub last_hash: String,
@@ -179,6 +181,7 @@ pub fn branch_info(root: &Path) -> BranchInfo {
             }
         }
     }
+    info.has_origin = git(root, &["remote", "get-url", "origin"]).is_some();
     if let Some(last) = git(root, &["log", "-1", "--format=%h%x1f%s"]) {
         if let Some((hash, subject)) = last.trim_end().split_once('\x1f') {
             info.last_hash = hash.to_string();

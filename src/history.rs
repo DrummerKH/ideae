@@ -132,7 +132,7 @@ impl HistoryView {
                     .text_color(cx.theme().muted_foreground)
                     .border_b_1()
                     .border_color(cx.theme().border)
-                    .child(format!("{} commits", self.commits.len())),
+                    .child(match self.commits.len() { 1 => "1 commit".to_string(), n => format!("{n} commits") }),
             )
             .child(
                 div()
