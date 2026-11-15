@@ -1593,7 +1593,12 @@ impl Render for ChangesView {
                             .line_number(true)
                             .render_header_suffix({
                                 let (root, task, lines) = (self.root.clone(), self.task.clone(), self.first_lines.clone());
-                                move |file, _, _| open_file_button(&root, &task, file, &lines)
+                                move |file, _, cx| {
+                                    h_flex()
+                                        .gap_2()
+                                        .when(staging, |row| row.child(viewed_checkbox(&task, file, cx)))
+                                        .child(open_file_button(&root, &task, file, &lines))
+                                }
                             })
                             .on_line_click({
                                 let view = cx.weak_entity();
@@ -3624,8 +3629,9 @@ impl TaskView {
         let touched = Rc::new(self.agent_touched.clone());
         let editing = self.agent_editing.clone();
         div().flex_1().min_h_0().child(
-            tree(&self.tree, move |ix, entry, selected, _, _| {
+            tree(&self.tree, move |ix, entry, selected, _, cx| {
                 let item = entry.item();
+                let label = if entry.is_folder() { StyledText::new(item.label.clone()) } else { file_label(item.label.clone(), cx) };
                 let icon = if !entry.is_folder() {
                     IconName::File
                 } else if entry.is_expanded() {
@@ -3660,7 +3666,7 @@ impl TaskView {
                             .gap_2()
                             .text_sm()
                             .child(icon)
-                            .child(div().truncate().child(item.label.clone()))
+                            .child(div().truncate().child(label))
                             .when(is_changed && agent.is_none(), |this| this.child(div().text_xs().text_color(gpui_kit::green()).child("●")))
                             .when_some(agent, |this, mark| this.child(div().text_xs().text_color(gpui_kit::blue()).child(mark))),
                     )
@@ -4460,6 +4466,10 @@ impl TaskView {
         self.viewed.get(file.path.as_ref()) == Some(&file.hash)
     }
 
+    fn is_path_viewed(&self, path: &str) -> bool {
+        self.files.iter().any(|f| f.path.as_ref() == path && self.viewed.get(path) == Some(&f.hash))
+    }
+
     fn toggle_viewed(&mut self, path: &str, cx: &mut Context<Self>) {
         let Some(file) = self.files.iter().find(|f| f.path.as_ref() == path) else { return };
         if self.viewed.get(path) == Some(&file.hash) {
@@ -4467,6 +4477,7 @@ impl TaskView {
         } else {
             self.viewed.insert(path.to_string(), file.hash);
         }
+        self.changes.update(cx, |_, cx| cx.notify());
         cx.emit(TaskEvent::Changed);
         cx.notify();
     }
@@ -4490,6 +4501,8 @@ impl TaskView {
         let keyboard = self.side_has_focus.get() && self.right == RightPane::Changes && ix == self.side_selected;
         let viewed = self.is_viewed(ix);
         let view_path = file.path.to_string();
+        let discard_path = file.path.to_string();
+        let view = cx.weak_entity();
         h_flex()
             .id(("file", id))
             .when(keyboard, |row| row.border_l_2().border_color(cx.theme().primary))
@@ -4502,7 +4515,7 @@ impl TaskView {
             .cursor_pointer()
             .hover(|s| s.bg(cx.theme().accent))
             .child(div().w(px(12.)).text_color(cx.theme().muted_foreground).child(status))
-            .child(div().flex_1().min_w_0().truncate().when(viewed, |d| d.text_color(cx.theme().muted_foreground)).child(name))
+            .child(div().flex_1().min_w_0().truncate().when(viewed, |d| d.text_color(cx.theme().muted_foreground)).child(file_label(name.into(), cx)))
             .children(self.agent_mark(&file.path))
             .when(viewed, |row| row.child(div().text_xs().text_color(gpui_kit::green()).child("✓")))
             .child(div().text_xs().text_color(gpui_kit::green()).child(format!("+{}", file.additions)))
@@ -4523,33 +4536,6 @@ impl TaskView {
                                 this.toggle_viewed(&view_path, cx)
                             })),
                     )
-                    .when(!deleted, |row| {
-                        row.child(
-                            Button::new(("open", id))
-                                .xsmall()
-                                .ghost()
-                                .label("open")
-                                .tooltip("Open the file at its first change")
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    cx.stop_propagation();
-                                    this.open_file(open_path.clone(), open_line, window, cx)
-                                })),
-                        )
-                    })
-                    .when(!in_staged, |row| {
-                        let discard_path = file.path.to_string();
-                        row.child(
-                            Button::new(("discard", id))
-                                .xsmall()
-                                .ghost()
-                                .label("↺")
-                                .tooltip("Discard the changes to this file (Undo follows)")
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    cx.stop_propagation();
-                                    this.confirm_discard(discard_path.clone(), window, cx)
-                                })),
-                        )
-                    })
                     .child(
                         Button::new(("stage", id))
                             .xsmall()
@@ -4563,6 +4549,23 @@ impl TaskView {
                     ),
             )
             .on_click(cx.listener(move |this, _, window, cx| this.show_changed_file(path.clone(), window, cx)))
+            .context_menu(move |menu, _, _| {
+                use gpui_kit::component::menu::PopupMenuItem;
+                let (open_view, open_path) = (view.clone(), open_path.clone());
+                let (discard_view, discard_path) = (view.clone(), discard_path.clone());
+                menu.when(!deleted, |menu| {
+                    menu.item(PopupMenuItem::new("Open").on_click(move |_, window, cx| {
+                        let path = open_path.clone();
+                        open_view.update(cx, |this, cx| this.open_file(path, open_line, window, cx)).ok();
+                    }))
+                })
+                .when(!in_staged, |menu| {
+                    menu.item(PopupMenuItem::new("Discard changes").on_click(move |_, window, cx| {
+                        let path = discard_path.clone();
+                        discard_view.update(cx, |this, cx| this.confirm_discard(path, window, cx)).ok();
+                    }))
+                })
+            })
             .into_any_element()
     }
 
@@ -5234,6 +5237,31 @@ mod outline_tests {
         let labels: Vec<String> = outline(Path::new("a.kt"), kt).into_iter().map(|i| i.label).collect();
         assert!(labels.iter().any(|l| l.ends_with("count")), "{labels:?}");
     }
+}
+
+/// A file name whose extension steps back: the name is what is read.
+fn file_label(name: SharedString, cx: &App) -> StyledText {
+    let extension = name
+        .rfind('.')
+        .filter(|&dot| dot > 0)
+        .map(|dot| (dot..name.len(), HighlightStyle { color: Some(cx.theme().muted_foreground), ..Default::default() }));
+    StyledText::new(name).with_highlights(extension)
+}
+
+/// "Viewed" in a diff file's header, the mark the Changes list shows too.
+fn viewed_checkbox(task: &WeakEntity<TaskView>, file: &DiffFile, cx: &App) -> AnyElement {
+    let path = file.path().clone();
+    let viewed = task.upgrade().is_some_and(|t| t.read(cx).is_path_viewed(&path));
+    let task = task.clone();
+    gpui_kit::component::checkbox::Checkbox::new(SharedString::from(format!("viewed-{path}")))
+        .label("Viewed")
+        .checked(viewed)
+        .tooltip("Viewed until it changes again")
+        .on_click(move |_, _, cx| {
+            cx.stop_propagation();
+            let _ = task.update(cx, |t, cx| t.toggle_viewed(&path, cx));
+        })
+        .into_any_element()
 }
 
 /// "open" in a diff file's header: the file as it is now, at the first line

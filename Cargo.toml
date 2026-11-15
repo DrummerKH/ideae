@@ -71,6 +71,7 @@ opt-level = 2
 # window_border.rs patched: no 20px client-side shadow inset (see the file).
 # diff/mod.rs patched: Diff::code_font_size, a per-view code size for zoom.
 # diff/mod.rs + state.rs patched: room past the last file; scroll_to_file puts a header a third down.
+# diff/mod.rs patched: the header of the file under the top edge sticks there.
 [patch.crates-io]
 gpui-component = { path = "vendor/gpui-component" }
 # terminal/core.rs + engine.rs patched: report light/dark (CSI ? 996 n, mode 2031).
