@@ -211,13 +211,20 @@ impl Daemon {
     fn on_frame(&self, frame: Frame, on_hook: &impl Fn(Hook)) {
         match frame {
             Frame::Bytes { kind, id, bytes } => {
-                let mut peers = self.peers.lock().unwrap();
-                let Some(p) = peers.get_mut(&id) else { return };
-                if kind == KIND_REPLAY {
-                    p.mute_until = Some(Instant::now() + REPLAY_MUTE);
-                }
+                let peer = {
+                    let mut peers = self.peers.lock().unwrap();
+                    let Some(p) = peers.get_mut(&id) else { return };
+                    if kind == KIND_REPLAY {
+                        p.mute_until = Some(Instant::now() + REPLAY_MUTE);
+                    }
+                    p.peer.clone()
+                };
                 if kind == KIND_BYTES || kind == KIND_REPLAY {
-                    p.peer.output(&bytes);
+                    // Not under the lock, which the UI thread takes too. While
+                    // the terminal is behind, nothing more is read from the
+                    // daemon, which then holds the program back.
+                    peer.wait_for_room();
+                    peer.output(&bytes);
                 }
             }
             Frame::Msg(Msg::Exited { id, code, signal }) => {

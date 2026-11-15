@@ -33,6 +33,9 @@ scripts/           Xvfb driver for UI checks, icons.py, macos-app.sh (a .app aro
 - Zig 0.17.x must be on PATH (libghostty-vt). System -dev libraries: see README.
 - `cargo build`, `cargo test`. LSP tests are `#[ignore]` and need gopls / rust-analyzer.
 - Variants have an end-to-end test on a real repository with real terminals, `#[ignore]` too: `cargo test -- --ignored two_variants` after changing them.
+- Saving a file and following it on disk have one too: `cargo test -- --ignored an_open_file` after changing how an open file is written, reloaded or refreshed.
+- So has the start: `cargo test -- --ignored the_tasks_of_the_last_run` after changing how the tasks of the last run are restored.
+- And the daemon's terminals: `cargo test -- --ignored a_window_that_does_not_read` after changing how output goes from a session to a window (it floods one that reads nothing).
 - UI can be tested without a display: `#[gpui_kit::test]` with `gpui_kit::test` (find, click, scroll by element id; mark elements with `.test_support()`), as `settings_ui.rs` does.
 - A debug build is the separate app `ideae-dev`: own state, sockets, window class, launcher. Keep that split for anything new that has an identity on the system.
 
@@ -65,3 +68,27 @@ IDEAE_STATE=/tmp/x/state.json scripts/drive.sh /tmp/x/run.log 7 \
 - The repository is public: no personal paths, hostnames, emails or private project names in code, tests or commits.
 - Agents and terminals belong to tasks; whatever a task starts must end on Close, Delete and quit.
 - No comments unless the why is non-obvious.
+
+## Speed and memory
+
+The app is meant to be fast and light. Before a change is ready to commit or
+push, read it once more for what it costs:
+
+- Nothing slow on the UI thread: no file or network I/O, no `git` or other
+  process, no waiting on a channel, lock or `sleep`. That is everything
+  outside `background_spawn` or a thread of its own: event handlers, entity
+  updates, the code after an `.await` in `cx.spawn`. Read, run and parse in
+  the background; bring the result to the UI thread to apply.
+- `render` runs on every frame: no disk access (`exists`, `is_file`), no
+  parsing, no collection rebuilt from all files or tasks. Compute when the
+  data changes and keep the result.
+- Per keystroke, nothing that grows with the file: no copy of the whole text
+  (`value()`, `text().to_string()`), no parse. Compare in place, or wait for a
+  pause in typing.
+- What repeats (timers, watchers, polls) skips work when nothing changed, and
+  does less for tasks out of view; every open task pays for it.
+- Memory: no second copy of large texts (file contents, patches) kept around;
+  share with `Rc`/`Arc`/`SharedString`. Caches have a bound and are dropped
+  with what they belong to.
+- A write moved off the UI thread must still be on disk when the task closes
+  or the app quits (as `FileView::save_now` does).

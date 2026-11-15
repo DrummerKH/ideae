@@ -100,25 +100,75 @@ const DIFF_ARGS: &[&str] = &[
 
 /// Uncommitted changes against HEAD, untracked files included, as one patch.
 pub fn working_patch(root: &Path) -> String {
-    patch_from(root, "HEAD")
+    let untracked = git(root, &["ls-files", "--others", "--exclude-standard", "-z"]).unwrap_or_default();
+    let untracked: Vec<&str> = untracked.split('\0').filter(|f| !f.is_empty()).collect();
+    tracked_patch(root, "HEAD") + &new_files_patch(root, &untracked)
 }
 
-/// The worktree (untracked files included) against `rev`.
-fn patch_from(root: &Path, rev: &str) -> String {
+/// The tracked files of the worktree against `rev`.
+fn tracked_patch(root: &Path, rev: &str) -> String {
     let mut args = vec!["diff", rev];
     args.extend_from_slice(DIFF_ARGS);
-    let mut patch = git(root, &args).unwrap_or_default();
+    git(root, &args).unwrap_or_default()
+}
 
-    let untracked = git(root, &["ls-files", "--others", "--exclude-standard", "-z"]).unwrap_or_default();
-    for file in untracked.split('\0').filter(|f| !f.is_empty()).take(200) {
-        let mut args = vec!["diff", "--no-index"];
-        args.extend_from_slice(DIFF_ARGS);
-        args.extend_from_slice(&["--", "/dev/null", file]);
-        if let Some(p) = git(root, &args) {
-            patch.push_str(&p);
-        }
+/// The most untracked files a patch shows, the largest of them shown in
+/// full, and the most of their text in all: an agent leaves logs, bundles
+/// and data files behind, and the patch is read again on every change.
+const NEW_FILES: usize = 200;
+const NEW_FILE_BYTES: u64 = 512 * 1024;
+const NEW_FILES_BYTES: usize = 4 * 1024 * 1024;
+
+/// Untracked files as the patch `git diff` would give were they added,
+/// made here: asking git costs a process a file, on every refresh.
+fn new_files_patch(root: &Path, untracked: &[&str]) -> String {
+    let mut patch = String::new();
+    for file in untracked.iter().take(NEW_FILES) {
+        new_file_patch(root, file, patch.len() < NEW_FILES_BYTES, &mut patch);
     }
     patch
+}
+
+fn new_file_patch(root: &Path, file: &str, in_full: bool, patch: &mut String) {
+    use std::fmt::Write as _;
+    let path = root.join(file);
+    let Ok(meta) = std::fs::symlink_metadata(&path) else { return };
+    #[cfg(unix)]
+    let executable = std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o111 != 0;
+    #[cfg(not(unix))]
+    let executable = false;
+    let (mode, text) = if meta.file_type().is_symlink() {
+        ("120000", std::fs::read_link(&path).ok().map(|to| to.to_string_lossy().into_owned()))
+    } else if !meta.is_file() {
+        return;
+    } else {
+        // Too large, or not text (as git tells: a NUL early on): named, not shown.
+        let text = (in_full && meta.len() <= NEW_FILE_BYTES)
+            .then(|| std::fs::read(&path).ok())
+            .flatten()
+            .filter(|bytes| !bytes[..bytes.len().min(8000)].contains(&0))
+            .and_then(|bytes| String::from_utf8(bytes).ok());
+        (if executable { "100755" } else { "100644" }, text)
+    };
+    let _ = write!(patch, "diff --git a/{file} b/{file}\nnew file mode {mode}\n");
+    match text {
+        None => {
+            let _ = writeln!(patch, "Binary files /dev/null and b/{file} differ");
+        }
+        Some(text) if text.is_empty() => {}
+        Some(text) => {
+            let lines = text.split_inclusive('\n').count();
+            let range = if lines == 1 { "+1".to_string() } else { format!("+1,{lines}") };
+            let _ = write!(patch, "--- /dev/null\n+++ b/{file}\n@@ -0,0 {range} @@\n");
+            for line in text.split_inclusive('\n') {
+                patch.push('+');
+                patch.push_str(line);
+            }
+            if !text.ends_with('\n') {
+                patch.push_str("\n\\ No newline at end of file\n");
+            }
+        }
+    }
 }
 
 /// First line of each file's first hunk on the new side, keyed by path.
@@ -168,34 +218,122 @@ pub struct BranchInfo {
     pub last_subject: String,
 }
 
-pub fn branch_info(root: &Path) -> BranchInfo {
-    let mut info = BranchInfo::default();
-    for line in git(root, &["status", "--branch", "--porcelain=v2"]).unwrap_or_default().lines() {
-        if let Some(head) = line.strip_prefix("# branch.head ") {
-            info.head = head.to_string();
-        } else if let Some(upstream) = line.strip_prefix("# branch.upstream ") {
-            info.upstream = Some(upstream.to_string());
-        } else if let Some(ab) = line.strip_prefix("# branch.ab ") {
+/// `git status` read once for all it tells: the branch, how far it is from
+/// its upstream, each changed file's state, the untracked files.
+#[derive(Default)]
+struct Status {
+    info: BranchInfo,
+    /// The commit HEAD is at.
+    oid: String,
+    states: std::collections::HashMap<String, FileState>,
+    untracked: Vec<String>,
+}
+
+fn status(root: &Path) -> Status {
+    parse_status(&git(root, &["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"]).unwrap_or_default())
+}
+
+fn parse_status(out: &str) -> Status {
+    let mut status = Status::default();
+    let mut entries = out.split('\0');
+    while let Some(entry) = entries.next() {
+        // What comes before the path: the kind, then fields by the kind.
+        let changed = |fields: usize| {
+            let mut parts = entry.splitn(fields + 1, ' ');
+            let xy = parts.nth(1)?.as_bytes();
+            Some((*xy.first()?, *xy.get(1)?, parts.nth(fields - 2)?.to_string()))
+        };
+        if let Some(head) = entry.strip_prefix("# branch.head ") {
+            status.info.head = head.to_string();
+        } else if let Some(oid) = entry.strip_prefix("# branch.oid ") {
+            status.oid = oid.to_string();
+        } else if let Some(upstream) = entry.strip_prefix("# branch.upstream ") {
+            status.info.upstream = Some(upstream.to_string());
+        } else if let Some(ab) = entry.strip_prefix("# branch.ab ") {
             for part in ab.split_whitespace() {
                 if let Some(n) = part.strip_prefix('+') {
-                    info.ahead = n.parse().unwrap_or(0);
+                    status.info.ahead = n.parse().unwrap_or(0);
                 } else if let Some(n) = part.strip_prefix('-') {
-                    info.behind = n.parse().unwrap_or(0);
+                    status.info.behind = n.parse().unwrap_or(0);
                 }
+            }
+        } else if let Some(path) = entry.strip_prefix("? ") {
+            status.states.insert(path.to_string(), FileState { staged: false, unstaged: true });
+            status.untracked.push(path.to_string());
+        } else {
+            let fields = match entry.as_bytes().first() {
+                Some(b'1') => 8,
+                Some(b'2') => {
+                    entries.next(); // the original path of a rename or copy
+                    9
+                }
+                Some(b'u') => 10,
+                _ => continue,
+            };
+            if let Some((x, y, path)) = changed(fields) {
+                status.states.insert(path, FileState { staged: x != b'.', unstaged: y != b'.' });
             }
         }
     }
-    info.has_origin = git(root, &["remote", "get-url", "origin"]).is_some();
+    status
+}
+
+/// What a refresh need not ask git every time: where the repository keeps
+/// itself, whether it has an origin, the branch work starts from. Asked
+/// again now and then, since a remote can be added and a default changed.
+#[derive(Default)]
+pub struct Known {
+    age: u32,
+    git_dir: Option<PathBuf>,
+    refs: Option<PathBuf>,
+    has_origin: bool,
+    base: Option<String>,
+}
+
+impl Known {
+    fn fresh(&mut self, root: &Path) {
+        if self.age % 30 == 0 {
+            self.git_dir = git(root, &["rev-parse", "--absolute-git-dir"]).map(|dir| PathBuf::from(dir.trim()));
+            self.refs = git(root, &["rev-parse", "--path-format=absolute", "--git-common-dir"])
+                .map(|common| PathBuf::from(common.trim()).join("refs"))
+                .filter(|refs| refs.is_dir());
+            self.has_origin = git(root, &["remote", "get-url", "origin"]).is_some();
+            self.base = base_ref(root);
+        }
+        self.age += 1;
+    }
+}
+
+/// All a task shows of its worktree, read in one go.
+pub struct Refreshed {
+    pub files: Vec<String>,
+    pub watch: (std::collections::BTreeSet<PathBuf>, Vec<PathBuf>),
+    pub info: BranchInfo,
+    pub states: std::collections::HashMap<String, FileState>,
+    /// The uncommitted changes, untracked files included.
+    pub working: String,
+    /// The branch compared with, and the changes since it forked from it.
+    pub base: Option<String>,
+    pub branch: String,
+}
+
+/// `picked`: the branch to compare with when not the one work starts from.
+pub fn refresh(root: &Path, picked: Option<String>, known: &mut Known) -> Refreshed {
+    known.fresh(root);
+    let files = files(root);
+    let mut flat: std::collections::BTreeSet<PathBuf> = files.iter().filter_map(|file| file.rsplit_once('/')).map(|(dir, _)| root.join(dir)).collect();
+    flat.insert(root.to_path_buf());
+    flat.extend(known.git_dir.clone());
+    let watch = (flat, known.refs.clone().into_iter().collect());
+
+    let Status { mut info, oid, states, untracked } = status(root);
+    info.has_origin = known.has_origin;
     // Not for the base branch itself (main, tracking origin/main).
-    if let Some(base) = base_ref(root).filter(|b| b.rsplit('/').next() != Some(info.head.as_str())) {
-        info.behind_base = git(root, &["rev-list", "--count", &format!("HEAD..{base}")])
-            .and_then(|n| n.trim().parse().ok())
-            .unwrap_or(0);
+    if let Some(base) = known.base.clone().filter(|b| b.rsplit('/').next() != Some(info.head.as_str())) {
+        info.behind_base = git(root, &["rev-list", "--count", &format!("HEAD..{base}")]).and_then(|n| n.trim().parse().ok()).unwrap_or(0);
         // Not published yet: its own commits are the ones ahead.
         if info.upstream.is_none() {
-            info.ahead = git(root, &["rev-list", "--count", &format!("{base}..HEAD")])
-                .and_then(|n| n.trim().parse().ok())
-                .unwrap_or(0);
+            info.ahead = git(root, &["rev-list", "--count", &format!("{base}..HEAD")]).and_then(|n| n.trim().parse().ok()).unwrap_or(0);
         }
         info.base = Some(base);
     }
@@ -205,7 +343,20 @@ pub fn branch_info(root: &Path) -> BranchInfo {
             info.last_subject = subject.to_string();
         }
     }
-    info
+
+    let untracked: Vec<&str> = untracked.iter().map(String::as_str).collect();
+    let new_files = new_files_patch(root, &untracked);
+    let working = tracked_patch(root, "HEAD") + &new_files;
+    // On the base branch itself the comparison is the uncommitted diff again.
+    let base = picked.or_else(|| known.base.clone().filter(|base| *base != info.head));
+    let fork = base.as_ref().and_then(|base| git(root, &["merge-base", "HEAD", base])).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let (base, branch) = match fork {
+        // No commit of its own yet: the same patch, not asked for twice.
+        Some(fork) if fork == oid => (base, working.clone()),
+        Some(fork) => (base, tracked_patch(root, &fork) + &new_files),
+        None => (None, String::new()),
+    };
+    Refreshed { files, watch, info, states, working, base, branch }
 }
 
 #[derive(Clone, Debug)]
@@ -248,28 +399,6 @@ pub fn commit_patch(root: &Path, hash: &str) -> String {
 pub struct FileState {
     pub staged: bool,
     pub unstaged: bool,
-}
-
-pub fn file_states(root: &Path) -> std::collections::HashMap<String, FileState> {
-    let mut states = std::collections::HashMap::new();
-    let out = git(root, &["status", "--porcelain=v1", "-z", "--untracked-files=all"]).unwrap_or_default();
-    let mut entries = out.split('\0');
-    while let Some(entry) = entries.next() {
-        if entry.len() < 4 {
-            continue;
-        }
-        let (x, y) = (entry.as_bytes()[0], entry.as_bytes()[1]);
-        let path = entry[3..].to_string();
-        if x == b'R' || x == b'C' {
-            entries.next(); // the original path of a rename or copy
-        }
-        let untracked = x == b'?';
-        states.insert(
-            path,
-            FileState { staged: !untracked && x != b' ', unstaged: untracked || y != b' ' },
-        );
-    }
-    states
 }
 
 /// Runs a command in `root` for a user action: stdout on success, stderr (or
@@ -381,29 +510,6 @@ pub fn pull_request(root: &Path, has_upstream: bool) -> Result<String, String> {
 /// The directories to watch so that any change to the worktree or its git
 /// state is seen: every directory holding a listed file, the worktree root,
 /// the git dir (HEAD, index) and the shared refs.
-pub fn watch_dirs(root: &Path, files: &[String]) -> (std::collections::BTreeSet<std::path::PathBuf>, Vec<std::path::PathBuf>) {
-    let mut flat = std::collections::BTreeSet::new();
-    flat.insert(root.to_path_buf());
-    for file in files {
-        if let Some((dir, _)) = file.rsplit_once('/') {
-            flat.insert(root.join(dir));
-        }
-    }
-    let mut recursive = Vec::new();
-    if let Some(git_dir) = git(root, &["rev-parse", "--absolute-git-dir"]) {
-        flat.insert(std::path::PathBuf::from(git_dir.trim()));
-    }
-    if let Some(common) = git(root, &["rev-parse", "--path-format=absolute", "--git-common-dir"]) {
-        let refs = std::path::PathBuf::from(common.trim()).join("refs");
-        if refs.is_dir() {
-            recursive.push(refs);
-        }
-    }
-    (flat, recursive)
-}
-
-/// The branch this task forks from: the remote's default branch, else the
-/// usual names. Exit code 1 counts as success in `git`, hence the emptiness checks.
 pub fn base_ref(root: &Path) -> Option<String> {
     let nonempty = |out: Option<String>| out.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     if let Some(r) = nonempty(git(root, &["rev-parse", "--abbrev-ref", "origin/HEAD"])) {
@@ -419,14 +525,6 @@ pub fn base_ref(root: &Path) -> Option<String> {
 
 /// Everything the task changed: from where it forked off `base` to the
 /// worktree as it is now, uncommitted work included.
-pub fn branch_patch(root: &Path, base: &str) -> Option<String> {
-    let fork = git(root, &["merge-base", "HEAD", base]).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())?;
-    Some(patch_from(root, &fork))
-}
-
-/// The files the task changed since it forked off `base`, committed or
-/// not, untracked included; lockfiles left out, as their clashes resolve
-/// themselves.
 pub fn touched_files(root: &Path, base: &str) -> Option<std::collections::BTreeSet<String>> {
     let fork = git(root, &["merge-base", "HEAD", base]).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())?;
     let changed = git(root, &["diff", "--name-only", "--no-renames", "-z", &fork])?;
@@ -462,20 +560,25 @@ impl BlameLine {
 }
 
 /// Who last changed each line (index 0 is line 1), by `git blame --porcelain`.
-pub fn blame(root: &Path, file: &Path) -> Vec<Option<BlameLine>> {
+pub fn blame(root: &Path, file: &Path) -> Vec<Option<std::sync::Arc<BlameLine>>> {
     let Some(out) = git(root, &["blame", "--porcelain", "--", &file.to_string_lossy()]) else {
         return Vec::new();
     };
-    let mut commits: std::collections::HashMap<String, BlameLine> = std::collections::HashMap::new();
-    let mut lines: Vec<Option<BlameLine>> = Vec::new();
-    let mut current: Option<(String, usize)> = None;
+    // A commit is told once and shared by its lines: a file has thousands
+    // of lines and a handful of commits.
+    let mut index: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut commits: Vec<BlameLine> = Vec::new();
+    let mut lines: Vec<Option<usize>> = Vec::new();
+    let mut current: Option<(usize, usize)> = None;
     for line in out.lines() {
         if line.starts_with('\t') {
-            if let Some((hash, final_line)) = current.take() {
-                if lines.len() < final_line {
-                    lines.resize(final_line, None);
+            if let Some((commit, final_line)) = current.take() {
+                if final_line > 0 {
+                    if lines.len() < final_line {
+                        lines.resize(final_line, None);
+                    }
+                    lines[final_line - 1] = Some(commit);
                 }
-                lines[final_line - 1] = commits.get(&hash).cloned();
             }
             continue;
         }
@@ -483,17 +586,14 @@ pub fn blame(root: &Path, file: &Path) -> Vec<Option<BlameLine>> {
         let first = parts.next().unwrap_or_default();
         if first.len() == 40 && first.bytes().all(|b| b.is_ascii_hexdigit()) {
             let final_line = parts.nth(1).and_then(|n| n.parse().ok()).unwrap_or(0);
-            commits.entry(first.to_string()).or_insert_with(|| BlameLine {
-                hash: first.to_string(),
-                author: String::new(),
-                time: 0,
-                summary: String::new(),
+            let commit = *index.entry(first).or_insert_with(|| {
+                commits.push(BlameLine { hash: first.to_string(), author: String::new(), time: 0, summary: String::new() });
+                commits.len() - 1
             });
-            current = Some((first.to_string(), final_line));
+            current = Some((commit, final_line));
             continue;
         }
-        let Some((hash, _)) = &current else { continue };
-        let Some(entry) = commits.get_mut(hash) else { continue };
+        let Some(entry) = current.and_then(|(commit, _)| commits.get_mut(commit)) else { continue };
         let rest = line.split_once(' ').map(|(_, r)| r).unwrap_or_default();
         match first {
             "author" => entry.author = rest.to_string(),
@@ -502,7 +602,8 @@ pub fn blame(root: &Path, file: &Path) -> Vec<Option<BlameLine>> {
             _ => {}
         }
     }
-    lines
+    let commits: Vec<std::sync::Arc<BlameLine>> = commits.into_iter().map(std::sync::Arc::new).collect();
+    lines.into_iter().map(|commit| commit.map(|commit| commits[commit].clone())).collect()
 }
 
 /// One commit's list entry, for a commit outside the loaded history.
@@ -900,10 +1001,29 @@ pub fn create_variant_worktrees(repo: &Path, branches: &[String], from: Option<&
     Ok((commit, made))
 }
 
-/// Whether a new task of this branch name would run into something: the
-/// branch, or the directory its worktree goes to.
-pub fn task_name_taken(repo: &Path, branch: &str) -> bool {
-    task_worktree_dir(repo, branch).exists() || branch_exists(repo, branch)
+/// The names a new task would run into, read once for asking about many:
+/// the repository's branches and the directories its worktrees are in.
+#[derive(Default)]
+pub struct TakenNames {
+    branches: std::collections::HashSet<String>,
+    dirs: std::collections::HashSet<String>,
+}
+
+impl TakenNames {
+    pub fn read(repo: &Path) -> Self {
+        let branches = git(repo, &["for-each-ref", "--format=%(refname:short)", "refs/heads"]).unwrap_or_default().lines().map(str::to_string).collect();
+        let dirs = std::fs::read_dir(task_worktree_dir(repo, ""))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        Self { branches, dirs }
+    }
+
+    pub fn has(&self, branch: &str) -> bool {
+        self.branches.contains(branch) || self.dirs.contains(&branch.replace('/', "-"))
+    }
 }
 
 /// Where a task's branch left its base.
@@ -1091,7 +1211,8 @@ mod variant_tests {
         let branches = ["fix-a".to_string(), "fix-b".to_string()];
         let (from, made) = create_variant_worktrees(&repo, &branches, None, false).unwrap();
         let made: Vec<PathBuf> = made.into_iter().map(Result::unwrap).collect();
-        assert!(task_name_taken(&repo, "fix-a") && !task_name_taken(&repo, "fix-c"));
+        let taken = TakenNames::read(&repo);
+        assert!(taken.has("fix-a") && taken.has("main") && !taken.has("fix-c"));
         let head = |dir: &Path| git(dir, &["rev-parse", "HEAD"]).unwrap();
         assert_eq!(head(&made[0]), head(&made[1]));
         assert_eq!((head(&made[0]), from.clone()), (head(&repo), head(&repo).trim().to_string()));
@@ -1129,5 +1250,118 @@ mod variant_tests {
         assert_eq!(shortstat(" 3 files changed, 84 insertions(+), 12 deletions(-)\n"), (3, 84, 12));
         assert_eq!(shortstat(" 1 file changed, 1 deletion(-)\n"), (1, 0, 1));
         assert_eq!(shortstat(""), (0, 0, 0));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod refresh_tests {
+    use super::*;
+    use gpui_kit::component::diff::{DiffFile, DiffFileStatus};
+
+    fn sh(dir: &Path, script: &str) {
+        let ok = Command::new("bash").arg("-ec").arg(script).current_dir(dir).status().unwrap().success();
+        assert!(ok, "{script}");
+    }
+
+    #[test]
+    fn status_tells_the_branch_the_states_and_the_untracked() {
+        let out = "# branch.oid abc\0# branch.head task\0# branch.upstream origin/task\0# branch.ab +2 -1\0\
+            1 .M N... 100644 100644 100644 aaa bbb src/a b.rs\0\
+            1 A. N... 000000 100644 100644 000 bbb new.rs\0\
+            2 R. N... 100644 100644 100644 aaa bbb R100 to here.rs\0from.rs\0\
+            u UU N... 100644 100644 100644 100644 a b c both.rs\0\
+            ? notes/todo.md\0";
+        let status = parse_status(out);
+        assert_eq!((status.info.head.as_str(), status.info.upstream.as_deref(), status.info.ahead, status.info.behind), ("task", Some("origin/task"), 2, 1));
+        assert_eq!(status.oid, "abc");
+        let state = |path: &str| status.states.get(path).map(|s| (s.staged, s.unstaged));
+        assert_eq!(state("src/a b.rs"), Some((false, true)));
+        assert_eq!(state("new.rs"), Some((true, false)));
+        assert_eq!(state("to here.rs"), Some((true, false)));
+        assert_eq!(state("both.rs"), Some((true, true)));
+        assert_eq!(state("notes/todo.md"), Some((false, true)));
+        assert_eq!((status.states.len(), status.untracked.as_slice()), (5, ["notes/todo.md".to_string()].as_slice()));
+    }
+
+    /// A refresh of a real worktree: what it reads, and its patch of new
+    /// files against the one git makes itself.
+    #[test]
+    fn a_refresh_reads_the_worktree_as_git_shows_it() {
+        let base = std::env::temp_dir().join(format!("ideae-refresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        sh(&base, "git init -q --bare -b main remote.git; git clone -q remote.git a 2>/dev/null; cd a
+            git config user.email t@t; git config user.name t; mkdir src
+            printf 'one\\ntwo\\n' > f.txt; echo x > src/staged.txt; git add .; git commit -qm base; git push -q origin main
+            git checkout -qb task
+            echo three >> f.txt; echo y >> src/staged.txt; git add src/staged.txt
+            printf 'new\\nfile\\n' > 'new one.txt'; printf 'no newline' > src/tail.txt; : > empty.txt
+            printf 'a\\0b' > data.bin; printf '#!/bin/sh\\n' > run.sh; chmod +x run.sh; ln -s f.txt link
+            head -c 700000 /dev/zero | tr '\\0' 'x' > big.txt");
+        let root = base.join("a").canonicalize().unwrap();
+        let mut known = Known::default();
+        let read = refresh(&root, None, &mut known);
+
+        assert_eq!((read.info.head.as_str(), read.info.base.as_deref(), read.info.has_origin, read.info.ahead), ("task", Some("origin/main"), true, 0));
+        assert!(!read.info.last_hash.is_empty() && read.info.last_subject == "base");
+        assert!(read.files.contains(&"src/tail.txt".to_string()) && read.files.contains(&"f.txt".to_string()));
+        assert!(read.watch.0.contains(&root) && read.watch.0.contains(&root.join("src")) && read.watch.0.contains(&root.join(".git")));
+        assert_eq!(read.watch.1, vec![root.join(".git/refs")]);
+        let state = |path: &str| read.states.get(path).map(|s| (s.staged, s.unstaged));
+        assert_eq!((state("f.txt"), state("src/staged.txt"), state("new one.txt")), (Some((false, true)), Some((true, false)), Some((false, true))));
+        assert_eq!((read.base.as_deref(), read.branch == read.working), (Some("origin/main"), true), "no commit of its own: one patch");
+
+        let ours = DiffFile::parse(&read.working).unwrap();
+        // The same files as git makes them, one process each.
+        let mut theirs = git(&root, &["diff", "HEAD"]).unwrap();
+        for file in ["big.txt", "data.bin", "empty.txt", "link", "new one.txt", "run.sh", "src/tail.txt"] {
+            theirs.push_str(&git(&root, &["diff", "--no-index", "--", "/dev/null", file]).unwrap());
+        }
+        let theirs = DiffFile::parse(&theirs).unwrap();
+        let shape = |files: &[DiffFile]| {
+            let mut all: Vec<_> = files.iter().map(|f| (f.path().to_string(), matches!(f.status(), DiffFileStatus::Added), f.additions(), f.deletions())).collect();
+            all.sort();
+            all
+        };
+        let (mut ours, theirs) = (shape(&ours), shape(&theirs));
+        // Too large to show: named, where git gives all of it.
+        let big = ours.iter_mut().find(|f| f.0 == "big.txt").unwrap();
+        assert_eq!((big.1, big.2), (true, 0));
+        big.2 = 1;
+        assert_eq!(ours, theirs);
+        assert!(read.working.len() < 10_000, "the large file is not in the patch");
+        assert_eq!(first_changed_lines(&read.working).get("new one.txt"), Some(&1));
+
+        // A commit of its own: the branch's patch has it, the working one does not.
+        sh(&root, "git commit -qm task");
+        let read = refresh(&root, None, &mut known);
+        assert_eq!(read.info.ahead, 1);
+        let (working, branch) = (DiffFile::parse(&read.working).unwrap(), DiffFile::parse(&read.branch).unwrap());
+        assert!(!working.iter().any(|f| f.path().as_ref() == "src/staged.txt") && branch.iter().any(|f| f.path().as_ref() == "src/staged.txt"));
+        assert!(branch.iter().any(|f| f.path().as_ref() == "new one.txt"), "untracked files are in both");
+        // Compared with a branch picked by hand.
+        assert_eq!(refresh(&root, Some("main".into()), &mut known).base.as_deref(), Some("main"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod blame_tests {
+    use super::*;
+
+    #[test]
+    fn lines_of_one_commit_share_what_is_known_of_it() {
+        let base = std::env::temp_dir().join(format!("ideae-blame-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let script = "git init -q -b main .; git config user.email t@t; git config user.name Ann; printf 'one\\ntwo\\nthree\\n' > f.txt; git add f.txt; git commit -qm first
+            git config user.name Bob; printf 'one\\nTWO\\nthree\\n' > f.txt; git commit -qam second";
+        assert!(Command::new("bash").arg("-ec").arg(script).current_dir(&base).status().unwrap().success());
+        let lines = blame(&base, &base.join("f.txt"));
+        let told: Vec<(&str, &str)> = lines.iter().map(|l| l.as_ref().map(|l| (l.author.as_str(), l.summary.as_str())).unwrap()).collect();
+        assert_eq!(told, [("Ann", "first"), ("Bob", "second"), ("Ann", "first")]);
+        assert!(std::sync::Arc::ptr_eq(lines[0].as_ref().unwrap(), lines[2].as_ref().unwrap()));
+        assert!(lines[0].as_ref().unwrap().time > 0 && lines[1].as_ref().unwrap().hash.len() == 40);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

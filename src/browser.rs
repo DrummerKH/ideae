@@ -121,6 +121,7 @@ fn chrome() -> Result<Arc<Chrome>> {
         }
         std::thread::sleep(Duration::from_millis(50));
     };
+    PORT.store(u32::from(port), std::sync::atomic::Ordering::Relaxed);
     let chrome = Arc::new(Chrome { port, ws_path, child, profile });
     *slot = Some(chrome.clone());
     Ok(chrome)
@@ -128,9 +129,13 @@ fn chrome() -> Result<Arc<Chrome>> {
 
 /// The DevTools endpoint for Playwright MCP (`--cdp-endpoint`), once Chrome runs.
 pub fn endpoint() -> Option<String> {
-    let slot = CHROME.get()?.lock().unwrap();
-    slot.as_ref().map(|c| format!("http://127.0.0.1:{}", c.port))
+    // Not through `CHROME`: it is locked for as long as Chrome takes to
+    // start, and this is asked on every frame.
+    Some(PORT.load(std::sync::atomic::Ordering::Relaxed)).filter(|port| *port > 0).map(|port| format!("http://127.0.0.1:{port}"))
 }
+
+/// The DevTools port of the Chrome that runs, 0 when none does.
+static PORT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 // ---------------------------------------------------------------- page session
 
@@ -138,6 +143,8 @@ enum Out {
     Command(&'static str, Value),
     /// A command whose result the UI waits for.
     Call(&'static str, Value, mpsc::Sender<Value>),
+    /// The tab came into view or left it.
+    Visible(bool),
     Close,
 }
 
@@ -182,12 +189,13 @@ impl Socket {
     fn call(&mut self, method: &str, params: Value, aside: &mut Vec<Value>) -> Result<Value> {
         let id = self.send(method, params)?;
         loop {
-            let Some(msg) = self.read()? else { continue };
+            let Some(mut msg) = self.read()? else { continue };
             if msg["id"].as_u64() == Some(id) {
                 if let Some(error) = msg.get("error") {
                     return Err(anyhow!("{method}: {}", error["message"]));
                 }
-                return Ok(msg["result"].clone());
+                // Taken, not copied: a screenshot is megabytes of text.
+                return Ok(msg["result"].take());
             }
             aside.push(msg);
         }
@@ -205,7 +213,40 @@ impl Socket {
     }
 }
 
+/// The pages open now. Chrome ends a while after the last one closes: it
+/// is a browser's worth of processes kept for nothing.
+static PAGES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const CHROME_IDLE: Duration = Duration::from_secs(60);
+
+struct OpenPage;
+
+impl OpenPage {
+    fn new() -> Self {
+        PAGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for OpenPage {
+    fn drop(&mut self) {
+        if PAGES.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) != 1 {
+            return;
+        }
+        std::thread::spawn(|| {
+            std::thread::sleep(CHROME_IDLE);
+            let Some(slot) = CHROME.get() else { return };
+            let mut slot = slot.lock().unwrap();
+            // Under the lock a new page waits for: it finds Chrome there, or starts one.
+            if PAGES.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                PORT.store(0, std::sync::atomic::Ordering::Relaxed);
+                *slot = None;
+            }
+        });
+    }
+}
+
 fn run_page(url: &str, in_tx: &async_channel::Sender<In>, out_rx: mpsc::Receiver<Out>) -> Result<()> {
+    let _open = OpenPage::new();
     let chrome = chrome()?;
     let (ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{}{}", chrome.port, chrome.ws_path))?;
     let mut socket = Socket { ws, next_id: 0, session: None };
@@ -223,9 +264,9 @@ fn run_page(url: &str, in_tx: &async_channel::Sender<In>, out_rx: mpsc::Receiver
     }
 
     let mut replies: std::collections::HashMap<u64, mpsc::Sender<Value>> = Default::default();
-    let handle = |msg: Value, socket: &mut Socket, replies: &mut std::collections::HashMap<u64, mpsc::Sender<Value>>| -> Result<()> {
+    let handle = |mut msg: Value, socket: &mut Socket, replies: &mut std::collections::HashMap<u64, mpsc::Sender<Value>>| -> Result<()> {
         if let Some(reply) = msg["id"].as_u64().and_then(|id| replies.remove(&id)) {
-            let _ = reply.send(msg["result"].clone());
+            let _ = reply.send(msg["result"].take());
             return Ok(());
         }
         match msg["method"].as_str() {
@@ -260,6 +301,16 @@ fn run_page(url: &str, in_tx: &async_channel::Sender<In>, out_rx: mpsc::Receiver
                 Ok(Out::Call(method, params, reply)) => {
                     let id = socket.send(method, params)?;
                     replies.insert(id, reply);
+                }
+                Ok(Out::Visible(visible)) => {
+                    // Out of view the page sends no frames, and this thread
+                    // looks for commands four times a second, not a hundred.
+                    if !visible {
+                        socket.send("Page.stopScreencast", json!({}))?;
+                    }
+                    if let MaybeTlsStream::Plain(stream) = socket.ws.get_mut() {
+                        stream.set_read_timeout(Some(Duration::from_millis(if visible { 10 } else { 250 })))?;
+                    }
                 }
                 Ok(Out::Close) | Err(mpsc::TryRecvError::Disconnected) => {
                     socket.session = None;
@@ -477,6 +528,8 @@ pub struct BrowserView {
     /// page was last told, to resize it only on change.
     bounds: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
     sent_size: std::rc::Rc<std::cell::Cell<(u32, u32, u32)>>,
+    /// In a tab that is shown, of a task in view.
+    visible: bool,
     /// A click picks an element for the agent instead of going to the page.
     picking: bool,
     /// The element under the pointer while picking, in the page area, and
@@ -508,6 +561,13 @@ impl BrowserView {
     pub fn new(url: &str, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (in_tx, in_rx) = async_channel::bounded::<In>(4);
         let out = spawn_page(url.to_string(), in_tx);
+        // The last frame's pixels go with the tab.
+        cx.on_release(|this, cx| {
+            if let Some(old) = this.frame.take() {
+                cx.drop_image(old, None);
+            }
+        })
+        .detach();
         let url_input = cx.new(|cx| InputState::new(window, cx).placeholder("http://localhost:3000"));
         url_input.update(cx, |input, cx| input.set_value(url.to_string(), window, cx));
         cx.subscribe_in(&url_input, window, |this, input, event: &InputEvent, _, cx| {
@@ -534,6 +594,8 @@ impl BrowserView {
                 };
                 let ok = this.update(cx, |this, cx| {
                     match update {
+                        // One sent before the page was told to stop.
+                        Some(Ok(image)) if !this.visible => cx.drop_image(image, None),
                         Some(Ok(image)) => {
                             this.show_frame(image, cx);
                             this.sharpen_later(cx);
@@ -562,6 +624,7 @@ impl BrowserView {
             focus: cx.focus_handle(),
             bounds: Default::default(),
             sent_size: Default::default(),
+            visible: true,
             picking: false,
             hover: None,
             asking: false,
@@ -573,6 +636,24 @@ impl BrowserView {
     pub fn title(&self) -> SharedString {
         let url = self.url.as_ref();
         url.split_once("://").map_or(url, |(_, rest)| rest).trim_end_matches('/').to_string().into()
+    }
+
+    /// Out of view the page stops sending frames and the last one is let
+    /// go: megabytes of pixels per tab. Back in view, drawing the page area
+    /// starts the frames again.
+    pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if std::mem::replace(&mut self.visible, visible) == visible {
+            return;
+        }
+        let _ = self.out.send(Out::Visible(visible));
+        if !visible {
+            self.sent_size.set((0, 0, 0));
+            self._sharpen = Task::ready(());
+            if let Some(old) = self.frame.take() {
+                cx.drop_image(old, None);
+            }
+        }
+        cx.notify();
     }
 
     fn show_frame(&mut self, image: Arc<RenderImage>, cx: &mut Context<Self>) {
@@ -602,14 +683,16 @@ impl BrowserView {
         });
     }
 
-    /// The page's selected text, from the CDP thread.
-    fn eval_string(&self, expression: &str) -> Option<String> {
+    /// What `expression` gives in the page, from the CDP thread: waited
+    /// for off the UI thread.
+    fn eval_string(&self, expression: &str, cx: &mut Context<Self>) -> Task<Option<String>> {
         let (tx, rx) = mpsc::channel();
-        self.out
-            .send(Out::Call("Runtime.evaluate", json!({ "expression": expression, "returnByValue": true }), tx))
-            .ok()?;
-        let result = rx.recv_timeout(Duration::from_secs(2)).ok()?;
-        result["result"]["value"].as_str().map(str::to_string)
+        let sent = self.out.send(Out::Call("Runtime.evaluate", json!({ "expression": expression, "returnByValue": true }), tx));
+        cx.background_spawn(async move {
+            sent.ok()?;
+            let result = rx.recv_timeout(Duration::from_secs(2)).ok()?;
+            result["result"]["value"].as_str().map(str::to_string)
+        })
     }
 
     fn set_picking(&mut self, on: bool, cx: &mut Context<Self>) {
@@ -654,9 +737,13 @@ impl BrowserView {
     }
 
     fn copy(&mut self, cx: &mut Context<Self>) {
-        if let Some(text) = self.eval_string("window.getSelection().toString()").filter(|t| !t.is_empty()) {
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
-        }
+        let selected = self.eval_string("window.getSelection().toString()", cx);
+        cx.spawn(async move |_, cx| {
+            if let Some(text) = selected.await.filter(|t| !t.is_empty()) {
+                let _ = cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string(text)));
+            }
+        })
+        .detach();
     }
 
     fn paste(&mut self, cx: &mut Context<Self>) {

@@ -279,6 +279,11 @@ fn tail(text: &str, lines: usize) -> String {
 }
 
 /// Whether the agent command is Claude Code, which can answer once and exit.
+/// The worktrees whose branch is pushed.
+fn pushed_of(paths: &[PathBuf]) -> std::collections::HashSet<PathBuf> {
+    paths.iter().filter(|path| git::has_upstream(path)).cloned().collect()
+}
+
 fn judge_can(agent: &str) -> bool {
     agent.split_whitespace().next().is_some_and(|program| Path::new(program).file_stem().is_some_and(|name| name == "claude"))
 }
@@ -492,10 +497,20 @@ impl Workspace {
     /// terminals to press Enter.
     pub(super) fn create_variants(&mut self, project: usize, title: String, prompt: String, notes: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(repo) = self.projects.get(project).map(|p| p.path.clone()) else { return };
+        cx.spawn_in(window, async move |this, cx| {
+            let job_repo = repo.clone();
+            let taken = cx.background_spawn(async move { git::TakenNames::read(&job_repo) }).await;
+            let _ = this.update_in(cx, |this, window, cx| this.create_variants_named(repo, &taken, title, prompt, notes, window, cx));
+        })
+        .detach();
+    }
+
+    fn create_variants_named(&mut self, repo: PathBuf, taken: &git::TakenNames, title: String, prompt: String, notes: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self.projects.iter().position(|p| p.path == repo) else { return };
         // A name nothing has yet: a ticket's title gives the same branch each time.
         let wanted = naming::branch_name(&title);
         let free = |group: &str| {
-            self.members(group).is_empty() && (1..=MOST as u32).all(|v| !self.name_taken(&repo, &branch_for(group, v))) && !self.name_taken(&repo, group)
+            self.members(group).is_empty() && (1..=MOST as u32).all(|v| !self.name_taken(&repo, &branch_for(group, v), taken)) && !self.name_taken(&repo, group, taken)
         };
         let group = std::iter::once(wanted.clone()).chain((2..).map(|n| format!("{wanted}-{n}"))).find(|g| free(g)).unwrap_or(wanted);
         let p = &mut self.projects[project];
@@ -626,6 +641,16 @@ impl Workspace {
     }
 
     fn add_variant(&mut self, like: &Path, prompt: String, note: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((pi, _)) = self.find(like) else { return };
+        let (repo, like) = (self.projects[pi].path.clone(), like.to_path_buf());
+        cx.spawn_in(window, async move |this, cx| {
+            let taken = cx.background_spawn(async move { git::TakenNames::read(&repo) }).await;
+            let _ = this.update_in(cx, |this, window, cx| this.add_variant_named(&like, &taken, prompt, note, window, cx));
+        })
+        .detach();
+    }
+
+    fn add_variant_named(&mut self, like: &Path, taken_names: &git::TakenNames, prompt: String, note: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some((pi, ti)) = self.find(like) else { return };
         let repo = self.projects[pi].path.clone();
         let source = &mut self.projects[pi].tasks[ti];
@@ -644,7 +669,7 @@ impl Workspace {
         }
         // A letter no variant has, and whose branch and directory are free:
         // the one kept after an earlier round sits in its old directory.
-        let taken = |v: u32| members.iter().any(|&(pi, ti)| self.projects[pi].tasks[ti].variant == v) || self.name_taken(&repo, &branch_for(&group, v));
+        let taken = |v: u32| members.iter().any(|&(pi, ti)| self.projects[pi].tasks[ti].variant == v) || self.name_taken(&repo, &branch_for(&group, v), taken_names);
         let Some(variant) = (1..=26).find(|&v| !taken(v)) else { return };
         let base = self.projects[pi].tasks[ti].base.clone();
         let after = members.iter().filter(|m| m.0 == pi).map(|m| m.1).max().unwrap_or(ti) + 1;
@@ -730,9 +755,9 @@ impl Workspace {
     }
 
     /// A branch, a directory or a listed task of this name is there already.
-    fn name_taken(&self, repo: &Path, branch: &str) -> bool {
+    fn name_taken(&self, repo: &Path, branch: &str, taken: &git::TakenNames) -> bool {
         let path = git::task_worktree_dir(repo, branch);
-        self.projects.iter().flat_map(|p| &p.tasks).any(|t| t.path == path || t.branch == branch) || git::task_name_taken(repo, branch)
+        self.projects.iter().flat_map(|p| &p.tasks).any(|t| t.path == path || t.branch == branch) || taken.has(branch)
     }
 
     /// What keeping this variant does to it and to the others, to confirm.
@@ -753,12 +778,27 @@ impl Workspace {
             window.push_notification(Notification::info("Wait until every variant is made."), cx);
             return;
         }
+        // Which of them are pushed is asked of git, off the UI thread.
+        let paths = self.member_paths(group);
+        let (group, keep) = (group.to_string(), keep.map(Path::to_path_buf));
+        cx.spawn_in(window, async move |this, cx| {
+            let pushed = cx.background_spawn(async move { pushed_of(&paths) }).await;
+            let _ = this.update_in(cx, |this, window, cx| this.settle_group_asked(&group, keep.as_deref(), pushed, window, cx));
+        })
+        .detach();
+    }
+
+    fn settle_group_asked(&mut self, group: &str, keep: Option<&Path>, pushed_ones: std::collections::HashSet<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        let members = self.members(group);
+        if members.is_empty() || members.iter().any(|&(pi, ti)| self.projects[pi].tasks[ti].busy.is_some()) {
+            return;
+        }
         let mut lines = Vec::new();
         let mut removed = 0;
         for &(pi, ti) in &members {
             let t = &self.projects[pi].tasks[ti];
             let name = letter(t.variant);
-            let pushed = git::has_upstream(&t.path);
+            let pushed = pushed_ones.contains(&t.path);
             lines.push(if Some(t.path.as_path()) == keep {
                 if t.branch == group {
                     format!("{name} stays on the branch {group}.")
@@ -790,15 +830,16 @@ impl Workspace {
         let this = cx.weak_entity();
         let (group, keep) = (group.to_string(), keep.map(Path::to_path_buf));
         window.open_alert_dialog(cx, move |dialog, _, _| {
-            let (this, group, keep) = (this.clone(), group.clone(), keep.clone());
+            let (this, group, keep, pushed) = (this.clone(), group.clone(), keep.clone(), pushed_ones.clone());
             dialog.confirm().title(title.clone()).description(lines.join("\n")).ok_text(ok.clone()).on_ok(move |_, window, cx| {
-                let _ = this.update(cx, |this, cx| this.settle_group(&group, keep.as_deref(), window, cx));
+                let _ = this.update(cx, |this, cx| this.settle_group(&group, keep.as_deref(), &pushed, window, cx));
                 true
             })
         });
     }
 
-    fn settle_group(&mut self, group: &str, keep: Option<&Path>, window: &mut Window, cx: &mut Context<Self>) {
+    /// `pushed`: the variants that stay whatever is kept, as the dialog said.
+    fn settle_group(&mut self, group: &str, keep: Option<&Path>, pushed: &std::collections::HashSet<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         let members = self.members(group);
         let Some(&(pi, _)) = members.first() else { return };
         let repo = self.projects[pi].path.clone();
@@ -812,7 +853,7 @@ impl Workspace {
             let t = &mut self.projects[pi].tasks[ti];
             if Some(t.path.as_path()) == keep {
                 kept = Some((letter(t.variant), t.branch.clone()));
-            } else if !git::has_upstream(&t.path) {
+            } else if !pushed.contains(&t.path) {
                 let parked = format!("{}/{now}-{}/{}", git::PARKED, group.replace('/', "-"), letter(t.variant).to_lowercase());
                 gone.push((t.path.clone(), t.branch.clone(), parked));
                 continue;
@@ -832,7 +873,7 @@ impl Workspace {
         if let Some(keep) = keep {
             self.switch(keep, window, cx);
         }
-        let rename = kept.as_ref().zip(keep).filter(|((_, branch), keep)| branch != group && !git::has_upstream(keep)).map(|_| group.to_string());
+        let rename = kept.as_ref().zip(keep).filter(|((_, branch), keep)| branch != group && !pushed.contains(*keep)).map(|_| group.to_string());
         let (winner, name) = (keep.map(Path::to_path_buf), kept.map(|k| k.0));
         let branch = winner.as_ref().and_then(|w| self.entry_mut(w)).map(|t| t.branch.clone()).unwrap_or_default();
         cx.spawn_in(window, async move |this, cx| {
@@ -1045,12 +1086,12 @@ impl Workspace {
                 }
                 let (run_path, run_command, run_slot, run_socket) = (path.clone(), command.clone(), job_slot.clone(), socket.clone());
                 let (state, seconds, output) = cx
-                    .background_spawn(async move {
+                    .background_spawn(crate::procs::on_thread(move || {
                         let mut shell = shell(&run_command);
                         shell.current_dir(&run_path).envs(ports);
                         tag(&mut shell, &run_path, run_socket.as_deref());
                         run_captured(shell, None, &run_slot)
-                    })
+                    }))
                     .await;
                 let _ = this.update(cx, |this, cx| {
                     if let Some(run) = this.checks.get_mut(&path) {
@@ -1123,7 +1164,7 @@ impl Workspace {
         let task = cx.spawn_in(window, async move |this, cx| {
             let run_slot = job_slot.clone();
             let (state, seconds, output, pictures) = cx
-                .background_spawn(async move {
+                .background_spawn(crate::procs::on_thread(move || {
                     static JUDGES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
                     // A folder of its own: the diffs are written there, and it is where the judge runs.
                     let folder = std::env::temp_dir().join(format!("ideae-judge-{}-{}", std::process::id(), JUDGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
@@ -1151,7 +1192,7 @@ impl Workspace {
                     }
                     let _ = std::fs::remove_dir_all(&folder);
                     (state, seconds, output, pictures)
-                })
+                }))
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 // Still this run's: not one started after it.
@@ -1537,7 +1578,7 @@ impl Workspace {
                                 )
                             }),
                     )
-                    .when_some(self.shots.get(&t.path).filter(|picture| picture.is_file()).cloned(), |card, picture| {
+                    .when_some(self.shots.get(&t.path).cloned(), |card, picture| {
                         card.child(
                             div().pl(px(34.)).child(
                                 img(picture).w(px(320.)).h(px(200.)).rounded_md().border_1().border_color(cx.theme().border),
@@ -1796,7 +1837,7 @@ impl Workspace {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{branch_for, full_prompt, judge_can, judge_command, judge_pick, letter, span, tokens};
     #[cfg(unix)]
     use super::{Judged, RunSlot, RunState, end_run, judge_brief, run_captured, shell, tail};
@@ -1810,7 +1851,7 @@ mod tests {
     /// of each variant, before any of them runs.
     /// The tests that open the app's window say where its state is through
     /// the environment, which is the whole process's: one at a time.
-    static ONE_WINDOW: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static ONE_WINDOW: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[gpui_kit::test]
     fn a_group_draws_in_the_sidebar_and_on_its_screen(cx: &mut TestAppContext) {
@@ -2088,6 +2129,14 @@ mod tests {
         });
         // The last one stops: the project's check runs in each, then the judge reads them.
         step(cx, &mut |w, window, cx| w.on_hook(hook(&paths[1], "Stop"), window, cx));
+        // Checks and the judge run on threads of their own: wait for them.
+        for _ in 0..1000 {
+            if workspace.update(cx, |w, _| w.judges.get(&group).is_some_and(|run| run.is_over())) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            cx.run_until_parked();
+        }
         workspace.update(cx, |w, cx| {
             assert!(w.group_settled(&group, cx));
             for path in &paths {
@@ -2114,7 +2163,7 @@ mod tests {
         .unwrap();
 
         // B is kept: A goes, parked; B gets the clean branch name.
-        step(cx, &mut |w, window, cx| w.settle_group(&group, Some(&paths[1]), window, cx));
+        step(cx, &mut |w, window, cx| w.settle_group(&group, Some(&paths[1]), &super::pushed_of(&w.member_paths(&group)), window, cx));
         workspace.update(cx, |w, _| {
             let tasks = &w.projects[0].tasks;
             assert_eq!(tasks.len(), 1, "only the one kept");
@@ -2139,7 +2188,7 @@ mod tests {
         });
 
         // None of them after all.
-        step(cx, &mut |w, window, cx| w.settle_group(&group, None, window, cx));
+        step(cx, &mut |w, window, cx| w.settle_group(&group, None, &super::pushed_of(&w.member_paths(&group)), window, cx));
         workspace.update(cx, |w, _| assert!(w.projects[0].tasks.is_empty() && w.active_group.is_none()));
         assert!(!paths[1].exists() && !third.exists());
         assert_eq!(git(&repo, &["for-each-ref", "--format=%(refname)", crate::git::PARKED]).lines().count(), 3, "all three parked");
@@ -2148,6 +2197,66 @@ mod tests {
         cx.update_window(handle.into(), |_, window, _| window.remove_window()).ok();
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(repo.with_file_name("repo.worktrees"));
+    }
+
+    /// The tasks open in the last run: the one in view with the window,
+    /// the others right after, and all of them open to a save in between.
+    #[cfg(unix)]
+    #[gpui_kit::test]
+    #[ignore]
+    fn the_tasks_of_the_last_run_come_back_after_the_one_in_view(cx: &mut TestAppContext) {
+        let _one = ONE_WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+        cx.executor().allow_parking();
+        let dir = std::env::temp_dir().join(format!("ideae-restore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = "git init -q -b main repo; cd repo; git config user.email t@t; git config user.name t; echo one > f.txt; git add f.txt; \
+            git commit -qm base; git worktree add -q ../repo.worktrees/other -b other";
+        assert!(std::process::Command::new("sh").arg("-ec").arg(script).current_dir(&dir).status().unwrap().success());
+        let repo = dir.join("repo").canonicalize().unwrap();
+        let other = repo.with_file_name("repo.worktrees").join("other");
+        // SAFETY: set before anything of the app reads them.
+        unsafe {
+            std::env::set_var("IDEAE_STATE", dir.join("state.json"));
+            std::env::set_var("IDEAE_NO_DAEMON", "1");
+        }
+        let tasks = vec![
+            TaskState { path: repo.clone(), branch: "main".into(), main: true, open: true, ..Default::default() },
+            TaskState { path: other.clone(), branch: "other".into(), title: "Other".into(), open: true, ..Default::default() },
+        ];
+        let saved = State { projects: vec![ProjectState { path: repo.clone(), tasks, ..Default::default() }], active_task: Some(other.clone()), ..Default::default() };
+        std::fs::write(dir.join("state.json"), serde_json::to_string(&saved).unwrap()).unwrap();
+        crate::state::set_settings(crate::state::Settings { notifications: false, pr_status: false, ..Default::default() });
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            gpui_cn::init(cx);
+            crate::theme::init(cx);
+        });
+        let (handle, workspace) = cx.update(|cx| {
+            let bounds = Bounds { origin: Point::default(), size: size(px(1300.), px(800.)) };
+            let options = WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() };
+            let opened = gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| Workspace::new(Vec::new(), Some(None), None, window, cx))).expect("a test window");
+            // Before anything else runs: as the first frame finds it.
+            opened.1.update(cx, |w, cx| {
+                assert_eq!(w.active.as_deref(), Some(other.as_path()));
+                let loaded: Vec<bool> = w.projects[0].tasks.iter().map(|t| t.view.is_some()).collect();
+                assert_eq!((loaded, w.restoring.clone()), (vec![false, true], vec![repo.clone()]), "the one in view, the other to come");
+                assert!(w.snapshot(cx).projects[0].tasks.iter().all(|t| t.open), "a save now keeps both open");
+            });
+            opened
+        });
+        cx.run_until_parked();
+        workspace.update(cx, |w, _| {
+            assert!(w.restoring.is_empty() && w.projects[0].tasks.iter().all(|t| t.view.is_some()), "both back");
+            assert_eq!(w.active.as_deref(), Some(other.as_path()));
+        });
+        workspace.update(cx, |w, cx| {
+            for view in w.views() {
+                view.update(cx, |t, cx| t.shut_down(cx));
+            }
+        });
+        cx.update_window(handle.into(), |_, window, _| window.remove_window()).ok();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
 }

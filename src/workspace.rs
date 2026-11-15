@@ -110,7 +110,12 @@ pub struct Workspace {
     /// Filters the sidebar's tasks.
     pub search: Entity<InputState>,
     /// The state as last written, to write only changes.
-    last_saved: String,
+    /// The state as last written, and the number of the save that wrote it:
+    /// a write that comes after a later one is dropped.
+    last_saved: std::sync::Arc<std::sync::Mutex<(u64, String)>>,
+    save_seq: u64,
+    /// Tasks open in the last run and not loaded yet, the next one last.
+    restoring: Vec<PathBuf>,
     _subscriptions: Vec<Subscription>,
     _tick: Task<()>,
     pub build: crate::build_watch::BuildWatch,
@@ -167,6 +172,7 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    #[cfg(test)]
     pub fn new(
         repos: Vec<PathBuf>,
         agent: Option<Option<String>>,
@@ -174,7 +180,20 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let saved = state::load();
+        Self::with_state(state::load(), repos, agent, appearance, window, cx)
+    }
+
+    /// As `new`, with the state already read.
+    pub fn with_state(
+        saved: State,
+        repos: Vec<PathBuf>,
+        agent: Option<Option<String>>,
+        appearance: Option<Appearance>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        state::init_settings(&saved.settings);
+        cx.background_spawn(async { crate::lsp::look_for_servers() }).detach();
         let appearance = appearance
             .or_else(|| saved.appearance.as_deref().and_then(Appearance::parse))
             .unwrap_or(Appearance::Auto);
@@ -222,7 +241,11 @@ impl Workspace {
                 None => eprintln!("daemon unavailable: terminals run in the window"),
             }
         }
+        // Reports wait until the tasks of the last run are back: one for a
+        // task not loaded yet would be lost.
+        let (restored_tx, restored_rx) = async_channel::bounded::<()>(1);
         cx.spawn_in(window, async move |this, cx| {
+            let _ = restored_rx.recv().await;
             while let Ok(event) = hook_rx.recv().await {
                 if this.update_in(cx, |this, window, cx| this.on_hook(event, window, cx)).is_err() {
                     break;
@@ -260,12 +283,12 @@ impl Workspace {
                 this.save(cx);
                 if this.keep_terminals {
                     for view in this.views() {
-                        view.update(cx, |t, cx| t.autosave_all(cx));
+                        view.update(cx, |t, cx| t.save_all_now(cx));
                     }
                 } else {
                     let seen = this.hook_socket.as_ref().map(|socket| crate::procs::task_processes(None, socket)).unwrap_or_default();
                     for view in this.views() {
-                        view.update(cx, |t, cx| t.shut_down(cx));
+                        view.update(cx, |t, cx| t.shut_down_at_quit(cx));
                     }
                     #[cfg(unix)]
                     if let Some(daemon) = crate::daemon::client::get() {
@@ -334,7 +357,7 @@ impl Workspace {
                 cx.background_executor().timer(std::time::Duration::from_secs(3)).await;
                 n += 1;
                 let alive = this.update_in(cx, |this, window, cx| {
-                    this.save(cx);
+                    this.save_later(cx);
                     this.check_build(window, cx);
                     // While an agent of the group in view works; a turn's end reads it too.
                     if this.active_group.clone().is_some_and(|group| !this.group_settled(&group, cx)) {
@@ -379,7 +402,7 @@ impl Workspace {
             _bridge: bridge,
             appearance,
             sidebar_width: px(saved.sidebar_width.unwrap_or(260.)),
-            pinned: crate::desktop::is_pinned(),
+            pinned: false,
             search: {
                 let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search tasks…"));
                 cx.subscribe(&search, |_, _, _: &InputEvent, cx| cx.notify()).detach();
@@ -432,7 +455,9 @@ impl Workspace {
                 cx.observe(&mon, |_, _, cx| cx.notify()).detach();
                 mon
             },
-            last_saved: String::new(),
+            last_saved: Default::default(),
+            save_seq: 0,
+            restoring: Vec::new(),
             _subscriptions: subscriptions,
             _tick: tick,
             requested_origin: None,
@@ -467,12 +492,42 @@ impl Workspace {
             }
         }
         this.sync_worktrees(window, cx);
-        // Sessions no task shows any more (closed while the window was gone).
-        #[cfg(unix)]
-        if let Some(daemon) = crate::daemon::client::get() {
-            let keep = this.views().iter().flat_map(|v| v.read(cx).sessions(cx)).collect();
-            daemon.prune(keep);
+        if crate::desktop::can_pin() {
+            cx.spawn(async move |this, cx| {
+                let pinned = cx.background_spawn(async { crate::desktop::is_pinned() }).await;
+                let _ = this.update(cx, |this, cx| {
+                    this.pinned = pinned;
+                    cx.notify();
+                });
+            })
+            .detach();
         }
+        // The other tasks of the last run come back one at a time, the
+        // window drawn in between: it is there with the task in view.
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                yield_now().await;
+                let more = this.update_in(cx, |this, window, cx| {
+                    let Some(path) = this.restoring.pop() else { return false };
+                    this.load(&path, window, cx);
+                    cx.notify();
+                    true
+                });
+                if !matches!(more, Ok(true)) {
+                    break;
+                }
+            }
+            // Sessions no task shows any more (closed while the window was gone).
+            #[cfg(unix)]
+            let _ = this.update(cx, |this, cx| {
+                if let Some(daemon) = crate::daemon::client::get() {
+                    let keep = this.views().iter().flat_map(|v| v.read(cx).sessions(cx)).collect();
+                    daemon.prune(keep);
+                }
+            });
+            drop(restored_tx);
+        })
+        .detach();
 
         if let Some(view) = this.active_view() {
             view.update(cx, |t, cx| {
@@ -551,10 +606,10 @@ impl Workspace {
             .filter(|t| t.open && t.path.exists())
             .map(|t| t.path.clone())
             .collect();
-        for path in open {
-            self.load(&path, window, cx);
-        }
+        // The one in view now; the rest after the window is up (`restoring`).
+        self.restoring = open.into_iter().rev().collect();
         if let Some(active) = saved.active_task.as_ref().filter(|p| self.find(p).is_some()) {
+            self.restoring.retain(|p| p != active);
             self.switch(active, window, cx);
         }
     }
@@ -624,7 +679,7 @@ impl Workspace {
                             main: t.main,
                             starred: t.starred,
                             last_active: t.last_active,
-                            open: t.view.is_some(),
+                            open: t.view.is_some() || self.restoring.contains(&t.path),
                             port_slot: t.port_slot,
                             session: match &t.view {
                                 Some(view) => view.read(cx).session(cx),
@@ -649,20 +704,27 @@ impl Workspace {
         serde_json::to_string_pretty(&self.snapshot(cx)).unwrap_or_default()
     }
 
+    /// On disk when it returns: before the window or the app goes.
     pub fn save(&mut self, cx: &App) {
         let json = self.serialize(cx);
-        if json != self.last_saved {
-            match state::save(&json) {
-                Ok(()) => self.last_saved = json,
-                Err(e) => eprintln!("saving state: {e}"),
-            }
-        }
+        self.save_seq += 1;
+        write_state(&self.last_saved, self.save_seq, json);
+    }
+
+    /// The now-and-then save: what it takes from the UI thread is the copy
+    /// of the state; turning it into text and writing it happen off it.
+    fn save_later(&mut self, cx: &mut Context<Self>) {
+        let snapshot = self.snapshot(cx);
+        self.save_seq += 1;
+        let (seq, last) = (self.save_seq, self.last_saved.clone());
+        cx.background_spawn(async move { write_state(&last, seq, serde_json::to_string_pretty(&snapshot).unwrap_or_default()) }).detach();
     }
 
     // ------------------------------------------------------------ tasks
 
     /// Starts a task: its terminals, agent and watchers.
     fn load(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) -> Option<Entity<TaskView>> {
+        self.restoring.retain(|p| p != path);
         let socket = self.hook_socket.clone();
         let variant = self.find(path).is_some_and(|(pi, ti)| !self.projects[pi].tasks[ti].group.is_empty());
         let agent = if variant { Self::agent_command_for(&self.agent_override, self._bridge.as_ref(), true) } else { self.agent.clone() };
@@ -764,12 +826,12 @@ impl Workspace {
         }
         cx.spawn_in(window, async move |this, cx| {
             let found = cx
-                .background_spawn(async move {
+                .background_spawn(crate::procs::on_thread(move || {
                     due.into_iter().map(|(path, branch)| {
                         let pr = crate::pr::lookup(&path, &branch);
                         (path, pr)
                     }).collect::<Vec<_>>()
-                })
+                }))
                 .await;
             let _ = this.update(cx, |this, cx| {
                 for (path, pr) in found {
@@ -811,7 +873,7 @@ impl Workspace {
         for path in &due {
             self.fetched.insert(path.clone(), now);
         }
-        cx.background_spawn(async move {
+        cx.background_spawn(crate::procs::on_thread(move || {
             for repo in due {
                 if let Err(e) = git::fetch_base(&repo) {
                     if std::env::var_os("IDEAE_DEBUG").is_some() {
@@ -819,7 +881,7 @@ impl Workspace {
                     }
                 }
             }
-        })
+        }))
         .detach();
     }
 
@@ -918,6 +980,9 @@ impl Workspace {
     }
 
     fn sleep_idle_language_servers(&mut self, cx: &mut Context<Self>) {
+        for view in self.views() {
+            view.update(cx, |t, cx| t.drop_unused_language_servers(Self::lsp_idle(), cx));
+        }
         for p in &self.projects {
             for t in &p.tasks {
                 let (Some(view), Some(left)) = (&t.view, t.left_view) else { continue };
@@ -988,7 +1053,22 @@ impl Workspace {
         if entry.main || entry.busy.is_some() {
             return;
         }
-        let (dirty, unpushed) = git::unsaved_work(path);
+        let this = cx.weak_entity();
+        let path = path.to_path_buf();
+        cx.spawn_in(window, async move |_, cx| {
+            let job_path = path.clone();
+            let lost = cx.background_spawn(async move { git::unsaved_work(&job_path) }).await;
+            let _ = this.update_in(cx, |this, window, cx| this.delete_task_dialog(&path, lost, window, cx));
+        })
+        .detach();
+    }
+
+    fn delete_task_dialog(&mut self, path: &Path, (dirty, unpushed): (usize, usize), window: &mut Window, cx: &mut Context<Self>) {
+        let Some((pi, ti)) = self.find(path) else { return };
+        let entry = &self.projects[pi].tasks[ti];
+        if entry.main || entry.busy.is_some() {
+            return;
+        }
         let mut description = format!("Removes the worktree {} and the branch {}.", path.display(), entry.branch);
         if dirty > 0 {
             description.push_str(&format!("\n{dirty} uncommitted file(s) will be lost."));
@@ -1127,12 +1207,12 @@ impl Workspace {
     pub fn open_main(&mut self, project: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(p) = self.projects.get_mut(project) else { return };
         if !p.tasks.iter().any(|t| t.main) {
-            let branch = git::worktrees(&p.path).into_iter().next().map(|w| w.branch).unwrap_or_default();
             p.tasks.insert(
                 0,
                 TaskEntry {
                     path: p.path.clone(),
-                    branch,
+                    // The task tells its branch once it has read it.
+                    branch: String::new(),
                     title: String::new(),
                     main: true,
                     starred: false,
@@ -1155,6 +1235,8 @@ impl Workspace {
         if let Some(view) = self.active_view() {
             view.update(cx, |t, cx| t.show_view(0, window, cx));
         }
+        // Its branch, for the list.
+        self.sync_worktrees(window, cx);
     }
 
     /// Asks for a title and, if you like, what to tell the agent; then makes
@@ -1245,7 +1327,7 @@ impl Workspace {
                     let (repo, input, prompt, filled) = (repo.clone(), input.clone(), prompt.clone(), filled.clone());
                     let task = window.spawn(cx, async move |cx| {
                         cx.background_executor().timer(std::time::Duration::from_millis(400)).await;
-                        let issue = cx.background_spawn(async move { gh_issue(&repo, number) }).await;
+                        let issue = cx.background_spawn(crate::procs::on_thread(move || { gh_issue(&repo, number) })).await;
                         let Some((issue_title, body)) = issue else { return };
                         let _ = cx.update(|window, cx| {
                             let current = prompt.read(cx).value().to_string();
@@ -1419,13 +1501,15 @@ impl Workspace {
 
     /// Adds a repository (by any path inside it) and returns its index.
     pub fn add_project(&mut self, path: &Path) -> Option<usize> {
-        let path = std::fs::canonicalize(path).ok()?;
-        let root = git::main_worktree(&path).unwrap_or(path);
+        Some(self.add_project_root(project_root(path)?))
+    }
+
+    fn add_project_root(&mut self, root: PathBuf) -> usize {
         if let Some(ix) = self.projects.iter().position(|p| p.path == root) {
-            return Some(ix);
+            return ix;
         }
         self.projects.push(Project::new(root));
-        Some(self.projects.len() - 1)
+        self.projects.len() - 1
     }
 
     pub fn add_project_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1437,9 +1521,10 @@ impl Workspace {
         });
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = picked.await else { return };
+            let roots = cx.background_spawn(async move { paths.iter().filter_map(|path| project_root(path)).collect::<Vec<_>>() }).await;
             let _ = this.update_in(cx, |this, window, cx| {
-                for path in paths {
-                    this.add_project(&path);
+                for root in roots {
+                    this.add_project_root(root);
                 }
                 this.sync_worktrees(window, cx);
                 cx.notify();
@@ -1769,7 +1854,7 @@ impl Workspace {
             return;
         }
         cx.spawn_in(window, async move |this, cx| {
-            let found = cx.background_spawn(async { crate::update::newer() }).await;
+            let found = cx.background_spawn(crate::procs::on_thread(move || { crate::update::newer() })).await;
             let _ = this.update(cx, |this, cx| {
                 this.update = found;
                 cx.notify();
@@ -1787,7 +1872,7 @@ impl Workspace {
         self.updating = true;
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
-            let result = cx.background_spawn(async move { crate::update::install(&release) }).await;
+            let result = cx.background_spawn(crate::procs::on_thread(move || { crate::update::install(&release) })).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.updating = false;
                 match result {
@@ -1820,6 +1905,40 @@ impl Workspace {
 }
 
 /// "DEV-123" at the start of a title.
+/// Writes the state when it is not what was written last, saves in the
+/// order they were asked for.
+fn write_state(last: &std::sync::Mutex<(u64, String)>, seq: u64, json: String) {
+    let mut last = last.lock().unwrap();
+    if seq < last.0 {
+        return;
+    }
+    last.0 = seq;
+    if json != last.1 {
+        match state::save(&json) {
+            Ok(()) => last.1 = json,
+            Err(e) => eprintln!("saving state: {e}"),
+        }
+    }
+}
+
+/// The repository a path is in: its main worktree, or the path itself.
+fn project_root(path: &Path) -> Option<PathBuf> {
+    let path = std::fs::canonicalize(path).ok()?;
+    Some(git::main_worktree(&path).unwrap_or(path))
+}
+
+/// Lets what else waits for the UI thread (a frame, input) go first.
+fn yield_now() -> impl std::future::Future<Output = ()> {
+    let mut yielded = false;
+    std::future::poll_fn(move |cx| {
+        if std::mem::replace(&mut yielded, true) {
+            return std::task::Poll::Ready(());
+        }
+        cx.waker().wake_by_ref();
+        std::task::Poll::Pending
+    })
+}
+
 fn jira_key(title: &str) -> Option<&str> {
     let first = title.split_whitespace().next()?;
     let (project, number) = first.split_once('-')?;

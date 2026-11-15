@@ -469,7 +469,8 @@ impl Workspace {
                 });
             }
         }
-        if let Some(pr) = t.pr.as_ref().filter(|p| p.open_feedback > 0 && crate::state::settings().pr_status) {
+        let pr_status = crate::state::with_settings(|s| s.pr_status);
+        if let Some(pr) = t.pr.as_ref().filter(|p| p.open_feedback > 0 && pr_status) {
             details.push(format!("{} review comment{}", pr.open_feedback, if pr.open_feedback == 1 { "" } else { "s" }));
         }
         if t.starred {
@@ -482,7 +483,7 @@ impl Workspace {
             details.push(busy.to_string());
         }
         let needs = if in_active { None } else { needs };
-        let pr = t.pr.clone().filter(|_| crate::state::settings().pr_status);
+        let pr = t.pr.clone().filter(|_| pr_status);
         let overlaps = self.overlaps(project, &path);
 
         let this = cx.weak_entity();

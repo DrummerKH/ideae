@@ -84,13 +84,19 @@ impl HistoryView {
             self.scroll.scroll_to_item(ix, ScrollStrategy::Center);
             return;
         }
-        let Some(commit) = git::commit_info(&self.root, hash) else { return };
-        let mut commits = (*self.commits).clone();
-        commits.insert(0, commit);
-        self.commits = Rc::new(commits);
-        self.selected = None;
-        self.select(0, cx);
-        self.scroll.scroll_to_item(0, ScrollStrategy::Top);
+        // Older than the list goes: asked of git, off the UI thread.
+        let (root, hash) = (self.root.clone(), hash.to_string());
+        self._show = cx.spawn(async move |this, cx| {
+            let Some(commit) = cx.background_spawn(async move { git::commit_info(&root, &hash) }).await else { return };
+            let _ = this.update(cx, |this, cx| {
+                let mut commits = (*this.commits).clone();
+                commits.insert(0, commit);
+                this.commits = Rc::new(commits);
+                this.selected = None;
+                this.select(0, cx);
+                this.scroll.scroll_to_item(0, ScrollStrategy::Top);
+            });
+        });
     }
 
     fn select(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -101,9 +107,13 @@ impl HistoryView {
         self.selected = Some(ix);
         let (root, hash) = (self.root.clone(), commit.hash.clone());
         self._show = cx.spawn(async move |this, cx| {
-            let patch = cx.background_spawn(async move { git::commit_patch(&root, &hash) }).await;
-            let files = crate::task::with_languages(DiffFile::parse(&patch).unwrap_or_default());
-            let lines = Rc::new(git::first_changed_lines(&patch));
+            let (files, lines) = cx
+                .background_spawn(async move {
+                    let patch = git::commit_patch(&root, &hash);
+                    (crate::task::with_languages(DiffFile::parse(&patch).unwrap_or_default()), git::first_changed_lines(&patch))
+                })
+                .await;
+            let lines = Rc::new(lines);
             let _ = this.update(cx, |this, cx| {
                 this.first_lines = lines;
                 this.diff.update(cx, |d, cx| d.set_files(files, cx));

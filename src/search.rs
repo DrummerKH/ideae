@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -66,7 +66,24 @@ fn builder() -> RegexMatcherBuilder {
 /// Matching lines under `root`, at most `per_file` from each file and `limit`
 /// in all, sorted by path and line. Each line is cut to `max_columns` chars.
 pub fn search(root: &Path, matcher: &RegexMatcher, per_file: u64, max_columns: usize, limit: usize) -> Vec<Line> {
-    search_in(root, matcher, None, per_file, max_columns, limit)
+    search_in(root, matcher, None, per_file, max_columns, limit, &AtomicBool::new(false))
+}
+
+/// Ends the search it was given to when dropped: a search nobody waits
+/// for any more would walk the whole tree for nothing.
+#[derive(Default)]
+pub struct StopOnDrop(std::sync::Arc<AtomicBool>);
+
+impl StopOnDrop {
+    pub fn flag(&self) -> std::sync::Arc<AtomicBool> {
+        self.0.clone()
+    }
+}
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 
 /// [`search`] over the files `mask` lets through.
@@ -77,6 +94,7 @@ pub fn search_in(
     per_file: u64,
     max_columns: usize,
     limit: usize,
+    stop: &AtomicBool,
 ) -> Vec<Line> {
     let found = Mutex::new(Vec::new());
     let count = AtomicUsize::new(0);
@@ -93,7 +111,7 @@ pub fn search_in(
             .build();
         let (found, count) = (&found, &count);
         Box::new(move |entry| {
-            if count.load(Ordering::Relaxed) >= limit {
+            if count.load(Ordering::Relaxed) >= limit || stop.load(Ordering::Relaxed) {
                 return WalkState::Quit;
             }
             let Ok(entry) = entry else { return WalkState::Continue };
@@ -136,7 +154,7 @@ pub fn search_in(
 mod tests {
     use std::{fs, path::PathBuf};
 
-    use super::{literal, regexes, search, search_in};
+    use super::{AtomicBool, literal, regexes, search, search_in};
 
     fn tree() -> PathBuf {
         let root = std::env::temp_dir().join(format!("ideae-search-{}", std::process::id()));
@@ -176,9 +194,11 @@ mod tests {
         let a = hits.iter().find(|h| h.path.ends_with("a.rs")).unwrap();
         assert_eq!(a.matches, [3..9], "where the match is in the line");
 
-        let rs = search_in(&root, &literal("needle").unwrap(), super::mask(&root, "*.rs"), 20, 300, 200);
+        let rs = search_in(&root, &literal("needle").unwrap(), super::mask(&root, "*.rs"), 20, 300, 200, &AtomicBool::new(false));
         assert!(rs.iter().all(|h| h.path.ends_with("a.rs")) && !rs.is_empty(), "mask lets only .rs through");
-        let not_txt = search_in(&root, &literal("needle").unwrap(), super::mask(&root, "!*.txt"), 20, 300, 200);
+        let not_txt = search_in(&root, &literal("needle").unwrap(), super::mask(&root, "!*.txt"), 20, 300, 200, &AtomicBool::new(false));
+        let stopped = search_in(&root, &literal("needle").unwrap(), None, 20, 300, 200, &AtomicBool::new(true));
+        assert!(stopped.is_empty(), "a search told to stop finds nothing more");
         assert!(not_txt.iter().all(|h| !h.path.to_string_lossy().ends_with(".txt")) && !not_txt.is_empty());
 
         let re = search(&root, &regexes(&[r"\bfn\s+needle\b".into(), r"^needle 2\d$".into()]).unwrap(), 20, 300, 200);

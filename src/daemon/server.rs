@@ -38,7 +38,7 @@ struct Session {
 #[derive(Default)]
 struct Server {
     sessions: HashMap<String, Session>,
-    clients: HashMap<u64, mpsc::Sender<Vec<u8>>>,
+    clients: HashMap<u64, Client>,
     hooks: HashMap<String, Hook>,
     next_client: u64,
     alone_since: Option<Instant>,
@@ -46,16 +46,46 @@ struct Server {
 
 type Shared = Arc<Mutex<Server>>;
 
+/// A window: where its frames go, and how many bytes of them wait to be
+/// written to its socket.
+struct Client {
+    tx: mpsc::Sender<Vec<u8>>,
+    queued: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// With this much waiting for a window, a session's output stays in its
+/// pty until the window catches up: the program is held back, as by a
+/// terminal that cannot keep up, instead of the daemon's memory filling.
+const CLIENT_QUEUE_BYTES: usize = 4 << 20;
+/// A window that takes nothing for this long (stopped, hung) holds no
+/// program back any longer.
+const CLIENT_STALL: Duration = Duration::from_secs(5);
+
 impl Server {
     fn send(&self, client: u64, frame: Vec<u8>) {
-        if let Some(tx) = self.clients.get(&client) {
-            let _ = tx.send(frame);
+        if let Some(client) = self.clients.get(&client) {
+            client.queue(frame);
         }
     }
 
     fn broadcast(&self, frame: &[u8]) {
-        for tx in self.clients.values() {
-            let _ = tx.send(frame.to_vec());
+        for client in self.clients.values() {
+            client.queue(frame.to_vec());
+        }
+    }
+
+    /// Whether one of these windows has too much waiting for it.
+    fn behind(&self, clients: &HashSet<u64>) -> bool {
+        clients.iter().filter_map(|c| self.clients.get(c)).any(|c| c.queued.load(std::sync::atomic::Ordering::Relaxed) > CLIENT_QUEUE_BYTES)
+    }
+}
+
+impl Client {
+    fn queue(&self, frame: Vec<u8>) {
+        let len = frame.len();
+        self.queued.fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+        if self.tx.send(frame).is_err() {
+            self.queued.fetch_sub(len, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -153,9 +183,13 @@ fn serve(shared: Shared, stream: UnixStream) {
         s.next_client
     };
     // Registered on Hello: `ideae --hook` connects only to report.
+    let queued: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
+    let written = queued.clone();
     let writer_thread = std::thread::spawn(move || {
         while let Ok(frame) = rx.recv() {
-            if writer.write_all(&frame).is_err() {
+            let sent = writer.write_all(&frame);
+            written.fetch_sub(frame.len(), std::sync::atomic::Ordering::Relaxed);
+            if sent.is_err() {
                 break;
             }
         }
@@ -168,7 +202,7 @@ fn serve(shared: Shared, stream: UnixStream) {
             Frame::Bytes { .. } => {}
             Frame::Msg(Msg::Hello { .. }) => {
                 let mut s = shared.lock().unwrap();
-                s.clients.insert(client, tx.clone());
+                s.clients.insert(client, Client { tx: tx.clone(), queued: queued.clone() });
                 s.alone_since = None;
                 registered = true;
                 let welcome = Msg::Welcome {
@@ -298,7 +332,23 @@ fn open(shared: &Shared, client: u64, id: String, spec: Spec, size: Size) {
 /// The session's output to its windows, until the program ends.
 fn pump(shared: Shared, id: String, handle: Arc<Mutex<Box<dyn ByteHandle>>>, sink: Arc<DetachedSink>) {
     let mut finished_at: Option<Instant> = None;
+    let mut behind_since: Option<Instant> = None;
     loop {
+        {
+            let s = shared.lock().unwrap();
+            let Some(session) = s.sessions.get(&id) else { return };
+            if !Arc::ptr_eq(&session.handle, &handle) {
+                return;
+            }
+            // Not taken from the pty while a window has megabytes to read yet.
+            if !s.behind(&session.attached) {
+                behind_since = None;
+            } else if behind_since.get_or_insert_with(Instant::now).elapsed() < CLIENT_STALL {
+                drop(s);
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+        }
         let batch = sink.next(Duration::from_millis(200));
         let mut s = shared.lock().unwrap();
         let Some(session) = s.sessions.get_mut(&id) else { return };
@@ -581,5 +631,54 @@ mod handover {
             std::thread::spawn(move || pump(shared, id, handle, detached));
         }
         Ok(channel)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read as _;
+
+    /// A program that prints without end, into a window that reads nothing:
+    /// what waits for the window stays a few megabytes, the program held
+    /// back through its pty.
+    #[test]
+    #[ignore]
+    fn a_window_that_does_not_read_holds_the_program_back() {
+        let _one = crate::workspace::variants::tests::ONE_WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ideae-daemon-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // SAFETY: set before anything of the daemon reads it.
+        unsafe { std::env::set_var("IDEAE_STATE", dir.join("state.json")) };
+        std::thread::spawn(|| run(false));
+        let path = proto::socket_path();
+        let mut stream = (0..200)
+            .find_map(|_| {
+                std::thread::sleep(Duration::from_millis(20));
+                UnixStream::connect(&path).ok()
+            })
+            .expect("the daemon listens");
+        proto::write_msg(&mut stream, &Msg::Hello { protocol: proto::PROTOCOL, version: crate::build_watch::build_id() }).unwrap();
+        assert!(matches!(proto::read_frame(&mut stream), Ok(Frame::Msg(Msg::Welcome { .. }))));
+        let spec = Spec { cwd: dir.clone(), env: Vec::new(), input: Some("yes 0123456789012345678901234567890123456789\n".into()) };
+        let size = Size { cols: 80, rows: 24, cell_w: 8, cell_h: 16 };
+        proto::write_msg(&mut stream, &Msg::Open { id: "flood".into(), spec, size }).unwrap();
+
+        // Three seconds of `yes` are gigabytes when nothing holds it back.
+        std::thread::sleep(Duration::from_secs(3));
+        proto::write_msg(&mut stream, &Msg::Kill { id: "flood".into() }).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let (mut waited, mut chunk) = (0usize, vec![0u8; 1 << 16]);
+        while let Ok(n) = stream.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            waited += n;
+        }
+        assert!(waited > 100_000, "it did print: {waited} bytes");
+        assert!(waited < 3 * CLIENT_QUEUE_BYTES, "{waited} bytes waited for a window that read none");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

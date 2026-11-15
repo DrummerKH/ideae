@@ -77,6 +77,22 @@ pub fn settings() -> Settings {
     loaded
 }
 
+/// One thing out of the settings, without a copy of them all.
+pub fn with_settings<T>(read: impl FnOnce(&Settings) -> T) -> T {
+    if let Some(s) = SETTINGS.read().unwrap().as_ref() {
+        return read(s);
+    }
+    read(&settings())
+}
+
+/// The settings as the state just read has them, unless set already.
+pub fn init_settings(settings: &Settings) {
+    let mut current = SETTINGS.write().unwrap();
+    if current.is_none() {
+        *current = Some(settings.clone());
+    }
+}
+
 pub fn set_settings(settings: Settings) {
     *SETTINGS.write().unwrap() = Some(settings);
 }

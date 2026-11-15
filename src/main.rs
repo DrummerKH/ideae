@@ -478,7 +478,7 @@ fn main() {
         }
     }
     procs::adopt_shell_env();
-    desktop::refresh_entry();
+    std::thread::spawn(desktop::refresh_entry);
     procs::catch_quit_signals();
 
     gpui_kit::application()
@@ -496,8 +496,10 @@ fn main() {
             // A saved window larger than the screen it opens on (another
             // monitor, another scale) shrinks to fit.
             let screen = cx.primary_display().map(|d| d.bounds());
-            let window_bounds = state::load()
+            let saved = state::load();
+            let window_bounds = saved
                 .window
+                .clone()
                 .filter(|w| w.width >= 400. && w.height >= 300.)
                 .map(|w| {
                     let (mut width, mut height) = (px(w.width), px(w.height));
@@ -529,7 +531,7 @@ fn main() {
             };
             gpui_kit::open_window(options, cx, |window, cx| {
                 cx.new(|cx| {
-                    let mut workspace = Workspace::new(repos, agent, appearance, window, cx);
+                    let mut workspace = Workspace::with_state(saved, repos, agent, appearance, window, cx);
                     workspace.placed_at(requested);
                     if let Some(task) = &open_task {
                         workspace.focus_task(task, window, cx);

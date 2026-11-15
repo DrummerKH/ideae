@@ -27,6 +27,18 @@ pub fn command(program: impl AsRef<OsStr>) -> Command {
     Command::new(program)
 }
 
+/// Runs `job` on a thread of its own and gives what it returns. For what
+/// waits long on something else (a language server, the network, a test
+/// run): the background pool has a thread per core, and a few of those
+/// waiting would hold up every save, search and refresh behind them.
+pub fn on_thread<T: Send + 'static>(job: impl FnOnce() -> T + Send + 'static) -> impl std::future::Future<Output = T> {
+    let (tx, rx) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let _ = tx.send_blocking(job());
+    });
+    async move { rx.recv().await.expect("the job's thread ended without a result") }
+}
+
 /// Where `program` is on PATH; with an extension from PATHEXT on Windows.
 pub fn which(program: impl AsRef<OsStr>) -> Option<PathBuf> {
     let program = std::path::Path::new(program.as_ref());

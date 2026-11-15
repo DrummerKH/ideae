@@ -154,10 +154,11 @@ impl Finder {
         if kind == FinderKind::Grep {
             use gpui_kit::component::input::{InputEvent, InputState};
             let mask = cx.new(|cx| InputState::new(window, cx).placeholder("*.rs, src/**, !*_test.go"));
-            let owner = finder.clone();
+            // Weak: the input is the finder's own, and would keep it alive.
+            let owner = finder.downgrade();
             cx.subscribe(&mask, move |_, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
-                    owner.update(cx, |f, cx| {
+                    let _ = owner.update(cx, |f, cx| {
                         let query = f.last_query.clone();
                         f.query(&query, cx)
                     });
@@ -321,7 +322,10 @@ impl Finder {
                 self._search = cx.spawn(async move |this, cx| {
                     // Wait for typing to pause; a newer query replaces this task.
                     cx.background_executor().timer(Duration::from_millis(200)).await;
-                    let hits = cx.background_spawn(async move { grep(&root, &query, regex, &mask) }).await;
+                    // Dropped with this task when a newer query comes: the walk ends.
+                    let stop = search::StopOnDrop::default();
+                    let flag = stop.flag();
+                    let hits = cx.background_spawn(async move { grep(&root, &query, regex, &mask, &flag) }).await;
                     let _ = this.update(cx, |f, cx| f.set_hits(hits, cx));
                 });
             }
@@ -466,10 +470,10 @@ pub(crate) fn score(path: &str, query: &[char]) -> Option<i64> {
     (qi == query.len()).then_some(score * 100 - path.len() as i64)
 }
 
-fn grep(root: &PathBuf, query: &str, regex: bool, mask: &str) -> Vec<Hit> {
+fn grep(root: &PathBuf, query: &str, regex: bool, mask: &str, stop: &std::sync::atomic::AtomicBool) -> Vec<Hit> {
     let matcher = if regex { search::regex(query) } else { search::literal(query) };
     let Some(matcher) = matcher else { return Vec::new() };
-    search::search_in(root, &matcher, search::mask(root, mask), 20, 300, GREP_LIMIT)
+    search::search_in(root, &matcher, search::mask(root, mask), 20, 300, GREP_LIMIT, stop)
         .into_iter()
         .map(|m| {
             // The cursor goes to the first match.

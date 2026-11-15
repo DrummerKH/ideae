@@ -321,11 +321,17 @@ pub struct FileView {
     /// Bumped on every change of the text, for caches of things derived from it.
     pub edit_version: u64,
     _lsp_sync: Task<()>,
+    /// The edit version being written, if a write is under way, and what
+    /// orders it with a later one.
+    saving: Option<u64>,
+    save_seq: u64,
+    write_gate: Arc<std::sync::Mutex<u64>>,
+    _save: Task<()>,
     /// The task's worktree (for git) and the task, to open a blamed commit.
     root: PathBuf,
     task: WeakEntity<TaskView>,
     /// Who last changed each line, and the line the cursor is on.
-    blame: Rc<Vec<Option<git::BlameLine>>>,
+    blame: Rc<Vec<Option<Arc<git::BlameLine>>>>,
     cursor_line: u32,
     /// The cursor's column, for the navigation history to come back to.
     cursor_col: u32,
@@ -346,29 +352,76 @@ pub struct FileView {
     _poll: Task<()>,
 }
 
+/// How many 150 ms waits a task out of view lets pass before it refreshes.
+const HIDDEN_REFRESH_WAITS: usize = 20;
+
 fn mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Whether the editor holds exactly `text`, without copying it out.
+fn same_text(rope: &Rope, text: &str) -> bool {
+    let mut rest = text.as_bytes();
+    rope.len() == rest.len()
+        && rope.chunks().all(|chunk| {
+            let (head, tail) = rest.split_at(chunk.len());
+            rest = tail;
+            head == chunk.as_bytes()
+        })
+}
+
+/// Writes of one file, in the order they were asked for: a write that
+/// starts after a later one has been made is dropped. Gives the file's
+/// time once written.
+fn write_in_order(gate: &std::sync::Mutex<u64>, seq: u64, path: &std::path::Path, bytes: &[u8]) -> std::io::Result<Option<std::time::SystemTime>> {
+    let mut latest = gate.lock().unwrap();
+    if seq > *latest {
+        std::fs::write(path, bytes)?;
+        *latest = seq;
+    }
+    Ok(mtime(path))
+}
+
+/// A file found changed on disk: the time the view knew, the time now,
+/// and what is in it.
+struct DiskChange {
+    known: Option<std::time::SystemTime>,
+    now: std::time::SystemTime,
+    content: String,
+}
+
+/// Off the UI thread: of the open files, those whose time on disk is not
+/// the one known, read.
+fn changed_on_disk(known: Vec<(PathBuf, Option<std::time::SystemTime>)>) -> Vec<Option<DiskChange>> {
+    known
+        .into_iter()
+        .map(|(path, known)| {
+            let now = mtime(&path).filter(|now| Some(*now) != known)?;
+            Some(DiskChange { known, now, content: std::fs::read_to_string(&path).ok()? })
+        })
+        .collect()
 }
 
 impl FileView {
     fn on_edit(&mut self, cx: &mut Context<Self>) {
         self.edit_version += 1;
-        let text = self.editor.read(cx).value();
-        let dirty = text != self.saved;
+        let dirty = !same_text(self.editor.read(cx).text(), &self.saved);
         if dirty != self.dirty {
             self.dirty = dirty;
             cx.notify();
         }
         // Tell the language server after typing pauses, so hover and
-        // definitions see the edited text.
+        // definitions see the edited text. The text is taken then, not on
+        // every key: it is a copy of the whole file.
         let Some(client) = self.lsp_client.clone() else { return };
         self.lsp_version += 1;
-        let (path, version) = (self.path.clone(), self.lsp_version);
-        self._lsp_sync = cx.spawn(async move |_, cx| {
+        let path = self.path.clone();
+        self._lsp_sync = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_millis(300)).await;
-            cx.background_spawn(async move {
+            let Ok((version, text)) = this.update(cx, |f, cx| (f.lsp_version, f.editor.read(cx).value())) else { return };
+            cx.background_spawn(crate::procs::on_thread(move || {
                 let _ = client.did_change(&path, version, &text);
-            })
+            }))
             .await;
         });
     }
@@ -376,26 +429,57 @@ impl FileView {
     /// Saves edits unless the file changed on disk meanwhile: then the
     /// conflict bar asks, rather than silently overwriting the other side.
     pub fn autosave(&mut self, cx: &mut Context<Self>) {
-        if self.dirty && !self.conflict {
+        if self.dirty && !self.conflict && self.saving != Some(self.edit_version) {
             self.save(cx);
         }
     }
 
+    /// Writes off the UI thread; the file counts as saved once it is written.
     fn save(&mut self, cx: &mut Context<Self>) {
         let text = self.editor.read(cx).value();
-        match std::fs::write(&self.path, text.as_bytes()) {
-            Ok(()) => {
+        self.save_seq += 1;
+        self.saving = Some(self.edit_version);
+        let (seq, path, gate) = (self.save_seq, self.path.clone(), self.write_gate.clone());
+        self._save = cx.spawn(async move |this, cx| {
+            let bytes = text.clone();
+            let written = cx.background_spawn(async move { write_in_order(&gate, seq, &path, bytes.as_bytes()) }).await;
+            let _ = this.update(cx, |this, cx| {
+                if seq == this.save_seq {
+                    this.saving = None;
+                    this.written(text, written, cx);
+                }
+            });
+        });
+    }
+
+    /// The task closes or the app quits: what is unsaved, or still being
+    /// written, is on disk when this returns.
+    pub fn save_now(&mut self, cx: &mut Context<Self>) {
+        if self.saving.is_none() && !(self.dirty && !self.conflict) {
+            return;
+        }
+        let text = self.editor.read(cx).value();
+        self.save_seq += 1;
+        self.saving = None;
+        self._save = Task::ready(());
+        let written = write_in_order(&self.write_gate, self.save_seq, &self.path, text.as_bytes());
+        self.written(text, written, cx);
+    }
+
+    fn written(&mut self, text: SharedString, written: std::io::Result<Option<std::time::SystemTime>>, cx: &mut Context<Self>) {
+        match written {
+            Ok(mtime) => {
+                self.dirty = !same_text(self.editor.read(cx).text(), &text);
                 self.saved = text;
-                self.disk_mtime = mtime(&self.path);
-                self.dirty = false;
+                self.disk_mtime = mtime;
                 self.conflict = false;
                 self.error = None;
                 self.load_blame(cx);
                 if let Some(client) = self.lsp_client.clone() {
                     let path = self.path.clone();
-                    cx.background_spawn(async move {
+                    cx.background_spawn(crate::procs::on_thread(move || {
                         let _ = client.did_save(&path);
-                    })
+                    }))
                     .detach();
                 }
             }
@@ -404,24 +488,30 @@ impl FileView {
         cx.notify();
     }
 
-    /// Called on every worktree refresh: picks up changes made on disk (by the
-    /// agent, git, another editor). Clean buffers reload in place; edited ones
-    /// get a choice instead of losing either side.
-    pub fn check_disk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let now = mtime(&self.path);
-        if now == self.disk_mtime || now.is_none() {
+    /// The file's time as this view knows it, for the refresh to compare
+    /// with the disk off the UI thread. None while a save is being written.
+    fn disk_known(&self) -> Option<(PathBuf, Option<std::time::SystemTime>)> {
+        self.saving.is_none().then(|| (self.path.clone(), self.disk_mtime))
+    }
+
+    /// Called on every worktree refresh with what `changed_on_disk` read:
+    /// picks up changes made on disk (by the agent, git, another editor).
+    /// Clean buffers reload in place; edited ones get a choice instead of
+    /// losing either side.
+    fn apply_disk(&mut self, change: DiskChange, window: &mut Window, cx: &mut Context<Self>) {
+        // Saved or reloaded since the disk was read: the next refresh looks again.
+        if self.saving.is_some() || self.disk_mtime != change.known {
             return;
         }
-        let Ok(content) = std::fs::read_to_string(&self.path) else { return };
-        self.disk_mtime = now;
-        if content.as_str() == self.saved.as_ref() {
+        self.disk_mtime = Some(change.now);
+        if change.content.as_str() == self.saved.as_ref() {
             return;
         }
         if self.dirty {
             self.conflict = true;
             cx.notify();
         } else {
-            self.reload(content, window, cx);
+            self.reload(change.content, window, cx);
         }
     }
 
@@ -440,9 +530,9 @@ impl FileView {
         if let Some(client) = self.lsp_client.clone() {
             self.lsp_version += 1;
             let (path, version) = (self.path.clone(), self.lsp_version);
-            cx.background_spawn(async move {
+            cx.background_spawn(crate::procs::on_thread(move || {
                 let _ = client.did_change(&path, version, &content_for_lsp);
-            })
+            }))
             .detach();
         }
         cx.notify();
@@ -776,13 +866,13 @@ impl HoverProvider for LspBridge {
             eprintln!("hover requested at {pos:?}");
         }
         let (client, uri) = (self.client.clone(), self.uri.clone());
-        cx.background_spawn(async move {
+        cx.background_spawn(crate::procs::on_thread(move || {
             let result = client.hover(&uri, pos).inspect_err(|e| eprintln!("hover: {e:#}"));
             if std::env::var_os("IDEAE_DEBUG").is_some() {
                 eprintln!("hover {uri} {pos:?} -> {}", if matches!(result, Ok(Some(_))) { "some" } else { "none/err" });
             }
             result
-        })
+        }))
     }
 }
 
@@ -796,13 +886,13 @@ impl DefinitionProvider for LspBridge {
     ) -> Task<anyhow::Result<Vec<lsp_types::LocationLink>>> {
         let pos = text.offset_to_position(offset);
         let (client, uri) = (self.client.clone(), self.uri.clone());
-        cx.background_spawn(async move {
+        cx.background_spawn(crate::procs::on_thread(move || {
             let result = client.definition(&uri, pos).inspect_err(|e| eprintln!("definition: {e:#}"));
             if std::env::var_os("IDEAE_DEBUG").is_some() {
                 eprintln!("definition {uri} {pos:?} -> {result:?}");
             }
             result
-        })
+        }))
     }
 }
 
@@ -827,11 +917,22 @@ pub struct ChangesView {
     first_lines: Rc<HashMap<String, u32>>,
     selection: Option<DiffLineRange>,
     task: WeakEntity<TaskView>,
+    /// The branches to compare with, for the menu: listed off the UI thread.
+    branches: Rc<std::cell::RefCell<Vec<String>>>,
     /// Review comments on lines of the diff, sent to the agent as one message.
     review: Vec<crate::state::ReviewNote>,
     /// The text of the last selection: a click in the context menu clears
     /// the selection before its action runs.
     selected_code: String,
+}
+
+/// Lists the repository's branches, newest first, into `known`.
+fn load_branches<T: 'static>(root: PathBuf, known: Rc<std::cell::RefCell<Vec<String>>>, cx: &mut Context<T>) {
+    cx.spawn(async move |_, cx| {
+        let found = cx.background_spawn(async move { git::branches(&root).into_iter().take(40).collect::<Vec<_>>() }).await;
+        *known.borrow_mut() = found;
+    })
+    .detach();
 }
 
 impl ChangesView {
@@ -849,6 +950,8 @@ impl ChangesView {
             _ => {}
         })
         .detach();
+        let branches = Rc::default();
+        load_branches(root.clone(), Rc::clone(&branches), cx);
         Self {
             root,
             diff,
@@ -860,6 +963,7 @@ impl ChangesView {
             task,
             review: Vec::new(),
             selected_code: String::new(),
+            branches,
         }
     }
 
@@ -1056,12 +1160,12 @@ impl ChangesView {
         // Read from the task rather than asking it to push: it would read this
         // view back while it is being updated.
         let Ok((files, lines)) = self.task.read_with(cx, |task, _| match scope {
-            DiffScope::Uncommitted => (task.uncommitted_diff.clone(), git::first_changed_lines(&task.patch)),
-            DiffScope::Branch => (task.branch_diff.clone(), git::first_changed_lines(&task.branch_patch)),
+            DiffScope::Uncommitted => (task.uncommitted_diff.clone(), task.uncommitted_lines.clone()),
+            DiffScope::Branch => (task.branch_diff.clone(), task.branch_lines.clone()),
         }) else {
             return;
         };
-        self.first_lines = Rc::new(lines);
+        self.first_lines = lines;
         self.diff.update(cx, |d, cx| d.set_files(files, cx));
         cx.notify();
     }
@@ -1108,14 +1212,17 @@ impl Render for ChangesView {
                             .on_click(cx.listener(|this, _, _, cx| this.set_scope(DiffScope::Branch, cx))),
                     )
                     .child({
-                        let (root, task, view) = (self.root.clone(), self.task.clone(), cx.weak_entity());
+                        let (root, task, view, known) = (self.root.clone(), self.task.clone(), cx.weak_entity(), self.branches.clone());
                         Button::new("pick-base")
                             .small()
                             .ghost()
                             .label("▾")
                             .tooltip("Compare with another branch")
-                            .dropdown_menu(move |mut menu, _, _| {
-                                for branch in git::branches(&root).into_iter().take(40) {
+                            .dropdown_menu(move |mut menu, _, cx| {
+                                // As listed last; asked again for the next time it opens.
+                                load_branches(root.clone(), known.clone(), cx);
+                                let branches = known.borrow().clone();
+                                for branch in branches {
                                     let (task, view, name) = (task.clone(), view.clone(), branch.clone());
                                     menu = menu.item(gpui_kit::component::menu::PopupMenuItem::new(branch).on_click(
                                         move |_, _, cx| {
@@ -1365,12 +1472,19 @@ struct TabItem {
     kind: TabKind,
     /// In the right pane; every tab is in the left one when not split.
     right: bool,
+    /// What the tab's label needs of its view, kept here: the task is not
+    /// to be drawn again whenever a terminal or a page draws a frame, as it
+    /// would be if drawing it read them. The terminal's or the page's
+    /// title, whether the file has unsaved edits, the service it runs.
+    shown: SharedString,
+    dirty: bool,
+    service: Option<String>,
 }
 
 impl TabItem {
     fn new(title: impl Into<SharedString>, kind: TabKind) -> Self {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
-        Self { id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed), title: title.into(), kind, right: false }
+        Self { id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed), title: title.into(), kind, right: false, shown: SharedString::default(), dirty: false, service: None }
     }
 }
 
@@ -1399,7 +1513,9 @@ pub struct TaskView {
     /// The file the agent is writing to now, and those it wrote to since
     /// the last prompt: marked in the Changes and Files panels.
     agent_editing: Option<SharedString>,
-    agent_touched: HashSet<SharedString>,
+    agent_touched: Rc<HashSet<SharedString>>,
+    /// The paths of `files`, for the tree's marks.
+    changed_paths: Rc<HashSet<SharedString>>,
     /// The command that starts the agent, for Restart.
     agent: Option<String>,
     /// Text for the agent's prompt once it is ready to take it, and whether
@@ -1444,11 +1560,14 @@ pub struct TaskView {
     changes: Entity<ChangesView>,
     history: Entity<HistoryView>,
     files: Vec<ChangedFile>,
-    patch: String,
     /// Parsed diffs of both scopes; the Changes tab shows one of them.
     uncommitted_diff: Vec<DiffFile>,
     branch_diff: Vec<DiffFile>,
-    branch_patch: String,
+    /// The first changed line of each file, per scope, for "open".
+    uncommitted_lines: Rc<HashMap<String, u32>>,
+    branch_lines: Rc<HashMap<String, u32>>,
+    /// The Changes tab shows an older diff than the one read last.
+    diff_stale: bool,
     branch_info: git::BranchInfo,
     right: RightPane,
     /// The file the Structure panel shows (tab id), and its outline cached by
@@ -1460,11 +1579,15 @@ pub struct TaskView {
     /// Whether the side panel holds the keyboard, set each render.
     side_has_focus: std::cell::Cell<bool>,
     structure: std::cell::RefCell<Option<(usize, u64, Rc<Vec<crate::finder::OutlineItem>>)>>,
+    /// The outline being made, by what it is of.
+    structure_job: std::cell::RefCell<(Option<(usize, u64)>, Task<()>)>,
     tree: Entity<TreeState>,
     /// The file list the tree was built from, and the folders open in it.
-    tree_files: Vec<String>,
+    tree_files: Arc<Vec<String>>,
+    /// The tree is of an older list: it is built when the Files panel shows.
+    tree_stale: bool,
     /// The same list for definition lookups running off the UI thread.
-    shared_files: Arc<std::sync::RwLock<Vec<String>>>,
+    shared_files: Arc<std::sync::RwLock<Arc<Vec<String>>>>,
     expanded: HashSet<SharedString>,
     /// Folders folded in the Changes tree, as "staged:dir" / "changes:dir".
     folded_changes: HashSet<String>,
@@ -1476,7 +1599,8 @@ pub struct TaskView {
     /// The git/gh action running, and the outcome of the last one.
     busy: Option<&'static str>,
     /// The file the last Discard threw away, for Undo.
-    discard_undo: Option<git::FileSnapshot>,
+    /// It is taken where the discard runs, off the UI thread.
+    discard_undo: Option<Arc<std::sync::Mutex<Option<git::FileSnapshot>>>>,
     action: Option<(bool, String)>,
     /// Wakes the refresh loop: file events, actions, the fallback tick.
     refresh_tx: async_channel::Sender<()>,
@@ -1487,6 +1611,8 @@ pub struct TaskView {
     watched: (BTreeSet<PathBuf>, Vec<PathBuf>),
     /// One server per (program, project root).
     lsp: HashMap<(&'static str, PathBuf), Arc<lsp::LspClient>>,
+    /// Since when no open file uses a server.
+    lsp_unused: HashMap<(&'static str, PathBuf), std::time::Instant>,
     /// Where you were before each jump, for Back and Forward.
     nav_back: Vec<NavPoint>,
     nav_forward: Vec<NavPoint>,
@@ -1543,11 +1669,16 @@ impl TaskView {
         .inspect_err(|e| eprintln!("file watcher off, polling only: {e}"))
         .ok();
         // Fallback for anything the watcher misses (new directories, remotes).
+        // Out of view a task is looked at once a minute: every open task pays
+        // for its refresh with a handful of git processes.
         let tick_tx = refresh_tx.clone();
-        cx.spawn(async move |_, cx| {
+        cx.spawn(async move |this, cx| {
+            let mut n = 0u32;
             loop {
                 cx.background_executor().timer(Duration::from_secs(10)).await;
-                if tick_tx.send(()).await.is_err() {
+                n += 1;
+                let Ok(visible) = this.read_with(cx, |t, _| t.visible) else { break };
+                if (visible || n % 6 == 0) && tick_tx.send(()).await.is_err() {
                     break;
                 }
             }
@@ -1558,39 +1689,65 @@ impl TaskView {
         let base_override: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
         let poll_base = base_override.clone();
         let poll = cx.spawn_in(window, async move |this, cx| {
+            // The patches shown, by hash: only a new one is parsed.
+            let mut seen = (text_hash(""), text_hash(""));
+            let mut known = git::Known::default();
             loop {
                 let root = poll_root.clone();
                 let picked = poll_base.lock().unwrap().clone();
-                let (patch, files, info, states, watch, branch) = cx
+                let Ok((open, open_known)) = this.update(cx, |this, cx| this.open_files_known(cx)) else { break };
+                let (read, patch, branch, on_disk, now_seen, now_known) = cx
                     .background_spawn(async move {
-                        let files = git::files(&root);
-                        let watch = git::watch_dirs(&root, &files);
-                        let info = git::branch_info(&root);
-                        // On the base branch itself the comparison is the uncommitted diff again.
-                        let branch = picked
-                            .or_else(|| git::base_ref(&root).filter(|base| *base != info.head))
-                            .and_then(|base| git::branch_patch(&root, &base).map(|p| (base, p)));
-                        (git::working_patch(&root), files, info, git::file_states(&root), watch, branch)
+                        let read = git::refresh(&root, picked, &mut known);
+                        // Nothing committed on the branch yet: one patch, parsed once.
+                        let same = read.branch == read.working;
+                        let patch = parse_patch(read.working.clone(), &mut seen.0);
+                        let branch = match &patch {
+                            Some(patch) if same => {
+                                seen.1 = seen.0;
+                                Some(patch.clone())
+                            }
+                            _ => parse_patch(read.branch.clone(), &mut seen.1),
+                        };
+                        (read, patch, branch, changed_on_disk(open_known), seen, known)
                     })
                     .await;
+                let git::Refreshed { files, watch, info, states, base, .. } = read;
+                known = now_known;
+                seen = now_seen;
                 let applied = this.update_in(cx, |this, window, cx| {
-                    this.check_open_files(window, cx);
-                    this.file_states = states;
-                    this.apply_patch(patch, cx);
-                    this.apply_branch_patch(branch, cx);
+                    for (file, change) in open.iter().zip(on_disk) {
+                        if let Some(change) = change {
+                            let _ = file.update(cx, |f, cx| f.apply_disk(change, window, cx));
+                        }
+                    }
+                    if this.file_states != states {
+                        this.file_states = states;
+                        cx.notify();
+                    }
+                    if let Some(patch) = patch {
+                        this.apply_patch(patch, cx);
+                    }
+                    this.apply_branch_patch(base, branch, cx);
                     this.apply_files(files, cx);
                     this.apply_branch(info, cx);
                     this.sync_watches(watch);
-                    cx.notify();
                 });
                 if applied.is_err() {
                     break;
                 }
-                // Wait for a change, then let a burst of events settle.
+                // Wait for a change, then let a burst of events settle. A
+                // task out of view (its agent writing away) waits longer,
+                // unless it comes into view meanwhile.
                 if refresh_rx.recv().await.is_err() {
                     break;
                 }
-                cx.background_executor().timer(Duration::from_millis(150)).await;
+                for _ in 0..HIDDEN_REFRESH_WAITS {
+                    cx.background_executor().timer(Duration::from_millis(150)).await;
+                    if !matches!(this.read_with(cx, |t, _| t.visible), Ok(false)) {
+                        break;
+                    }
+                }
                 while refresh_rx.try_recv().is_ok() {}
             }
         });
@@ -1606,7 +1763,8 @@ impl TaskView {
             agent_status: crate::agent::AgentStatus::Unknown,
             agent_activity: None,
             agent_editing: None,
-            agent_touched: HashSet::new(),
+            agent_touched: Rc::default(),
+            changed_paths: Rc::default(),
             agent: agent.clone(),
             pending_prompt: None,
             queued_message: None,
@@ -1632,10 +1790,11 @@ impl TaskView {
             changes,
             history,
             files: Vec::new(),
-            patch: String::new(),
             uncommitted_diff: Vec::new(),
             branch_diff: Vec::new(),
-            branch_patch: String::new(),
+            uncommitted_lines: Rc::default(),
+            branch_lines: Rc::default(),
+            diff_stale: false,
             branch_info: git::BranchInfo::default(),
             right: RightPane::Changes,
             structure_file: None,
@@ -1643,8 +1802,10 @@ impl TaskView {
             side_selected: 0,
             side_has_focus: Default::default(),
             structure: Default::default(),
+            structure_job: std::cell::RefCell::new((None, Task::ready(()))),
             tree,
-            tree_files: Vec::new(),
+            tree_files: Arc::default(),
+            tree_stale: false,
             shared_files: Arc::default(),
             expanded: HashSet::new(),
             folded_changes: HashSet::new(),
@@ -1659,6 +1820,7 @@ impl TaskView {
             watcher,
             watched: Default::default(),
             lsp: HashMap::new(),
+            lsp_unused: HashMap::new(),
             nav_back: Vec::new(),
             nav_forward: Vec::new(),
             navigating: false,
@@ -1769,6 +1931,10 @@ impl TaskView {
                 }
             }
             TerminalEvent::TitleChanged | TerminalEvent::Bell => {
+                let title = state.read(cx).title().clone();
+                if let Some(tab) = this.tabs.iter_mut().find(|t| matches!(&t.kind, TabKind::Terminal(v) if v.read(cx).state == *state)) {
+                    tab.shown = title;
+                }
                 cx.emit(TaskEvent::Changed);
                 cx.notify();
             }
@@ -1782,8 +1948,9 @@ impl TaskView {
         let id = SharedString::from(format!("{}-term-{seq}", root.display()));
         let task = (role == "agent").then(|| cx.weak_entity());
         let service_name = service.map(|(name, _)| name);
-        let view = cx.new(|cx| TermView::new(id, state, session, seq, task, service_name, cx));
-        TabItem::new(title.to_string(), TabKind::Terminal(view))
+        let shown = state.read(cx).title().clone();
+        let view = cx.new(|cx| TermView::new(id, state, session, seq, task, service_name.clone(), cx));
+        TabItem { shown, service: service_name, ..TabItem::new(title.to_string(), TabKind::Terminal(view)) }
     }
 
     fn ix_of(&self, id: usize) -> Option<usize> {
@@ -2230,10 +2397,10 @@ impl TaskView {
         let query = PlacesQuery { path, pos, word: word.clone(), implementations };
         cx.spawn_in(window, async move |this, cx| {
             let places = cx
-                .background_spawn(async move {
+                .background_spawn(crate::procs::on_thread(move || {
                     let files = files.read().unwrap().clone();
                     find_places(&root, &files, &query, &buffer, client.as_deref())
-                })
+                }))
                 .await;
             let _ = this.update_in(cx, |this, window, cx| this.present_places(&word, implementations, places, window, cx));
         })
@@ -2294,7 +2461,7 @@ impl TaskView {
 
     fn install_lsp(&mut self, program: &'static str, window: &mut Window, cx: &mut Context<Self>) {
         use gpui_kit::component::notification::Notification;
-        let install = cx.background_spawn(async move { crate::lsp_install::install(program) });
+        let install = cx.background_spawn(crate::procs::on_thread(move || { crate::lsp_install::install(program) }));
         cx.spawn_in(window, async move |this, cx| {
             // The headers say "installing" once the install has begun.
             cx.background_executor().timer(Duration::from_millis(50)).await;
@@ -2359,7 +2526,7 @@ impl TaskView {
     }
 
     pub fn open_finder(&mut self, kind: crate::finder::FinderKind, window: &mut Window, cx: &mut Context<Self>) {
-        let files = Arc::new(self.tree_files.clone());
+        let files = self.tree_files.clone();
         crate::finder::Finder::open(kind, self.root.clone(), files, cx.weak_entity(), window, cx);
     }
 
@@ -2371,12 +2538,19 @@ impl TaskView {
 
     pub fn open_browser(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.new(|cx| crate::browser::BrowserView::new(url, window, cx));
-        cx.subscribe_in(&view, window, |this, _, event: &crate::browser::BrowserEvent, window, cx| match event {
-            crate::browser::BrowserEvent::Navigated => cx.notify(),
+        cx.subscribe_in(&view, window, |this, view, event: &crate::browser::BrowserEvent, window, cx| match event {
+            crate::browser::BrowserEvent::Navigated => {
+                let title = view.read(cx).title();
+                if let Some(tab) = this.tabs.iter_mut().find(|t| matches!(&t.kind, TabKind::Browser(v) if v == view)) {
+                    tab.shown = title;
+                }
+                cx.notify()
+            }
             crate::browser::BrowserEvent::Picked(message) => this.paste_to_agent(message.clone(), window, cx),
         })
         .detach();
-        let mut tab = TabItem::new("web", TabKind::Browser(view));
+        let shown = view.read(cx).title();
+        let mut tab = TabItem { shown, ..TabItem::new("web", TabKind::Browser(view)) };
         tab.right = self.focus_right && self.is_split();
         self.tabs.push(tab);
         self.activate(self.tabs.len() - 1, window, cx);
@@ -2421,24 +2595,34 @@ impl TaskView {
     /// one named after the class (then the member by its outline), or the
     /// class's declaration found by ripgrep.
     fn open_symbol(&mut self, symbol: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let places = find_symbol(&self.root, &self.tree_files, symbol);
-        match places.len() {
-            0 => {}
-            1 => {
-                let (path, line, _) = places.into_iter().next().unwrap();
-                self.open_file(path, line, window, cx);
-            }
-            _ => {
-                let hits = places
-                    .into_iter()
-                    .map(|(path, line, code)| {
-                        let shown = path.strip_prefix(&self.root).unwrap_or(&path).display().to_string();
-                        crate::finder::Hit { text: format!("{}   {shown}", code.trim()), path: shown, line: line + 1, col: 0, ranges: Vec::new() }
-                    })
-                    .collect();
-                crate::finder::Finder::open_hits(self.root.clone(), hits, cx.weak_entity(), window, cx)
-            }
-        }
+        let (root, files, symbol) = (self.root.clone(), self.shared_files.clone(), symbol.to_string());
+        cx.spawn_in(window, async move |this, cx| {
+            // It searches the project: not on the UI thread.
+            let places = cx
+                .background_spawn(async move {
+                    let files = files.read().unwrap().clone();
+                    find_symbol(&root, &files, &symbol)
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| match places.len() {
+                0 => {}
+                1 => {
+                    let (path, line, _) = places.into_iter().next().unwrap();
+                    this.open_file(path, line, window, cx);
+                }
+                _ => {
+                    let hits = places
+                        .into_iter()
+                        .map(|(path, line, code)| {
+                            let shown = path.strip_prefix(&this.root).unwrap_or(&path).display().to_string();
+                            crate::finder::Hit { text: format!("{}   {shown}", code.trim()), path: shown, line: line + 1, col: 0, ranges: Vec::new() }
+                        })
+                        .collect();
+                    crate::finder::Finder::open_hits(this.root.clone(), hits, cx.weak_entity(), window, cx)
+                }
+            });
+        })
+        .detach();
     }
 
     pub fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2465,11 +2649,9 @@ impl TaskView {
     }
 
     /// The agent terminal's title, which Claude Code uses as a status line.
-    pub fn agent_title(&self, cx: &App) -> Option<SharedString> {
+    pub fn agent_title(&self, _: &App) -> Option<SharedString> {
         self.tabs.iter().find_map(|tab| match &tab.kind {
-            TabKind::Terminal(view) if tab.title == "agent" => {
-                Some(view.read(cx).state.read(cx).title().clone())
-            }
+            TabKind::Terminal(_) if tab.title == "agent" => Some(tab.shown.clone()),
             _ => None,
         })
     }
@@ -2491,6 +2673,16 @@ impl TaskView {
         for tab in &self.tabs {
             if let TabKind::File(file) = &tab.kind {
                 file.update(cx, |f, cx| f.autosave(cx));
+            }
+        }
+    }
+
+    /// As `autosave_all`, and on disk when it returns: the task or the app
+    /// goes next.
+    pub fn save_all_now(&mut self, cx: &mut Context<Self>) {
+        for tab in &self.tabs {
+            if let TabKind::File(file) = &tab.kind {
+                file.update(cx, |f, cx| f.save_now(cx));
             }
         }
     }
@@ -2520,12 +2712,12 @@ impl TaskView {
     pub fn follow_agent(&mut self, event: &str, file: Option<&str>) {
         match event {
             "UserPromptSubmit" => {
-                self.agent_touched.clear();
+                self.agent_touched = Rc::default();
                 self.agent_editing = None;
             }
             "PreToolUse" => {
                 self.agent_editing = file.and_then(|file| path_in(&self.root, std::path::Path::new(file))).map(SharedString::from);
-                self.agent_touched.extend(self.agent_editing.clone());
+                Rc::make_mut(&mut self.agent_touched).extend(self.agent_editing.clone());
             }
             _ => {}
         }
@@ -2553,9 +2745,12 @@ impl TaskView {
         self.visible = visible;
         self.sync_visibility(cx);
         if visible {
+            // What it skipped while out of view.
+            let _ = self.refresh_tx.try_send(());
+            self.show_diff_if_seen(cx);
             self.focus_active(window, cx);
             if self.right == RightPane::Run && self._listening_poll.is_none() {
-                self.refresh_services();
+                self.refresh_services(cx);
                 self.watch_listening(cx);
             }
         }
@@ -2564,10 +2759,12 @@ impl TaskView {
     /// Hidden terminals keep parsing but stop producing frames.
     fn sync_visibility(&mut self, cx: &mut Context<Self>) {
         for tab in &self.tabs {
-            if let TabKind::Terminal(view) = &tab.kind {
-                let shown = tab.id == self.left_active || Some(tab.id) == self.right_active;
-                let visible = self.visible && shown;
-                view.read(cx).state.clone().update(cx, |s, cx| s.set_visible(visible, cx));
+            let shown = tab.id == self.left_active || Some(tab.id) == self.right_active;
+            let visible = self.visible && shown;
+            match &tab.kind {
+                TabKind::Terminal(view) => view.read(cx).state.clone().update(cx, |s, cx| s.set_visible(visible, cx)),
+                TabKind::Browser(view) => view.update(cx, |b, cx| b.set_visible(visible, cx)),
+                _ => {}
             }
         }
     }
@@ -2613,6 +2810,7 @@ impl TaskView {
         }
         self.autosave_unfocused(cx);
         self.sync_visibility(cx);
+        self.show_diff_if_seen(cx);
         self.focus_active(window, cx);
         self.note_recent(cx);
         cx.notify();
@@ -2738,6 +2936,17 @@ impl TaskView {
 
     fn remove_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let removed = self.tabs.remove(ix);
+        // The server keeps every text it was given until told otherwise.
+        if let TabKind::File(file) = &removed.kind {
+            let f = file.read(cx);
+            if let Some(client) = f.lsp_client.clone() {
+                let path = f.path.clone();
+                cx.background_spawn(crate::procs::on_thread(move || {
+                    let _ = client.did_close(&path);
+                }))
+                .detach();
+            }
+        }
         // The pane that showed it moves to its left neighbour in that pane, not
         // onto whatever comes next (a diff the same click would hit).
         let neighbour = self.tabs[..ix.min(self.tabs.len())]
@@ -2759,20 +2968,8 @@ impl TaskView {
         cx.notify();
     }
 
-    fn apply_patch(&mut self, patch: String, cx: &mut Context<Self>) {
-        if patch == self.patch {
-            return;
-        }
-        let files = match DiffFile::parse(&patch) {
-            Ok(files) => files,
-            Err(error) => {
-                eprintln!("diff parse: {error}");
-                return;
-            }
-        };
-        let first_lines = git::first_changed_lines(&patch);
-        let hashes = file_patch_hashes(&patch);
-        self.patch = patch;
+    fn apply_patch(&mut self, parsed: ParsedPatch, cx: &mut Context<Self>) {
+        let ParsedPatch { files, first_lines, hashes } = parsed;
         self.files = files
             .iter()
             .map(|f| ChangedFile {
@@ -2785,25 +2982,26 @@ impl TaskView {
             })
             .collect();
         // A file that is no longer changed is no longer viewed either.
-        let changed: HashSet<&str> = self.files.iter().map(|f| f.path.as_ref()).collect();
+        let changed: HashSet<SharedString> = self.files.iter().map(|f| f.path.clone()).collect();
         self.viewed.retain(|path, _| changed.contains(path.as_str()));
-        self.uncommitted_diff = with_languages(files);
+        self.changed_paths = Rc::new(changed);
+        self.uncommitted_diff = files;
+        self.uncommitted_lines = Rc::new(first_lines);
         self.refresh_scope(DiffScope::Uncommitted, cx);
         cx.emit(TaskEvent::Changed);
         cx.notify();
     }
 
-    fn apply_branch_patch(&mut self, branch: Option<(String, String)>, cx: &mut Context<Self>) {
-        let (base, patch) = match branch {
-            Some((base, patch)) => (Some(base), patch),
-            None => (None, String::new()),
-        };
+    /// The diff against `base`; `parsed` when it is another one than before.
+    fn apply_branch_patch(&mut self, base: Option<String>, parsed: Option<ParsedPatch>, cx: &mut Context<Self>) {
         let base_changed = self.changes.read(cx).base != base;
-        if patch == self.branch_patch && !base_changed {
+        if parsed.is_none() && !base_changed {
             return;
         }
-        self.branch_diff = with_languages(DiffFile::parse(&patch).unwrap_or_default());
-        self.branch_patch = patch;
+        if let Some(parsed) = parsed {
+            self.branch_diff = parsed.files;
+            self.branch_lines = Rc::new(parsed.first_lines);
+        }
         self.changes.update(cx, |c, _| c.base = base);
         self.refresh_scope(DiffScope::Branch, cx);
     }
@@ -2812,13 +3010,27 @@ impl TaskView {
     /// so scrolling the other one is not reset.
     fn refresh_scope(&mut self, changed: DiffScope, cx: &mut Context<Self>) {
         if self.changes.read(cx).scope == changed {
-            self.show_scope(cx);
-        } else {
-            let counts = (self.uncommitted_diff.len(), self.branch_diff.len());
-            self.changes.update(cx, |c, cx| {
+            self.diff_stale = true;
+            self.show_diff_if_seen(cx);
+        }
+        let counts = (self.uncommitted_diff.len(), self.branch_diff.len());
+        self.changes.update(cx, |c, cx| {
+            if c.counts != counts {
                 c.counts = counts;
                 cx.notify();
-            });
+            }
+        });
+    }
+
+    /// The Changes tab gets a new diff when it is looked at: laying one out
+    /// and colouring it for a tab that is closed, behind another, or in a
+    /// task out of view would be done again on every change an agent makes.
+    fn show_diff_if_seen(&mut self, cx: &mut Context<Self>) {
+        let seen = self.visible
+            && self.tabs.iter().any(|t| matches!(t.kind, TabKind::Changes) && (t.id == self.left_active || Some(t.id) == self.right_active));
+        if self.diff_stale && seen {
+            self.diff_stale = false;
+            self.show_scope(cx);
         }
     }
 
@@ -2831,11 +3043,10 @@ impl TaskView {
     fn show_scope(&mut self, cx: &mut Context<Self>) {
         let counts = (self.uncommitted_diff.len(), self.branch_diff.len());
         let scope = self.changes.read(cx).scope;
-        let (files, patch) = match scope {
-            DiffScope::Uncommitted => (self.uncommitted_diff.clone(), &self.patch),
-            DiffScope::Branch => (self.branch_diff.clone(), &self.branch_patch),
+        let (files, lines) = match scope {
+            DiffScope::Uncommitted => (self.uncommitted_diff.clone(), self.uncommitted_lines.clone()),
+            DiffScope::Branch => (self.branch_diff.clone(), self.branch_lines.clone()),
         };
-        let lines = Rc::new(git::first_changed_lines(patch));
         let diff = self.changes.read(cx).diff.clone();
         diff.update(cx, |state, cx| state.set_files(files, cx));
         self.changes.update(cx, |c, cx| {
@@ -2845,18 +3056,16 @@ impl TaskView {
         });
     }
 
-    fn check_open_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let files: Vec<Entity<FileView>> = self
-            .tabs
+    /// The open files and the time each knows its file by, for
+    /// `changed_on_disk`. One being saved is left out.
+    fn open_files_known(&self, cx: &App) -> (Vec<WeakEntity<FileView>>, Vec<(PathBuf, Option<std::time::SystemTime>)>) {
+        self.tabs
             .iter()
             .filter_map(|t| match &t.kind {
-                TabKind::File(f) => Some(f.clone()),
+                TabKind::File(f) => Some((f.downgrade(), f.read(cx).disk_known()?)),
                 _ => None,
             })
-            .collect();
-        for file in files {
-            file.update(cx, |f, cx| f.check_disk(window, cx));
-        }
+            .unzip()
     }
 
     fn sync_watches(&mut self, watch: (BTreeSet<PathBuf>, Vec<PathBuf>)) {
@@ -2881,10 +3090,11 @@ impl TaskView {
     }
 
     fn apply_files(&mut self, files: Vec<String>, cx: &mut Context<Self>) {
-        if files == self.tree_files {
+        if files == *self.tree_files {
             return;
         }
-        let items = build_tree(&files, &self.expanded);
+        // One list, shared by the tree, the finder and the lookups off the UI thread.
+        let files = Arc::new(files);
         *self.shared_files.write().unwrap() = files.clone();
         // Class names for terminal links: `Profit` in output links to Profit.kt.
         gpui_cn::terminal::add_known_names(files.iter().filter_map(|f| {
@@ -2893,7 +3103,18 @@ impl TaskView {
             (stem.len() > 2 && stem.chars().next()?.is_ascii_uppercase()).then(|| stem.to_string())
         }));
         self.tree_files = files;
-        self.tree.update(cx, |t, cx| t.set_items(items, cx));
+        self.tree_stale = true;
+        self.fill_tree(cx);
+    }
+
+    /// The Files panel's tree, built when the panel is the one shown: it
+    /// holds every path again, several times over, in every open task.
+    fn fill_tree(&mut self, cx: &mut Context<Self>) {
+        if self.tree_stale && self.right == RightPane::Files {
+            self.tree_stale = false;
+            let items = build_tree(&self.tree_files, &self.expanded);
+            self.tree.update(cx, |t, cx| t.set_items(items, cx));
+        }
     }
 
     fn apply_branch(&mut self, info: git::BranchInfo, cx: &mut Context<Self>) {
@@ -2969,9 +3190,14 @@ impl TaskView {
         }
     }
 
+    /// For the buttons, drawn every frame: without asking the disk whether
+    /// the files are still there, as `navigate` does.
     pub fn can_navigate(&self, back: bool) -> bool {
         let stack = if back { &self.nav_back } else { &self.nav_forward };
-        stack.iter().any(|p| self.nav_reachable(p))
+        stack.iter().any(|p| match p {
+            NavPoint::File { .. } => true,
+            NavPoint::Tab(id) => self.ix_of(*id).is_some(),
+        })
     }
 
     /// Mouse Back/Forward, Alt+Left/Right: the place before (or after) the
@@ -3020,8 +3246,9 @@ impl TaskView {
             2 => RightPane::Structure,
             _ => RightPane::Run,
         };
+        self.fill_tree(cx);
         if self.right == RightPane::Run {
-            self.refresh_services();
+            self.refresh_services(cx);
             self.watch_listening(cx);
         }
         self.side_selected = match self.right {
@@ -3090,13 +3317,39 @@ impl TaskView {
             let f = file.read(cx);
             (f.path.clone(), f.edit_version)
         };
-        if let Some((_, _, items)) = self.structure.borrow().as_ref().filter(|(i, v, _)| *i == id && *v == version) {
+        // While you type, the outline of a moment ago: `refresh_structure`
+        // brings the new one once the typing pauses.
+        if let Some((_, _, items)) = self.structure.borrow().as_ref().filter(|(i, _, _)| *i == id) {
             return items.clone();
         }
         let text = file.read(cx).editor.read(cx).text().to_string();
         let items = Rc::new(outline(&path, &text));
         *self.structure.borrow_mut() = Some((id, version, items.clone()));
         items
+    }
+
+    /// Parses the Structure panel's file again, off the UI thread, when its
+    /// text is not the one the outline was made from.
+    fn refresh_structure(&self, cx: &mut Context<Self>) {
+        let Some((id, file)) = self.structure_target() else { return };
+        let (path, version) = {
+            let f = file.read(cx);
+            (f.path.clone(), f.edit_version)
+        };
+        let current = Some((id, version));
+        if self.structure.borrow().as_ref().map(|(i, v, _)| (*i, *v)) == current || self.structure_job.borrow().0 == current {
+            return;
+        }
+        let job = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(200)).await;
+            let (version, text) = file.read_with(cx, |f, cx| (f.edit_version, f.editor.read(cx).text().to_string()));
+            let items = cx.background_spawn(async move { outline(&path, &text) }).await;
+            let _ = this.update(cx, |this, cx| {
+                *this.structure.borrow_mut() = Some((id, version, Rc::new(items)));
+                cx.notify();
+            });
+        });
+        *self.structure_job.borrow_mut() = (current, job);
     }
 
     /// Shows the Changes or History tab, opening it in the pane you are in
@@ -3241,8 +3494,8 @@ impl TaskView {
     fn render_tree(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.weak_entity();
         let root = self.root.clone();
-        let changed: Rc<HashSet<SharedString>> = Rc::new(self.files.iter().map(|f| f.path.clone()).collect());
-        let touched = Rc::new(self.agent_touched.clone());
+        let changed = self.changed_paths.clone();
+        let touched = self.agent_touched.clone();
         let editing = self.agent_editing.clone();
         div().flex_1().min_h_0().child(
             tree(&self.tree, move |ix, entry, selected, _, _| {
@@ -3390,6 +3643,10 @@ impl TaskView {
             lsp_version: 1,
             edit_version: 0,
             _lsp_sync: Task::ready(()),
+            saving: None,
+            save_seq: 0,
+            write_gate: Arc::default(),
+            _save: Task::ready(()),
             expand_stack: Vec::new(),
             last_expanded: None,
             root: root.clone(),
@@ -3423,7 +3680,17 @@ impl TaskView {
             }),
         }});
         // The tab label shows whether the file has unsaved edits.
-        cx.observe(&file, |_, _, cx| cx.notify()).detach();
+        // The cursor moving a line is the file's own to draw, except for the
+        // Structure panel, which marks where it is.
+        cx.observe(&file, |this, file, cx| {
+            let dirty = file.read(cx).dirty;
+            let Some(tab) = this.tabs.iter_mut().find(|t| matches!(&t.kind, TabKind::File(f) if *f == file)) else { return };
+            let follows = this.right == RightPane::Structure && this.structure_file == Some(tab.id);
+            if std::mem::replace(&mut tab.dirty, dirty) != dirty || follows {
+                cx.notify();
+            }
+        })
+        .detach();
         file.update(cx, |f, cx| f.load_blame(cx));
         self.attach_lsp(&path, content, &editor, &file, cx);
         self.use_search_definitions(&path, &editor, false, cx);
@@ -3501,7 +3768,7 @@ impl TaskView {
         let weak_file = file.downgrade();
         cx.spawn(async move |_, cx| {
             let result = cx
-                .background_spawn(async move { open_client.did_open(&open_path, language_id, &content) })
+                .background_spawn(crate::procs::on_thread(move || { open_client.did_open(&open_path, language_id, &content) }))
                 .await;
             let (ok, status) = match result {
                 Ok(()) => (true, "ready · hover, Ctrl+click = definition".to_string()),
@@ -3610,25 +3877,19 @@ impl TaskView {
             )
             .children(in_pane.into_iter().map(|ix| (ix, &self.tabs[ix])).map(|(ix, tab)| {
                 let mut label = tab.title.clone();
-                if let TabKind::Terminal(view) = &tab.kind {
-                    let title = view.read(cx).state.read(cx).title();
-                    if !title.is_empty() {
-                        label = format!("{}: {}", tab.title, short_title(title)).into();
-                    }
+                if matches!(tab.kind, TabKind::Terminal(_)) && !tab.shown.is_empty() {
+                    label = format!("{}: {}", tab.title, short_title(&tab.shown)).into();
                 }
                 if tab.title == "agent" {
                     if let Some((glyph, _)) = status_glyph(&self.agent_status) {
                         label = format!("{glyph} {label}").into();
                     }
                 }
-                if let TabKind::Browser(view) = &tab.kind {
-                    let title = view.read(cx).title();
-                    if !title.is_empty() && title != "about:blank" {
-                        label = short_title(&title).into();
-                    }
+                if matches!(tab.kind, TabKind::Browser(_)) && !tab.shown.is_empty() && tab.shown != "about:blank" {
+                    label = short_title(&tab.shown).into();
                 }
-                if let TabKind::File(file) = &tab.kind {
-                    if file.read(cx).dirty {
+                if matches!(tab.kind, TabKind::File(_)) {
+                    if tab.dirty {
                         label = format!("● {label}").into();
                     }
                 }
@@ -3725,6 +3986,7 @@ impl TaskView {
                             .selected(self.right == RightPane::Files)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.right = RightPane::Files;
+                                this.fill_tree(cx);
                                 cx.notify();
                             })),
                     )
@@ -3749,7 +4011,7 @@ impl TaskView {
                             .selected(self.right == RightPane::Run)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.right = RightPane::Run;
-                                this.refresh_services();
+                                this.refresh_services(cx);
                                 this.watch_listening(cx);
                                 cx.notify();
                             }))
@@ -3782,6 +4044,7 @@ impl TaskView {
             let f = file.read(cx);
             (f.path.clone(), f.cursor_line)
         };
+        self.refresh_structure(cx);
         let items = self.structure_items(cx);
         let keyboard = self.side_has_focus.get();
         // The innermost declaration the cursor is in: the last one starting at or above it.
@@ -4021,11 +4284,7 @@ impl TaskView {
                     if folded {
                         hidden_under = Some(format!("{path}/"));
                     }
-                    let dir_files: Vec<String> = files
-                        .iter()
-                        .map(|&ix| self.files[ix].path.to_string())
-                        .filter(|f| f.starts_with(&format!("{path}/")))
-                        .collect();
+                    let under = format!("{path}/");
                     let group = SharedString::from(format!("change-dir-{key}"));
                     list = list.child(
                         h_flex()
@@ -4050,7 +4309,17 @@ impl TaskView {
                                         .tooltip(if in_staged { "Unstage the folder" } else { "Stage the folder" })
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             cx.stop_propagation();
-                                            this.stage_paths(dir_files.clone(), !in_staged, window, cx)
+                                            // Looked up on the click, not for every folder on every frame.
+                                            let dir_files = this
+                                                .files
+                                                .iter()
+                                                .filter(|f| f.path.starts_with(under.as_str()) && {
+                                                    let state = this.state_of(&f.path);
+                                                    if in_staged { state.staged } else { state.unstaged }
+                                                })
+                                                .map(|f| f.path.to_string())
+                                                .collect();
+                                            this.stage_paths(dir_files, !in_staged, window, cx)
                                         })),
                                 ),
                             )
@@ -4184,13 +4453,23 @@ impl TaskView {
         if self.busy.is_some() {
             return;
         }
-        let snapshot = git::snapshot(&self.root, &path);
-        self.run_action("Discard", move |root| git::discard(&root, &path).map(|_| format!("Discarded {path}")), false, window, cx);
-        self.discard_undo = Some(snapshot);
+        let kept: Arc<std::sync::Mutex<Option<git::FileSnapshot>>> = Arc::default();
+        let slot = kept.clone();
+        self.run_action(
+            "Discard",
+            move |root| {
+                *slot.lock().unwrap() = Some(git::snapshot(&root, &path));
+                git::discard(&root, &path).map(|_| format!("Discarded {path}"))
+            },
+            false,
+            window,
+            cx,
+        );
+        self.discard_undo = Some(kept);
     }
 
     fn undo_discard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(snapshot) = self.discard_undo.take() else { return };
+        let Some(snapshot) = self.discard_undo.take().and_then(|kept| kept.lock().unwrap().take()) else { return };
         self.run_action("Undo", move |root| git::restore(&root, &snapshot), false, window, cx);
     }
 
@@ -4219,7 +4498,7 @@ impl TaskView {
         let root = self.root.clone();
         let staged_only = !self.staged_paths().is_empty();
         cx.spawn_in(window, async move |this, cx| {
-            let result = cx.background_spawn(async move { git::suggest_message(&root, staged_only) }).await;
+            let result = cx.background_spawn(crate::procs::on_thread(move || { git::suggest_message(&root, staged_only) })).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.busy = None;
                 match result {
@@ -4256,7 +4535,7 @@ impl TaskView {
         let root = self.root.clone();
         cx.spawn_in(window, async move |this, cx| {
             let job_base = base.clone();
-            let result = cx.background_spawn(async move { git::rebase_onto(&root, &job_base) }).await;
+            let result = cx.background_spawn(crate::procs::on_thread(move || { git::rebase_onto(&root, &job_base) })).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.busy = None;
                 this.action = Some(match result {
@@ -4298,7 +4577,7 @@ impl TaskView {
         cx.notify();
         let root = self.root.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let result = cx.background_spawn(async move { job(root) }).await;
+            let result = cx.background_spawn(crate::procs::on_thread(move || { job(root) })).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.busy = None;
                 match result {
@@ -4435,6 +4714,35 @@ fn build_tree(files: &[String], expanded: &HashSet<SharedString>) -> Vec<TreeIte
         out
     }
     items(&root, "", expanded)
+}
+
+/// A `git diff` as the panels need it, made off the UI thread.
+#[derive(Clone)]
+struct ParsedPatch {
+    files: Vec<DiffFile>,
+    first_lines: HashMap<String, u32>,
+    hashes: HashMap<String, u64>,
+}
+
+fn text_hash(text: &str) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Parses `patch` unless it is the one seen last (`seen`, its hash).
+fn parse_patch(patch: String, seen: &mut u64) -> Option<ParsedPatch> {
+    let hash = text_hash(&patch);
+    if std::mem::replace(seen, hash) == hash {
+        return None;
+    }
+    let files = DiffFile::parse(&patch).inspect_err(|error| eprintln!("diff parse: {error}")).ok()?;
+    Some(ParsedPatch {
+        first_lines: git::first_changed_lines(&patch),
+        hashes: file_patch_hashes(&patch),
+        files: with_languages(files),
+    })
 }
 
 /// Each file's part of a `git diff`, hashed, by its path after the change.
@@ -5125,7 +5433,7 @@ impl DefinitionProvider for UsagesAtDeclaration {
 /// word under the cursor (with `Class.` before it, if any) by `find_symbol`.
 struct SearchDefinitionProvider {
     root: PathBuf,
-    files: Arc<std::sync::RwLock<Vec<String>>>,
+    files: Arc<std::sync::RwLock<Arc<Vec<String>>>>,
 }
 
 impl DefinitionProvider for SearchDefinitionProvider {
@@ -5351,16 +5659,27 @@ impl TaskView {
     /// Stops every terminal and browser of the task before it is dropped,
     /// and what they started that left their sessions.
     pub fn shut_down(&mut self, cx: &mut Context<Self>) {
-        self.autosave_all(cx);
+        self.end(true, cx);
+    }
+
+    /// As `shut_down` when the app quits: it looks for what every task
+    /// left behind once, itself.
+    pub fn shut_down_at_quit(&mut self, cx: &mut Context<Self>) {
+        self.end(false, cx);
+    }
+
+    fn end(&mut self, strays: bool, cx: &mut Context<Self>) {
+        self.save_all_now(cx);
         let task = self.root.display().to_string();
+        let socket = self.hook_socket.clone().filter(|_| strays);
         // Before the terminals go: what they started is told by them.
-        let seen = self.hook_socket.as_ref().map(|socket| crate::procs::task_processes(Some(&task), socket)).unwrap_or_default();
+        let seen = socket.as_ref().map(|socket| crate::procs::task_processes(Some(&task), socket)).unwrap_or_default();
         for tab in &self.tabs {
             if let TabKind::Terminal(view) = &tab.kind {
                 TermView::end(&view, cx);
             }
         }
-        if let Some(socket) = self.hook_socket.clone() {
+        if let Some(socket) = socket {
             std::thread::spawn(move || crate::procs::end_task_strays(Some(&task), &socket, seen));
         }
     }
@@ -5461,6 +5780,35 @@ impl TaskView {
         self.set_language_servers(on, cx);
     }
 
+    /// Ends the servers no open file has used for `idle`: one runs on for a
+    /// while after its last file closes, since the next file of the
+    /// language would have it index the project again.
+    pub fn drop_unused_language_servers(&mut self, idle: Duration, cx: &App) {
+        let used: Vec<Arc<lsp::LspClient>> = self
+            .tabs
+            .iter()
+            .filter_map(|t| match &t.kind {
+                TabKind::File(f) => f.read(cx).lsp_client.clone(),
+                _ => None,
+            })
+            .collect();
+        let now = std::time::Instant::now();
+        let mut over = Vec::new();
+        for (key, client) in &self.lsp {
+            if used.iter().any(|u| Arc::ptr_eq(u, client)) {
+                self.lsp_unused.remove(key);
+            } else if now.duration_since(*self.lsp_unused.entry(key.clone()).or_insert(now)) >= idle {
+                over.push(key.clone());
+            }
+        }
+        for key in over {
+            self.lsp_unused.remove(&key);
+            if let Some(client) = self.lsp.remove(&key) {
+                client.shut_down();
+            }
+        }
+    }
+
     pub fn has_language_servers(&self) -> bool {
         !self.lsp.is_empty()
     }
@@ -5553,11 +5901,8 @@ fn location_of(range: &DiffLineRange) -> String {
 use gpui_kit::component::notification::Notification;
 
 impl TaskView {
-    fn service_ix(&self, name: &str, cx: &App) -> Option<usize> {
-        self.tabs.iter().position(|t| match &t.kind {
-            TabKind::Terminal(v) => v.read(cx).service.as_deref() == Some(name),
-            _ => false,
-        })
+    fn service_ix(&self, name: &str, _: &App) -> Option<usize> {
+        self.tabs.iter().position(|t| matches!(t.kind, TabKind::Terminal(_)) && t.service.as_deref() == Some(name))
     }
 
     /// The services running now, with their ports, for the task's row.
@@ -5754,16 +6099,24 @@ impl TaskView {
     }
 
     /// Rereads `.ideae.toml` and, without one, looks for what to suggest.
-    fn refresh_services(&mut self) {
-        match crate::services::load(&self.root) {
-            Ok(services) => {
-                self.services = services;
-                self.services_error = None;
-            }
-            Err(e) => self.services_error = Some(e),
-        }
-        let known: HashSet<String> = self.services.iter().map(|s| s.name.clone()).collect();
-        self.services_found = crate::services::detect(&self.root).into_iter().filter(|f| !known.contains(&f.service.name)).collect();
+    fn refresh_services(&mut self, cx: &mut Context<Self>) {
+        let root = self.root.clone();
+        cx.spawn(async move |this, cx| {
+            let (loaded, found) = cx.background_spawn(async move { (crate::services::load(&root), crate::services::detect(&root)) }).await;
+            let _ = this.update(cx, |this, cx| {
+                match loaded {
+                    Ok(services) => {
+                        this.services = services;
+                        this.services_error = None;
+                    }
+                    Err(e) => this.services_error = Some(e),
+                }
+                let known: HashSet<String> = this.services.iter().map(|s| s.name.clone()).collect();
+                this.services_found = found.into_iter().filter(|f| !known.contains(&f.service.name)).collect();
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn add_found_service(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -5988,7 +6341,7 @@ impl TaskView {
         let root = self.root.clone();
         cx.spawn_in(window, async move |this, cx| {
             let job_pr = pr.clone();
-            let feedback = cx.background_spawn(async move { crate::pr::feedback(&root, &job_pr) }).await;
+            let feedback = cx.background_spawn(crate::procs::on_thread(move || { crate::pr::feedback(&root, &job_pr) })).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.busy = None;
                 match feedback {
@@ -6042,5 +6395,179 @@ mod path_in_tests {
             assert_eq!(path_in(&link, &real.join("src/new.rs")).as_deref(), Some("src/new.rs"));
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+}
+
+#[cfg(test)]
+mod disk_tests {
+    use super::{DiskChange, Rope, changed_on_disk, mtime, parse_patch, same_text, text_hash, write_in_order};
+
+    #[test]
+    fn the_editor_text_is_compared_in_place() {
+        // Long enough to be in several chunks of the rope.
+        let text = "fn main() { println!(\"привет\"); }\n".repeat(4000);
+        let rope = Rope::from(text.as_str());
+        assert!(same_text(&rope, &text));
+        assert!(!same_text(&rope, &text.replacen("main", "mine", 1)), "the same length, another text");
+        assert!(!same_text(&rope, &text[..text.len() - 1]));
+        assert!(same_text(&Rope::from(""), ""));
+    }
+
+    #[test]
+    fn writes_keep_their_order_and_changes_on_disk_are_read() {
+        let dir = std::env::temp_dir().join(format!("ideae-disk-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        let gate = std::sync::Mutex::new(0);
+        let written = write_in_order(&gate, 2, &file, b"later").unwrap();
+        assert_eq!(written, mtime(&file));
+        // A write asked for earlier that only starts now.
+        write_in_order(&gate, 1, &file, b"earlier").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "later");
+
+        let gone = dir.join("gone.txt");
+        let stale = written.map(|t| t - std::time::Duration::from_secs(5));
+        let found = changed_on_disk(vec![(file.clone(), written), (file.clone(), stale), (file.clone(), None), (gone, None)]);
+        assert!(found[0].is_none(), "as known");
+        assert!(matches!(&found[1], Some(DiskChange { known, now, content }) if *known == stale && Some(*now) == written && content == "later"));
+        assert!(found[2].is_some() && found[3].is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_patch_is_parsed_once() {
+        let patch = "diff --git a/a.txt b/a.txt\nindex 5626abf..f719efd 100644\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1,2 @@\n one\n+two\n";
+        let mut seen = text_hash("");
+        assert!(parse_patch(String::new(), &mut seen).is_none(), "nothing changed, as at the start");
+        let parsed = parse_patch(patch.into(), &mut seen).unwrap();
+        assert_eq!(parsed.files.len(), 1);
+        assert_eq!(parsed.first_lines.get("a.txt"), Some(&1));
+        assert!(parsed.hashes.contains_key("a.txt"));
+        assert!(parse_patch(patch.into(), &mut seen).is_none(), "the same again");
+        assert!(parse_patch(String::new(), &mut seen).is_some_and(|p| p.files.is_empty()), "committed: no changes left");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod open_file_scenario {
+    use super::{FileView, TabKind, TaskView};
+    use crate::state::{ProjectState, State};
+    use crate::workspace::Workspace;
+    use gpui_kit::{AppContext as _, Bounds, Entity, Point, TestAppContext, WindowBounds, WindowOptions, px, size};
+    use std::time::Duration;
+
+    /// A file open in a task of a real repository: typing, saving, the
+    /// agent writing it meanwhile, the app quitting mid-save.
+    #[gpui_kit::test]
+    #[ignore]
+    fn an_open_file_is_saved_and_follows_the_disk(cx: &mut TestAppContext) {
+        let _one = crate::workspace::variants::tests::ONE_WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+        // The task's terminal is real: its threads wake the app when they like.
+        cx.executor().allow_parking();
+        let dir = std::env::temp_dir().join(format!("ideae-open-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = "git init -q -b main repo; cd repo; git config user.email t@t; git config user.name t; echo one > f.txt; git add f.txt; git commit -qm base";
+        assert!(std::process::Command::new("sh").arg("-ec").arg(script).current_dir(&dir).status().unwrap().success());
+        let repo = dir.join("repo").canonicalize().unwrap();
+        let path = repo.join("f.txt");
+        // SAFETY: set before anything of the app reads them.
+        unsafe {
+            std::env::set_var("IDEAE_STATE", dir.join("state.json"));
+            std::env::set_var("IDEAE_NO_DAEMON", "1");
+        }
+        let saved = State { projects: vec![ProjectState { path: repo.clone(), ..Default::default() }], ..Default::default() };
+        std::fs::write(dir.join("state.json"), serde_json::to_string(&saved).unwrap()).unwrap();
+        crate::state::set_settings(crate::state::Settings { notifications: false, pr_status: false, ..Default::default() });
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            gpui_cn::init(cx);
+            crate::theme::init(cx);
+        });
+        let (handle, workspace) = cx.update(|cx| {
+            let bounds = Bounds { origin: Point::default(), size: size(px(1300.), px(800.)) };
+            let options = WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() };
+            gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| Workspace::new(Vec::new(), Some(None), None, window, cx))).expect("a test window")
+        });
+        cx.update_window(handle.into(), |_, window, cx| workspace.update(cx, |w, cx| w.open_main(0, window, cx))).unwrap();
+        cx.run_until_parked();
+        let task: Entity<TaskView> = workspace.update(cx, |w, _| w.active_view().expect("the main checkout in view"));
+        cx.update_window(handle.into(), |_, window, cx| task.update(cx, |t, cx| t.open_file(path.clone(), 0, window, cx))).unwrap();
+        let file: Entity<FileView> = task.update(cx, |t, _| {
+            t.tabs.iter().find_map(|tab| match &tab.kind {
+                TabKind::File(f) => Some(f.clone()),
+                _ => None,
+            })
+            .expect("the file's tab")
+        });
+        let typed = |cx: &mut TestAppContext, text: &str| {
+            cx.update_window(handle.into(), |_, window, cx| file.update(cx, |f, cx| f.editor.update(cx, |e, cx| e.insert(text, window, cx)))).unwrap();
+            cx.run_until_parked();
+        };
+        // The refresh a file event starts, and its pause for more of them.
+        let refreshed = |cx: &mut TestAppContext| {
+            task.update(cx, |t, _| t.refresh_tx.try_send(()).unwrap());
+            cx.run_until_parked();
+            cx.executor().advance_clock(Duration::from_millis(200));
+            cx.run_until_parked();
+        };
+        let on_disk = || std::fs::read_to_string(&path).unwrap();
+        let shown = |cx: &mut TestAppContext| file.update(cx, |f, cx| f.editor.read(cx).value().to_string());
+
+        typed(cx, "zero\n");
+        file.update(cx, |f, cx| {
+            assert!(f.dirty, "typed in");
+            f.save(cx);
+            assert!(f.dirty && f.saving.is_some() && f.disk_known().is_none(), "being written, off this thread");
+        });
+        assert_eq!(on_disk(), "one\n");
+        cx.run_until_parked();
+        assert_eq!(on_disk(), "zero\none\n");
+        file.update(cx, |f, _| assert!(!f.dirty && f.saving.is_none() && f.error.is_none() && f.disk_mtime == super::mtime(&path)));
+        refreshed(cx);
+        task.update(cx, |t, _| {
+            assert_eq!(t.files.len(), 1, "one changed file");
+            assert_eq!((t.uncommitted_diff.len(), t.uncommitted_lines.get("f.txt")), (1, Some(&1)));
+        });
+        assert_eq!(shown(cx), "zero\none\n", "its own save is no change on disk");
+
+        // The agent writes the file: a clean buffer follows.
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&path, "agent\n").unwrap();
+        refreshed(cx);
+        assert_eq!(shown(cx), "agent\n");
+        file.update(cx, |f, _| assert!(!f.dirty && !f.conflict));
+
+        // And again while there are edits: a choice, and neither side lost.
+        typed(cx, "mine ");
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&path, "theirs\n").unwrap();
+        refreshed(cx);
+        file.update(cx, |f, cx| {
+            assert!(f.dirty && f.conflict);
+            f.autosave(cx);
+            f.save_now(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!((shown(cx), on_disk()), ("agent\nmine ".to_string(), "theirs\n".to_string()));
+
+        // Quitting right after a save, with more typed since: all of it is on disk at once.
+        file.update(cx, |f, cx| {
+            f.conflict = false;
+            f.save(cx);
+        });
+        cx.update_window(handle.into(), |_, window, cx| file.update(cx, |f, cx| f.editor.update(cx, |e, cx| e.insert("and ", window, cx)))).unwrap();
+        file.update(cx, |f, cx| f.save_now(cx));
+        let last = shown(cx);
+        assert!(last.contains("and ") && last.contains("mine "));
+        assert_eq!(on_disk(), last);
+        cx.run_until_parked();
+        assert_eq!(on_disk(), last, "the earlier write does not come after");
+        file.update(cx, |f, _| assert!(!f.dirty && f.saving.is_none()));
+
+        task.update(cx, |t, cx| t.shut_down(cx));
+        cx.update_window(handle.into(), |_, window, _| window.remove_window()).ok();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

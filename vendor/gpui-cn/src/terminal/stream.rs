@@ -133,6 +133,17 @@ impl StreamPeer {
         }
     }
 
+    /// ideae patch: blocks while a megabyte of output waits for the
+    /// terminal's parser, as [`ByteSink::wait_for_room`] does for a source
+    /// that reads a pty: what feeds [`output`](Self::output) from a socket
+    /// calls it before each write, so a flood holds the sender back
+    /// instead of filling memory. Returns false once the terminal is
+    /// closing; true at once before it has started.
+    pub fn wait_for_room(&self) -> bool {
+        let sink = self.shared.lock().sink.clone();
+        sink.is_none_or(|sink| sink.wait_for_room())
+    }
+
     /// Reports that the program ended. The terminal shows the status and
     /// emits [`TerminalEvent::Exited`](super::TerminalEvent::Exited).
     pub fn exit(&self, status: ExitStatus) {

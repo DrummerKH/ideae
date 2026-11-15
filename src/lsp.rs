@@ -40,7 +40,7 @@ pub struct LspClient {
     import: Import,
     /// `capabilities` from the server's answer to `initialize`.
     capabilities: Mutex<Value>,
-    child: Mutex<Child>,
+    child: Mutex<Option<Child>>,
 }
 
 /// Power saving: no language servers run, none start.
@@ -132,20 +132,28 @@ fn locate(program: &str) -> Option<PathBuf> {
 /// (intelephense crashes without a transport flag).
 fn runs(program: &str) -> bool {
     static CACHE: Mutex<Option<HashMap<String, bool>>> = Mutex::new(None);
-    let mut cache = CACHE.lock().unwrap();
-    *cache.get_or_insert_with(HashMap::new).entry(program.to_string()).or_insert_with(|| {
-        if program != "rust-analyzer" {
-            return on_path(program);
-        }
-        on_path(program)
-            && crate::procs::command(program)
+    if let Some(known) = CACHE.lock().unwrap().as_ref().and_then(|cache| cache.get(program).copied()) {
+        return known;
+    }
+    // Not under the lock: asking takes a process, and the UI thread asks too.
+    let found = on_path(program)
+        && (program != "rust-analyzer"
+            || crate::procs::command(program)
                 .arg("--version")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
-                .is_ok_and(|s| s.success())
-    })
+                .is_ok_and(|s| s.success()));
+    CACHE.lock().unwrap().get_or_insert_with(HashMap::new).insert(program.to_string(), found);
+    found
+}
+
+/// Finds out which servers are there before a file asks, off the UI thread.
+pub fn look_for_servers() {
+    for def in SERVERS {
+        runs(def.program);
+    }
 }
 
 pub fn on_path(program: &str) -> bool {
@@ -347,7 +355,7 @@ impl LspClient {
             progress,
             import,
             capabilities: Mutex::new(Value::Null),
-            child: Mutex::new(child),
+            child: Mutex::new(Some(child)),
         });
 
         let init = client.clone();
@@ -427,6 +435,16 @@ impl LspClient {
             "textDocument/didOpen",
             json!({ "textDocument": { "uri": uri, "languageId": language_id, "version": 1, "text": text } }),
         )
+    }
+
+    /// The file's tab closed: the server lets go of the text, and opening
+    /// the file again sends it anew.
+    pub fn did_close(&self, path: &Path) -> Result<()> {
+        let uri = path_to_uri(path);
+        if !self.opened.lock().unwrap().remove(&uri) {
+            return Ok(());
+        }
+        self.notify("textDocument/didClose", json!({ "textDocument": { "uri": uri } }))
     }
 
     /// Full-text sync: a change without a range replaces the whole document,
@@ -532,9 +550,13 @@ impl LspClient {
 impl LspClient {
     /// Ends the server now, even while files still hold the client.
     pub fn shut_down(&self) {
-        let mut child = self.child.lock().unwrap();
+        let Some(mut child) = self.child.lock().unwrap().take() else { return };
         let _ = child.kill();
-        let _ = child.wait();
+        // Reaping one that held gigabytes takes a while: not on this thread,
+        // which is the UI's more often than not.
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
     }
 }
 
