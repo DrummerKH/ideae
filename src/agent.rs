@@ -57,13 +57,27 @@ pub struct HookEvent {
     pub task: PathBuf,
     pub event: String,
     pub message: Option<String>,
+    /// Of a Notification: permission_prompt, idle_prompt, …
+    pub kind: Option<String>,
 }
 
 impl HookEvent {
+    fn is_idle_reminder(&self) -> bool {
+        match self.kind.as_deref() {
+            Some(kind) => kind == "idle_prompt",
+            // Versions without notification_type.
+            None => self.message.as_deref().is_some_and(|m| m.contains("waiting for your input")),
+        }
+    }
+
     pub fn status(&self) -> Option<AgentStatus> {
         Some(match self.event.as_str() {
             "SessionStart" => AgentStatus::Idle,
             "UserPromptSubmit" | "PreToolUse" => AgentStatus::Working,
+            // A minute after a turn ends Claude reminds that it waits; that is
+            // no question, the turn is just done.
+            "Notification" if self.is_idle_reminder() => AgentStatus::Done,
+            "Notification" if self.kind.as_deref() == Some("auth_success") => return None,
             "Notification" => AgentStatus::NeedsInput(
                 self.message.clone().unwrap_or_else(|| "Claude needs your input".into()),
             ),
@@ -168,6 +182,7 @@ fn parse_line(line: &str) -> Option<HookEvent> {
         task: PathBuf::from(v["task"].as_str()?),
         event: v["event"].as_str()?.to_string(),
         message: v["message"].as_str().map(str::to_string),
+        kind: v["kind"].as_str().map(str::to_string),
     })
 }
 
@@ -188,9 +203,28 @@ pub fn run_hook(event: &str) {
         "task": task,
         "event": event,
         "message": payload["message"].as_str(),
+        "kind": payload["notification_type"].as_str(),
     });
     if let Ok(mut stream) = UnixStream::connect(socket) {
         let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
         let _ = writeln!(stream, "{line}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn note(message: &str, kind: Option<&str>) -> Option<AgentStatus> {
+        HookEvent { task: PathBuf::new(), event: "Notification".into(), message: Some(message.into()), kind: kind.map(Into::into) }
+            .status()
+    }
+
+    #[test]
+    fn idle_reminder_is_not_a_question() {
+        assert_eq!(note("Claude is waiting for your input", Some("idle_prompt")), Some(AgentStatus::Done));
+        assert_eq!(note("Claude is waiting for your input", None), Some(AgentStatus::Done));
+        assert!(matches!(note("Claude needs your permission to use Bash", Some("permission_prompt")), Some(AgentStatus::NeedsInput(_))));
+        assert!(matches!(note("Claude needs your permission to use Bash", None), Some(AgentStatus::NeedsInput(_))));
     }
 }

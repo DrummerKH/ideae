@@ -72,6 +72,8 @@ pub struct Workspace {
     /// In the GNOME dash; asked once, not while the menu opens.
     pub pinned: bool,
     pub sysmon: Entity<crate::sysmon::SysMon>,
+    /// Filters the sidebar's tasks.
+    pub search: Entity<InputState>,
     /// The state as last written, to write only changes.
     last_saved: String,
     _subscriptions: Vec<Subscription>,
@@ -179,6 +181,11 @@ impl Workspace {
             appearance,
             sidebar_width: px(saved.sidebar_width.unwrap_or(260.)),
             pinned: crate::desktop::is_pinned(),
+            search: {
+                let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search tasks…"));
+                cx.subscribe(&search, |_, _, _: &InputEvent, cx| cx.notify()).detach();
+                search
+            },
             sysmon: {
                 let mon = cx.new(crate::sysmon::SysMon::new);
                 cx.observe(&mon, |_, _, cx| cx.notify()).detach();
@@ -788,6 +795,7 @@ impl Workspace {
         let seen = self.active.as_deref() == Some(event.task.as_path()) && window.is_window_active();
         let was = view.read(cx).agent_status.clone();
         view.update(cx, |t, cx| t.set_agent_status(status.clone(), seen, cx));
+        self.projects[pi].tasks[ti].last_active = state::now();
         if status.is_attention() && !seen && status != was {
             let body = match &status {
                 agent::AgentStatus::NeedsInput(message) => message.clone(),
