@@ -2828,6 +2828,42 @@ impl TaskView {
 
     /// Which of the views `show_view` knows is in front: the agent, the
     /// changes, the history or a shell.
+    /// Where in the task you are looking, for another variant to show the
+    /// same: the file at the top of the diff (true), or the file open in
+    /// the editor and the line the cursor is on.
+    pub fn shown_place(&self, cx: &App) -> Option<(bool, String, u32)> {
+        match &self.tabs.get(self.focused_ix()?)?.kind {
+            TabKind::Changes => {
+                let top = self.changes.read(cx).diff.read(cx).top_file()?;
+                Some((true, top.to_string(), 0))
+            }
+            TabKind::File(file) => {
+                let file = file.read(cx);
+                let path = file.path.strip_prefix(&self.root).ok()?.to_string_lossy().into_owned();
+                Some((false, path, file.editor.read(cx).cursor_position().line))
+            }
+            _ => None,
+        }
+    }
+
+    /// The same place in this task: its changes at that file, or the file
+    /// at that line. False when this task has no such file.
+    pub fn show_place(&mut self, in_changes: bool, path: &str, line: u32, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if in_changes {
+            match self.changed_paths.contains(path) {
+                true => self.show_changed_file(SharedString::from(path.to_string()), window, cx),
+                false => self.show_view(1, window, cx),
+            }
+            return true;
+        }
+        let file = self.root.join(path);
+        let there = file.is_file();
+        if there {
+            self.open_file(file, line, window, cx);
+        }
+        there
+    }
+
     pub fn shown_view(&self) -> usize {
         match self.focused_ix().and_then(|ix| self.tabs.get(ix)) {
             Some(tab) => match &tab.kind {

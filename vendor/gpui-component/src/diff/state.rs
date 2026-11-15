@@ -827,6 +827,12 @@ impl DiffState {
     }
 
     /// Scrolls to the header of the file at `path`, a [`DiffFile::path`].
+    /// ideae patch: the file whose rows are at the top of the view.
+    pub fn top_file(&self) -> Option<SharedString> {
+        let row = self.rows.get(self.list.logical_scroll_top().item_ix)?;
+        self.files.get(row.file()).map(|file| file.path().clone())
+    }
+
     pub fn scroll_to_file(&mut self, path: &str, cx: &mut Context<Self>) {
         let Some(item_ix) = self
             .file_ix(path)
