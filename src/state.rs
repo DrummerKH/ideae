@@ -124,6 +124,8 @@ pub struct TaskSession {
     pub side_panel: u8,
     /// Review comments not sent to the agent yet.
     pub review: Vec<ReviewNote>,
+    /// Changed files marked viewed, with a hash of their diff then.
+    pub viewed: std::collections::BTreeMap<String, u64>,
 }
 
 /// A review comment on lines of the diff.

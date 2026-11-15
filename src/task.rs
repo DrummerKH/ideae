@@ -1308,6 +1308,8 @@ impl TabItem {
 
 struct ChangedFile {
     path: SharedString,
+    /// Of its part of the diff, to tell whether it changed since viewed.
+    hash: u64,
     first_line: u32,
     status: DiffFileStatus,
     additions: usize,
@@ -1330,6 +1332,9 @@ pub struct TaskView {
     agent: Option<String>,
     /// Text for the agent's prompt once it is ready to take it.
     pending_prompt: Option<String>,
+    /// Changed files you marked viewed, with their diff's hash then: a new
+    /// change to one unmarks it.
+    viewed: BTreeMap<String, u64>,
     /// Files you were in, the latest first, with where the cursor was.
     recent: Vec<(PathBuf, u32, u32)>,
     /// Its pull request, as last seen on GitHub.
@@ -1520,6 +1525,7 @@ impl TaskView {
             pending_prompt: None,
             recent: Vec::new(),
             pr: None,
+            viewed: BTreeMap::new(),
             port_slot,
             services,
             hook_socket,
@@ -2555,17 +2561,22 @@ impl TaskView {
             }
         };
         let first_lines = git::first_changed_lines(&patch);
+        let hashes = file_patch_hashes(&patch);
         self.patch = patch;
         self.files = files
             .iter()
             .map(|f| ChangedFile {
                 path: f.path().clone(),
+                hash: hashes.get(f.path().as_ref()).copied().unwrap_or(0),
                 first_line: first_lines.get(f.path().as_ref()).copied().unwrap_or(1),
                 status: f.status(),
                 additions: f.additions(),
                 deletions: f.deletions(),
             })
             .collect();
+        // A file that is no longer changed is no longer viewed either.
+        let changed: HashSet<&str> = self.files.iter().map(|f| f.path.as_ref()).collect();
+        self.viewed.retain(|path, _| changed.contains(path.as_str()));
         self.uncommitted_diff = with_languages(files);
         self.refresh_scope(DiffScope::Uncommitted, cx);
         cx.emit(TaskEvent::Changed);
@@ -3690,7 +3701,13 @@ impl TaskView {
         if self.files.is_empty() {
             list = list.child(div().p_3().text_sm().text_color(cx.theme().muted_foreground).child("No uncommitted changes"));
         } else if !unstaged.is_empty() {
-            list = list.child(section("stage-all", format!("CHANGES ({})", unstaged.len()), "stage all", true, cx));
+            let viewed = unstaged.iter().filter(|&&ix| self.is_viewed(ix)).count();
+            let title = if viewed > 0 {
+                format!("CHANGES ({}) · {viewed} viewed", unstaged.len())
+            } else {
+                format!("CHANGES ({})", unstaged.len())
+            };
+            list = list.child(section("stage-all", title, "stage all", true, cx));
             list = self.render_change_tree(list, &unstaged, false, cx);
         }
         list.overflow_y_scrollbar()
@@ -3766,6 +3783,22 @@ impl TaskView {
         list
     }
 
+    fn is_viewed(&self, ix: usize) -> bool {
+        let file = &self.files[ix];
+        self.viewed.get(file.path.as_ref()) == Some(&file.hash)
+    }
+
+    fn toggle_viewed(&mut self, path: &str, cx: &mut Context<Self>) {
+        let Some(file) = self.files.iter().find(|f| f.path.as_ref() == path) else { return };
+        if self.viewed.get(path) == Some(&file.hash) {
+            self.viewed.remove(path);
+        } else {
+            self.viewed.insert(path.to_string(), file.hash);
+        }
+        cx.emit(TaskEvent::Changed);
+        cx.notify();
+    }
+
     fn render_change_row(&self, ix: usize, depth: usize, in_staged: bool, cx: &mut Context<Self>) -> AnyElement {
         let file = &self.files[ix];
         let path = file.path.clone();
@@ -3783,6 +3816,8 @@ impl TaskView {
         };
         let id = if in_staged { ix * 2 + 1 } else { ix * 2 };
         let keyboard = self.side_has_focus.get() && self.right == RightPane::Changes && ix == self.side_selected;
+        let viewed = self.is_viewed(ix);
+        let view_path = file.path.to_string();
         h_flex()
             .id(("file", id))
             .when(keyboard, |row| row.border_l_2().border_color(cx.theme().primary))
@@ -3795,7 +3830,19 @@ impl TaskView {
             .cursor_pointer()
             .hover(|s| s.bg(cx.theme().accent))
             .child(div().w(px(12.)).text_color(cx.theme().muted_foreground).child(status))
-            .child(div().flex_1().min_w_0().truncate().child(name))
+            .child(div().flex_1().min_w_0().truncate().when(viewed, |d| d.text_color(cx.theme().muted_foreground)).child(name))
+            .child(
+                Button::new(("viewed", id))
+                    .xsmall()
+                    .ghost()
+                    .label(if viewed { "✓" } else { "○" })
+                    .when(viewed, |b| b.text_color(gpui_kit::green()))
+                    .tooltip(if viewed { "Viewed; click to unmark" } else { "Mark as viewed until it changes again" })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.toggle_viewed(&view_path, cx)
+                    })),
+            )
             .child(div().text_xs().text_color(gpui_kit::green()).child(format!("+{}", file.additions)))
             .child(div().text_xs().text_color(gpui_kit::red()).child(format!("-{}", file.deletions)))
             .when(!deleted, |row| {
@@ -4076,6 +4123,29 @@ fn build_tree(files: &[String], expanded: &HashSet<SharedString>) -> Vec<TreeIte
         out
     }
     items(&root, "", expanded)
+}
+
+/// Each file's part of a `git diff`, hashed, by its path after the change.
+fn file_patch_hashes(patch: &str) -> HashMap<String, u64> {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut out = HashMap::new();
+    let mut current: Option<(String, std::collections::hash_map::DefaultHasher)> = None;
+    for line in patch.lines() {
+        if let Some(header) = line.strip_prefix("diff --git ") {
+            if let Some((path, hasher)) = current.take() {
+                out.insert(path, hasher.finish());
+            }
+            // "a/x b/x": the path after " b/".
+            let path = header.rsplit_once(" b/").map_or(header, |(_, b)| b).to_string();
+            current = Some((path, std::collections::hash_map::DefaultHasher::new()));
+        } else if let Some((_, hasher)) = current.as_mut() {
+            line.hash(hasher);
+        }
+    }
+    if let Some((path, hasher)) = current {
+        out.insert(path, hasher.finish());
+    }
+    out
 }
 
 /// A glyph and its color for the agent status, if it has one to show.
@@ -4855,6 +4925,7 @@ impl TaskView {
             focus_right: self.focus_right,
             expanded: self.expanded.iter().map(|e| e.to_string()).collect(),
             review: self.changes.read(cx).review.clone(),
+            viewed: self.viewed.clone(),
             side_panel: match self.right {
                 RightPane::Changes => 0,
                 RightPane::Files => 1,
@@ -4913,6 +4984,7 @@ impl TaskView {
         self.focus_right = session.focus_right;
         self.normalize();
         self.expanded = session.expanded.iter().map(|e| SharedString::from(e.clone())).collect();
+        self.viewed = session.viewed.clone();
         let review = session.review.clone();
         self.changes.update(cx, |c, cx| {
             c.review = review;
