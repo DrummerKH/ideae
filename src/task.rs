@@ -1348,6 +1348,9 @@ pub struct TaskView {
     /// run, for the Run panel; read when it is shown.
     services_error: Option<String>,
     services_found: Vec<crate::services::Found>,
+    /// Ports the task's processes listen on, while the Run panel shows.
+    listening: Vec<crate::services::Listening>,
+    _listening_poll: Option<Task<()>>,
     hook_socket: Option<String>,
     /// Numbers terminals so each has a unique element id and default title.
     terminal_seq: usize,
@@ -1538,6 +1541,8 @@ impl TaskView {
             services,
             services_error: None,
             services_found: Vec::new(),
+            listening: Vec::new(),
+            _listening_poll: None,
             hook_socket,
             terminal_seq: 1,
             unseen: false,
@@ -2359,6 +2364,10 @@ impl TaskView {
         self.sync_visibility(cx);
         if visible {
             self.focus_active(window, cx);
+            if self.right == RightPane::Run && self._listening_poll.is_none() {
+                self.refresh_services();
+                self.watch_listening(cx);
+            }
         }
     }
 
@@ -2823,6 +2832,7 @@ impl TaskView {
         };
         if self.right == RightPane::Run {
             self.refresh_services();
+            self.watch_listening(cx);
         }
         self.side_selected = match self.right {
             // Start on the declaration the cursor is in.
@@ -3534,6 +3544,7 @@ impl TaskView {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.right = RightPane::Run;
                                 this.refresh_services();
+                                this.watch_listening(cx);
                                 cx.notify();
                             }))
                     }),
@@ -5415,6 +5426,35 @@ impl TaskView {
         self.open_file(path, 0, window, cx);
     }
 
+    /// Every few seconds while the Run panel is in view: the ports the
+    /// task's processes listen on.
+    fn watch_listening(&mut self, cx: &mut Context<Self>) {
+        let Some(socket) = self.hook_socket.clone() else { return };
+        let root = self.root.display().to_string();
+        self._listening_poll = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let (root, socket) = (root.clone(), socket.clone());
+                let ports = cx
+                    .background_spawn(async move {
+                        crate::services::listening(&crate::procs::task_processes(Some(&root), &socket))
+                    })
+                    .await;
+                let shown = this.update(cx, |t, cx| {
+                    if t.listening != ports {
+                        t.listening = ports;
+                        cx.notify();
+                    }
+                    t.right == RightPane::Run && t.visible
+                });
+                if !matches!(shown, Ok(true)) {
+                    let _ = this.update(cx, |t, _| t._listening_poll = None);
+                    return;
+                }
+                cx.background_executor().timer(Duration::from_secs(3)).await;
+            }
+        }));
+    }
+
     /// Rereads `.ideae.toml` and, without one, looks for what to suggest.
     fn refresh_services(&mut self) {
         match crate::services::load(&self.root) {
@@ -5478,6 +5518,40 @@ impl TaskView {
         panel
     }
 
+    /// Ports something of the task listens on that no service describes.
+    fn render_listening(&self, mut panel: Stateful<Div>, cx: &mut Context<Self>) -> Stateful<Div> {
+        let described: Vec<u16> = self.services.iter().filter_map(|s| s.port(self.port_slot)).collect();
+        let ports: Vec<_> = self.listening.iter().filter(|l| !described.contains(&l.port)).cloned().collect();
+        if ports.is_empty() {
+            return panel;
+        }
+        let muted = cx.theme().muted_foreground;
+        panel = panel.child(div().px_3().pt_2().text_xs().text_color(muted).child("LISTENING"));
+        for l in ports {
+            let url = format!("http://localhost:{}", l.port);
+            panel = panel.child(
+                h_flex()
+                    .id(("listening", l.port as usize))
+                    .px_3()
+                    .py_1()
+                    .gap_2()
+                    .hover(|d| d.bg(cx.theme().accent))
+                    .child(div().text_color(gpui_kit::green()).child("●"))
+                    .child(div().child(format!(":{}", l.port)))
+                    .child(div().flex_1().min_w_0().truncate().text_xs().text_color(muted).child(format!("{} {}", l.name, l.pid)))
+                    .child(
+                        Button::new(("listening-open", l.port as usize))
+                            .xsmall()
+                            .ghost()
+                            .label("open")
+                            .tooltip(format!("Open {url} in a Web tab"))
+                            .on_click(cx.listener(move |this, _, window, cx| this.open_browser(&url, window, cx))),
+                    ),
+            );
+        }
+        panel
+    }
+
     fn render_run_panel(&self, cx: &mut Context<Self>) -> AnyElement {
         let muted = cx.theme().muted_foreground;
         let mut panel = v_flex().id("run-panel").flex_1().min_h_0().overflow_y_scroll().text_sm();
@@ -5497,6 +5571,7 @@ impl TaskView {
                          get them as IDEAE_PORT_<NAME>.",
                     )),
             );
+            panel = self.render_listening(panel, cx);
             panel = self.render_found(panel, "FOUND IN THE PROJECT", cx);
             return panel
                 .child(
@@ -5568,6 +5643,7 @@ impl TaskView {
                     }),
             );
         }
+        panel = self.render_listening(panel, cx);
         panel = self.render_found(panel, "ALSO IN THE PROJECT", cx);
         panel
             .child(

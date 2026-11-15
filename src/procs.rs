@@ -294,24 +294,61 @@ pub fn end_child_sessions() {
     }
 }
 
-/// Ends what a task started that left its terminals' sessions, such as a
-/// shell an agent runs in the background with a session of its own: every
-/// process with this app's `socket` and, if given, the task's root in its
-/// environment. Another ideae started from a task's terminal inherits the
-/// same, so the trees of ideae processes are left alone.
+/// A process's environment, NUL-separated.
 #[cfg(target_os = "linux")]
-pub fn end_task_strays(task: Option<&str>, socket: &str) {
+fn environ(pid: i32) -> Option<Vec<u8>> {
+    std::fs::read(format!("/proc/{pid}/environ")).ok()
+}
+
+/// From KERN_PROCARGS2: argc, the executable's path, NUL padding, the
+/// arguments, then the environment.
+#[cfg(target_os = "macos")]
+fn environ(pid: i32) -> Option<Vec<u8>> {
+    let mut size: libc::size_t = 0;
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    // SAFETY: a null buffer asks for the size; the second call fills one of it.
+    unsafe {
+        if libc::sysctl(mib.as_mut_ptr(), 3, std::ptr::null_mut(), &mut size, std::ptr::null_mut(), 0) != 0 {
+            return None;
+        }
+    }
+    let mut buf = vec![0u8; size];
+    // SAFETY: as above, with the buffer `size` long.
+    unsafe {
+        if libc::sysctl(mib.as_mut_ptr(), 3, buf.as_mut_ptr().cast(), &mut size, std::ptr::null_mut(), 0) != 0 {
+            return None;
+        }
+    }
+    buf.truncate(size);
+    let argc = i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?) as usize;
+    let mut at = 4 + buf[4..].iter().position(|&b| b == 0)?;
+    while buf.get(at) == Some(&0) {
+        at += 1;
+    }
+    for _ in 0..argc {
+        at += buf.get(at..)?.iter().position(|&b| b == 0)? + 1;
+    }
+    let env = &buf[at.min(buf.len())..];
+    let end = env.windows(2).position(|w| w == [0, 0]).map_or(env.len(), |i| i + 1);
+    Some(env[..end].to_vec())
+}
+
+/// Every process started for a task: with this app's `socket` and, if
+/// given, the task's root in its environment, wherever it went (a session
+/// of its own included). Another ideae started from a task's terminal
+/// inherits the same, so the trees of ideae processes are left out.
+#[cfg(unix)]
+pub fn task_processes(task: Option<&str>, socket: &str) -> Vec<i32> {
     let me = std::process::id() as i32;
     let daemon = crate::daemon::client::get().and_then(|d| d.pid()).map(|p| p as i32);
     let sock = format!("{}={socket}", crate::agent::SOCK_ENV);
     let task = task.map(|t| format!("{}={t}", crate::agent::TASK_ENV));
     let tagged = |pid: i32| {
-        let Ok(env) = std::fs::read(format!("/proc/{pid}/environ")) else { return false };
+        let Some(env) = environ(pid) else { return false };
         let vars: Vec<&[u8]> = env.split(|&b| b == 0).collect();
         vars.contains(&sock.as_bytes()) && task.as_ref().is_none_or(|t| vars.contains(&t.as_bytes()))
     };
     let ideae = |pid: i32| name(pid as u32).is_some_and(|n| n.starts_with("ideae"));
-    // Under another ideae (or itself one): not ours to end.
     let in_other_app = |pid: i32| {
         let mut at = Some(pid);
         for _ in 0..64 {
@@ -324,11 +361,20 @@ pub fn end_task_strays(task: Option<&str>, socket: &str) {
         }
         false
     };
-    let strays = || -> Vec<i32> {
-        pids().into_iter().filter(|&p| p != me && Some(p) != daemon && running(p) && tagged(p) && !in_other_app(p)).collect()
-    };
+    pids().into_iter().filter(|&p| p != me && Some(p) != daemon && running(p) && tagged(p) && !in_other_app(p)).collect()
+}
+
+#[cfg(not(unix))]
+pub fn task_processes(_: Option<&str>, _: &str) -> Vec<i32> {
+    Vec::new()
+}
+
+/// Ends what a task started that left its terminals' sessions, such as a
+/// shell an agent runs in the background with a session of its own.
+#[cfg(unix)]
+pub fn end_task_strays(task: Option<&str>, socket: &str) {
     for (signal, grace) in [(libc::SIGTERM, 500), (libc::SIGKILL, 0)] {
-        let alive = strays();
+        let alive = task_processes(task, socket);
         if alive.is_empty() {
             return;
         }
@@ -337,15 +383,14 @@ pub fn end_task_strays(task: Option<&str>, socket: &str) {
             unsafe { libc::kill(pid, signal) };
         }
         let deadline = Instant::now() + Duration::from_millis(grace);
-        while Instant::now() < deadline && !strays().is_empty() {
+        while Instant::now() < deadline && !task_processes(task, socket).is_empty() {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
 }
 
-/// Reading another process's environment needs /proc; elsewhere a stray
-/// lives on.
-#[cfg(not(target_os = "linux"))]
+/// On Windows a terminal's tree is in a job that dies with it.
+#[cfg(not(unix))]
 pub fn end_task_strays(_: Option<&str>, _: &str) {}
 
 #[cfg_attr(not(unix), allow(dead_code))]
@@ -370,7 +415,7 @@ pub fn quit_requested() -> bool {
     QUIT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, unix))]
 mod stray_tests {
     use std::os::unix::process::CommandExt as _;
     use std::process::{Child, Command};

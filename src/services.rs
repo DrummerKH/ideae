@@ -230,6 +230,86 @@ pub fn task_env(all: &[Service], slot: u32) -> Vec<(String, String)> {
     env
 }
 
+/// A TCP port one of `pids` listens on, with that process.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Listening {
+    pub port: u16,
+    pub pid: i32,
+    pub name: String,
+}
+
+/// The ports `pids` listen on, lowest first.
+#[cfg(target_os = "linux")]
+pub fn listening(pids: &[i32]) -> Vec<Listening> {
+    // inode → port, from the listening sockets of the whole machine.
+    let mut ports: std::collections::HashMap<String, u16> = std::collections::HashMap::new();
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(text) = std::fs::read_to_string(table) else { continue };
+        for line in text.lines().skip(1) {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() > 9 && f[3] == "0A" {
+                if let Some(port) = f[1].rsplit(':').next().and_then(|h| u16::from_str_radix(h, 16).ok()) {
+                    ports.insert(format!("socket:[{}]", f[9]), port);
+                }
+            }
+        }
+    }
+    let mut out: Vec<Listening> = Vec::new();
+    for &pid in pids {
+        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else { continue };
+        for fd in fds.flatten() {
+            let Ok(link) = std::fs::read_link(fd.path()) else { continue };
+            if let Some(&port) = ports.get(link.to_string_lossy().as_ref()) {
+                if !out.iter().any(|l| l.port == port) {
+                    let name = crate::procs::name(pid as u32).unwrap_or_default();
+                    out.push(Listening { port, pid, name });
+                }
+            }
+        }
+    }
+    out.sort_by_key(|l| l.port);
+    out
+}
+
+/// `lsof` for the ports of `pids`.
+#[cfg(target_os = "macos")]
+pub fn listening(pids: &[i32]) -> Vec<Listening> {
+    if pids.is_empty() {
+        return Vec::new();
+    }
+    let list: Vec<String> = pids.iter().map(i32::to_string).collect();
+    let Ok(out) = crate::procs::command("lsof")
+        .args(["-a", "-p", &list.join(","), "-iTCP", "-sTCP:LISTEN", "-P", "-n", "-Fpcn"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let mut found: Vec<Listening> = Vec::new();
+    let (mut pid, mut name) = (0, String::new());
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        match line.split_at_checked(1) {
+            Some(("p", v)) => pid = v.parse().unwrap_or(0),
+            Some(("c", v)) => name = v.to_string(),
+            // "n*:3000" or "n127.0.0.1:3000".
+            Some(("n", v)) => {
+                if let Some(port) = v.rsplit(':').next().and_then(|p| p.parse().ok()) {
+                    if !found.iter().any(|l| l.port == port) {
+                        found.push(Listening { port, pid, name: name.clone() });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    found.sort_by_key(|l| l.port);
+    found
+}
+
+#[cfg(not(unix))]
+pub fn listening(_: &[i32]) -> Vec<Listening> {
+    Vec::new()
+}
+
 /// Something listens on `port` already: its process name when it can be
 /// told, else just that it is taken.
 pub fn port_taken(port: u16) -> Option<String> {
