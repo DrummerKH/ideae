@@ -1,7 +1,11 @@
 //! The window: projects and their tasks in the sidebar, the task in view, and
 //! the state saved between runs.
 
-use std::path::{Path, PathBuf};
+use std::{
+    cell::RefCell,
+    path::{Path, PathBuf},
+    rc::Rc,
+};
 
 use gpui_kit::component::{
     WindowExt as _,
@@ -930,6 +934,56 @@ impl Workspace {
         let on_title = on_enter.clone();
         cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, window, cx| on_title(this, event, false, window, cx))
             .detach();
+        // A ticket in the title fills the prompt, unless you wrote one yourself.
+        let filled: Rc<RefCell<String>> = Rc::default();
+        let fetch: Rc<RefCell<Option<Task<()>>>> = Rc::default();
+        let repo = p.path.clone();
+        {
+            let prompt = prompt.clone();
+            cx.subscribe_in(&input, window, move |_, input, event: &InputEvent, window, cx| {
+                if !matches!(event, InputEvent::Change) {
+                    return;
+                }
+                let title = input.read(cx).value().trim().to_string();
+                let current = prompt.read(cx).value().to_string();
+                if !current.trim().is_empty() && current != *filled.borrow() {
+                    return;
+                }
+                let set = |text: String, window: &mut Window, cx: &mut App| {
+                    *filled.borrow_mut() = text.clone();
+                    prompt.update(cx, |p, cx| p.set_value(text, window, cx));
+                };
+                if let Some(key) = jira_key(&title) {
+                    *fetch.borrow_mut() = None;
+                    set(format!("Jira issue {key}: read it, its description and comments, and do what it asks."), window, cx);
+                } else if let Some(number) = github_issue(&title) {
+                    let (repo, input, prompt, filled) = (repo.clone(), input.clone(), prompt.clone(), filled.clone());
+                    let task = window.spawn(cx, async move |cx| {
+                        cx.background_executor().timer(std::time::Duration::from_millis(400)).await;
+                        let issue = cx.background_spawn(async move { gh_issue(&repo, number) }).await;
+                        let Some((issue_title, body)) = issue else { return };
+                        let _ = cx.update(|window, cx| {
+                            let current = prompt.read(cx).value().to_string();
+                            if !current.trim().is_empty() && current != *filled.borrow() {
+                                return;
+                            }
+                            let text = format!("GitHub issue #{number}: {issue_title}\n\n{}\n", body.trim());
+                            *filled.borrow_mut() = text.clone();
+                            prompt.update(cx, |p, cx| p.set_value(text, window, cx));
+                            // Only the reference typed: the issue's title names the task.
+                            let typed = input.read(cx).value().trim().to_string();
+                            if github_issue(&typed) == Some(number) && typed.split_whitespace().count() == 1 {
+                                input.update(cx, |i, cx| i.set_value(format!("#{number} {issue_title}"), window, cx));
+                            }
+                        });
+                    });
+                    *fetch.borrow_mut() = Some(task);
+                } else if !filled.borrow().is_empty() {
+                    set(String::new(), window, cx);
+                }
+            })
+            .detach();
+        }
         cx.subscribe_in(&prompt, window, move |this, _, event: &InputEvent, window, cx| on_enter(this, event, true, window, cx))
             .detach();
         let focused = std::rc::Rc::new(std::cell::Cell::new(false));
@@ -1359,6 +1413,42 @@ impl Workspace {
         theme::apply(appearance, window, cx);
         cx.notify();
     }
+}
+
+/// "DEV-123" at the start of a title.
+fn jira_key(title: &str) -> Option<&str> {
+    let first = title.split_whitespace().next()?;
+    let (project, number) = first.split_once('-')?;
+    let ok = project.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        && project.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        && !number.is_empty()
+        && number.chars().all(|c| c.is_ascii_digit());
+    ok.then_some(first)
+}
+
+/// "#123" at the start of a title, or a GitHub issue link in it.
+fn github_issue(title: &str) -> Option<u64> {
+    let first = title.split_whitespace().next()?;
+    if let Some(n) = first.strip_prefix('#') {
+        return n.parse().ok();
+    }
+    let (_, rest) = title.split_once("/issues/")?;
+    rest.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+}
+
+/// The issue's title and body, by `gh` in the repository.
+fn gh_issue(repo: &Path, number: u64) -> Option<(String, String)> {
+    let out = crate::procs::command("gh")
+        .current_dir(repo)
+        .env("GH_PROMPT_DISABLED", "1")
+        .args(["issue", "view", &number.to_string(), "--json", "title,body"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    Some((v["title"].as_str()?.to_string(), v["body"].as_str().unwrap_or_default().to_string()))
 }
 
 fn branch_hint(title: &str) -> String {
