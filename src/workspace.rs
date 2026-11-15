@@ -904,7 +904,7 @@ impl Workspace {
                         .justify_end()
                         .items_center()
                         .gap_2()
-                        .child(div().text_xs().text_color(muted).child("Ctrl+Enter"))
+                        .child(div().text_xs().text_color(muted).child(crate::keys::label("Ctrl+Enter")))
                         .child(Button::new("create-task").primary().label("Create").on_click(move |_, window, cx| submit(window, cx)))
                 })
         });

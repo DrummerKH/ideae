@@ -164,6 +164,11 @@ pub fn data_home() -> PathBuf {
     if cfg!(windows) {
         return var("LOCALAPPDATA").unwrap_or_else(std::env::temp_dir);
     }
+    if cfg!(target_os = "macos") {
+        if let Some(home) = var("HOME") {
+            return home.join("Library/Application Support");
+        }
+    }
     var("XDG_DATA_HOME").or_else(|| var("HOME").map(|h| h.join(".local/share"))).unwrap_or_else(std::env::temp_dir)
 }
 

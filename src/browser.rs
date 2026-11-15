@@ -44,6 +44,13 @@ impl Drop for Chrome {
 
 #[cfg(unix)]
 fn find_chrome() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    for app in ["Google Chrome.app/Contents/MacOS/Google Chrome", "Chromium.app/Contents/MacOS/Chromium", "Microsoft Edge.app/Contents/MacOS/Microsoft Edge"] {
+        let path = PathBuf::from("/Applications").join(app);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
     ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"]
         .into_iter()
         .find(|p| crate::procs::command(p).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success()))

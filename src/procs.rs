@@ -65,7 +65,7 @@ pub fn which(program: impl AsRef<OsStr>) -> Option<PathBuf> {
 /// Starts a program that must not outlive the app, even when the app is
 /// killed: a language server, the headless browser.
 pub fn spawn_tied(command: &mut Command) -> std::io::Result<Child> {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         use std::os::unix::process::CommandExt as _;
         // SAFETY: prctl only sets a flag of the child.
@@ -75,6 +75,12 @@ pub fn spawn_tied(command: &mut Command) -> std::io::Result<Child> {
                 Ok(())
             });
         }
+        command.spawn()
+    }
+    // macOS has no parent-death signal: these end with their task or on
+    // quit, not when the app is killed.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
         command.spawn()
     }
     #[cfg(windows)]
@@ -162,18 +168,60 @@ mod win {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn pids() -> Vec<i32> {
     std::fs::read_dir("/proc")
         .map(|dir| dir.flatten().filter_map(|e| e.file_name().to_str()?.parse().ok()).collect())
         .unwrap_or_default()
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn ppid(pid: i32) -> Option<i32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let (_, rest) = stat.rsplit_once(')')?;
     rest.split_whitespace().nth(1)?.parse().ok()
+}
+
+#[cfg(target_os = "macos")]
+fn pids() -> Vec<i32> {
+    // SAFETY: a null buffer asks for the count; the second call fills one
+    // of the size given.
+    unsafe {
+        let n = libc::proc_listallpids(std::ptr::null_mut(), 0).max(0) as usize;
+        let mut pids = vec![0i32; n + 64];
+        let size = (pids.len() * std::mem::size_of::<i32>()) as libc::c_int;
+        let got = libc::proc_listallpids(pids.as_mut_ptr().cast(), size).max(0) as usize;
+        pids.truncate(got);
+        pids
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn bsd_info(pid: i32) -> Option<libc::proc_bsdinfo> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: proc_pidinfo writes at most `size` bytes into `info`.
+    let got = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+    (got == size).then_some(info)
+}
+
+#[cfg(target_os = "macos")]
+fn ppid(pid: i32) -> Option<i32> {
+    bsd_info(pid).map(|i| i.pbi_ppid as i32)
+}
+
+/// A process's name, such as `bash`.
+#[cfg(target_os = "linux")]
+pub fn name(pid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/comm")).ok().map(|n| n.trim().to_string())
+}
+
+#[cfg(target_os = "macos")]
+pub fn name(pid: u32) -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: proc_name writes at most the buffer's size.
+    let n = unsafe { libc::proc_name(pid as i32, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    (n > 0).then(|| String::from_utf8_lossy(&buf[..n as usize]).into_owned())
 }
 
 #[cfg(unix)]
@@ -182,12 +230,18 @@ fn sid(pid: i32) -> i32 {
     unsafe { libc::getsid(pid) }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn running(pid: i32) -> bool {
     std::fs::read_to_string(format!("/proc/{pid}/stat"))
         .ok()
         .and_then(|s| s.rsplit_once(')').map(|(_, rest)| !rest.trim_start().starts_with('Z')))
         .unwrap_or(false)
+}
+
+/// Running and no zombie (status SZOMB is 5).
+#[cfg(target_os = "macos")]
+fn running(pid: i32) -> bool {
+    bsd_info(pid).is_some_and(|i| i.pbi_status != 5)
 }
 
 /// Every session led by a child of this process (the terminals' shells):
@@ -196,13 +250,25 @@ fn running(pid: i32) -> bool {
 #[cfg(not(unix))]
 pub fn end_child_sessions() {}
 
+/// A process running `ideae --daemon`.
+#[cfg(target_os = "linux")]
+fn is_daemon(pid: i32) -> bool {
+    std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| c.split(|&b| b == 0).any(|arg| arg == b"--daemon"))
+}
+
+/// The window knows its daemon's pid from the socket.
+#[cfg(target_os = "macos")]
+fn is_daemon(pid: i32) -> bool {
+    crate::daemon::client::get().and_then(|d| d.pid()) == Some(pid)
+}
+
 #[cfg(unix)]
 pub fn end_child_sessions() {
     let me = std::process::id() as i32;
     // The daemon leads a session too, and its terminals outlive the window
     // by design; it ends them itself when told to.
     let daemon = |p: i32| {
-        std::fs::read(format!("/proc/{p}/cmdline")).is_ok_and(|c| c.split(|&b| b == 0).any(|arg| arg == b"--daemon"))
+        is_daemon(p)
     };
     let leaders: Vec<i32> =
         pids().into_iter().filter(|&p| ppid(p) == Some(me) && sid(p) == p && !daemon(p)).collect();

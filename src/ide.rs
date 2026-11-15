@@ -47,6 +47,7 @@ pub fn installed() -> &'static [Ide] {
         dirs.push(PathBuf::from("/snap/bin"));
         if let Some(home) = std::env::var_os("HOME") {
             dirs.push(Path::new(&home).join(".local/share/JetBrains/Toolbox/scripts"));
+            dirs.push(Path::new(&home).join("Library/Application Support/JetBrains/Toolbox/scripts"));
         }
         KNOWN
             .iter()

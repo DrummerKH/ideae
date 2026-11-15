@@ -548,8 +548,17 @@ mod adopted {
 
     impl Child {
         fn alive(&self) -> bool {
-            let Ok(stat) = std::fs::read_to_string(format!("/proc/{}/stat", self.pid)) else { return false };
-            stat.rsplit_once(')').is_some_and(|(_, rest)| !rest.trim_start().starts_with('Z'))
+            #[cfg(target_os = "linux")]
+            {
+                let Ok(stat) = std::fs::read_to_string(format!("/proc/{}/stat", self.pid)) else { return false };
+                stat.rsplit_once(')').is_some_and(|(_, rest)| !rest.trim_start().starts_with('Z'))
+            }
+            // Not this process's child, so it cannot linger as its zombie.
+            #[cfg(not(target_os = "linux"))]
+            // SAFETY: a zero signal only probes the pid.
+            unsafe {
+                libc::kill(self.pid as libc::pid_t, 0) == 0
+            }
         }
     }
 

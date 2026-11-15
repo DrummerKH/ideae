@@ -56,6 +56,15 @@ its arguments. A task's terminals, the agent's included, get
 `IDEAE_PORT_<NAME>`. A service runs in its own terminal tab and survives a
 window restart; a taken port is reported with the process holding it.
 
+## macOS
+
+Releases carry an Apple Silicon build: `ideae-<tag>-macos-arm64.app.zip`.
+It is signed ad hoc, without an Apple Developer ID, so the first start
+needs right click → Open (or `xattr -d com.apple.quarantine ideae.app`).
+Shortcuts use Cmd where Linux uses Ctrl. Not there yet on macOS: the
+process monitor in the title bar, clicks on notifications, the Kotlin
+language server install.
+
 ## Updates
 
 Release builds ask the GitHub API for this repository's latest release at

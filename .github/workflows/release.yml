@@ -86,8 +86,58 @@ jobs:
           name: windows
           path: ideae-*-windows-x86_64.exe
 
+  # Apple Silicon. The bare binary is what updates download; the .app in a
+  # zip is for a first install. Ad-hoc signed only (no Developer ID yet):
+  # the first start needs right click, Open.
+  macos:
+    needs: version
+    runs-on: macos-14
+    env:
+      IDEAE_VERSION: ${{ needs.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+      - run: cargo build --release --locked
+      - name: Package
+        run: |
+          bin="ideae-$IDEAE_VERSION-macos-arm64"
+          cp target/release/ideae "$bin"
+          codesign --force --sign - "$bin"
+          app=ideae.app/Contents
+          mkdir -p "$app/MacOS" "$app/Resources"
+          cp "$bin" "$app/MacOS/ideae"
+          cat > "$app/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleName</key><string>ideae</string>
+            <key>CFBundleDisplayName</key><string>ideae</string>
+            <key>CFBundleIdentifier</key><string>io.github.scillarium.ideae</string>
+            <key>CFBundleExecutable</key><string>ideae</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>$IDEAE_VERSION</string>
+            <key>CFBundleVersion</key><string>$IDEAE_VERSION</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict></plist>
+          PLIST
+          codesign --force --sign - ideae.app
+          ditto -c -k --keepParent ideae.app "ideae-$IDEAE_VERSION-macos-arm64.app.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: ideae-*-macos-arm64*
+
+  # A macOS build that fails leaves the others to be released.
   release:
-    needs: [version, linux, windows]
+    needs: [version, linux, windows, macos]
+    if: ${{ !cancelled() && needs.linux.result == 'success' && needs.windows.result == 'success' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write

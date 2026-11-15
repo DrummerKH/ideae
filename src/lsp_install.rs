@@ -27,7 +27,7 @@ pub fn recipe(program: &str) -> Option<Recipe> {
             ("Installs typescript-language-server and typescript with npm, about 30 MB.", &["npm"])
         }
         "intelephense" => ("Installs intelephense with npm, about 20 MB.", &["npm"]),
-        "kotlin-lsp" if cfg!(windows) => return None,
+        "kotlin-lsp" if cfg!(any(windows, target_os = "macos")) => return None,
         "kotlin-lsp" => (
             "Downloads the latest JetBrains Kotlin LSP release: about 370 MB, 1.2 GB unpacked, Java included. The download is checked against its published SHA-256.",
             &["curl", "tar", "sha256sum"],
@@ -158,7 +158,8 @@ fn build(program: &str, staging: &Path) -> Result<PathBuf> {
             #[cfg(unix)]
             {
                 let gz = bin.join("rust-analyzer.gz");
-                download(&format!("{latest}/rust-analyzer-{arch}-unknown-linux-gnu.gz"), &gz)?;
+                let system = if cfg!(target_os = "macos") { "apple-darwin" } else { "unknown-linux-gnu" };
+                download(&format!("{latest}/rust-analyzer-{arch}-{system}.gz"), &gz)?;
                 run(crate::procs::command("gzip").arg("-d").arg(&gz))?;
                 use std::os::unix::fs::PermissionsExt as _;
                 std::fs::set_permissions(bin.join("rust-analyzer"), std::fs::Permissions::from_mode(0o755))?;

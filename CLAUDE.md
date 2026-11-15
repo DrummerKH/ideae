@@ -55,6 +55,9 @@ IDEAE_STATE=/tmp/x/state.json scripts/drive.sh /tmp/x/run.log 7 \
   window and finds `npm.cmd` and the like), and programs that must die with
   the app with `procs::spawn_tied`. Check the Windows side compiles with
   `cargo check --target x86_64-pc-windows-gnu --target-dir target/win`.
+- macOS: `scripts/check-macos.sh` type-checks it from Linux (cargo-zigbuild).
+  Keys go through `keys::bind`/`keys::label` (Cmd on macOS); Linux-only
+  process code (`/proc`, `prctl`) needs a macOS branch (`libproc`) or a cfg.
 - The repository is public: no personal paths, hostnames, emails or private project names in code, tests or commits.
 - Agents and terminals belong to tasks; whatever a task starts must end on Close, Delete and quit.
 - No comments unless the why is non-obvious.

@@ -517,7 +517,11 @@ mod handover {
             msg.msg_iovlen = 1;
             msg.msg_control = control.as_mut_ptr().cast();
             msg.msg_controllen = space as _;
-            if libc::recvmsg(stream.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) < 0 {
+            #[cfg(target_os = "linux")]
+            let flags = libc::MSG_CMSG_CLOEXEC;
+            #[cfg(not(target_os = "linux"))]
+            let flags = 0;
+            if libc::recvmsg(stream.as_raw_fd(), &mut msg, flags) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
@@ -526,7 +530,10 @@ mod handover {
                     let n = ((*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize) / std::mem::size_of::<RawFd>();
                     let data = libc::CMSG_DATA(cmsg).cast::<RawFd>();
                     for i in 0..n {
-                        fds.push(OwnedFd::from_raw_fd(*data.add(i)));
+                        let fd = *data.add(i);
+                        // Without MSG_CMSG_CLOEXEC (macOS) it is set here.
+                        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                        fds.push(OwnedFd::from_raw_fd(fd));
                     }
                 }
                 cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
@@ -551,7 +558,7 @@ mod handover {
             s.hooks.insert(hook.task.clone(), hook);
         }
         for (session, fd) in state.sessions.into_iter().zip(fds) {
-            let program = std::fs::read_to_string(format!("/proc/{}/comm", session.pid)).ok().map(|n| n.trim().to_string());
+            let program = crate::procs::name(session.pid);
             let (sink, detached) = ByteSink::detached();
             let Ok(handle) = gpui_cn::terminal::adopt(fd, session.pid, program, sink) else { continue };
             let handle = Arc::new(Mutex::new(handle));

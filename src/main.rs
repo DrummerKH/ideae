@@ -12,6 +12,7 @@ mod git;
 mod grammars;
 mod history;
 mod ide;
+mod keys;
 mod lsp;
 mod lsp_install;
 mod naming;
@@ -84,7 +85,7 @@ impl Render for Workspace {
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .on_click(|_, _, cx| cx.stop_propagation())
                                 .gap_3()
-                                .when(sysmon::SUPPORTED, |row| row.child(div().mr_2().child(sysmon::SysMon::render_widget(&self.sysmon, cx))))
+                                .when(sysmon::SUPPORTED, |row| row.when(cfg!(target_os = "linux"), |s| s.child(div().mr_2().child(sysmon::SysMon::render_widget(&self.sysmon, cx)))))
                                 .children(self.render_update(cx))
                                 .children(self.render_new_build(cx))
                                 .child(self.render_power_saving(cx))
@@ -92,7 +93,7 @@ impl Render for Workspace {
                                     Button::new("go-to-file")
                                         .xsmall()
                                         .ghost()
-                                        .label("Go to file  ⌃⇧N")
+                                        .label(format!("Go to file  {}", keys::label("Ctrl+Shift+N")))
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.finder(finder::FinderKind::Files, window, cx)
                                         })),
@@ -101,7 +102,7 @@ impl Render for Workspace {
                                     Button::new("find-in-files")
                                         .xsmall()
                                         .ghost()
-                                        .label("Find  ⌃⇧F")
+                                        .label(format!("Find  {}", keys::label("Ctrl+Shift+F")))
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.finder(finder::FinderKind::Grep, window, cx)
                                         })),
@@ -310,12 +311,12 @@ impl Workspace {
                 let _ = a.update(cx, |w, cx| w.add_project_dialog(window, cx));
             }))
             .when_some(project, |menu, project| {
-                menu.item(PopupMenuItem::new("New task…  Ctrl+Shift+T").on_click(move |_, window, cx| {
+                menu.item(PopupMenuItem::new(format!("New task…  {}", keys::label("Ctrl+Shift+T"))).on_click(move |_, window, cx| {
                     let _ = b.update(cx, |w, cx| w.new_task_dialog(project, window, cx));
                 }))
             })
             .separator()
-            .item(PopupMenuItem::new("Settings…  Ctrl+,").on_click({
+            .item(PopupMenuItem::new(format!("Settings…  {}", keys::label("Ctrl+,"))).on_click({
                 let s = this.clone();
                 move |_, window, cx| {
                     let _ = s.update(cx, |w, cx| w.open_settings(window, cx));
@@ -341,7 +342,7 @@ impl Workspace {
             .item(PopupMenuItem::new("Restart").on_click(move |_, window, cx| {
                 let _ = c.update(cx, |w, cx| w.restart(window, cx));
             }))
-            .item(PopupMenuItem::new("Exit  Ctrl+Q").on_click(move |_, window, cx| {
+            .item(PopupMenuItem::new(format!("Exit  {}", keys::label("Ctrl+Q"))).on_click(move |_, window, cx| {
                 let _ = d.update(cx, |w, cx| w.request_quit(window, cx));
             }))
         })
@@ -478,52 +479,52 @@ fn main() {
             for context in [None, Some(gpui_cn::terminal::KEY_CONTEXT)] {
                 use task::{ShowSidePanel, ShowView};
                 cx.bind_keys([
-                    KeyBinding::new("ctrl-1", ShowView(0), context),
-                    KeyBinding::new("ctrl-2", ShowView(1), context),
-                    KeyBinding::new("ctrl-3", ShowView(2), context),
-                    KeyBinding::new("ctrl-`", ShowView(3), context),
-                    KeyBinding::new("alt-1", ShowSidePanel(0), context),
-                    KeyBinding::new("alt-2", ShowSidePanel(1), context),
-                    KeyBinding::new("alt-3", ShowSidePanel(2), context),
-                    KeyBinding::new("ctrl-pagedown", task::NextTab, context),
-                    KeyBinding::new("ctrl-pageup", task::PrevTab, context),
+                    KeyBinding::new(keys::bind("ctrl-1"), ShowView(0), context),
+                    KeyBinding::new(keys::bind("ctrl-2"), ShowView(1), context),
+                    KeyBinding::new(keys::bind("ctrl-3"), ShowView(2), context),
+                    KeyBinding::new(keys::bind("ctrl-`"), ShowView(3), context),
+                    KeyBinding::new(keys::bind("alt-1"), ShowSidePanel(0), context),
+                    KeyBinding::new(keys::bind("alt-2"), ShowSidePanel(1), context),
+                    KeyBinding::new(keys::bind("alt-3"), ShowSidePanel(2), context),
+                    KeyBinding::new(keys::bind("ctrl-pagedown"), task::NextTab, context),
+                    KeyBinding::new(keys::bind("ctrl-pageup"), task::PrevTab, context),
                 ]);
                 // JetBrains' keys: Ctrl+P and the like belong to the shell.
                 cx.bind_keys([
-                    KeyBinding::new("ctrl-s", task::SaveFile, None),
+                    KeyBinding::new(keys::bind("ctrl-s"), task::SaveFile, None),
                     // Editor only ("Input"): in a terminal Ctrl+W deletes a word.
-                    KeyBinding::new("ctrl-w", task::ExpandSelection, Some("Input")),
-                    KeyBinding::new("ctrl-shift-w", task::ShrinkSelection, Some("Input")),
-                    KeyBinding::new("ctrl-/", task::ToggleComment, Some("Input")),
-                    KeyBinding::new("ctrl-f12", task::ShowOutline, Some("Input")),
+                    KeyBinding::new(keys::bind("ctrl-w"), task::ExpandSelection, Some("Input")),
+                    KeyBinding::new(keys::bind("ctrl-shift-w"), task::ShrinkSelection, Some("Input")),
+                    KeyBinding::new(keys::bind("ctrl-/"), task::ToggleComment, Some("Input")),
+                    KeyBinding::new(keys::bind("ctrl-f12"), task::ShowOutline, Some("Input")),
                     // JetBrains' Go to Declaration, same as Ctrl+click.
-                    KeyBinding::new("ctrl-b", gpui_kit::component::input::GoToDefinition, Some("Input")),
-                    KeyBinding::new("ctrl-alt-b", task::ShowUsages, Some("Input")),
-                    KeyBinding::new("shift-escape", task::ToggleZoom, context),
-                    KeyBinding::new("ctrl-shift-n", GoToFile, context),
-                    KeyBinding::new("ctrl-shift-f", FindInFiles, context),
-                    KeyBinding::new("ctrl-shift-t", NewTask, context),
-                    KeyBinding::new("ctrl-q", Quit, context),
-                    KeyBinding::new("ctrl-,", OpenSettings, context),
+                    KeyBinding::new(keys::bind("ctrl-b"), gpui_kit::component::input::GoToDefinition, Some("Input")),
+                    KeyBinding::new(keys::bind("ctrl-alt-b"), task::ShowUsages, Some("Input")),
+                    KeyBinding::new(keys::bind("shift-escape"), task::ToggleZoom, context),
+                    KeyBinding::new(keys::bind("ctrl-shift-n"), GoToFile, context),
+                    KeyBinding::new(keys::bind("ctrl-shift-f"), FindInFiles, context),
+                    KeyBinding::new(keys::bind("ctrl-shift-t"), NewTask, context),
+                    KeyBinding::new(keys::bind("ctrl-q"), Quit, context),
+                    KeyBinding::new(keys::bind("ctrl-,"), OpenSettings, context),
                     // In a terminal it was Select All, which the mouse and Copy still do.
-                    KeyBinding::new("ctrl-shift-a", palette::CommandPalette, context),
+                    KeyBinding::new(keys::bind("ctrl-shift-a"), palette::CommandPalette, context),
                 ]);
             }
             // Not in a terminal: Ctrl+E is the end of the line there, in the shell
             // and in Claude Code's prompt.
             cx.bind_keys([
-                KeyBinding::new("ctrl-e", palette::RecentPlaces, None),
-                KeyBinding::new("ctrl-e", NoAction, Some(gpui_cn::terminal::KEY_CONTEXT)),
+                KeyBinding::new(keys::bind("ctrl-e"), palette::RecentPlaces, None),
+                KeyBinding::new(keys::bind("ctrl-e"), NoAction, Some(gpui_cn::terminal::KEY_CONTEXT)),
                 // Readline's forward-char, which the arrow key does as well.
-                KeyBinding::new("ctrl-f", task::FindInTerminal, Some(gpui_cn::terminal::KEY_CONTEXT)),
+                KeyBinding::new(keys::bind("ctrl-f"), task::FindInTerminal, Some(gpui_cn::terminal::KEY_CONTEXT)),
             ]);
             // Ctrl+Alt+Left/Right switch GNOME workspaces. In a terminal Alt+Left
             // stays the shell's word move.
             cx.bind_keys([
-                KeyBinding::new("alt-left", task::NavigateBack, None),
-                KeyBinding::new("alt-right", task::NavigateForward, None),
-                KeyBinding::new("alt-left", NoAction, Some(gpui_cn::terminal::KEY_CONTEXT)),
-                KeyBinding::new("alt-right", NoAction, Some(gpui_cn::terminal::KEY_CONTEXT)),
+                KeyBinding::new(keys::bind("alt-left"), task::NavigateBack, None),
+                KeyBinding::new(keys::bind("alt-right"), task::NavigateForward, None),
+                KeyBinding::new(keys::bind("alt-left"), NoAction, Some(gpui_cn::terminal::KEY_CONTEXT)),
+                KeyBinding::new(keys::bind("alt-right"), NoAction, Some(gpui_cn::terminal::KEY_CONTEXT)),
             ]);
 
             // A saved window larger than the screen it opens on (another

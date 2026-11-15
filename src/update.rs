@@ -31,7 +31,15 @@ fn repo() -> Option<String> {
 
 /// This system's binary in a release.
 fn suffix() -> &'static str {
-    if cfg!(windows) { "-windows-x86_64.exe" } else { "-linux-x86_64" }
+    if cfg!(windows) {
+        "-windows-x86_64.exe"
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        "-macos-arm64"
+    } else if cfg!(target_os = "macos") {
+        "-macos-x86_64"
+    } else {
+        "-linux-x86_64"
+    }
 }
 
 /// A newer release than this one, off the UI thread.

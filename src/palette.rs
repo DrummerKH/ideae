@@ -31,6 +31,7 @@ impl Entry {
 
     /// Runs an action the way its keys would, from where focus is.
     fn action(label: &str, keys: &str, action: impl Action) -> Self {
+        let keys = &crate::keys::label(keys);
         let action: Rc<dyn Action> = Rc::new(action);
         Self::new(label.to_string(), move |window, cx| window.dispatch_action(action.boxed_clone(), cx)).keys(keys)
     }
@@ -41,6 +42,7 @@ impl Entry {
     }
 
     fn keys(mut self, keys: &str) -> Self {
+        let keys = &crate::keys::label(keys);
         self.keys = keys.to_string().into();
         self
     }
@@ -249,7 +251,7 @@ impl Workspace {
         let again: Run = Rc::new(move |window, cx| {
             let _ = this.update(cx, |w, cx| w.recent_files(window, cx));
         });
-        open("Recent tasks (Ctrl+E: files)", entries, Some(again), window, cx);
+        open(&format!("Recent tasks ({}: files)", crate::keys::label("Ctrl+E")), entries, Some(again), window, cx);
     }
 
     /// Files of the current task by when you were last in them.
@@ -278,6 +280,6 @@ impl Workspace {
         let again: Run = Rc::new(move |window, cx| {
             let _ = this.update(cx, |w, cx| w.recent_tasks(window, cx));
         });
-        open("Recent files (Ctrl+E: tasks)", entries, Some(again), window, cx);
+        open(&format!("Recent files ({}: tasks)", crate::keys::label("Ctrl+E")), entries, Some(again), window, cx);
     }
 }

@@ -164,6 +164,19 @@ fn size_of(viewport: Viewport) -> Size {
 }
 
 /// The pid of the process at the other end, 0 when unknown.
+#[cfg(target_os = "macos")]
+fn peer_pid(stream: &UnixStream) -> i32 {
+    use std::os::fd::AsRawFd as _;
+    let mut pid: libc::pid_t = 0;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    // SAFETY: LOCAL_PEERPID writes a pid_t of the given length.
+    let ok = unsafe {
+        libc::getsockopt(stream.as_raw_fd(), libc::SOL_LOCAL, libc::LOCAL_PEERPID, (&raw mut pid).cast(), &mut len)
+    } == 0;
+    if ok { pid } else { 0 }
+}
+
+#[cfg(target_os = "linux")]
 fn peer_pid(stream: &UnixStream) -> i32 {
     use std::os::fd::AsRawFd as _;
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };

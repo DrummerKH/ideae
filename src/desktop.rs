@@ -63,7 +63,7 @@ fn set_favorites(list: &[String]) {
 
 /// A desktop notification. On Windows a balloon from PowerShell, which needs
 /// no app registration as a toast does.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(all(unix, not(target_os = "macos")), allow(dead_code))]
 pub fn notify(title: &str, body: &str) {
     #[cfg(windows)]
     let child = {
@@ -78,7 +78,9 @@ pub fn notify(title: &str, body: &str) {
         );
         crate::procs::command("powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command", &script]).spawn()
     };
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    let child = osascript_notification(title, body).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
     let child = crate::procs::command("notify-send").args(["-a", APP_ID, title, body]).spawn();
     // Waited for off the UI thread, or each one stays a zombie.
     if let Ok(mut child) = child {
@@ -90,12 +92,13 @@ pub fn notify(title: &str, body: &str) {
 /// notify-send's default action, waited for on a thread of its own; a
 /// Windows balloon reports no clicks, so there it is a plain one.
 pub fn notify_with(title: &str, body: &str, on_click: impl FnOnce() + Send + 'static) {
-    #[cfg(windows)]
+    // Neither a Windows balloon nor an AppleScript notification reports clicks.
+    #[cfg(any(windows, target_os = "macos"))]
     {
         drop(on_click);
         notify(title, body);
     }
-    #[cfg(not(windows))]
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
         let child = crate::procs::command("notify-send")
             .args(["-a", APP_ID, "-A", "default=Open", title, body])
@@ -124,6 +127,17 @@ pub fn open_window_on(path: &std::path::Path) {
             std::thread::spawn(move || child.wait());
         }
     }
+}
+
+/// `display notification` from AppleScript: the strings go in as
+/// arguments, so nothing in them is read as script.
+#[cfg(target_os = "macos")]
+fn osascript_notification(title: &str, body: &str) -> std::process::Command {
+    let mut command = crate::procs::command("osascript");
+    command
+        .args(["-e", "on run argv", "-e", "display notification (item 2 of argv) with title (item 1 of argv)", "-e", "end run"])
+        .args([title, body]);
+    command
 }
 
 pub fn can_pin() -> bool {
