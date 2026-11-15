@@ -117,6 +117,7 @@ pub fn notify_with(title: &str, body: &str, on_click: impl FnOnce() + Send + 'st
 
 /// Starts a window on the task at `path` (from a notification the daemon
 /// raised while no window was open).
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn open_window_on(path: &std::path::Path) {
     if let Ok(exe) = exe() {
         if let Ok(mut child) = crate::procs::command(exe).arg("--task").arg(path).spawn() {
