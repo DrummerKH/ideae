@@ -383,9 +383,8 @@ fn notify(hook: &Hook) {
         _ => "Finished".into(),
     };
     let task = std::path::Path::new(&hook.task).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    if let Ok(mut child) = std::process::Command::new("notify-send").args(["-a", crate::state::APP_ID, &task, &body]).spawn() {
-        std::thread::spawn(move || child.wait());
-    }
+    let path = std::path::PathBuf::from(&hook.task);
+    crate::desktop::notify_with(&task, &body, move || crate::desktop::open_window_on(&path));
 }
 
 /// Moving the sessions to a daemon of a newer build without stopping their

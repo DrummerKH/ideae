@@ -89,6 +89,8 @@ pub struct Workspace {
     _subscriptions: Vec<Subscription>,
     _tick: Task<()>,
     pub build: crate::build_watch::BuildWatch,
+    /// Clicked notifications send their task here.
+    open_task_tx: async_channel::Sender<PathBuf>,
     /// Where the window is, to open there next time.
     window_place: Option<state::WindowPlace>,
     /// Where the window was asked to open, and when: some window managers
@@ -238,6 +240,20 @@ impl Workspace {
         })
         .detach();
 
+        // A clicked notification brings the window up on its task.
+        let (open_task_tx, open_task_rx) = async_channel::unbounded::<PathBuf>();
+        cx.spawn_in(window, async move |this, cx| {
+            while let Ok(path) = open_task_rx.recv().await {
+                if this.update_in(cx, |this, window, cx| {
+                    window.activate_window();
+                    this.focus_task(&path, window, cx);
+                }).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+
         // Closing the window the window manager's way is the same as ×.
         let closing = cx.weak_entity();
         window.on_window_should_close(cx, move |_, cx| {
@@ -296,6 +312,7 @@ impl Workspace {
             _tick: tick,
             requested_origin: None,
             origin_offset: Point::default(),
+            open_task_tx,
             window_place: saved.window.clone(),
             update: None,
             updating: false,
@@ -1110,7 +1127,10 @@ impl Workspace {
                 agent::AgentStatus::NeedsInput(message) => message.clone(),
                 _ => "Finished".to_string(),
             };
-            crate::desktop::notify(&label, &body);
+            let (tx, path) = (self.open_task_tx.clone(), event.task.clone());
+            crate::desktop::notify_with(&label, &body, move || {
+                let _ = tx.send_blocking(path);
+            });
         }
         cx.notify();
     }
@@ -1169,6 +1189,17 @@ impl Workspace {
         }
         self.save(cx);
         cx.notify();
+    }
+
+    /// Shows the task at `path` with its agent in front.
+    pub fn focus_task(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find(path).is_none() {
+            return;
+        }
+        self.switch(path, window, cx);
+        if let Some(view) = self.active_view() {
+            view.update(cx, |t, cx| t.show_view(0, window, cx));
+        }
     }
 
     pub fn placed_at(&mut self, origin: Option<Point<Pixels>>) {

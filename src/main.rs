@@ -440,11 +440,13 @@ fn main() {
     // None: as Settings say; Some(None): --no-agent.
     let mut agent: Option<Option<String>> = None;
     let mut appearance: Option<Appearance> = None;
+    let mut open_task: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--agent" => agent = Some(args.next()),
             "--no-agent" => agent = Some(None),
+            "--task" => open_task = args.next().map(PathBuf::from),
             "--theme" => {
                 appearance = args.next().and_then(|v| Appearance::parse(&v))
             }
@@ -453,7 +455,7 @@ fn main() {
                 return;
             }
             "--help" | "-h" => {
-                println!("usage: ideae [--agent CMD | --no-agent] [--theme auto|light|dark] [--version] [REPO...]\nRepos join the project list, kept in {}.", state::data_dir().join("state.json").display());
+                println!("usage: ideae [--agent CMD | --no-agent] [--theme auto|light|dark] [--task PATH] [--version] [REPO...]\nRepos join the project list, kept in {}.", state::data_dir().join("state.json").display());
                 return;
             }
             _ => repos.push(PathBuf::from(arg)),
@@ -562,6 +564,9 @@ fn main() {
                 cx.new(|cx| {
                     let mut workspace = Workspace::new(repos, agent, appearance, window, cx);
                     workspace.placed_at(requested);
+                    if let Some(task) = &open_task {
+                        workspace.focus_task(task, window, cx);
+                    }
                     workspace
                 })
             })

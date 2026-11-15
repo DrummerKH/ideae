@@ -63,6 +63,7 @@ fn set_favorites(list: &[String]) {
 
 /// A desktop notification. On Windows a balloon from PowerShell, which needs
 /// no app registration as a toast does.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn notify(title: &str, body: &str) {
     #[cfg(windows)]
     let child = {
@@ -82,6 +83,45 @@ pub fn notify(title: &str, body: &str) {
     // Waited for off the UI thread, or each one stays a zombie.
     if let Ok(mut child) = child {
         std::thread::spawn(move || child.wait());
+    }
+}
+
+/// A notification that runs `on_click` when it is clicked. On Linux that is
+/// notify-send's default action, waited for on a thread of its own; a
+/// Windows balloon reports no clicks, so there it is a plain one.
+pub fn notify_with(title: &str, body: &str, on_click: impl FnOnce() + Send + 'static) {
+    #[cfg(windows)]
+    {
+        drop(on_click);
+        notify(title, body);
+    }
+    #[cfg(not(windows))]
+    {
+        let child = crate::procs::command("notify-send")
+            .args(["-a", APP_ID, "-A", "default=Open", title, body])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        if let Ok(child) = child {
+            std::thread::spawn(move || {
+                if let Ok(out) = child.wait_with_output() {
+                    if String::from_utf8_lossy(&out.stdout).trim() == "default" {
+                        on_click();
+                    }
+                }
+            });
+        }
+    }
+}
+
+/// Starts a window on the task at `path` (from a notification the daemon
+/// raised while no window was open).
+pub fn open_window_on(path: &std::path::Path) {
+    if let Ok(exe) = exe() {
+        if let Ok(mut child) = crate::procs::command(exe).arg("--task").arg(path).spawn() {
+            std::thread::spawn(move || child.wait());
+        }
     }
 }
 
