@@ -191,6 +191,12 @@ pub fn branch_info(root: &Path) -> BranchInfo {
         info.behind_base = git(root, &["rev-list", "--count", &format!("HEAD..{base}")])
             .and_then(|n| n.trim().parse().ok())
             .unwrap_or(0);
+        // Not published yet: its own commits are the ones ahead.
+        if info.upstream.is_none() {
+            info.ahead = git(root, &["rev-list", "--count", &format!("{base}..HEAD")])
+                .and_then(|n| n.trim().parse().ok())
+                .unwrap_or(0);
+        }
         info.base = Some(base);
     }
     if let Some(last) = git(root, &["log", "-1", "--format=%h%x1f%s"]) {

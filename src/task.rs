@@ -2140,6 +2140,12 @@ impl TaskView {
         self.files.len()
     }
 
+    /// Commits not pushed: ahead of the upstream, or the branch's own ones
+    /// before it is published.
+    pub fn unpushed(&self) -> u32 {
+        self.branch_info.ahead
+    }
+
     pub fn set_visible(&mut self, visible: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.visible = visible;
         self.sync_visibility(cx);

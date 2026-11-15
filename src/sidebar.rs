@@ -290,16 +290,16 @@ impl Workspace {
         let is_active = self.active.as_deref() == Some(path.as_path());
         let running = t.view.is_some();
 
-        let (glyph, changes, unseen, needs) = match &t.view {
+        let ((glyph, changes, unseen, needs), unpushed) = match &t.view {
             Some(view) => {
                 let v = view.read(cx);
                 let needs = match &v.agent_status {
                     AgentStatus::NeedsInput(message) => Some(message.clone()),
                     _ => None,
                 };
-                (task::status_glyph(&v.agent_status), v.change_count(), v.unseen, needs)
+                ((task::status_glyph(&v.agent_status), v.change_count(), v.unseen, needs), v.unpushed())
             }
-            None => (None, 0, false, None),
+            None => ((None, 0, false, None), 0),
         };
         let muted = cx.theme().muted_foreground;
         // Second line: when it was last busy, and where (the project in the
@@ -397,7 +397,34 @@ impl Workspace {
                             .when(!running, |s| s.text_color(muted))
                             .child(label.clone()),
                     )
-                    .when(changes > 0, |s| s.child(div().flex_none().text_xs().text_color(muted).child(changes.to_string()))),
+                    .when(unpushed > 0, |s| {
+                        s.child(
+                            div()
+                                .id(SharedString::from(format!("unpushed-{}", path.display())))
+                                .flex_none()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(format!("↑{unpushed}"))
+                                .tooltip(move |window, cx| {
+                                    let n = if unpushed == 1 { "1 commit".into() } else { format!("{unpushed} commits") };
+                                    gpui_kit::component::tooltip::Tooltip::new(format!("{n} not pushed")).build(window, cx)
+                                }),
+                        )
+                    })
+                    .when(changes > 0, |s| {
+                        s.child(
+                            div()
+                                .id(SharedString::from(format!("changes-{}", path.display())))
+                                .flex_none()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(changes.to_string())
+                                .tooltip(move |window, cx| {
+                                    let n = if changes == 1 { "1 file".into() } else { format!("{changes} files") };
+                                    gpui_kit::component::tooltip::Tooltip::new(format!("{n} with uncommitted changes")).build(window, cx)
+                                }),
+                        )
+                    }),
             )
             .when(!details.is_empty() || pr.is_some(), |s| {
                 s.child(
