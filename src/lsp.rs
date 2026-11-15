@@ -18,9 +18,6 @@ use std::{
 use anyhow::{Context as _, Result, anyhow};
 use serde_json::{Value, json};
 
-/// Off by default (`--lsp` turns it on): servers are a per-repo decision.
-pub static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 type Pending = Arc<Mutex<HashMap<i64, mpsc::Sender<Result<Value>>>>>;
 /// Work-done progress the server has begun and not ended: token → title.
 type Progress = Arc<Mutex<HashMap<String, String>>>;
@@ -40,9 +37,6 @@ pub struct LspClient {
 pub fn server_for(
     path: &Path,
 ) -> Result<(&'static str, &'static str, &'static [&'static str]), String> {
-    if !ENABLED.load(Ordering::Relaxed) {
-        return Err("LSP off (start with --lsp)".into());
-    }
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
     let entry: (&str, &str, &[&str]) = match ext {
         "go" => ("go", "gopls", &[]),

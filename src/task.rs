@@ -2208,7 +2208,14 @@ impl TaskView {
                     self.lsp.insert(key, client.clone());
                     client
                 }
-                Err(error) => return set_status(file, Some(false), format!("{program} failed: {error:#}"), cx),
+                Err(error) => {
+                    // Not installed is the normal case for many languages, not an error.
+                    let missing = error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+                    let status = if missing { format!("{program} not installed") } else { format!("{program} failed: {error:#}") };
+                    return set_status(file, Some(false), status, cx);
+                }
             },
         };
         set_status(file, None, "starting…".to_string(), cx);

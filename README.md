@@ -23,8 +23,8 @@ Status: early, Linux only (Ubuntu 24.04 or newer is what it is tested on).
   fires when a task out of view wants you.
 - **State.** Projects, tasks, open tabs, cursor lines and open folders
   survive a restart (`~/.local/share/ideae/state.json`).
-- **Editor.** Tree-sitter highlighting, go to definition (LSP with
-  `--lsp`, or a search-based fallback), file structure, blame of the cursor
+- **Editor.** Tree-sitter highlighting, go to definition (LSP when the
+  language server is installed, else a search-based fallback), file structure, blame of the cursor
   line, syntax-aware selection, autosave when you leave a file.
 - **Git.** Changes with stage/unstage/discard, commit, push, PR (`gh`), the
   branch against its base, history, safe pull.
@@ -46,7 +46,7 @@ cargo build --release
 ./target/release/ideae [REPO...]
 ```
 
-Options: `--agent CMD` or `--no-agent`, `--lsp`, `--theme auto|light|dark`.
+Options: `--agent CMD` or `--no-agent`, `--theme auto|light|dark`.
 
 A debug build is a separate app (`ideae-dev`): its own state, sockets and
 launcher entry, so it can run next to a release build.

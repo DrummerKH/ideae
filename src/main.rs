@@ -335,12 +335,11 @@ fn main() {
         match arg.as_str() {
             "--agent" => agent = args.next(),
             "--no-agent" => agent = None,
-            "--lsp" => lsp::ENABLED.store(true, std::sync::atomic::Ordering::Relaxed),
             "--theme" => {
                 appearance = args.next().and_then(|v| Appearance::parse(&v))
             }
             "--help" | "-h" => {
-                println!("usage: ideae [--agent CMD | --no-agent] [--lsp] [--theme auto|light|dark] [REPO...]\nRepos join the project list, kept in ~/.local/share/ideae/state.json.");
+                println!("usage: ideae [--agent CMD | --no-agent] [--theme auto|light|dark] [REPO...]\nRepos join the project list, kept in ~/.local/share/ideae/state.json.");
                 return;
             }
             _ => repos.push(PathBuf::from(arg)),
