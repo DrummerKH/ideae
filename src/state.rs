@@ -13,10 +13,24 @@ pub struct State {
     pub side_panel_width: Option<f32>,
     pub active_collapsed: bool,
     pub power_saving: bool,
+    pub window: Option<WindowPlace>,
     pub active_task: Option<PathBuf>,
     /// Text size per kind of view.
     pub zoom: crate::zoom::Zoom,
     pub projects: Vec<ProjectState>,
+}
+
+/// The window's size and place. Wayland lets no app choose its position;
+/// there the size and the maximized state still come back.
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq)]
+#[serde(default)]
+pub struct WindowPlace {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub maximized: bool,
+    pub fullscreen: bool,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq)]

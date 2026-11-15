@@ -120,6 +120,8 @@ impl Render for Workspace {
                             resizable_panel()
                                 .size(self.sidebar_width)
                                 .size_range(px(150.)..px(520.))
+                                // Keeps its width when the window resizes.
+                                .fixed()
                                 .child(self.render_sidebar(cx)),
                         )
                         .child(resizable_panel().child(match self.active_view() {
@@ -470,8 +472,22 @@ fn main() {
                 KeyBinding::new("alt-right", NoAction, Some(gpui_cn::terminal::KEY_CONTEXT)),
             ]);
 
+            let window_bounds = state::load()
+                .window
+                .filter(|w| w.width >= 400. && w.height >= 300.)
+                .map(|w| {
+                    let bounds = Bounds::new(point(px(w.x), px(w.y)), size(px(w.width), px(w.height)));
+                    if w.fullscreen {
+                        WindowBounds::Fullscreen(bounds)
+                    } else if w.maximized {
+                        WindowBounds::Maximized(bounds)
+                    } else {
+                        WindowBounds::Windowed(bounds)
+                    }
+                })
+                .unwrap_or_else(|| WindowBounds::centered(size(px(1500.), px(920.)), cx));
             let options = WindowOptions {
-                window_bounds: Some(WindowBounds::centered(size(px(1500.), px(920.)), cx)),
+                window_bounds: Some(window_bounds),
                 app_id: Some(state::APP_ID.into()),
                 ..TitleBar::window_options()
             };

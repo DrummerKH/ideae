@@ -85,6 +85,8 @@ pub struct Workspace {
     _subscriptions: Vec<Subscription>,
     _tick: Task<()>,
     pub build: crate::build_watch::BuildWatch,
+    /// Where the window is, to open there next time.
+    window_place: Option<state::WindowPlace>,
     /// Quitting while the agents go on: a restart, or the window's ×.
     keep_terminals: bool,
 }
@@ -200,6 +202,23 @@ impl Workspace {
             }),
         ];
 
+        cx.observe_window_bounds(window, |this: &mut Self, window, _| {
+            let (bounds, maximized, fullscreen) = match window.window_bounds() {
+                WindowBounds::Windowed(b) => (b, false, false),
+                WindowBounds::Maximized(b) => (b, true, false),
+                WindowBounds::Fullscreen(b) => (b, false, true),
+            };
+            this.window_place = Some(state::WindowPlace {
+                x: f32::from(bounds.origin.x),
+                y: f32::from(bounds.origin.y),
+                width: f32::from(bounds.size.width),
+                height: f32::from(bounds.size.height),
+                maximized,
+                fullscreen,
+            });
+        })
+        .detach();
+
         // Closing the window the window manager's way is the same as ×.
         let closing = cx.weak_entity();
         window.on_window_should_close(cx, move |_, cx| {
@@ -251,6 +270,7 @@ impl Workspace {
             last_saved: String::new(),
             _subscriptions: subscriptions,
             _tick: tick,
+            window_place: saved.window.clone(),
             keep_terminals: false,
             build: crate::build_watch::BuildWatch::new(),
         };
@@ -374,6 +394,7 @@ impl Workspace {
             side_panel_width: cx.try_global::<SidePanelWidth>().map(|w| f32::from(w.0)),
             active_collapsed: self.active_collapsed,
             power_saving: crate::lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed),
+            window: self.window_place.clone(),
             active_task: self.active.clone(),
             zoom: crate::zoom::current(cx),
             projects: self

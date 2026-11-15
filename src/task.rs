@@ -3334,6 +3334,7 @@ impl Render for TaskView {
                         resizable_panel()
                             .size(cx.try_global::<SidePanelWidth>().map_or(px(300.), |w| w.0))
                             .size_range(px(200.)..px(640.))
+                            .fixed()
                             .child(self.render_files(cx)),
                     ),
             )
