@@ -158,6 +158,16 @@ impl Render for Workspace {
                     task.update(cx, |t, cx| t.cycle_tab(false, window, cx));
                 }
             }))
+            .on_action(cx.listener(|this, _: &task::NavigateBack, window, cx| {
+                if let Some(task) = this.active_view() {
+                    task.update(cx, |t, cx| t.navigate(true, window, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &task::NavigateForward, window, cx| {
+                if let Some(task) = this.active_view() {
+                    task.update(cx, |t, cx| t.navigate(false, window, cx));
+                }
+            }))
             .on_action(cx.listener(|this, a: &task::ShowSidePanel, window, cx| {
                 if let Some(task) = this.active_view() {
                     task.update(cx, |t, cx| t.show_side_panel(a.0, window, cx));
@@ -410,6 +420,14 @@ fn main() {
                     KeyBinding::new("ctrl-shift-t", NewTask, context),
                 ]);
             }
+            // Ctrl+Alt+Left/Right switch GNOME workspaces. In a terminal Alt+Left
+            // stays the shell's word move.
+            cx.bind_keys([
+                KeyBinding::new("alt-left", task::NavigateBack, None),
+                KeyBinding::new("alt-right", task::NavigateForward, None),
+                KeyBinding::new("alt-left", NoAction, Some(gpui_cn::terminal::KEY_CONTEXT)),
+                KeyBinding::new("alt-right", NoAction, Some(gpui_cn::terminal::KEY_CONTEXT)),
+            ]);
 
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::centered(size(px(1500.), px(920.)), cx)),

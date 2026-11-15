@@ -96,7 +96,7 @@ fn shell_quote(s: &str) -> String {
 actions!(ideae_file, [SaveFile, ExpandSelection, ShrinkSelection, ToggleComment, ShowOutline, ShowUsages, SendToAgent]);
 actions!(ideae_task, [ToggleZoom, SendDiffToAgent]);
 
-actions!(ideae_task, [NextTab, PrevTab]);
+actions!(ideae_task, [NextTab, PrevTab, NavigateBack, NavigateForward]);
 
 /// Ctrl+1/2/3/`: the agent, Changes, History, a shell.
 #[derive(Clone, PartialEq, gpui_kit::Action)]
@@ -129,6 +129,8 @@ pub struct FileView {
     /// Who last changed each line, and the line the cursor is on.
     blame: Rc<Vec<Option<git::BlameLine>>>,
     cursor_line: u32,
+    /// The cursor's column, for the navigation history to come back to.
+    cursor_col: u32,
     _blame: Task<()>,
     /// Selections Ctrl+W grew from, for Ctrl+Shift+W to step back through.
     expand_stack: Vec<std::ops::Range<usize>>,
@@ -831,6 +833,27 @@ enum RightPane {
     Structure,
 }
 
+const NAV_LIMIT: usize = 100;
+
+/// A place in the navigation history. Files go by path, so a closed one
+/// opens again; other tabs by id, and are skipped once closed.
+#[derive(Clone, Debug)]
+enum NavPoint {
+    File { path: PathBuf, line: u32, col: u32 },
+    Tab(usize),
+}
+
+impl NavPoint {
+    /// The same line counts as the same place: a step back should go somewhere.
+    fn same_place(&self, other: &NavPoint) -> bool {
+        match (self, other) {
+            (NavPoint::File { path: a, line: la, .. }, NavPoint::File { path: b, line: lb, .. }) => a == b && la == lb,
+            (NavPoint::Tab(a), NavPoint::Tab(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
 struct TabItem {
     /// Stable across inserts and removals, unlike the index.
     id: usize,
@@ -923,6 +946,10 @@ pub struct TaskView {
     watched: (BTreeSet<PathBuf>, Vec<PathBuf>),
     /// One server per (program, project root).
     lsp: HashMap<(&'static str, PathBuf), Arc<lsp::LspClient>>,
+    /// Where you were before each jump, for Back and Forward.
+    nav_back: Vec<NavPoint>,
+    nav_forward: Vec<NavPoint>,
+    navigating: bool,
     visible: bool,
     _poll: Task<()>,
 }
@@ -1069,6 +1096,9 @@ impl TaskView {
             watcher,
             watched: Default::default(),
             lsp: HashMap::new(),
+            nav_back: Vec::new(),
+            nav_forward: Vec::new(),
+            navigating: false,
             visible: false,
             _poll: poll,
         };
@@ -1729,7 +1759,13 @@ impl TaskView {
 
     /// Shows tab `ix` in its own pane and focuses that pane.
     fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.get(ix) else { return };
+        if ix >= self.tabs.len() {
+            return;
+        }
+        if self.focused_ix() != Some(ix) {
+            self.record_nav(cx);
+        }
+        let tab = &self.tabs[ix];
         if matches!(tab.kind, TabKind::File(_)) {
             self.structure_file = Some(tab.id);
         }
@@ -2011,6 +2047,75 @@ impl TaskView {
     }
 
     /// Ctrl+PgUp/PgDn: the neighbouring tab in the focused pane, wrapping.
+    /// Where you are: the file and cursor, or the tab that is no file.
+    fn nav_point(&self, cx: &App) -> Option<NavPoint> {
+        let tab = self.tabs.get(self.focused_ix()?)?;
+        Some(match &tab.kind {
+            TabKind::File(file) => {
+                let f = file.read(cx);
+                NavPoint::File { path: f.path.clone(), line: f.cursor_line, col: f.cursor_col }
+            }
+            _ => NavPoint::Tab(tab.id),
+        })
+    }
+
+    /// Called before a jump: remembers the place it leaves.
+    fn record_nav(&mut self, cx: &mut Context<Self>) {
+        if self.navigating {
+            return;
+        }
+        let Some(point) = self.nav_point(cx) else { return };
+        if !self.nav_back.last().is_some_and(|last| last.same_place(&point)) {
+            self.nav_back.push(point);
+            if self.nav_back.len() > NAV_LIMIT {
+                self.nav_back.remove(0);
+            }
+        }
+        self.nav_forward.clear();
+        cx.notify();
+    }
+
+    fn nav_reachable(&self, point: &NavPoint) -> bool {
+        match point {
+            NavPoint::File { path, .. } => path.is_file(),
+            NavPoint::Tab(id) => self.ix_of(*id).is_some(),
+        }
+    }
+
+    pub fn can_navigate(&self, back: bool) -> bool {
+        let stack = if back { &self.nav_back } else { &self.nav_forward };
+        stack.iter().any(|p| self.nav_reachable(p))
+    }
+
+    /// Mouse Back/Forward, Alt+Left/Right: the place before (or after) the
+    /// last jump, a tab or a spot in a file.
+    pub fn navigate(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let here = self.nav_point(cx);
+        let target = loop {
+            let stack = if back { &mut self.nav_back } else { &mut self.nav_forward };
+            let Some(point) = stack.pop() else { return };
+            if here.as_ref().is_some_and(|h| h.same_place(&point)) || !self.nav_reachable(&point) {
+                continue;
+            }
+            break point;
+        };
+        if let Some(here) = here {
+            let other = if back { &mut self.nav_forward } else { &mut self.nav_back };
+            other.push(here);
+        }
+        self.navigating = true;
+        match target {
+            NavPoint::File { path, line, col } => self.open_file_at(path, line, col, window, cx),
+            NavPoint::Tab(id) => {
+                if let Some(ix) = self.ix_of(id) {
+                    self.activate(ix, window, cx);
+                }
+            }
+        }
+        self.navigating = false;
+        cx.notify();
+    }
+
     pub fn cycle_tab(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
         let right = self.focus_right && self.is_split();
         let in_pane: Vec<usize> = (0..self.tabs.len()).filter(|&ix| self.tabs[ix].right == right).collect();
@@ -2134,6 +2239,33 @@ impl TaskView {
             .text_xs()
             .border_b_1()
             .border_color(cx.theme().border)
+            .child(
+                h_flex()
+                    .child(
+                        Button::new("nav-back")
+                            .xsmall()
+                            .ghost()
+                            .icon(IconName::ArrowLeft)
+                            .disabled(!self.can_navigate(true))
+                            .tooltip("Back (Alt+Left, mouse Back)")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.navigate(true, window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("nav-forward")
+                            .xsmall()
+                            .ghost()
+                            .icon(IconName::ArrowRight)
+                            .disabled(!self.can_navigate(false))
+                            .tooltip("Forward (Alt+Right, mouse Forward)")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.navigate(false, window, cx)
+                            })),
+                    ),
+            )
             .child(div().font_semibold().child(format!("⎇ {}", if b.head.is_empty() { "…" } else { &b.head })))
             .when_some(b.upstream.clone(), |this, up| {
                 this.child(div().text_color(cx.theme().muted_foreground).child(format!("→ {up}")))
@@ -2255,6 +2387,7 @@ impl TaskView {
 
     /// Opens `path` (or its tab) with the cursor at 0-based `line`, `col`.
     pub fn open_file_at(&mut self, path: PathBuf, line: u32, col: u32, window: &mut Window, cx: &mut Context<Self>) {
+        self.record_nav(cx);
         if let Some(ix) = self.tabs.iter().position(|t| match &t.kind {
             TabKind::File(f) => f.read(cx).path == path,
             _ => false,
@@ -2305,7 +2438,8 @@ impl TaskView {
         let file = cx.new(|cx| {
             // The editor notifies on cursor moves too: follow the line for blame.
             cx.observe(&editor, |this: &mut FileView, editor, cx| {
-                let line = editor.read(cx).cursor_position().line;
+                let Position { line, character } = editor.read(cx).cursor_position();
+                this.cursor_col = character;
                 if line != this.cursor_line {
                     this.cursor_line = line;
                     cx.notify();
@@ -2337,6 +2471,7 @@ impl TaskView {
             task: task.clone(),
             blame: Rc::default(),
             cursor_line: line,
+            cursor_col: col,
             _blame: Task::ready(()),
             lsp_status: SharedString::default(),
             lsp_ok: Some(false),
@@ -3097,6 +3232,13 @@ impl Render for TaskView {
         div()
             .size_full()
             .track_focus(&self.focus)
+            // Capture phase: terminals and editors handle mouse downs themselves.
+            .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                if let MouseButton::Navigate(direction) = event.button {
+                    cx.stop_propagation();
+                    this.navigate(direction == NavigationDirection::Back, window, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &ToggleZoom, window, cx| this.toggle_zoom_focused(window, cx)))
             .on_action(cx.listener(|this, _: &ShowOutline, window, cx| this.show_outline(window, cx)))
             .on_action(cx.listener(|this, _: &ShowUsages, window, cx| this.show_usages_at_cursor(window, cx)))
@@ -3873,6 +4015,8 @@ fn show_document_handler(task: WeakEntity<TaskView>, this_path: PathBuf) -> gpui
             return false;
         };
         if target == this_path {
+            // The editor moves the cursor itself; this is where it was.
+            let _ = task.update(cx, |task, cx| task.record_nav(cx));
             return false;
         }
         let line = params.selection.map(|r| r.start.line).unwrap_or(0);

@@ -3,7 +3,7 @@
 #
 #   scripts/drive.sh LOG STARTUP_SECS "steps..." -- [app args...]
 #
-# Steps (scripts/xdrive.py): move:X,Y click rclick press release wheel:up|down
+# Steps (scripts/xdrive.py): move:X,Y click[:BUTTON] rclick press release wheel:up|down
 # down:ctrl up:ctrl type:text key:return wait:SECS shot:FILE.png
 #
 # The app gets no D-Bus session, so it cannot touch the real desktop (dash
