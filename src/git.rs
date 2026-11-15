@@ -524,6 +524,44 @@ pub fn discard(root: &Path, path: &str) -> Result<String, String> {
     }
 }
 
+/// A file as it was in the worktree and the index, to put back after a
+/// discard. The index holds a blob that is in the object store already.
+#[derive(Clone, Debug)]
+pub struct FileSnapshot {
+    pub path: String,
+    worktree: Option<Vec<u8>>,
+    /// "mode,sha" of its index entry.
+    index: Option<String>,
+}
+
+pub fn snapshot(root: &Path, path: &str) -> FileSnapshot {
+    let index = git(root, &["ls-files", "-s", "--", path]).and_then(|out| {
+        let mut f = out.lines().next()?.split_whitespace();
+        Some(format!("{},{}", f.next()?, f.next()?))
+    });
+    FileSnapshot { path: path.to_string(), worktree: std::fs::read(root.join(path)).ok(), index }
+}
+
+pub fn restore(root: &Path, snap: &FileSnapshot) -> Result<String, String> {
+    let path = &snap.path;
+    match &snap.index {
+        Some(entry) => run(root, "git", &["update-index", "--add", "--cacheinfo", &format!("{entry},{path}")])?,
+        None => run(root, "git", &["rm", "--cached", "-q", "--ignore-unmatch", "--", path])?,
+    };
+    let file = root.join(path);
+    match &snap.worktree {
+        Some(bytes) => {
+            if let Some(dir) = file.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            }
+            std::fs::write(&file, bytes).map_err(|e| e.to_string())?;
+        }
+        None if file.exists() => std::fs::remove_file(&file).map_err(|e| e.to_string())?,
+        None => {}
+    }
+    Ok(format!("Restored {path}"))
+}
+
 pub fn fetch(root: &Path) -> Result<String, String> {
     run(root, "git", &["fetch", "--prune"]).map(|out| if out.is_empty() { "Fetched".into() } else { out })
 }
@@ -579,6 +617,38 @@ pub fn pull_safe(root: &Path) -> Result<String, String> {
             let _ = run(root, "git", &["rebase", "--abort"]);
             Err(format!("conflicts, nothing changed: {}", e.lines().next().unwrap_or_default()))
         }
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::{discard, restore, run, snapshot};
+
+    #[test]
+    fn discard_then_restore_brings_back_worktree_and_index() {
+        let root = std::env::temp_dir().join(format!("ideae-snap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| run(&root, "git", args).unwrap();
+        git(&["init", "-q"]);
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"]);
+        std::fs::write(root.join("a.txt"), "staged\n").unwrap();
+        git(&["add", "a.txt"]);
+        std::fs::write(root.join("a.txt"), "worktree\n").unwrap();
+        std::fs::write(root.join("new.txt"), "fresh\n").unwrap();
+        let (a, new) = (snapshot(&root, "a.txt"), snapshot(&root, "new.txt"));
+        discard(&root, "a.txt").unwrap();
+        discard(&root, "new.txt").unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "one\n");
+        assert!(!root.join("new.txt").exists());
+        restore(&root, &a).unwrap();
+        restore(&root, &new).unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "worktree\n");
+        assert_eq!(git(&["show", ":a.txt"]), "staged");
+        assert_eq!(std::fs::read_to_string(root.join("new.txt")).unwrap(), "fresh\n");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
 

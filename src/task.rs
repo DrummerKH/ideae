@@ -1399,6 +1399,8 @@ pub struct TaskView {
     commit_input: Entity<gpui_kit::component::input::TextareaState>,
     /// The git/gh action running, and the outcome of the last one.
     busy: Option<&'static str>,
+    /// The file the last Discard threw away, for Undo.
+    discard_undo: Option<git::FileSnapshot>,
     action: Option<(bool, String)>,
     /// Wakes the refresh loop: file events, actions, the fallback tick.
     refresh_tx: async_channel::Sender<()>,
@@ -1569,6 +1571,7 @@ impl TaskView {
             file_states: HashMap::new(),
             commit_input,
             busy: None,
+            discard_undo: None,
             action: None,
             refresh_tx,
             base_override,
@@ -3643,6 +3646,15 @@ impl TaskView {
                                 .text_color(if ok { gpui_kit::green() } else { gpui_kit::red() })
                                 .child(message.lines().find(|l| !l.trim().is_empty()).unwrap_or_default().to_string()),
                         )
+                        .when(self.discard_undo.is_some(), |row| {
+                            row.child(
+                                Button::new("undo-discard")
+                                    .xsmall()
+                                    .outline()
+                                    .label("Undo")
+                                    .on_click(cx.listener(|this, _, window, cx| this.undo_discard(window, cx))),
+                            )
+                        })
                         .child(
                             Button::new("dismiss-action")
                                 .xsmall()
@@ -3650,6 +3662,7 @@ impl TaskView {
                                 .label("×")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.action = None;
+                                    this.discard_undo = None;
                                     cx.notify();
                                 })),
                         ),
@@ -3941,24 +3954,20 @@ impl TaskView {
             .into_any_element()
     }
 
+    /// Discards at once; what was there is kept for Undo until the next
+    /// git action.
     fn confirm_discard(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
-        let task = cx.weak_entity();
-        window.open_alert_dialog(cx, move |dialog, _, _| {
-            let task = task.clone();
-            let path = path.clone();
-            dialog
-                .confirm()
-                .title(format!("Discard changes to {path}?"))
-                .description("Staged and unstaged edits are lost; a new file is deleted.")
-                .ok_text("Discard")
-                .on_ok(move |_, window, cx| {
-                    let path = path.clone();
-                    let _ = task.update(cx, |t, cx| {
-                        t.run_action("Discard", move |root| git::discard(&root, &path), false, window, cx)
-                    });
-                    true
-                })
-        });
+        if self.busy.is_some() {
+            return;
+        }
+        let snapshot = git::snapshot(&self.root, &path);
+        self.run_action("Discard", move |root| git::discard(&root, &path).map(|_| format!("Discarded {path}")), false, window, cx);
+        self.discard_undo = Some(snapshot);
+    }
+
+    fn undo_discard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(snapshot) = self.discard_undo.take() else { return };
+        self.run_action("Undo", move |root| git::restore(&root, &snapshot), false, window, cx);
     }
 
     fn stage_paths(&mut self, paths: Vec<String>, stage: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -4061,6 +4070,7 @@ impl TaskView {
         }
         self.busy = Some(label);
         self.action = None;
+        self.discard_undo = None;
         cx.notify();
         let root = self.root.clone();
         cx.spawn_in(window, async move |this, cx| {
