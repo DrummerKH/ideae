@@ -8,7 +8,7 @@ use gpui_kit::component::{
     command::{Command, CommandItem, CommandState},
     h_flex,
 };
-use gpui_kit::*;
+use gpui_kit::{prelude::FluentBuilder as _, *};
 
 use crate::{task, workspace::Workspace};
 
@@ -79,8 +79,18 @@ impl Palette {
     }
 }
 
-/// Opens a list; `again` is what Ctrl+E does while it is open.
-fn open(placeholder: &str, entries: Vec<Entry>, again: Option<Run>, window: &mut Window, cx: &mut App) {
+/// The two lists Ctrl+E goes between.
+#[derive(Clone, Copy, PartialEq)]
+enum Recent {
+    Tasks,
+    Files,
+}
+
+/// Opens a list; with `recent`, which of the two it is and how to open the
+/// other, which Ctrl+E and a click on its tab do.
+fn open(placeholder: &str, entries: Vec<Entry>, recent: Option<(Recent, Run)>, window: &mut Window, cx: &mut App) {
+    let again = recent.as_ref().map(|(_, run)| run.clone());
+    let tab_shown = recent.as_ref().map(|(which, _)| *which);
     let command = cx.new(|cx| CommandState::new(window, cx));
     let palette = cx.new(|_| Palette { entries: Rc::new(entries), shown: Rc::default() });
     palette.update(cx, |p, cx| p.query("", cx));
@@ -101,6 +111,51 @@ fn open(placeholder: &str, entries: Vec<Entry>, again: Option<Run>, window: &mut
             let items = shown.iter().map(|&ix| item(&entries[ix]));
             let (query_owner, confirm_owner) = (palette.clone(), palette.clone());
             let again = again.clone();
+            let tabs_again = again.clone();
+            let mut list = Command::new(&command)
+                .bordered(false)
+                .filterable(false)
+                .placeholder(placeholder.clone())
+                .min_h(px(360.))
+                .max_h(px(360.))
+                .items(items);
+            if let Some(tab_shown) = tab_shown {
+                list = list.header(move |_, _, cx| {
+                    let tab = |which: Recent, label: &'static str, cx: &App| {
+                        let again = tabs_again.clone();
+                        let current = which == tab_shown;
+                        div()
+                            .id(label)
+                            .px_2()
+                            .py_0p5()
+                            .rounded_md()
+                            .text_sm()
+                            .when(current, |d| d.bg(cx.theme().accent).text_color(cx.theme().foreground))
+                            .when(!current, |d| {
+                                d.text_color(cx.theme().muted_foreground).cursor_pointer().hover(|d| d.text_color(cx.theme().foreground))
+                            })
+                            .child(label)
+                            .when(!current, |d| {
+                                d.on_click(move |_, window, cx| {
+                                    if let Some(again) = &again {
+                                        window.close_dialog(cx);
+                                        again(window, cx);
+                                    }
+                                })
+                            })
+                    };
+                    h_flex()
+                        .gap_1()
+                        .px_2()
+                        .py_1p5()
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .child(tab(Recent::Tasks, "Recent tasks", cx))
+                        .child(tab(Recent::Files, "Recent files", cx))
+                        .child(div().flex_1())
+                        .child(div().text_xs().text_color(cx.theme().muted_foreground).child(format!("{} switches", crate::keys::label("Ctrl+E"))))
+                });
+            }
             content.child(
                 div()
                     .on_action(move |_: &RecentPlaces, window, cx| {
@@ -110,14 +165,7 @@ fn open(placeholder: &str, entries: Vec<Entry>, again: Option<Run>, window: &mut
                         }
                     })
                     .child(
-                        Command::new(&command)
-                            .bordered(false)
-                            .filterable(false)
-                            .placeholder(placeholder.clone())
-                            .min_h(px(360.))
-                            .max_h(px(360.))
-                            .items(items)
-                            .on_query(move |query, _, cx| {
+                        list.on_query(move |query, _, cx| {
                                 let _ = query_owner.update(cx, |p, cx| p.query(query, cx));
                             })
                             .on_confirm(move |index: IndexPath, window, cx| {
@@ -252,7 +300,7 @@ impl Workspace {
         let again: Run = Rc::new(move |window, cx| {
             let _ = this.update(cx, |w, cx| w.recent_files(window, cx));
         });
-        open(&format!("Recent tasks ({}: files)", crate::keys::label("Ctrl+E")), entries, Some(again), window, cx);
+        open("Recent tasks…", entries, Some((Recent::Tasks, again)), window, cx);
     }
 
     /// Files of the current task by when you were last in them.
@@ -281,6 +329,6 @@ impl Workspace {
         let again: Run = Rc::new(move |window, cx| {
             let _ = this.update(cx, |w, cx| w.recent_tasks(window, cx));
         });
-        open(&format!("Recent files ({}: tasks)", crate::keys::label("Ctrl+E")), entries, Some(again), window, cx);
+        open("Recent files…", entries, Some((Recent::Files, again)), window, cx);
     }
 }

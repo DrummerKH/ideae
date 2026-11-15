@@ -512,11 +512,11 @@ fn main() {
                     KeyBinding::new(keys::bind("alt-down"), palette::NextWaiting, context),
                 ]);
             }
-            // Not in a terminal: Ctrl+E is the end of the line there, in the shell
-            // and in Claude Code's prompt.
             cx.bind_keys([
+                // Everywhere, terminals too: there it was the end of the line,
+                // which End still is.
                 KeyBinding::new(keys::bind("ctrl-e"), palette::RecentPlaces, None),
-                KeyBinding::new(keys::bind("ctrl-e"), NoAction, Some(gpui_cn::terminal::KEY_CONTEXT)),
+                KeyBinding::new(keys::bind("ctrl-e"), palette::RecentPlaces, Some(gpui_cn::terminal::KEY_CONTEXT)),
                 // Readline's forward-char, which the arrow key does as well.
                 KeyBinding::new(keys::bind("ctrl-f"), task::FindInTerminal, Some(gpui_cn::terminal::KEY_CONTEXT)),
             ]);
