@@ -27,10 +27,9 @@ pub fn recipe(program: &str) -> Option<Recipe> {
             ("Installs typescript-language-server and typescript with npm, about 30 MB.", &["npm"])
         }
         "intelephense" => ("Installs intelephense with npm, about 20 MB.", &["npm"]),
-        "kotlin-lsp" if cfg!(any(windows, target_os = "macos")) => return None,
         "kotlin-lsp" => (
             "Downloads the latest JetBrains Kotlin LSP release: about 370 MB, 1.2 GB unpacked, Java included. The download is checked against its published SHA-256.",
-            &["curl", "tar", "sha256sum"],
+            &["curl", "tar"],
         ),
         _ => return None,
     };
@@ -59,6 +58,7 @@ fn executable(program: &str) -> Option<&'static str> {
         "rust-analyzer" => "bin/rust-analyzer",
         "typescript-language-server" => "node_modules/.bin/typescript-language-server",
         "intelephense" => "node_modules/.bin/intelephense",
+        "kotlin-lsp" if cfg!(windows) => "bin/intellij-server.exe",
         "kotlin-lsp" => "bin/intellij-server",
         _ => return None,
     })
@@ -175,7 +175,15 @@ fn build(program: &str, staging: &Path) -> Result<PathBuf> {
             let release: serde_json::Value = serde_json::from_slice(&release).context("reading the latest release")?;
             let tag = release["tag_name"].as_str().ok_or_else(|| anyhow!("no tag in the latest release"))?;
             let version = kotlin_version(tag).ok_or_else(|| anyhow!("unexpected release tag {tag}"))?;
-            let name = format!("kotlin-server-{version}{suffix}.tar.gz");
+            // A tarball for Linux, a zip for macOS (.sit) and Windows; tar
+            // (bsdtar there) unpacks those zips too.
+            let name = if cfg!(windows) {
+                format!("kotlin-server-{version}{suffix}.win.zip")
+            } else if cfg!(target_os = "macos") {
+                format!("kotlin-server-{version}{suffix}.sit")
+            } else {
+                format!("kotlin-server-{version}{suffix}.tar.gz")
+            };
             let url = format!("https://download.jetbrains.com/language-server/kotlin-server/{version}/{name}");
             let archive = staging.join(&name);
             download(&url, &archive)?;
@@ -185,13 +193,16 @@ fn build(program: &str, staging: &Path) -> Result<PathBuf> {
             if expected.len() != 64 || expected != actual {
                 bail!("{name}: SHA-256 {actual} does not match the published {expected}");
             }
-            run(crate::procs::command("tar").arg("xzf").arg(&archive).arg("-C").arg(staging))?;
+            let into = staging.join("unpacked");
+            std::fs::create_dir_all(&into)?;
+            run(crate::procs::command("tar").arg("-xf").arg(&archive).arg("-C").arg(&into))?;
             std::fs::remove_file(&archive)?;
-            let unpacked = std::fs::read_dir(staging)?
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .find(|p| p.is_dir() && p.join("bin/intellij-server").is_file())
-                .ok_or_else(|| anyhow!("{name} holds no bin/intellij-server"))?;
+            // In a folder of its own (Linux, macOS) or right at the top (Windows).
+            let launcher = executable("kotlin-lsp").unwrap_or("bin/intellij-server");
+            let unpacked = std::iter::once(into.clone())
+                .chain(std::fs::read_dir(&into)?.filter_map(|e| e.ok()).map(|e| e.path()))
+                .find(|p| p.is_dir() && p.join(launcher).is_file())
+                .ok_or_else(|| anyhow!("{name} holds no {launcher}"))?;
             return Ok(unpacked);
         }
         _ => bail!("ideae cannot install {program}"),
@@ -224,12 +235,13 @@ fn fetch(url: &str) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
+/// Here rather than sha256sum, which macOS and Windows lack.
 fn sha256(path: &Path) -> Result<String> {
-    let out = crate::procs::command("sha256sum").arg(path).stdin(Stdio::null()).output()?;
-    if !out.status.success() {
-        bail!("sha256sum: {}", last_line(&out.stderr));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).split_whitespace().next().unwrap_or_default().to_lowercase())
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    let mut file = std::fs::File::open(path)?;
+    std::io::copy(&mut file, &mut hasher)?;
+    Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Runs a step, failing with the last line it printed.
@@ -262,10 +274,6 @@ mod tests {
     #[test]
     fn every_server_has_a_recipe_and_an_executable() {
         for program in crate::lsp::SERVERS.iter().map(|s| s.program) {
-            // No Kotlin LSP install on Windows and macOS yet.
-            if cfg!(any(windows, target_os = "macos")) && program == "kotlin-lsp" {
-                continue;
-            }
             assert!(recipe(program).is_some() && executable(program).is_some(), "{program}");
         }
     }
