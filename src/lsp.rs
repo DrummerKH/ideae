@@ -117,7 +117,8 @@ pub struct Symbol {
 }
 
 pub struct LspClient {
-    stdin: Arc<Mutex<ChildStdin>>,
+    /// To the thread that writes to the server.
+    out: mpsc::Sender<Out>,
     pending: Pending,
     next_id: AtomicI64,
     ready: (Mutex<Option<Result<(), String>>>, Condvar),
@@ -420,12 +421,14 @@ impl LspClient {
         // Dies with the app even when it exits without running destructors.
         let mut child = crate::procs::spawn_tied(&mut command)
             .with_context(|| format!("starting {program}"))?;
-        let stdin = Arc::new(Mutex::new(child.stdin.take().expect("piped stdin")));
+        let stdin = child.stdin.take().expect("piped stdin");
+        let (out, outbox) = mpsc::channel();
+        thread::Builder::new().name(format!("lsp-write-{program}")).spawn(move || write_loop(stdin, outbox))?;
         let stdout = child.stdout.take().expect("piped stdout");
         let pending: Pending = Arc::default();
         let progress: Progress = Arc::default();
 
-        let reader_stdin = stdin.clone();
+        let reader_out = out.clone();
         let reader_pending = pending.clone();
         let reader_progress = progress.clone();
         let import: Import = Arc::default();
@@ -434,10 +437,10 @@ impl LspClient {
         let reader_problems = problems.clone();
         thread::Builder::new()
             .name(format!("lsp-read-{program}"))
-            .spawn(move || read_loop(stdout, reader_stdin, reader_pending, reader_progress, reader_import, reader_problems))?;
+            .spawn(move || read_loop(stdout, reader_out, reader_pending, reader_progress, reader_import, reader_problems))?;
 
         let client = Arc::new(Self {
-            stdin,
+            out,
             pending,
             next_id: AtomicI64::new(1),
             ready: (Mutex::new(None), Condvar::new()),
@@ -456,6 +459,9 @@ impl LspClient {
             .name(format!("lsp-init-{program}"))
             .spawn(move || {
                 let result = init.initialize(&root, init_options).map_err(|e| e.to_string());
+                if result.is_ok() {
+                    let _ = init.out.send(Out::Ready);
+                }
                 let (lock, cvar) = &init.ready;
                 *lock.lock().unwrap() = Some(result);
                 cvar.notify_all();
@@ -466,7 +472,8 @@ impl LspClient {
     fn initialize(&self, root: &Path, init_options: Value) -> Result<()> {
         let uri = path_to_uri(root);
         let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let answer = self.raw_request(
+        let answer = self.request(
+            true,
             "initialize",
             json!({
                 "processId": std::process::id(),
@@ -517,7 +524,7 @@ impl LspClient {
             }),
         )?;
         *self.capabilities.lock().unwrap() = answer["capabilities"].clone();
-        self.notify("initialized", json!({}))
+        self.send(Out::Now(json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} })))
     }
 
     fn wait_ready(&self) -> Result<()> {
@@ -570,21 +577,24 @@ impl LspClient {
     /// Full-text sync: a change without a range replaces the whole document,
     /// which every server accepts whatever sync kind it prefers.
     pub fn did_change(&self, path: &Path, version: i32, text: &str) -> Result<()> {
-        self.wait_ready()?;
+        let uri = path_to_uri(path);
+        // Before its file is opened there the server has nothing to change:
+        // the text it is opened with is as new.
+        if !self.opened.lock().unwrap().contains(&uri) {
+            return Ok(());
+        }
         // Numbered here, past the caller's own count: the text also goes out
         // ahead of a request about it, and a file's versions must only grow.
         let version = version.max(0) + self.changes.fetch_add(1, Ordering::Relaxed) as i32;
-        self.notify(
-            "textDocument/didChange",
-            json!({
-                "textDocument": { "uri": path_to_uri(path), "version": version },
-                "contentChanges": [{ "text": text }],
-            }),
-        )
+        let message = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didChange",
+            "params": { "textDocument": { "uri": uri, "version": version }, "contentChanges": [{ "text": text }] },
+        });
+        self.send(Out::Change { uri, message })
     }
 
     pub fn did_save(&self, path: &Path) -> Result<()> {
-        self.wait_ready()?;
         self.notify("textDocument/didSave", json!({ "textDocument": { "uri": path_to_uri(path) } }))
     }
 
@@ -781,19 +791,29 @@ impl LspClient {
     }
 
     fn raw_request(&self, method: &str, params: Value) -> Result<Value> {
+        self.request(false, method, params)
+    }
+
+    /// `early`: part of the handshake, sent before the server is ready.
+    fn request(&self, early: bool, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel();
         self.pending.lock().unwrap().insert(id, tx);
-        write_message(&self.stdin, &json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))?;
-        let result = rx
-            .recv_timeout(Duration::from_secs(30))
-            .map_err(|_| anyhow!("{method}: no response"));
+        let message = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        let sent = self.send(if early { Out::Now(message) } else { Out::Later(message) });
+        // Ends at once when the server is gone: the reader drops what waits.
+        let result = sent.and_then(|()| rx.recv_timeout(Duration::from_secs(30)).map_err(|_| anyhow!("{method}: no response")));
         self.pending.lock().unwrap().remove(&id);
         result?
     }
 
     fn notify(&self, method: &str, params: Value) -> Result<()> {
-        write_message(&self.stdin, &json!({ "jsonrpc": "2.0", "method": method, "params": params }))
+        self.send(Out::Later(json!({ "jsonrpc": "2.0", "method": method, "params": params })))
+    }
+
+    /// Never waits: one thread writes, in the order asked.
+    fn send(&self, out: Out) -> Result<()> {
+        self.out.send(out).map_err(|_| anyhow!("the language server is gone"))
     }
 }
 
@@ -880,16 +900,75 @@ fn position_params(uri: &str, pos: lsp_types::Position) -> Value {
     json!({ "textDocument": { "uri": uri }, "position": { "line": pos.line, "character": pos.character } })
 }
 
-fn write_message(stdin: &Mutex<ChildStdin>, message: &Value) -> Result<()> {
+/// A message for the server.
+enum Out {
+    /// Of the handshake, or an answer to the server: sent as it comes.
+    Now(Value),
+    /// Kept until the server is ready, then sent in the order asked.
+    Later(Value),
+    /// A file's new text, kept as `Later`: of those waiting for one file
+    /// only the newest is sent.
+    Change { uri: String, message: Value },
+    /// The handshake is over.
+    Ready,
+}
+
+/// Writes to the server, alone: callers on many threads would write out of
+/// order, a text before the file is opened or an older one after a newer,
+/// and all of them would wait on a server that has stopped reading.
+fn write_loop(mut stdin: ChildStdin, outbox: mpsc::Receiver<Out>) {
+    let mut ready = false;
+    let mut held: Vec<Out> = Vec::new();
+    while let Ok(first) = outbox.recv() {
+        let mut queue = Vec::new();
+        for out in std::iter::once(first).chain(outbox.try_iter()) {
+            match out {
+                Out::Ready => {
+                    ready = true;
+                    queue.append(&mut held);
+                }
+                Out::Now(_) => queue.push(out),
+                _ if ready => queue.push(out),
+                _ => held.push(out),
+            }
+        }
+        for waiting in [&mut queue, &mut held] {
+            let mut newest = HashMap::new();
+            for (ix, out) in waiting.iter().enumerate() {
+                if let Out::Change { uri, .. } = out {
+                    newest.insert(uri.clone(), ix);
+                }
+            }
+            let mut ix = 0;
+            waiting.retain(|out| {
+                ix += 1;
+                !matches!(out, Out::Change { uri, .. } if newest.get(uri) != Some(&(ix - 1)))
+            });
+        }
+        for out in queue {
+            let (Out::Now(message) | Out::Later(message) | Out::Change { message, .. }) = out else { continue };
+            if write_message(&mut stdin, &message).is_err() {
+                return;
+            }
+        }
+    }
+}
+
+fn write_message(stdin: &mut ChildStdin, message: &Value) -> Result<()> {
     let body = serde_json::to_vec(message)?;
-    let mut stdin = stdin.lock().unwrap();
     write!(stdin, "Content-Length: {}\r\n\r\n", body.len())?;
     stdin.write_all(&body)?;
     stdin.flush()?;
     Ok(())
 }
 
-fn read_loop(stdout: impl Read, stdin: Arc<Mutex<ChildStdin>>, pending: Pending, progress: Progress, import: Import, problems: Problems) {
+fn read_loop(stdout: impl Read, out: mpsc::Sender<Out>, pending: Pending, progress: Progress, import: Import, problems: Problems) {
+    read_messages(stdout, out, &pending, progress, import, problems);
+    // The server is gone: what waits for its answer need not wait out its time.
+    pending.lock().unwrap().clear();
+}
+
+fn read_messages(stdout: impl Read, out: mpsc::Sender<Out>, pending: &Pending, progress: Progress, import: Import, problems: Problems) {
     let mut reader = BufReader::new(stdout);
     loop {
         let mut length = None;
@@ -923,7 +1002,7 @@ fn read_loop(stdout: impl Read, stdin: Arc<Mutex<ChildStdin>>, pending: Pending,
                 } else {
                     Value::Null
                 };
-                let _ = write_message(&stdin, &json!({ "jsonrpc": "2.0", "id": id, "result": result }));
+                let _ = out.send(Out::Now(json!({ "jsonrpc": "2.0", "id": id, "result": result })));
             }
             (Some(id), None) => {
                 let Some(id) = id.as_i64() else { continue };
@@ -1261,5 +1340,48 @@ mod tests {
         assert!(!links.is_empty(), "no definition");
         assert_eq!(uri_to_path(links[0].target_uri.as_str()).unwrap(), file);
         assert_eq!(links[0].target_selection_range.start.line as usize, decl_line);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod write_tests {
+    use super::*;
+
+    /// What the server is sent, read back from a `cat` in its place.
+    #[test]
+    fn the_server_is_written_to_in_order_and_only_the_newest_text() {
+        let mut child = std::process::Command::new("cat").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let (out, outbox) = mpsc::channel();
+        let named = |name: &str| json!({ "method": name });
+        let change = |text: &str| Out::Change { uri: "file:///a".into(), message: json!({ "method": "change", "text": text }) };
+        // All of it asked before a byte is written, the handshake in the middle.
+        for message in [
+            Out::Later(named("open")),
+            change("one"),
+            Out::Now(named("initialize")),
+            change("two"),
+            Out::Change { uri: "file:///b".into(), message: named("other") },
+            Out::Ready,
+            Out::Later(named("hover")),
+            change("three"),
+        ] {
+            out.send(message).unwrap();
+        }
+        drop(out);
+        write_loop(child.stdin.take().unwrap(), outbox);
+        let mut written = String::new();
+        child.stdout.take().unwrap().read_to_string(&mut written).unwrap();
+        let _ = child.wait();
+        let sent: Vec<String> = written
+            .split("Content-Length: ")
+            .filter_map(|part| part.split_once("\r\n\r\n"))
+            .map(|(_, body)| {
+                let message: Value = serde_json::from_str(body).unwrap();
+                message["text"].as_str().or(message["method"].as_str()).unwrap().to_string()
+            })
+            .collect();
+        // The handshake at once; then what waited, in the order asked, a
+        // file's text once: the newest, where the last of them was asked.
+        assert_eq!(sent, ["initialize", "open", "other", "hover", "three"]);
     }
 }

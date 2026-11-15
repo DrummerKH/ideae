@@ -181,14 +181,63 @@ pub struct Hunk {
     /// (`modified` false) when it only removes.
     pub line: u32,
     pub modified: bool,
-    /// The file's header and this change as `git apply -R` takes it from
-    /// the file as it is now: the other changes of its hunk are there.
-    pub patch: String,
-    /// The same for `git apply` to the file as it was: they are not.
-    pub stage: String,
     /// Its lines, added and removed: what it is, wherever in the file the
     /// other changes have moved it.
     pub changes: String,
+    /// The hunk it is in, kept once for all its changes, and which of the
+    /// hunk's lines are this one: its patches are made when asked for. Made
+    /// for each change ahead, they were the hunk again for every change in it.
+    source: std::sync::Arc<HunkSource>,
+    lines: std::ops::Range<usize>,
+}
+
+#[derive(Debug, PartialEq)]
+struct HunkSource {
+    /// The file's header.
+    header: String,
+    /// The first line on the old side and on the new.
+    old: u32,
+    new: u32,
+    lines: Vec<String>,
+}
+
+impl Hunk {
+    /// The file's header and this change as `git apply -R` takes it from
+    /// the file as it is now: the other changes of its hunk are there.
+    pub fn patch(&self) -> String {
+        self.alone(true)
+    }
+
+    /// The same for `git apply` to the file as it was: they are not.
+    pub fn stage(&self) -> String {
+        self.alone(false)
+    }
+
+    /// With `as_it_is` the lines the other changes added are around this
+    /// one, and those they removed are not; without, the reverse.
+    fn alone(&self, as_it_is: bool) -> String {
+        let HunkSource { header, old, new, lines } = &*self.source;
+        let (mut body, mut olds, mut news, mut kept) = (String::new(), 0, 0, true);
+        for (i, line) in lines.iter().enumerate() {
+            let (sign, rest) = line.split_at(1.min(line.len()));
+            let here = self.lines.contains(&i);
+            let stays = if as_it_is { "+" } else { "-" };
+            kept = match sign {
+                "\\" => kept,
+                "+" | "-" if !here => sign == stays,
+                _ => true,
+            };
+            if !kept {
+                continue;
+            }
+            let sign = if here || !line.starts_with(['+', '-']) { sign } else { " " };
+            olds += u32::from(sign == " " || sign == "-");
+            news += u32::from(sign == " " || sign == "+");
+            body.push_str(sign);
+            body.push_str(rest);
+        }
+        format!("{header}@@ -{old},{olds} +{new},{news} @@\n{body}")
+    }
 }
 
 /// The changes of a patch `git diff` made. Not those of files that are new
@@ -204,6 +253,7 @@ pub fn hunks(patch: &str) -> Vec<Hunk> {
             return;
         }
         let changed = |line: &str| line.starts_with(['+', '-']);
+        let mut source = None;
         let mut at = 0;
         while at < lines.len() {
             if !changed(lines[at]) {
@@ -211,30 +261,6 @@ pub fn hunks(patch: &str) -> Vec<Hunk> {
                 continue;
             }
             let end = (at..lines.len()).find(|&i| !changed(lines[i]) && !lines[i].starts_with('\\')).unwrap_or(lines.len());
-            // With `as_it_is` the lines the other changes added are around
-            // this one, and those they removed are not; without, the reverse.
-            let alone = |as_it_is: bool| {
-                let (mut body, mut olds, mut news, mut kept) = (String::new(), 0, 0, true);
-                for (i, line) in lines.iter().enumerate() {
-                    let (sign, rest) = line.split_at(1.min(line.len()));
-                    let here = (at..end).contains(&i);
-                    let stays = if as_it_is { "+" } else { "-" };
-                    kept = match sign {
-                        "\\" => kept,
-                        "+" | "-" if !here => sign == stays,
-                        _ => true,
-                    };
-                    if !kept {
-                        continue;
-                    }
-                    let sign = if here || !changed(line) { sign } else { " " };
-                    olds += u32::from(sign == " " || sign == "-");
-                    news += u32::from(sign == " " || sign == "+");
-                    body.push_str(sign);
-                    body.push_str(rest);
-                }
-                format!("{header}@@ -{old},{olds} +{new},{news} @@\n{body}")
-            };
             let (mut old_line, mut new_line, mut last) = (old, new, None);
             for (i, line) in lines.iter().enumerate().take(end) {
                 let here = i >= at;
@@ -260,7 +286,8 @@ pub fn hunks(patch: &str) -> Vec<Hunk> {
                 }
             }
             if let Some((line, modified)) = last {
-                found.push(Hunk { path: path.to_string(), line, modified, patch: alone(true), stage: alone(false), changes: lines[at..end].concat() });
+                let source = source.get_or_insert_with(|| std::sync::Arc::new(HunkSource { header: header.to_string(), old, new, lines: lines.iter().map(|line| line.to_string()).collect() }));
+                found.push(Hunk { path: path.to_string(), line, modified, changes: lines[at..end].concat(), source: source.clone(), lines: at..end });
             }
             at = end;
         }
@@ -298,7 +325,7 @@ pub fn hunks(patch: &str) -> Vec<Hunk> {
 pub fn stage_change(root: &Path, change: &Hunk, stage: bool) -> Result<String, String> {
     let against = if stage { git(root, &["diff", "--", &change.path]) } else { git(root, &["diff", "--cached", "--", &change.path]) };
     let now = hunks(&against.unwrap_or_default()).into_iter().find(|hunk| hunk.changes == change.changes).ok_or("the change is no longer there")?;
-    if stage { apply_hunk(root, &now.stage, false, true) } else { apply_hunk(root, &now.patch, true, true) }
+    if stage { apply_hunk(root, &now.stage(), false, true) } else { apply_hunk(root, &now.patch(), true, true) }
 }
 
 /// Applies one hunk: to the worktree (`reverse` takes the change back),
@@ -1983,12 +2010,12 @@ mod variant_tests {
         sh(&repo, "seq 1 30 > n.txt; git add n.txt; git commit -qm numbers; sed -i.bak -e 's/^2$/two/' -e 's/^28$/twenty-eight/' n.txt; rm n.txt.bak");
         let found = hunks(&working_patch(&repo));
         assert_eq!(found.iter().map(|h| (h.path.as_str(), h.line, h.modified)).collect::<Vec<_>>(), [("n.txt", 2, true), ("n.txt", 28, true)]);
-        apply_hunk(&repo, &found[0].patch, true, false).unwrap();
+        apply_hunk(&repo, &found[0].patch(), true, false).unwrap();
         let text = std::fs::read_to_string(repo.join("n.txt")).unwrap();
         assert!(text.starts_with("1\n2\n3\n") && text.contains("twenty-eight"), "the first is back, the second is there");
-        apply_hunk(&repo, &hunks(&working_patch(&repo))[0].stage, false, true).unwrap();
+        apply_hunk(&repo, &hunks(&working_patch(&repo))[0].stage(), false, true).unwrap();
         assert!(git(&repo, &["diff", "--cached"]).unwrap().contains("+twenty-eight"), "staged");
-        assert!(apply_hunk(&repo, &found[0].patch, true, false).is_err(), "what is no longer there cannot be taken back");
+        assert!(apply_hunk(&repo, &found[0].patch(), true, false).is_err(), "what is no longer there cannot be taken back");
         sh(&repo, "git reset -q --hard; rm -f gone.txt; echo new > untracked.txt");
         assert!(hunks(&working_patch(&repo)).is_empty(), "a new file is no hunk");
 
@@ -1999,9 +2026,9 @@ mod variant_tests {
         let found = hunks(&working_patch(&repo));
         assert_eq!(found.iter().map(|h| (h.line, h.modified)).collect::<Vec<_>>(), [(2, true), (4, false), (7, true)]);
         let numbers = |repo: &Path| std::fs::read_to_string(repo.join("n.txt")).unwrap().replace('\n', " ");
-        apply_hunk(&repo, &found[1].patch, true, false).unwrap();
+        apply_hunk(&repo, &found[1].patch(), true, false).unwrap();
         assert_eq!(numbers(&repo), "1 two 3 4 5 6 six and a half 7 8 9 10 11 12 ", "the removed line is back, alone");
-        apply_hunk(&repo, &found[2].stage, false, true).unwrap();
+        apply_hunk(&repo, &found[2].stage(), false, true).unwrap();
         assert_eq!(git(&repo, &["diff", "--cached", "--numstat"]).unwrap().trim(), "2\t0\tn.txt", "only the two added lines are staged");
         let left = hunks(&working_patch(&repo));
         assert_eq!(left.len(), 2, "the patch is against the commit: what is staged is still in it");
@@ -2014,7 +2041,7 @@ mod variant_tests {
         assert!(stage_change(&repo, &found[2], false).is_err(), "it is not staged any more");
         stage_change(&repo, &left[0], false).unwrap();
         assert_eq!(refresh(&repo, None, false, &mut Known::default()).patches.unwrap().staged, "", "nothing staged: not asked for");
-        apply_hunk(&repo, &left[0].patch, true, false).unwrap();
+        apply_hunk(&repo, &left[0].patch(), true, false).unwrap();
         assert_eq!(numbers(&repo), "1 2 3 4 5 6 six and a half 7 8 9 10 11 12 ");
         sh(&repo, "rm untracked.txt");
 

@@ -1721,7 +1721,12 @@ impl Workspace {
                 self.group_changed(group);
             }
         }
-        self.projects[pi].tasks[ti].last_active = state::now();
+        // To the minute: an agent reports every tool it uses, and each new
+        // second here would have the state written again.
+        let last = &mut self.projects[pi].tasks[ti].last_active;
+        if state::now().saturating_sub(*last) >= 60 || turn_over {
+            *last = state::now();
+        }
         if turn_over {
             self.projects[pi].tasks[ti].done_at = state::now();
             self.refresh_variant_info(window, cx);

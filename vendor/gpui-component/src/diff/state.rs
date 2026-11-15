@@ -229,6 +229,8 @@ pub struct DiffState {
     presentation_options: PresentationOptions,
     syntax_highlighter: Option<DiffSyntaxHighlighter>,
     presentations: Vec<Option<Arc<FilePresentation>>>,
+    /// ideae patch: what each file was given as by `update_files`, 0 for none.
+    keys: Vec<u64>,
     viewport: Size<Pixels>,
     layout: Option<LayoutKey>,
     content_width: Pixels,
@@ -336,6 +338,7 @@ impl DiffState {
         let mut state = Self {
             expanded: vec![Vec::new(); files.len()],
             presentations: vec![None; files.len()],
+            keys: Vec::new(),
             file_ixs: file_ixs(&files),
             files,
             mode: DiffMode::Unified,
@@ -611,6 +614,7 @@ impl DiffState {
             TextSelection::clear_for_window(window, cx);
         }
         self.files = files.into_iter().collect();
+        self.keys.clear();
         self.file_ixs = file_ixs(&self.files);
         self.collapsed
             .retain(|path| self.file_ixs.contains_key(path));
@@ -628,6 +632,77 @@ impl DiffState {
         self.geometry.borrow_mut().clear();
         self.rebuild(true);
         self.horizontal_scroll.set_offset(point(px(0.), px(0.)));
+        self.ensure_presentation(cx);
+        cx.notify();
+    }
+
+    /// ideae patch: the files again, as they are a moment later, each with
+    /// a key (not 0) that is the same while its part of the patch is. A file
+    /// with the key it had keeps its colours and what was opened of its
+    /// context; the view stays at the line it was at. `set_files` is for
+    /// another diff; this one is for the same diff while an agent writes,
+    /// which would else jump to the top and lose its colours at every save.
+    pub fn update_files(&mut self, files: impl IntoIterator<Item = (DiffFile, u64)>, cx: &mut Context<Self>) {
+        if self.files.is_empty() {
+            let (files, keys): (Vec<_>, Vec<_>) = files.into_iter().unzip();
+            self.set_files(files, cx);
+            self.keys = keys;
+            return;
+        }
+        let anchor = self.row_position(self.list.logical_scroll_top().item_ix);
+        if let Some(window) = self.window
+            && self.selection_is_local(cx)
+        {
+            TextSelection::clear_for_window(window, cx);
+        }
+        let mut kept: std::collections::HashMap<SharedString, (u64, DiffFile, Option<Arc<FilePresentation>>, Vec<Range<usize>>)> = self
+            .files
+            .drain(..)
+            .zip(std::mem::take(&mut self.presentations))
+            .zip(std::mem::take(&mut self.expanded))
+            .enumerate()
+            .filter_map(|(ix, ((file, presentation), expanded))| {
+                let key = self.keys.get(ix).copied().filter(|key| *key != 0)?;
+                Some((file.path().clone(), (key, file, presentation, expanded)))
+            })
+            .collect();
+        self.keys.clear();
+        for (file, key) in files {
+            match kept.remove(file.path()).filter(|(was, ..)| *was == key) {
+                Some((_, same, presentation, expanded)) => {
+                    self.files.push(same);
+                    self.presentations.push(presentation);
+                    self.expanded.push(expanded);
+                }
+                None => {
+                    self.files.push(file);
+                    self.presentations.push(None);
+                    self.expanded.push(Vec::new());
+                }
+            }
+            self.keys.push(key);
+        }
+        self.file_ixs = file_ixs(&self.files);
+        self.collapsed
+            .retain(|path| self.file_ixs.contains_key(path));
+        self.resolutions.clear();
+        // The files in the making are counted by their place, which may be another now.
+        self.presentation_generation += 1;
+        self.preparing = None;
+        self._presentation = Task::ready(());
+        self.layout = None;
+        self.annotations.clear();
+        self.selection.set_local_selection(false, cx);
+        self.selection.set_fallback_copy_text("", cx);
+        self.selected_lines = None;
+        self.selection_anchor = None;
+        self.selection_cursor = None;
+        self.selecting = false;
+        self.geometry.borrow_mut().clear();
+        self.rebuild(false);
+        if let Some(anchor) = anchor {
+            self.reveal_line(&anchor);
+        }
         self.ensure_presentation(cx);
         cx.notify();
     }

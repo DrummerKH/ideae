@@ -398,6 +398,36 @@ fn write_in_order(gate: &std::sync::Mutex<u64>, seq: u64, path: &std::path::Path
     Ok(mtime(path))
 }
 
+/// The task's file watcher and the directories it watches now: each on its
+/// own, and those under git's refs with all that is in them.
+struct Watching {
+    watcher: Option<notify::RecommendedWatcher>,
+    watched: (BTreeSet<PathBuf>, Vec<PathBuf>),
+}
+
+impl Watching {
+    fn sync(&mut self, watch: (BTreeSet<PathBuf>, Vec<PathBuf>)) {
+        if watch == self.watched {
+            return;
+        }
+        let Some(watcher) = self.watcher.as_mut() else { return };
+        let (old_flat, old_rec) = std::mem::take(&mut self.watched);
+        for dir in old_flat.difference(&watch.0) {
+            let _ = watcher.unwatch(dir);
+        }
+        for dir in watch.0.difference(&old_flat) {
+            let _ = watcher.watch(dir, RecursiveMode::NonRecursive);
+        }
+        for dir in old_rec.iter().filter(|d| !watch.1.contains(d)) {
+            let _ = watcher.unwatch(dir);
+        }
+        for dir in watch.1.iter().filter(|d| !old_rec.contains(d)) {
+            let _ = watcher.watch(dir, RecursiveMode::Recursive);
+        }
+        self.watched = watch;
+    }
+}
+
 /// A file found changed on disk: the time the view knew, the time now,
 /// and what is in it.
 struct DiskChange {
@@ -606,7 +636,8 @@ impl FileView {
                 cx.background_spawn(async move { (git::blame(&root, &path), git::committed_text(&root, &path, since_base)) }).await;
             let _ = this.update(cx, |this, cx| {
                 this.blame = Rc::new(blame);
-                this.committed = committed.map(Arc::from);
+                // A file with nothing changed is one text, not two.
+                this.committed = committed.map(|text| if text == this.saved.as_ref() { this.saved.clone().into() } else { Arc::from(text) });
                 this.mark_changes(false, cx);
                 cx.notify();
             });
@@ -2070,6 +2101,10 @@ pub struct TaskView {
     /// The first changed line of each file, per scope, for "open".
     uncommitted_lines: Rc<HashMap<String, u32>>,
     branch_lines: Rc<HashMap<String, u32>>,
+    /// Each file's part of the patch, hashed: what tells the diff view which
+    /// files are as they were.
+    uncommitted_keys: Rc<HashMap<String, u64>>,
+    branch_keys: Rc<HashMap<String, u64>>,
     /// The files the branch changed since its base, lock files aside.
     branch_paths: Rc<BTreeSet<String>>,
     /// The single changes of each, to take back or stage one alone.
@@ -2122,8 +2157,9 @@ pub struct TaskView {
     /// The branch "Branch vs …" compares with, when picked by hand; shared
     /// with the refresh loop.
     base_override: Arc<std::sync::Mutex<Option<String>>>,
-    watcher: Option<notify::RecommendedWatcher>,
-    watched: (BTreeSet<PathBuf>, Vec<PathBuf>),
+    /// Kept for as long as the task: the refresh, off the UI thread, tells
+    /// it what to watch.
+    _watching: Arc<std::sync::Mutex<Watching>>,
     /// One server per (program, project root).
     lsp: HashMap<(&'static str, PathBuf), Arc<lsp::LspClient>>,
     /// Since when no open file uses a server.
@@ -2183,6 +2219,8 @@ impl TaskView {
         })
         .inspect_err(|e| eprintln!("file watcher off, polling only: {e}"))
         .ok();
+        let watching = Arc::new(std::sync::Mutex::new(Watching { watcher, watched: Default::default() }));
+        let poll_watching = watching.clone();
         // Fallback for anything the watcher misses (new directories, remotes).
         // Out of view a task is looked at once a minute: every open task pays
         // for its refresh with a handful of git processes.
@@ -2212,9 +2250,12 @@ impl TaskView {
                 let picked = poll_base.lock().unwrap().clone();
                 let Ok((open, open_known)) = this.update(cx, |this, cx| this.open_files_known(cx)) else { break };
                 let Ok(light) = this.read_with(cx, |this, _| !this.visible) else { break };
+                let watching = poll_watching.clone();
                 let (read, patch, branch, shared, staged, on_disk, now_seen, now_known) = cx
                     .background_spawn(async move {
                         let mut read = git::refresh(&root, picked, light, &mut known);
+                        // Here, not on the UI thread: a call for every directory that came or went.
+                        watching.lock().unwrap().sync(std::mem::take(&mut read.watch));
                         // None of them when the patches are those of the refresh before.
                         let (patch, branch, shared, staged) = match read.patches.take() {
                             Some(git::Patches { working, branch, staged }) => {
@@ -2237,7 +2278,7 @@ impl TaskView {
                         (read, patch, branch, shared, staged, changed_on_disk(open_known), seen, known)
                     })
                     .await;
-                let git::Refreshed { files, watch, info, states, base, stashes, .. } = read;
+                let git::Refreshed { files, info, states, base, stashes, .. } = read;
                 known = now_known;
                 seen = now_seen;
                 let applied = this.update_in(cx, |this, window, cx| {
@@ -2266,7 +2307,6 @@ impl TaskView {
                     this.apply_branch_patch(base, branch, shared, cx);
                     this.apply_files(files, cx);
                     this.apply_branch(info, cx);
-                    this.sync_watches(watch);
                 });
                 if applied.is_err() {
                     break;
@@ -2329,6 +2369,8 @@ impl TaskView {
             branch_diff: Vec::new(),
             uncommitted_lines: Rc::default(),
             branch_lines: Rc::default(),
+            uncommitted_keys: Rc::default(),
+            branch_keys: Rc::default(),
             branch_paths: Rc::default(),
             uncommitted_hunks: Rc::default(),
             conflict_marked: Vec::new(),
@@ -2358,8 +2400,7 @@ impl TaskView {
             action: None,
             refresh_tx,
             base_override,
-            watcher,
-            watched: Default::default(),
+            _watching: watching,
             lsp: HashMap::new(),
             lsp_unused: HashMap::new(),
             nav_back: Vec::new(),
@@ -3557,6 +3598,7 @@ impl TaskView {
 
     pub fn set_visible(&mut self, visible: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.visible = visible;
+        self.fill_tree(cx);
         self.sync_visibility(cx);
         if visible {
             // What it skipped while out of view.
@@ -3751,6 +3793,14 @@ impl TaskView {
 
     fn remove_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let removed = self.tabs.remove(ix);
+        // The diff laid out and coloured goes with its tab; it is made
+        // again from what the task keeps when the tab is next looked at.
+        if matches!(removed.kind, TabKind::Changes) {
+            let diff = self.changes.read(cx).diff.clone();
+            diff.update(cx, |state, cx| state.set_files([], cx));
+            self.changes.update(cx, |changes, _| (changes.hunks, changes.first_lines) = Default::default());
+            self.diff_stale = true;
+        }
         // The server keeps every text it was given until told otherwise.
         if let TabKind::File(file) = &removed.kind {
             let f = file.read(cx);
@@ -3786,6 +3836,8 @@ impl TaskView {
     fn apply_patch(&mut self, parsed: ParsedPatch, cx: &mut Context<Self>) {
         let ParsedPatch { files, first_lines, hashes, hunks, marked } = parsed;
         self.uncommitted_hunks = Rc::new(hunks);
+        // Never 0, which is no key to the diff view.
+        self.uncommitted_keys = Rc::new(hashes.iter().map(|(path, hash)| (path.clone(), *hash | 1)).collect());
         if self.conflict_marked != marked {
             self.conflict_marked = marked;
             self.markers_accepted = false;
@@ -3824,12 +3876,13 @@ impl TaskView {
         if shared {
             self.branch_paths = paths(&self.uncommitted_diff);
             self.branch_diff = self.uncommitted_diff.clone();
-            (self.branch_lines, self.branch_hunks) = (self.uncommitted_lines.clone(), self.uncommitted_hunks.clone());
+            (self.branch_lines, self.branch_hunks, self.branch_keys) = (self.uncommitted_lines.clone(), self.uncommitted_hunks.clone(), self.uncommitted_keys.clone());
         } else if let Some(parsed) = parsed {
             self.branch_paths = paths(&parsed.files);
             self.branch_diff = parsed.files;
             self.branch_lines = Rc::new(parsed.first_lines);
             self.branch_hunks = Rc::new(parsed.hunks);
+            self.branch_keys = Rc::new(parsed.hashes.into_iter().map(|(path, hash)| (path, hash | 1)).collect());
         }
         self.changes.update(cx, |c, _| c.base = base);
         self.refresh_scope(DiffScope::Branch, cx);
@@ -3880,8 +3933,19 @@ impl TaskView {
             DiffScope::Uncommitted => self.uncommitted_hunks.clone(),
             DiffScope::Branch => self.branch_hunks.clone(),
         };
+        let keys = match scope {
+            DiffScope::Uncommitted => self.uncommitted_keys.clone(),
+            DiffScope::Branch => self.branch_keys.clone(),
+        };
         let diff = self.changes.read(cx).diff.clone();
-        diff.update(cx, |state, cx| state.set_files(files, cx));
+        // The same diff a moment later: it stays where it is read.
+        diff.update(cx, |state, cx| {
+            let keyed = files.into_iter().map(|file| {
+                let key = keys.get(file.path().as_ref()).copied().unwrap_or(0);
+                (file, key)
+            });
+            state.update_files(keyed, cx)
+        });
         self.changes.update(cx, |c, cx| {
             c.counts = counts;
             c.first_lines = lines;
@@ -3902,26 +3966,6 @@ impl TaskView {
             .unzip()
     }
 
-    fn sync_watches(&mut self, watch: (BTreeSet<PathBuf>, Vec<PathBuf>)) {
-        if watch == self.watched {
-            return;
-        }
-        let Some(watcher) = self.watcher.as_mut() else { return };
-        let (old_flat, old_rec) = std::mem::take(&mut self.watched);
-        for dir in old_flat.difference(&watch.0) {
-            let _ = watcher.unwatch(dir);
-        }
-        for dir in watch.0.difference(&old_flat) {
-            let _ = watcher.watch(dir, RecursiveMode::NonRecursive);
-        }
-        for dir in old_rec.iter().filter(|d| !watch.1.contains(d)) {
-            let _ = watcher.unwatch(dir);
-        }
-        for dir in watch.1.iter().filter(|d| !old_rec.contains(d)) {
-            let _ = watcher.watch(dir, RecursiveMode::Recursive);
-        }
-        self.watched = watch;
-    }
 
     fn apply_files(&mut self, files: Vec<String>, cx: &mut Context<Self>) {
         if files == *self.tree_files {
@@ -3944,10 +3988,15 @@ impl TaskView {
     /// The Files panel's tree, built when the panel is the one shown: it
     /// holds every path again, several times over, in every open task.
     fn fill_tree(&mut self, cx: &mut Context<Self>) {
-        if self.tree_stale && self.visible && self.right == RightPane::Files {
+        let shown = self.visible && self.right == RightPane::Files;
+        if self.tree_stale && shown {
             self.tree_stale = false;
             let items = build_tree(&self.tree_files, &self.expanded);
             self.tree.update(cx, |t, cx| t.set_items(items, cx));
+        } else if !self.tree_stale && !shown {
+            // Let go of when not shown: every path again, in every task that showed it once.
+            self.tree_stale = true;
+            self.tree.update(cx, |t, cx| t.set_items(Vec::new(), cx));
         }
     }
 
@@ -4855,6 +4904,7 @@ impl TaskView {
                             .selected(self.right == RightPane::Changes)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.right = RightPane::Changes;
+                                this.fill_tree(cx);
                                 cx.notify();
                             })),
                     )
@@ -4878,6 +4928,7 @@ impl TaskView {
                             .selected(self.right == RightPane::Structure)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.right = RightPane::Structure;
+                                this.fill_tree(cx);
                                 cx.notify();
                             })),
                     )
@@ -4891,6 +4942,7 @@ impl TaskView {
                             .selected(self.right == RightPane::Run)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.right = RightPane::Run;
+                                this.fill_tree(cx);
                                 this.refresh_services(cx);
                                 this.watch_listening(cx);
                                 cx.notify();
@@ -5438,7 +5490,7 @@ impl TaskView {
             "Revert",
             move |root| {
                 *slot.lock().unwrap() = Some(git::snapshot(&root, &hunk.path));
-                git::apply_hunk(&root, &hunk.patch, true, false).map(|_| format!("Took a change of {} back", hunk.path))
+                git::apply_hunk(&root, &hunk.patch(), true, false).map(|_| format!("Took a change of {} back", hunk.path))
             },
             false,
             window,
@@ -7690,5 +7742,76 @@ mod open_file_scenario {
         task.update(cx, |t, cx| t.shut_down(cx));
         cx.update_window(handle.into(), |_, window, _| window.remove_window()).ok();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod diff_update_tests {
+    use gpui_kit::component::diff::{Diff, DiffFile, DiffState};
+    use gpui_kit::{AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, Styled as _, TestAppContext, VisualTestContext, Window, div, px};
+
+    struct Host {
+        state: Entity<DiffState>,
+    }
+
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(400.)).h(px(200.)).child(Diff::new(&self.state).size_full())
+        }
+    }
+
+    fn draw(cx: &mut VisualTestContext) {
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            _ = window.draw(cx);
+        });
+    }
+
+    /// A file of 200 lines, the first ones changed to `tag`.
+    fn file(name: &str, tag: &str) -> (DiffFile, u64) {
+        let lines: String = (0..200).map(|ix| format!(" line {ix}\n")).collect();
+        let patch = format!("diff --git a/{name} b/{name}\n--- a/{name}\n+++ b/{name}\n@@ -1,201 +1,201 @@\n-old\n+{tag}\n{lines}");
+        (DiffFile::parse(&patch).unwrap().remove(0), super::text_hash(&patch) | 1)
+    }
+
+    /// The Changes tab while an agent writes: a new patch leaves the view at
+    /// the file it was reading, where taking it as another diff goes to the top.
+    #[gpui_kit::test]
+    fn a_diff_that_changes_stays_where_it_is_read(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            gpui_cn::init(cx);
+            crate::theme::init(cx);
+        });
+        let state = cx.new(|cx| DiffState::new([], cx));
+        let (_, cx) = cx.add_window_view({
+            let state = state.clone();
+            move |_, _| Host { state }
+        });
+        cx.update(|_, cx| state.update(cx, |state, cx| state.update_files([file("a.txt", "one"), file("b.txt", "one"), file("c.txt", "one")], cx)));
+        for _ in 0..3 {
+            draw(cx);
+        }
+        // To the third file: its header comes a third down the view, the end of the second above it.
+        cx.update(|_, cx| state.update(cx, |state, cx| state.scroll_to_file("c.txt", cx)));
+        draw(cx);
+        let top = |cx: &mut VisualTestContext| cx.update(|_, cx| state.read(cx).top_file().map(|path| path.to_string()));
+        assert_eq!(top(cx).as_deref(), Some("b.txt"));
+
+        // b.txt changes again, the others are as they were, d.txt is new.
+        cx.update(|_, cx| {
+            state.update(cx, |state, cx| state.update_files([file("a.txt", "one"), file("b.txt", "two"), file("c.txt", "one"), file("d.txt", "one")], cx))
+        });
+        draw(cx);
+        assert_eq!(top(cx).as_deref(), Some("b.txt"), "still at the lines being read");
+        // And the file before it goes.
+        cx.update(|_, cx| state.update(cx, |state, cx| state.update_files([file("b.txt", "two"), file("c.txt", "one"), file("d.txt", "one")], cx)));
+        draw(cx);
+        assert_eq!(top(cx).as_deref(), Some("b.txt"));
+
+        // Another diff altogether starts at its top.
+        cx.update(|_, cx| state.update(cx, |state, cx| state.set_files([file("a.txt", "one").0, file("b.txt", "one").0], cx)));
+        draw(cx);
+        assert_eq!(top(cx).as_deref(), Some("a.txt"));
     }
 }

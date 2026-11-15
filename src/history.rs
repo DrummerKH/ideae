@@ -27,13 +27,17 @@ pub struct HistoryView {
     task: WeakEntity<TaskView>,
     /// HEAD moved since the commits were read.
     stale: bool,
+    /// How many commits are asked for.
+    limit: usize,
     _load: Task<()>,
     _show: Task<()>,
 }
 
 /// The whole history: `git log` of 6k commits takes 30 ms and the list is
 /// virtualized. The cap only guards against giant monorepos.
-const LIMIT: usize = 200_000;
+/// The commits read at first, and four times as many with each "older":
+/// a long history is megabytes a task, and seldom read to its end.
+const FIRST: usize = 2_000;
 
 impl HistoryView {
     pub fn new(root: PathBuf, task: WeakEntity<TaskView>, cx: &mut Context<Self>) -> Self {
@@ -49,6 +53,7 @@ impl HistoryView {
             scroll: UniformListScrollHandle::new(),
             task,
             stale: false,
+            limit: FIRST,
             _load: Task::ready(()),
             _show: Task::ready(()),
         }
@@ -67,9 +72,9 @@ impl HistoryView {
 
     fn load(&mut self, cx: &mut Context<Self>) {
         self.stale = false;
-        let root = self.root.clone();
+        let (root, limit) = (self.root.clone(), self.limit);
         self._load = cx.spawn(async move |this, cx| {
-            let commits = cx.background_spawn(async move { git::history(&root, LIMIT) }).await;
+            let commits = cx.background_spawn(async move { git::history(&root, limit) }).await;
             let _ = this.update(cx, |this, cx| {
                 // Keep the selection on the same commit when it is still listed.
                 let selected_hash = this.selected.and_then(|ix| this.commits.get(ix)).map(|c| c.hash.clone());
@@ -153,7 +158,20 @@ impl HistoryView {
                     .text_color(cx.theme().muted_foreground)
                     .border_b_1()
                     .border_color(cx.theme().border)
-                    .child(match self.commits.len() { 1 => "1 commit".to_string(), n => format!("{n} commits") }),
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .child(match self.commits.len() { 1 => "1 commit".to_string(), n => format!("{n} commits") })
+                            .when(self.commits.len() >= self.limit, |row| {
+                                row.child(Button::new("older-commits").xsmall().ghost().label("older…").tooltip("Reads further back").on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.limit *= 4;
+                                        this.stale = true;
+                                        cx.notify();
+                                    },
+                                )))
+                            }),
+                    ),
             )
             .child(
                 div()
