@@ -3486,6 +3486,9 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 editor_paddings,
             );
             window.paint_quad(fill(gutter_bounds, gutter_bg));
+            // ideae patch: marks of the rows, at the gutter's right edge.
+            let line_marks = self.state.read(cx).line_marks.clone();
+            let mark_x = gutter_bounds.right() - px(4.);
 
             // Each item is the normal lines.
             for (lines, &buffer_line) in line_numbers
@@ -3507,6 +3510,13 @@ impl<M: InputModeKind> Element for TextElement<M> {
                             bg_color,
                         ));
                     }
+                }
+
+                if let Some(&color) = line_marks.rows.get(&buffer_line) {
+                    window.paint_quad(fill(Bounds::new(point(mark_x, p.y), size(px(3.), height)), color));
+                }
+                if let Some(&color) = line_marks.gone_before.get(&buffer_line) {
+                    window.paint_quad(fill(Bounds::new(point(mark_x - px(3.), p.y - px(1.)), size(px(6.), px(2.))), color));
                 }
 
                 for line in lines {

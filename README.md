@@ -52,10 +52,19 @@ Windows build exists and is being tried out (see [Windows](#windows)).
   implementations (LSP when the language server is installed, else a
   search-based fallback; a missing server can be installed from the editor
   header into `~/.local/share/ideae/lsp`), file structure, blame of the cursor
-  line, syntax-aware selection, autosave when you leave a file. Markdown
-  has a Preview in its header.
+  line, syntax-aware selection, autosave when you leave a file. Lines are
+  deleted, duplicated, moved and joined on keys of their own, the next
+  occurrence of a selection joins it, and words can end at the humps of
+  camelCase and the underscores of snake_case (Settings, Editor). The
+  gutter marks what differs from the last commit: green by the lines
+  added, blue by those changed, red where some are gone. With a language
+  server the editor also completes as you type, underlines what the server
+  finds wrong, offers its fixes (Alt+Enter), renames a symbol everywhere
+  (Shift+F6) and reformats the file (Ctrl+Alt+L). Markdown has a Preview
+  in its header.
 - **Git.** Changes with stage/unstage/discard, commit, push, PR (`gh`), the
-  branch against its base, history, safe pull.
+  branch against its base, history, safe pull. Each hunk of a diff can be
+  reverted on its own, and staged.
 - **Terminals.** Built on libghostty-vt. Ctrl+click on paths, `file:line`,
   class and function names opens them in the editor.
 - **Browser tabs.** Headless Chrome, streamed into a tab. ⌖ in its

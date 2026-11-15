@@ -138,6 +138,61 @@ pub enum InputEvent {
 
 pub(super) const CONTEXT: &str = "Input";
 
+/// ideae patch: what the gutter marks beside the line numbers, by buffer
+/// row: a strip the height of a row in its color, and a short bar at the
+/// top of a row before which something is gone.
+#[derive(Default, PartialEq)]
+pub struct LineMarks {
+    pub rows: std::collections::HashMap<usize, gpui::Hsla>,
+    pub gone_before: std::collections::HashMap<usize, gpui::Hsla>,
+}
+
+/// ideae patch: words in code end at the humps of a camelCase name and at
+/// the underscores of a snake_case one, for moving, selecting and deleting
+/// by word.
+pub static HUMP_WORDS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The humps of a word: `XMLHttpRequest2` is XML, Http, Request2 and
+/// `my_var` is my, var; the underscores are between them.
+fn humps(word: &str) -> Vec<std::ops::Range<usize>> {
+    let chars: Vec<(usize, char)> = word.char_indices().collect();
+    let mut found = Vec::new();
+    let mut start = None;
+    for (n, &(at, c)) in chars.iter().enumerate() {
+        if !c.is_alphanumeric() {
+            if let Some(start) = start.take() {
+                found.push(start..at);
+            }
+            continue;
+        }
+        let Some(open) = start else {
+            start = Some(at);
+            continue;
+        };
+        let before = chars[n - 1].1;
+        let after_lower = chars.get(n + 1).is_some_and(|(_, next)| next.is_lowercase());
+        // fooBar, and the last capital of XMLHttp.
+        if c.is_uppercase() && (before.is_lowercase() || before.is_numeric() || (before.is_uppercase() && after_lower)) {
+            found.push(open..at);
+            start = Some(at);
+        }
+    }
+    if let Some(start) = start {
+        found.push(start..word.len());
+    }
+    found
+}
+
+/// ideae patch: where the last hump of a word starts.
+pub fn last_hump_start(word: &str) -> usize {
+    humps(word).last().map_or(0, |hump| hump.start)
+}
+
+/// ideae patch: where the first hump of a word ends.
+pub fn first_hump_end(word: &str) -> usize {
+    humps(word).first().map_or(word.len(), |hump| hump.end)
+}
+
 pub(crate) fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("backspace", Backspace, Some(CONTEXT)),
@@ -485,6 +540,8 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(crate) readonly: bool,
     pub(crate) text_align: TextAlign,
     pub(super) masked: bool,
+    /// ideae patch: marks in the gutter, by buffer row (see [`LineMarks`]).
+    pub(super) line_marks: std::rc::Rc<LineMarks>,
     pub(super) clean_on_escape: bool,
     pub(super) submit_on_enter: bool,
     /// Overrides for [`Self::text_input_configuration`].
@@ -979,6 +1036,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             readonly: false,
             text_align: TextAlign::Left,
             masked: false,
+            line_marks: Default::default(),
             clean_on_escape: false,
             submit_on_enter: false,
             input_action: None,
@@ -1840,6 +1898,11 @@ impl<M: InputModeKind> InputBaseState<M> {
             .rfind(|(_, s)| !s.trim_start().is_empty())
             .map(|(i, _)| i)
             .unwrap_or(0);
+        // ideae patch: in code, to the start of the last hump of the word.
+        let target = match self.is_code_editor() && HUMP_WORDS.load(std::sync::atomic::Ordering::Relaxed) {
+            true => target + last_hump_start(left_part[target..].trim_end()),
+            false => target,
+        };
         self.token_boundary(target, Bias::Left)
     }
 
@@ -1853,9 +1916,11 @@ impl<M: InputModeKind> InputBaseState<M> {
         let offset = self.offset_from_utf16(self.offset_to_utf16(offset));
         let right_part = self.text.slice(offset..self.text.len()).to_string();
 
+        // ideae patch: in code, to the end of the first hump of the word.
+        let humps = self.is_code_editor() && HUMP_WORDS.load(std::sync::atomic::Ordering::Relaxed);
         let target = UnicodeSegmentation::split_word_bound_indices(right_part.as_str())
             .find(|(_, s)| !s.trim_start().is_empty())
-            .map(|(i, s)| offset + i + s.len())
+            .map(|(i, s)| offset + i + if humps { first_hump_end(s) } else { s.len() })
             .unwrap_or(self.text.len());
         self.token_boundary(target, Bias::Right)
     }
@@ -3523,6 +3588,14 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.active_selection_mut().reversed = false;
         self.selected_word_range = None;
         self.select_to(end, cx);
+    }
+
+    /// ideae patch: replaces the gutter's marks.
+    pub fn set_line_marks(&mut self, marks: LineMarks, cx: &mut Context<Self>) {
+        if *self.line_marks != marks {
+            self.line_marks = std::rc::Rc::new(marks);
+            cx.notify();
+        }
     }
 
     /// Add `range` as an additional selection, keeping the existing ones —

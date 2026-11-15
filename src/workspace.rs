@@ -180,6 +180,7 @@ impl Workspace {
             .unwrap_or(Appearance::Auto);
         theme::apply(appearance, window, cx);
         crate::lsp::POWER_SAVING.store(saved.power_saving, std::sync::atomic::Ordering::Relaxed);
+        gpui_kit::base::input::HUMP_WORDS.store(saved.settings.hump_words, std::sync::atomic::Ordering::Relaxed);
         if let Some(width) = saved.side_panel_width {
             cx.set_global(SidePanelWidth(px(width)));
         }
@@ -1679,6 +1680,12 @@ impl Workspace {
     pub fn apply_settings(&mut self, new: state::Settings, cx: &mut Context<Self>) {
         let old = state::settings();
         state::set_settings(new.clone());
+        gpui_kit::base::input::HUMP_WORDS.store(new.hump_words, std::sync::atomic::Ordering::Relaxed);
+        if old.gutter_since_base != new.gutter_since_base {
+            for view in self.views() {
+                view.update(cx, |t, cx| t.reload_gutters(cx));
+            }
+        }
         self.agent = Self::agent_command(&self.agent_override, self._bridge.as_ref());
         if old.keys != new.keys {
             crate::keymap::rebind(&old, cx);

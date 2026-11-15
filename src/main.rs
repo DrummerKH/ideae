@@ -7,6 +7,7 @@ mod build_watch;
 #[cfg(unix)]
 mod daemon;
 mod desktop;
+mod edit;
 mod finder;
 mod git;
 mod grammars;

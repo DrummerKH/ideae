@@ -41,6 +41,12 @@ pub struct Settings {
     pub fetch_minutes: u32,
     /// Release builds ask GitHub for newer releases.
     pub check_updates: bool,
+    /// Words in code end at the humps of camelCase and the underscores of
+    /// snake_case, for moving, selecting and deleting by word.
+    pub hump_words: bool,
+    /// The editor's gutter marks what the branch changed since it left its
+    /// base, not only since the last commit.
+    pub gutter_since_base: bool,
     /// Agents keep Claude Code's LSP plugins (a rust-analyzer per agent…).
     pub agent_lsp: bool,
     /// Shortcuts set by hand, by id (keymap.rs): keystrokes such as
@@ -59,6 +65,8 @@ impl Default for Settings {
             pr_status: true,
             fetch_minutes: 5,
             check_updates: true,
+            hump_words: false,
+            gutter_since_base: false,
             agent_lsp: true,
             keys: std::collections::BTreeMap::new(),
         }

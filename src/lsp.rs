@@ -22,6 +22,9 @@ type Pending = Arc<Mutex<HashMap<i64, mpsc::Sender<Result<Value>>>>>;
 /// Work-done progress the server has begun and not ended: token → title.
 type Progress = Arc<Mutex<HashMap<String, String>>>;
 type Import = Arc<Mutex<ImportState>>;
+/// What the server last found wrong in each file, by uri, and a count of
+/// its reports: a file's view looks again when that moved.
+type Problems = Arc<Mutex<(u64, HashMap<String, Vec<lsp_types::Diagnostic>>)>>;
 
 /// The server's import of the build: its errors so far, and how it ended.
 #[derive(Default)]
@@ -38,6 +41,8 @@ pub struct LspClient {
     opened: Mutex<HashSet<String>>,
     progress: Progress,
     import: Import,
+    problems: Problems,
+    changes: AtomicI64,
     /// `capabilities` from the server's answer to `initialize`.
     capabilities: Mutex<Value>,
     child: Mutex<Child>,
@@ -334,9 +339,11 @@ impl LspClient {
         let reader_progress = progress.clone();
         let import: Import = Arc::default();
         let reader_import = import.clone();
+        let problems: Problems = Arc::default();
+        let reader_problems = problems.clone();
         thread::Builder::new()
             .name(format!("lsp-read-{program}"))
-            .spawn(move || read_loop(stdout, reader_stdin, reader_pending, reader_progress, reader_import))?;
+            .spawn(move || read_loop(stdout, reader_stdin, reader_pending, reader_progress, reader_import, reader_problems))?;
 
         let client = Arc::new(Self {
             stdin,
@@ -346,6 +353,8 @@ impl LspClient {
             opened: Mutex::default(),
             progress,
             import,
+            problems,
+            changes: AtomicI64::new(1),
             capabilities: Mutex::new(Value::Null),
             child: Mutex::new(child),
         });
@@ -382,8 +391,16 @@ impl LspClient {
                         "implementation": { "linkSupport": true },
                         "references": {},
                         "synchronization": { "didSave": false },
+                        // Plain text to insert: the editor has no snippets.
+                        "completion": { "completionItem": { "snippetSupport": false, "documentationFormat": ["markdown", "plaintext"] } },
+                        "publishDiagnostics": {},
+                        "codeAction": {
+                            "codeActionLiteralSupport": { "codeActionKind": { "valueSet": ["quickfix", "refactor", "source"] } },
+                        },
+                        "rename": {},
+                        "formatting": {},
                     },
-                    "workspace": { "workspaceFolders": true, "configuration": true },
+                    "workspace": { "workspaceFolders": true, "configuration": true, "workspaceEdit": { "documentChanges": true } },
                     "window": { "workDoneProgress": true },
                 },
             }),
@@ -433,6 +450,9 @@ impl LspClient {
     /// which every server accepts whatever sync kind it prefers.
     pub fn did_change(&self, path: &Path, version: i32, text: &str) -> Result<()> {
         self.wait_ready()?;
+        // Numbered here, past the caller's own count: the text also goes out
+        // ahead of a request about it, and a file's versions must only grow.
+        let version = version.max(0) + self.changes.fetch_add(1, Ordering::Relaxed) as i32;
         self.notify(
             "textDocument/didChange",
             json!({
@@ -512,6 +532,75 @@ impl LspClient {
         Ok(serde_json::from_value::<Option<Vec<lsp_types::Location>>>(value)?.unwrap_or_default())
     }
 
+    /// textDocument/completion at a position; `trigger` is the character
+    /// that asked for it, when one did.
+    pub fn completion(&self, uri: &str, pos: lsp_types::Position, trigger: Option<String>) -> Result<lsp_types::CompletionResponse> {
+        self.wait_ready()?;
+        let mut params = position_params(uri, pos);
+        params["context"] = match trigger {
+            Some(character) => json!({ "triggerKind": 2, "triggerCharacter": character }),
+            None => json!({ "triggerKind": 1 }),
+        };
+        let value = self.raw_request("textDocument/completion", params)?;
+        Ok(serde_json::from_value::<Option<lsp_types::CompletionResponse>>(value)?.unwrap_or(lsp_types::CompletionResponse::Array(Vec::new())))
+    }
+
+    /// The characters after which the server wants to be asked to complete.
+    pub fn completion_triggers(&self) -> Vec<String> {
+        let capabilities = self.capabilities.lock().unwrap();
+        capabilities["completionProvider"]["triggerCharacters"]
+            .as_array()
+            .map(|chars| chars.iter().filter_map(|c| c.as_str().map(str::to_string)).collect())
+            .unwrap_or_default()
+    }
+
+    /// What the server last found wrong in the file, and the count of its
+    /// reports so far: unchanged, nothing is new.
+    pub fn problems(&self, uri: &str) -> (u64, Vec<lsp_types::Diagnostic>) {
+        let problems = self.problems.lock().unwrap();
+        (problems.0, problems.1.get(uri).cloned().unwrap_or_default())
+    }
+
+    /// textDocument/codeAction: the fixes and refactorings for a range,
+    /// with what is wrong there. Only those that are edits: a command would
+    /// have the server change files behind the editor.
+    pub fn code_actions(&self, uri: &str, range: lsp_types::Range) -> Result<Vec<lsp_types::CodeAction>> {
+        self.wait_ready()?;
+        let inside = |d: &lsp_types::Diagnostic| d.range.start <= range.end && range.start <= d.range.end;
+        let wrong: Vec<lsp_types::Diagnostic> = self.problems(uri).1.into_iter().filter(inside).collect();
+        let params = json!({ "textDocument": { "uri": uri }, "range": range, "context": { "diagnostics": wrong, "triggerKind": 1 } });
+        let value = self.raw_request("textDocument/codeAction", params)?;
+        let found = serde_json::from_value::<Option<Vec<lsp_types::CodeActionOrCommand>>>(value)?.unwrap_or_default();
+        Ok(found
+            .into_iter()
+            .filter_map(|action| match action {
+                lsp_types::CodeActionOrCommand::CodeAction(action) => Some(action),
+                lsp_types::CodeActionOrCommand::Command(_) => None,
+            })
+            .collect())
+    }
+
+    /// codeAction/resolve: the edit of an action the server listed without one.
+    pub fn resolve_code_action(&self, action: &lsp_types::CodeAction) -> Result<lsp_types::CodeAction> {
+        self.wait_ready()?;
+        Ok(serde_json::from_value(self.raw_request("codeAction/resolve", serde_json::to_value(action)?)?)?)
+    }
+
+    /// textDocument/rename: every edit that gives the symbol its new name.
+    pub fn rename(&self, uri: &str, pos: lsp_types::Position, name: &str) -> Result<Option<lsp_types::WorkspaceEdit>> {
+        self.wait_ready()?;
+        let mut params = position_params(uri, pos);
+        params["newName"] = json!(name);
+        Ok(serde_json::from_value(self.raw_request("textDocument/rename", params)?)?)
+    }
+
+    /// textDocument/formatting: the edits that format the file.
+    pub fn formatting(&self, uri: &str, tab_size: u32, spaces: bool) -> Result<Vec<lsp_types::TextEdit>> {
+        self.wait_ready()?;
+        let params = json!({ "textDocument": { "uri": uri }, "options": { "tabSize": tab_size, "insertSpaces": spaces } });
+        Ok(serde_json::from_value::<Option<Vec<lsp_types::TextEdit>>>(self.raw_request("textDocument/formatting", params)?)?.unwrap_or_default())
+    }
+
     fn raw_request(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel();
@@ -544,6 +633,66 @@ impl Drop for LspClient {
     }
 }
 
+/// The edits of a workspace edit, by file.
+pub fn edits_by_file(edit: &lsp_types::WorkspaceEdit) -> Vec<(PathBuf, Vec<lsp_types::TextEdit>)> {
+    let mut found: Vec<(PathBuf, Vec<lsp_types::TextEdit>)> = Vec::new();
+    let mut add = |uri: &str, edits: Vec<lsp_types::TextEdit>| {
+        if let Some(path) = uri_to_path(uri) {
+            match found.iter_mut().find(|(known, _)| *known == path) {
+                Some((_, all)) => all.extend(edits),
+                None => found.push((path, edits)),
+            }
+        }
+    };
+    for (uri, edits) in edit.changes.iter().flatten() {
+        add(uri.as_str(), edits.clone());
+    }
+    let documents = match &edit.document_changes {
+        Some(lsp_types::DocumentChanges::Edits(edits)) => edits.iter().collect::<Vec<_>>(),
+        Some(lsp_types::DocumentChanges::Operations(operations)) => operations
+            .iter()
+            .filter_map(|operation| match operation {
+                lsp_types::DocumentChangeOperation::Edit(edit) => Some(edit),
+                lsp_types::DocumentChangeOperation::Op(_) => None,
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    for document in documents {
+        let edits = document
+            .edits
+            .iter()
+            .map(|edit| match edit {
+                lsp_types::OneOf::Left(edit) => edit.clone(),
+                lsp_types::OneOf::Right(annotated) => annotated.text_edit.clone(),
+            })
+            .collect();
+        add(document.text_document.uri.as_str(), edits);
+    }
+    found
+}
+
+/// `text` with the edits made: each range is of the text as it was.
+/// Columns count characters, as the client told the server.
+pub fn apply_edits(text: &str, edits: &[lsp_types::TextEdit]) -> String {
+    let lines: Vec<usize> = std::iter::once(0).chain(text.match_indices('\n').map(|(i, _)| i + 1)).collect();
+    let offset = |pos: &lsp_types::Position| {
+        let Some(&start) = lines.get(pos.line as usize) else { return text.len() };
+        let line = &text[start..lines.get(pos.line as usize + 1).map_or(text.len(), |next| next - 1)];
+        start + line.char_indices().nth(pos.character as usize).map_or(line.len(), |(i, _)| i)
+    };
+    let mut ranges: Vec<(usize, usize, &str)> = edits.iter().map(|e| (offset(&e.range.start), offset(&e.range.end), e.new_text.as_str())).collect();
+    // From the end, so that what is before an edit keeps its place.
+    ranges.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    let mut out = text.to_string();
+    for (start, end, new) in ranges {
+        if start <= end && end <= out.len() {
+            out.replace_range(start..end, new);
+        }
+    }
+    out
+}
+
 fn position_params(uri: &str, pos: lsp_types::Position) -> Value {
     json!({ "textDocument": { "uri": uri }, "position": { "line": pos.line, "character": pos.character } })
 }
@@ -557,7 +706,7 @@ fn write_message(stdin: &Mutex<ChildStdin>, message: &Value) -> Result<()> {
     Ok(())
 }
 
-fn read_loop(stdout: impl Read, stdin: Arc<Mutex<ChildStdin>>, pending: Pending, progress: Progress, import: Import) {
+fn read_loop(stdout: impl Read, stdin: Arc<Mutex<ChildStdin>>, pending: Pending, progress: Progress, import: Import, problems: Problems) {
     let mut reader = BufReader::new(stdout);
     loop {
         let mut length = None;
@@ -602,6 +751,15 @@ fn read_loop(stdout: impl Read, stdin: Arc<Mutex<ChildStdin>>, pending: Pending,
                     };
                     let _ = tx.send(result);
                 }
+            }
+            (None, Some(method)) if method == "textDocument/publishDiagnostics" => {
+                let params = &message["params"];
+                let (Some(uri), Ok(found)) = (params["uri"].as_str(), serde_json::from_value::<Vec<lsp_types::Diagnostic>>(params["diagnostics"].clone())) else {
+                    continue;
+                };
+                let mut problems = problems.lock().unwrap();
+                problems.0 += 1;
+                problems.1.insert(uri.to_string(), found);
             }
             (None, Some(method)) if method == "$/progress" => {
                 let params = &message["params"];
@@ -734,6 +892,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn edits_apply_from_the_end() {
+        let at = |line: u32, from: u32, to: u32, new: &str| lsp_types::TextEdit {
+            range: lsp_types::Range::new(lsp_types::Position::new(line, from), lsp_types::Position::new(line, to)),
+            new_text: new.to_string(),
+        };
+        let text = "let aé = foo(aé);\nprint(aé)\n";
+        let renamed = apply_edits(text, &[at(0, 4, 6, "total"), at(0, 13, 15, "total"), at(1, 6, 8, "total")]);
+        assert_eq!(renamed, "let total = foo(total);\nprint(total)\n", "columns are characters, and every range is of the text as it was");
+        assert_eq!(apply_edits("a\n", &[at(5, 0, 0, "end")]), "a\nend", "past the end is the end");
+    }
+
+    #[test]
     fn uris_round_trip() {
         let path = if cfg!(windows) { PathBuf::from(r"C:\Users\A B\src\main.rs") } else { PathBuf::from("/home/a b/src/main.rs") };
         let uri = path_to_uri(&path);
@@ -775,6 +945,72 @@ mod tests {
 
     /// Needs rust-analyzer: `cargo test -- --ignored`. The root comes from
     /// project_root, as in the app: the directory above is no cargo project.
+    /// What the editor asks of a server beyond navigation, on a crate made
+    /// for it: what is wrong, the fix offered, completion, rename, format.
+    #[test]
+    #[ignore]
+    fn rust_analyzer_completes_fixes_renames_and_formats() {
+        let root = std::env::temp_dir().join(format!("ideae-ra-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+        let file = root.join("src/main.rs");
+        let text = "fn greeting() -> String {\n    String::new()\n}\n\nfn main() {\n    let   words = greeting();\n    let n: u32 = words;\n    println!(\"{}\", n);\n}\n";
+        std::fs::write(&file, text).unwrap();
+        let client = LspClient::spawn("rust-analyzer", Path::new("rust-analyzer"), &[], &root, Value::Null).unwrap();
+        client.did_open(&file, "rust", text).unwrap();
+        let uri = path_to_uri(&file);
+        let wait = |what: &str, done: &mut dyn FnMut() -> bool| {
+            let started = std::time::Instant::now();
+            while !done() {
+                assert!(started.elapsed() < Duration::from_secs(240), "{what} never came");
+                thread::sleep(Duration::from_secs(1));
+            }
+        };
+
+        let mut wrong = Vec::new();
+        wait("the type error", &mut || {
+            wrong = client.problems(&uri).1;
+            wrong.iter().any(|d| d.range.start.line == 6)
+        });
+
+        let mut items = Vec::new();
+        wait("completion", &mut || {
+            let typed = text.replace("words = greeting()", "words = gre()");
+            client.did_change(&file, 0, &typed).unwrap();
+            items = match client.completion(&uri, lsp_types::Position::new(5, 21), None) {
+                Ok(lsp_types::CompletionResponse::Array(items)) => items,
+                Ok(lsp_types::CompletionResponse::List(list)) => list.items,
+                Err(_) => Vec::new(),
+            };
+            items.iter().any(|item| item.label.starts_with("greeting"))
+        });
+        client.did_change(&file, 0, text).unwrap();
+
+        let mut renamed = None;
+        wait("rename", &mut || {
+            renamed = client.rename(&uri, lsp_types::Position::new(0, 4), "salute").ok().flatten();
+            renamed.is_some()
+        });
+        let edits = edits_by_file(&renamed.unwrap());
+        let (path, edits) = &edits[0];
+        assert_eq!(path.canonicalize().unwrap(), file.canonicalize().unwrap());
+        let after = apply_edits(text, edits);
+        assert!(after.contains("fn salute()") && after.contains("words = salute()"), "{after}");
+
+        let formatted = apply_edits(text, &client.formatting(&uri, 4, true).unwrap());
+        assert!(formatted.contains("    let words = greeting();"), "{formatted}");
+
+        let line = lsp_types::Range::new(lsp_types::Position::new(5, 10), lsp_types::Position::new(5, 10));
+        let actions = client.code_actions(&uri, line).unwrap();
+        assert!(!actions.is_empty(), "something is offered on a `let`");
+        let action = match actions[0].edit {
+            Some(_) => actions[0].clone(),
+            None => client.resolve_code_action(&actions[0]).unwrap(),
+        };
+        assert!(action.edit.is_some(), "{action:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     #[ignore]
     fn rust_analyzer_local_definition() {
