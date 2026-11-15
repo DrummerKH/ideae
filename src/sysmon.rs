@@ -2,13 +2,12 @@
 //! readout in the title bar, the process tree in its tooltip.
 //!
 //! CPU is a share of the whole machine (all cores = 100%), for processes as
-//! for the system, so the numbers add up. Memory is PSS where readable:
-//! shared pages are split between the processes that map them.
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+//! for the system, so the numbers add up. Memory is what a process holds in
+//! RAM: on Linux PSS where readable (shared pages are split between the
+//! processes that map them), on macOS the resident size, on Windows the
+//! working set.
 
-use std::{collections::HashMap, rc::Rc, time::{Duration, Instant}};
-#[cfg(target_os = "linux")]
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf, rc::Rc, time::{Duration, Instant}};
 
 use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
 use gpui_kit::{prelude::FluentBuilder as _, *};
@@ -74,11 +73,15 @@ pub struct Snapshot {
     pub own_mem: u64,
 }
 
-#[cfg(target_os = "linux")]
 struct Raw {
     ppid: i32,
+    /// The session it is in; its own pid for a terminal's shell. Windows
+    /// has no sessions: there a terminal's shell gets its own pid here.
     sid: i32,
     name: String,
+    /// CPU time so far, which Linux has with the process list; elsewhere
+    /// `os::usage` asks for it.
+    #[cfg(target_os = "linux")]
     ticks: u64,
 }
 
@@ -90,49 +93,33 @@ struct Sampler {
 }
 
 #[cfg(target_os = "linux")]
-fn clk_tck() -> f32 {
-    // SAFETY: sysconf only reads a constant.
-    (unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).max(1) as f32
-}
+mod os {
+    use std::collections::HashMap;
 
-#[cfg(target_os = "linux")]
-fn page_size() -> u64 {
-    // SAFETY: as above.
-    (unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).max(1) as u64
-}
+    use super::Raw;
 
-/// Only Linux is read for now; elsewhere the readout stays hidden.
-pub const SUPPORTED: bool = cfg!(target_os = "linux");
-
-#[cfg(not(target_os = "linux"))]
-impl Sampler {
-    fn sample(&mut self) -> Snapshot {
-        Snapshot::default()
+    fn sysconf(name: libc::c_int) -> u64 {
+        // SAFETY: sysconf only reads a constant.
+        (unsafe { libc::sysconf(name) }).max(1) as u64
     }
-}
 
-#[cfg(target_os = "linux")]
-impl Sampler {
-    fn sample(&mut self) -> Snapshot {
-        let now = Instant::now();
-        let elapsed = self.at.map_or(0., |at| now.duration_since(at).as_secs_f32());
-        self.at = Some(now);
+    pub fn ticks_per_sec() -> f32 {
+        sysconf(libc::_SC_CLK_TCK) as f32
+    }
 
+    /// Cores, and CPU ticks so far: all of them and the idle ones.
+    pub fn cpu() -> (f32, Option<(u64, u64)>) {
         let stat = std::fs::read_to_string("/proc/stat").unwrap_or_default();
         let cores = stat.lines().filter(|l| l.starts_with("cpu") && !l.starts_with("cpu ")).count().max(1) as f32;
-        let mut snap = Snapshot::default();
-        if let Some(line) = stat.lines().next() {
+        let ticks = stat.lines().next().map(|line| {
             let v: Vec<u64> = line.split_whitespace().skip(1).filter_map(|x| x.parse().ok()).collect();
-            let total: u64 = v.iter().take(8).sum();
-            let idle = v.get(3).copied().unwrap_or(0) + v.get(4).copied().unwrap_or(0);
-            if let Some((pt, pi)) = self.cpu {
-                let (dt, di) = (total.saturating_sub(pt), idle.saturating_sub(pi));
-                if dt > 0 {
-                    snap.cpu = 100. * (1. - di as f32 / dt as f32);
-                }
-            }
-            self.cpu = Some((total, idle));
-        }
+            (v.iter().take(8).sum::<u64>(), v.get(3).copied().unwrap_or(0) + v.get(4).copied().unwrap_or(0))
+        });
+        (cores, ticks)
+    }
+
+    /// RAM in all and in use.
+    pub fn memory() -> (u64, u64) {
         let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
         let field = |name: &str| {
             meminfo
@@ -142,11 +129,12 @@ impl Sampler {
                 .unwrap_or(0)
                 * 1024
         };
-        snap.mem_total = field("MemTotal:");
-        snap.mem_used = snap.mem_total.saturating_sub(field("MemAvailable:"));
+        let total = field("MemTotal:");
+        (total, total.saturating_sub(field("MemAvailable:")))
+    }
 
-        // Every process, to find the app's descendants.
-        let mut all: HashMap<i32, Raw> = HashMap::new();
+    pub fn processes(_me: i32) -> HashMap<i32, Raw> {
+        let mut all = HashMap::new();
         for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
             let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else { continue };
             let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else { continue };
@@ -166,6 +154,222 @@ impl Sampler {
                 },
             );
         }
+        all
+    }
+
+    /// CPU time so far and memory: PSS, or RSS when smaps_rollup cannot be read.
+    pub fn usage(pid: i32, raw: &Raw) -> (u64, u64) {
+        let pss = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).ok().and_then(|text| {
+            Some(text.lines().find(|l| l.starts_with("Pss:"))?.split_whitespace().nth(1)?.parse::<u64>().ok()? * 1024)
+        });
+        let memory = pss.unwrap_or_else(|| {
+            std::fs::read_to_string(format!("/proc/{pid}/statm"))
+                .ok()
+                .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
+                .map_or(0, |pages| pages * sysconf(libc::_SC_PAGESIZE))
+        });
+        (raw.ticks, memory)
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod os {
+    use std::collections::HashMap;
+
+    use super::Raw;
+
+    /// Nanoseconds.
+    pub fn ticks_per_sec() -> f32 {
+        1e9
+    }
+
+    #[allow(deprecated)]
+    fn host() -> libc::mach_port_t {
+        // SAFETY: returns the port every process has.
+        unsafe { libc::mach_host_self() }
+    }
+
+    pub fn cpu() -> (f32, Option<(u64, u64)>) {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get()) as f32;
+        let mut info: libc::host_cpu_load_info = unsafe { std::mem::zeroed() };
+        let mut count = libc::HOST_CPU_LOAD_INFO_COUNT;
+        // SAFETY: host_statistics writes at most `count` integers into `info`.
+        let ok = unsafe { libc::host_statistics(host(), libc::HOST_CPU_LOAD_INFO, (&raw mut info).cast(), &mut count) } == 0;
+        let ticks = ok.then(|| {
+            let total = info.cpu_ticks.iter().map(|&t| u64::from(t)).sum();
+            (total, u64::from(info.cpu_ticks[libc::CPU_STATE_IDLE as usize]))
+        });
+        (cores, ticks)
+    }
+
+    /// In use as Activity Monitor has it: app memory, wired and compressed.
+    pub fn memory() -> (u64, u64) {
+        let mut total = 0u64;
+        let mut size = std::mem::size_of::<u64>();
+        // SAFETY: sysctlbyname writes `size` bytes into `total`; the name ends in NUL.
+        unsafe { libc::sysctlbyname(c"hw.memsize".as_ptr(), (&raw mut total).cast(), &mut size, std::ptr::null_mut(), 0) };
+        let mut vm: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+        let mut count = libc::HOST_VM_INFO64_COUNT;
+        // SAFETY: host_statistics64 writes at most `count` integers into `vm`.
+        if unsafe { libc::host_statistics64(host(), libc::HOST_VM_INFO64, (&raw mut vm).cast(), &mut count) } != 0 {
+            return (total, 0);
+        }
+        // SAFETY: sysconf only reads a constant.
+        let page = (unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).max(1) as u64;
+        let pages = u64::from(vm.internal_page_count).saturating_sub(u64::from(vm.purgeable_count))
+            + u64::from(vm.wire_count)
+            + u64::from(vm.compressor_page_count);
+        (total, pages * page)
+    }
+
+    pub fn processes(_me: i32) -> HashMap<i32, Raw> {
+        let mut all = HashMap::new();
+        for (pid, ppid, name) in crate::procs::running_with_parents() {
+            all.insert(pid, Raw { ppid, sid: crate::procs::sid(pid), name });
+        }
+        all
+    }
+
+    /// CPU time so far and the resident size.
+    #[allow(deprecated)]
+    pub fn usage(pid: i32, _: &Raw) -> (u64, u64) {
+        let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+        // SAFETY: proc_pid_rusage fills the struct of the flavor asked for.
+        if unsafe { libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V2, (&raw mut info).cast()) } != 0 {
+            return (0, 0);
+        }
+        // The times are in Mach ticks, which are not nanoseconds on Apple silicon.
+        static TIMEBASE: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+        let (numer, denom) = *TIMEBASE.get_or_init(|| {
+            let mut base = libc::mach_timebase_info { numer: 1, denom: 1 };
+            // SAFETY: writes the two numbers.
+            unsafe { libc::mach_timebase_info(&mut base) };
+            (u64::from(base.numer.max(1)), u64::from(base.denom.max(1)))
+        });
+        let ticks = (info.ri_user_time + info.ri_system_time) as u128 * numer as u128 / denom as u128;
+        (ticks as u64, info.ri_resident_size)
+    }
+}
+
+#[cfg(windows)]
+mod os {
+    use std::collections::HashMap;
+
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, FILETIME, INVALID_HANDLE_VALUE},
+        System::{
+            Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS},
+            ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
+            SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX},
+            Threading::{GetProcessTimes, GetSystemTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+        },
+    };
+
+    use super::Raw;
+
+    /// File time: 100 nanoseconds.
+    pub fn ticks_per_sec() -> f32 {
+        1e7
+    }
+
+    fn ticks(time: &FILETIME) -> u64 {
+        u64::from(time.dwHighDateTime) << 32 | u64::from(time.dwLowDateTime)
+    }
+
+    pub fn cpu() -> (f32, Option<(u64, u64)>) {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get()) as f32;
+        let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let (mut idle, mut kernel, mut user) = (zero, zero, zero);
+        // SAFETY: the three times are written to.
+        let ok = unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) } != 0;
+        // The kernel's time has the idle time in it.
+        (cores, ok.then(|| (ticks(&kernel) + ticks(&user), ticks(&idle))))
+    }
+
+    pub fn memory() -> (u64, u64) {
+        let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        // SAFETY: the struct says how long it is.
+        if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
+            return (0, 0);
+        }
+        (status.ullTotalPhys, status.ullTotalPhys.saturating_sub(status.ullAvailPhys))
+    }
+
+    pub fn processes(me: i32) -> HashMap<i32, Raw> {
+        let mut all = HashMap::new();
+        // SAFETY: the snapshot handle is checked and closed here; each entry
+        // says how long it is.
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snapshot == INVALID_HANDLE_VALUE {
+                return all;
+            }
+            let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            let mut more = Process32FirstW(snapshot, &mut entry) != 0;
+            while more {
+                let end = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
+                let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
+                let name = name.strip_suffix(".exe").or_else(|| name.strip_suffix(".EXE")).unwrap_or(&name).to_string();
+                let (pid, ppid) = (entry.th32ProcessID as i32, entry.th32ParentProcessID as i32);
+                // What the app started with a task in its environment is a terminal's shell.
+                let shell = ppid == me && super::own_env(pid).is_some_and(|env| env.0.is_some());
+                all.insert(pid, Raw { ppid, sid: if shell { pid } else { 0 }, name });
+                more = Process32NextW(snapshot, &mut entry) != 0;
+            }
+            CloseHandle(snapshot);
+        }
+        all
+    }
+
+    /// CPU time so far and the working set.
+    pub fn usage(pid: i32, _: &Raw) -> (u64, u64) {
+        // SAFETY: the handle is checked and closed here; the structs are
+        // written to at their own size.
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
+            if handle.is_null() {
+                return (0, 0);
+            }
+            let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+            let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+            let time = if GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) != 0 {
+                ticks(&kernel) + ticks(&user)
+            } else {
+                0
+            };
+            let mut counters: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+            let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+            let memory = if K32GetProcessMemoryInfo(handle, &mut counters, size) != 0 { counters.WorkingSetSize as u64 } else { 0 };
+            CloseHandle(handle);
+            (time, memory)
+        }
+    }
+}
+
+impl Sampler {
+    fn sample(&mut self) -> Snapshot {
+        let now = Instant::now();
+        let elapsed = self.at.map_or(0., |at| now.duration_since(at).as_secs_f32());
+        self.at = Some(now);
+
+        let mut snap = Snapshot::default();
+        let (cores, cpu) = os::cpu();
+        if let Some((total, idle)) = cpu {
+            if let Some((pt, pi)) = self.cpu {
+                let (dt, di) = (total.saturating_sub(pt), idle.saturating_sub(pi));
+                if dt > 0 {
+                    snap.cpu = 100. * (1. - di as f32 / dt as f32);
+                }
+            }
+            self.cpu = Some((total, idle));
+        }
+        (snap.mem_total, snap.mem_used) = os::memory();
+
+        let me = std::process::id() as i32;
+        // Every process, to find the app's descendants.
+        let all = os::processes(me);
         let mut children: HashMap<i32, Vec<i32>> = HashMap::new();
         for (&pid, raw) in &all {
             children.entry(raw.ppid).or_default().push(pid);
@@ -174,8 +378,7 @@ impl Sampler {
             list.sort();
         }
 
-        let me = std::process::id() as i32;
-        let (tck, pages) = (clk_tck(), page_size());
+        let tck = os::ticks_per_sec();
         let mut ticks = HashMap::new();
         // The app, its daemon, and the daemon's terminal sessions: found by
         // the socket in their environment, since a session handed to a newer
@@ -189,7 +392,7 @@ impl Sampler {
             let candidates: std::collections::HashSet<i32> = all
                 .iter()
                 .filter(|(pid, raw)| raw.sid == **pid && raw.ppid != me && Some(**pid) != daemon)
-                .filter(|(pid, _)| session_env(**pid).2.as_deref() == Some(socket.as_str()))
+                .filter(|(pid, _)| session_env(**pid, &children).2.as_deref() == Some(socket.as_str()))
                 .map(|(pid, _)| *pid)
                 .collect();
             // A session of its own only when nothing of ours is above it: an
@@ -235,6 +438,9 @@ impl Sampler {
                 // language servers and Chrome do not.
                 if raw.sid == pid {
                     Kind::Terminal
+                } else if matches!(raw.name.as_str(), "conhost" | "OpenConsole") {
+                    // Windows: what a terminal draws through.
+                    Kind::Terminal
                 } else if raw.name.contains("chrom") {
                     Kind::Browser
                 } else if raw.name == "git" || raw.name == "notify-send" {
@@ -247,16 +453,17 @@ impl Sampler {
             };
             let leader = Some(pid) != daemon && (session_root || (raw.ppid == me && raw.sid == pid));
             let (task, agent_tab) = if leader {
-                let (task, agent, _) = session_env(pid);
+                let (task, agent, _) = session_env(pid, &children);
                 (task, agent)
             } else {
                 (task, false)
             };
             let kind = if agent_tab { Kind::Agent } else { kind };
+            let (spent, mem) = os::usage(pid, raw);
             let prev = self.ticks.get(&pid).copied();
-            ticks.insert(pid, raw.ticks);
+            ticks.insert(pid, spent);
             let cpu = match prev {
-                Some(prev) if elapsed > 0. => 100. * raw.ticks.saturating_sub(prev) as f32 / (elapsed * tck * cores),
+                Some(prev) if elapsed > 0. => 100. * spent.saturating_sub(prev) as f32 / (elapsed * tck * cores),
                 _ => 0.,
             };
             snap.procs.push(Proc {
@@ -268,7 +475,7 @@ impl Sampler {
                 kind,
                 top,
                 cpu,
-                mem: memory(pid, pages),
+                mem,
             });
             if let Some(kids) = children.get(&pid) {
                 // Reversed, so the stack pops them in pid order. Sessions
@@ -325,25 +532,11 @@ fn is_language_server(name: &str) -> bool {
     NAMES.iter().any(|n| name.starts_with(n)) || name.contains("language-server") || name.ends_with("-lsp")
 }
 
-#[cfg(target_os = "linux")]
-/// PSS, or RSS when smaps_rollup cannot be read.
-fn memory(pid: i32, page: u64) -> u64 {
-    if let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")) {
-        if let Some(kb) = text.lines().find(|l| l.starts_with("Pss:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok()) {
-            return kb * 1024;
-        }
-    }
-    std::fs::read_to_string(format!("/proc/{pid}/statm"))
-        .ok()
-        .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
-        .map_or(0, |pages| pages * page)
-}
-
-#[cfg(target_os = "linux")]
-/// The task a terminal's shell was started for, and whether it is the
-/// agent's tab, from its environment.
-fn session_env(pid: i32) -> (Option<String>, bool, Option<String>) {
-    let Ok(env) = std::fs::read(format!("/proc/{pid}/environ")) else { return (None, false, None) };
+/// The task in a process's environment, whether it is in the agent's tab,
+/// and the app's socket. None when the environment cannot be read, or is
+/// kept back as macOS does for the system's own programs.
+fn own_env(pid: i32) -> Option<(Option<String>, bool, Option<String>)> {
+    let env = crate::procs::environ(pid).filter(|env| !env.is_empty())?;
     let task_key = format!("{}=", crate::agent::TASK_ENV);
     let sock_key = format!("{}=", crate::agent::SOCK_ENV);
     let role = format!("{}=agent", crate::agent::ROLE_ENV);
@@ -357,16 +550,43 @@ fn session_env(pid: i32) -> (Option<String>, bool, Option<String>) {
             agent = true;
         }
     }
-    (task, agent, sock)
+    Some((task, agent, sock))
 }
 
-#[cfg(target_os = "linux")]
+/// The same for a terminal's session. Its leader's own environment may be
+/// out of reach (on macOS that is root's `login`, then a system shell);
+/// what it started has inherited it: the nearest one that shows its
+/// environment answers.
+fn session_env(pid: i32, children: &HashMap<i32, Vec<i32>>) -> (Option<String>, bool, Option<String>) {
+    const MOST: usize = 16;
+    let mut queue = std::collections::VecDeque::from([pid]);
+    let mut asked = 0;
+    while let Some(at) = queue.pop_front() {
+        match own_env(at) {
+            Some(env) => return env,
+            None => queue.extend(children.get(&at).into_iter().flatten()),
+        }
+        asked += 1;
+        if asked == MOST {
+            break;
+        }
+    }
+    (None, false, None)
+}
+
 /// The daemon's pid and socket, when terminals run there.
+#[cfg(unix)]
 fn daemon_of_app() -> (Option<i32>, Option<String>) {
     match crate::daemon::client::get() {
         Some(d) => (d.pid(), Some(crate::daemon::proto::socket_path().display().to_string())),
         None => (None, None),
     }
+}
+
+/// Windows has no daemon: terminals live in the window.
+#[cfg(not(unix))]
+fn daemon_of_app() -> (Option<i32>, Option<String>) {
+    (None, None)
 }
 
 pub fn bytes(n: u64) -> String {
@@ -429,10 +649,10 @@ impl SysMon {
             .text_color(muted)
             .child("CPU")
             .child(bar(s.cpu, cx))
-            .child(div().w(px(26.)).child(format!("{:.0}%", s.cpu)))
+            .child(div().w(px(30.)).whitespace_nowrap().child(format!("{:.0}%", s.cpu)))
             .child("RAM")
             .child(bar(mem_pct, cx))
-            .child(div().w(px(26.)).child(format!("{mem_pct:.0}%")))
+            .child(div().w(px(30.)).whitespace_nowrap().child(format!("{mem_pct:.0}%")))
             .child(div().pl_1().child(format!(
                 "ideae {} · tasks {}",
                 bytes(s.own_mem),
@@ -521,5 +741,74 @@ impl Render for SysTooltip {
             .when(s.procs.len() > shown, |el| {
                 el.child(div().text_color(muted).child(format!("… {} more", s.procs.len() - shown)))
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Kind, Sampler};
+
+    /// Stands in for what runs in a terminal: started again by the test below.
+    #[test]
+    #[ignore]
+    fn sleeper() {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn sees_the_system_this_process_and_a_task_it_started() {
+        let me = std::process::id() as i32;
+        let exe = std::env::current_exe().unwrap();
+        let sleeper = ["--exact", "sysmon::tests::sleeper", "--ignored"];
+        // On Unix under a shell, whose own environment macOS keeps back.
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = std::process::Command::new("sh");
+            command.arg("-c").arg(format!("'{}' {}; true", exe.display(), sleeper.join(" ")));
+            command
+        };
+        #[cfg(not(unix))]
+        let mut command = {
+            let mut command = crate::procs::command(&exe);
+            command.args(sleeper);
+            command
+        };
+        command.env(crate::agent::TASK_ENV, "/somewhere/a-task").env(crate::agent::ROLE_ENV, "agent");
+        #[cfg(unix)]
+        // SAFETY: setsid in the child before exec, as a terminal's shell has it.
+        unsafe {
+            use std::os::unix::process::CommandExt as _;
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let mut shell = command.spawn().unwrap();
+        let mut sampler = Sampler::default();
+        sampler.sample();
+        let started = std::time::Instant::now();
+        while started.elapsed() < std::time::Duration::from_millis(300) {
+            std::hint::black_box((0..10_000u64).sum::<u64>());
+        }
+        let snap = sampler.sample();
+        for p in snap.procs.iter().filter(|p| p.top == shell.id() as i32) {
+            assert!(crate::procs::alive(p.pid as u32));
+            #[cfg(unix)]
+            // SAFETY: kill only sends a signal, to what this test started.
+            unsafe {
+                libc::kill(p.pid, libc::SIGKILL)
+            };
+        }
+        let _ = shell.kill();
+        let _ = shell.wait();
+
+        assert!(snap.mem_total > 0 && snap.mem_used > 0 && snap.mem_used <= snap.mem_total, "RAM {} of {}", snap.mem_used, snap.mem_total);
+        assert!((0. ..=100.).contains(&snap.cpu), "CPU {}", snap.cpu);
+        let own = snap.procs.iter().find(|p| p.pid == me).expect("this process");
+        assert!(own.kind == Kind::Editor && own.mem > 1024 * 1024, "{} bytes", own.mem);
+        assert!(own.cpu > 0., "a busy process uses CPU");
+        let agent = snap.procs.iter().find(|p| p.pid == shell.id() as i32).expect("the shell it started");
+        assert_eq!((agent.task.as_deref(), agent.kind == Kind::Agent), (Some("a-task"), true));
+        assert_eq!(snap.by_task.first().map(|t| t.0.as_str()), Some("a-task"));
     }
 }

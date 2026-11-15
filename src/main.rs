@@ -87,7 +87,7 @@ impl Render for Workspace {
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .on_click(|_, _, cx| cx.stop_propagation())
                                 .gap_3()
-                                .when(sysmon::SUPPORTED, |row| row.when(cfg!(target_os = "linux"), |s| s.child(div().mr_2().child(sysmon::SysMon::render_widget(&self.sysmon, cx)))))
+                                .child(div().mr_2().child(sysmon::SysMon::render_widget(&self.sysmon, cx)))
                                 .children(self.render_update(cx))
                                 .children(self.render_new_build(cx))
                                 .child(self.render_power_saving(cx))

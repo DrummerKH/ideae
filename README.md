@@ -61,9 +61,8 @@ window restart; a taken port is reported with the process holding it.
 Releases carry an Apple Silicon build: `ideae-<tag>-macos-arm64.app.zip`.
 It is signed ad hoc, without an Apple Developer ID, so the first start
 needs right click → Open (or `xattr -d com.apple.quarantine ideae.app`).
-Shortcuts use Cmd where Linux uses Ctrl. Not there yet on macOS: the
-process monitor in the title bar, clicks on notifications, the Kotlin
-language server install.
+Shortcuts use Cmd where Linux uses Ctrl. Not there yet on macOS: clicks
+on notifications, the Kotlin language server install.
 
 A build of your own becomes an app the Dock can keep with
 `scripts/macos-app.sh --link target/release/ideae ~/Applications/ideae.app`:
@@ -123,8 +122,8 @@ Chrome.
 
 State and language servers live in `%LOCALAPPDATA%\ideae`.
 
-Not there yet on Windows: the CPU/RAM readout in the title bar, pinning
-to a launcher, the Kotlin language server install.
+Not there yet on Windows: pinning to a launcher, the Kotlin language
+server install.
 
 To build on Windows: Rust (MSVC), Zig 0.17.x and the Windows SDK (gpui
 compiles its shaders with `fxc.exe`; point `GPUI_FXC_PATH` at it when it is

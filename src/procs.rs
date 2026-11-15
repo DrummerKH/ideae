@@ -110,7 +110,10 @@ mod win {
                 AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
                 JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation, SetInformationJobObject,
             },
-            Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+            Diagnostics::Debug::ReadProcessMemory,
+            Threading::{
+                GetExitCodeProcess, OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+            },
         },
     };
 
@@ -151,6 +154,58 @@ mod win {
             // SAFETY: both handles are open.
             unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle() as HANDLE) };
         }
+    }
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtQueryInformationProcess(process: HANDLE, class: u32, info: *mut core::ffi::c_void, size: u32, written: *mut u32) -> i32;
+    }
+
+    /// The environment as the process was started with it, as UTF-8 with
+    /// NULs between the variables. Windows keeps it in the process's own
+    /// memory: the PEB points at the process parameters, and those at the
+    /// block and its size (the offsets are those of 64-bit Windows).
+    #[cfg(target_pointer_width = "64")]
+    pub fn environ(pid: u32) -> Option<Vec<u8>> {
+        const PARAMETERS_IN_PEB: usize = 0x20;
+        const ENVIRONMENT_IN_PARAMETERS: usize = 0x80;
+        const ENVIRONMENT_SIZE_IN_PARAMETERS: usize = 0x3f0;
+        const MOST: usize = 1 << 20;
+        // SAFETY: the handle is checked and closed here; every read is into
+        // a buffer of the size asked for, and checked.
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid);
+            if handle.is_null() {
+                return None;
+            }
+            let read = |address: usize, into: *mut core::ffi::c_void, size: usize| {
+                let mut got = 0usize;
+                ReadProcessMemory(handle, address as *const _, into, size, &mut got) != 0 && got == size
+            };
+            let pointer = |address: usize| {
+                let mut value = 0usize;
+                read(address, (&raw mut value).cast(), std::mem::size_of::<usize>()).then_some(value)
+            };
+            let block = (|| {
+                // PROCESS_BASIC_INFORMATION: the PEB's address is its second field.
+                let mut basic = [0usize; 6];
+                if NtQueryInformationProcess(handle, 0, basic.as_mut_ptr().cast(), std::mem::size_of_val(&basic) as u32, std::ptr::null_mut()) != 0 {
+                    return None;
+                }
+                let parameters = pointer(basic[1] + PARAMETERS_IN_PEB)?;
+                let environment = pointer(parameters + ENVIRONMENT_IN_PARAMETERS)?;
+                let size = pointer(parameters + ENVIRONMENT_SIZE_IN_PARAMETERS)?.min(MOST) & !1;
+                let mut wide = vec![0u16; size / 2];
+                read(environment, wide.as_mut_ptr().cast(), size).then_some(wide)
+            })();
+            CloseHandle(handle);
+            Some(String::from_utf16_lossy(&block?).into_bytes())
+        }
+    }
+
+    #[cfg(not(target_pointer_width = "64"))]
+    pub fn environ(_: u32) -> Option<Vec<u8>> {
+        None
     }
 
     pub fn alive(pid: u32) -> bool {
@@ -196,18 +251,33 @@ fn pids() -> Vec<i32> {
     }
 }
 
+/// The short form, which macOS gives for other users' processes too:
+/// a terminal there is started through root's `login`.
 #[cfg(target_os = "macos")]
-fn bsd_info(pid: i32) -> Option<libc::proc_bsdinfo> {
-    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+fn bsd_info(pid: i32) -> Option<libc::proc_bsdshortinfo> {
+    let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int;
     // SAFETY: proc_pidinfo writes at most `size` bytes into `info`.
-    let got = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+    let got = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDT_SHORTBSDINFO, 0, (&raw mut info).cast(), size) };
     (got == size).then_some(info)
 }
 
 #[cfg(target_os = "macos")]
 fn ppid(pid: i32) -> Option<i32> {
-    bsd_info(pid).map(|i| i.pbi_ppid as i32)
+    bsd_info(pid).map(|i| i.pbsi_ppid as i32)
+}
+
+/// Every process that runs (no zombies), with its parent and name.
+#[cfg(target_os = "macos")]
+pub fn running_with_parents() -> Vec<(i32, i32, String)> {
+    pids()
+        .into_iter()
+        .filter_map(|pid| {
+            let info = bsd_info(pid).filter(|i| i.pbsi_status != 5)?;
+            let short = || info.pbsi_comm.iter().take_while(|&&c| c != 0).map(|&c| c as u8 as char).collect();
+            Some((pid, info.pbsi_ppid as i32, name(pid as u32).unwrap_or_else(short)))
+        })
+        .collect()
 }
 
 /// A process's name, such as `bash`.
@@ -225,7 +295,7 @@ pub fn name(pid: u32) -> Option<String> {
 }
 
 #[cfg(unix)]
-fn sid(pid: i32) -> i32 {
+pub fn sid(pid: i32) -> i32 {
     // SAFETY: getsid only reads the process table.
     unsafe { libc::getsid(pid) }
 }
@@ -241,7 +311,7 @@ fn running(pid: i32) -> bool {
 /// Running and no zombie (status SZOMB is 5).
 #[cfg(target_os = "macos")]
 fn running(pid: i32) -> bool {
-    bsd_info(pid).is_some_and(|i| i.pbi_status != 5)
+    bsd_info(pid).is_some_and(|i| i.pbsi_status != 5)
 }
 
 /// Every session led by a child of this process (the terminals' shells):
@@ -295,15 +365,22 @@ pub fn end_child_sessions() {
 }
 
 /// A process's environment, NUL-separated.
+#[cfg(windows)]
+pub fn environ(pid: i32) -> Option<Vec<u8>> {
+    win::environ(pid as u32)
+}
+
+/// A process's environment, NUL-separated.
 #[cfg(target_os = "linux")]
-fn environ(pid: i32) -> Option<Vec<u8>> {
+pub fn environ(pid: i32) -> Option<Vec<u8>> {
     std::fs::read(format!("/proc/{pid}/environ")).ok()
 }
 
 /// From KERN_PROCARGS2: argc, the executable's path, NUL padding, the
-/// arguments, then the environment.
+/// arguments, then the environment. For the system's own programs
+/// (/bin/zsh, /bin/sleep) macOS leaves the environment out: empty then.
 #[cfg(target_os = "macos")]
-fn environ(pid: i32) -> Option<Vec<u8>> {
+pub fn environ(pid: i32) -> Option<Vec<u8>> {
     let mut size: libc::size_t = 0;
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
     // SAFETY: a null buffer asks for the size; the second call fills one of it.
