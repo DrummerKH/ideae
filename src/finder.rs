@@ -21,7 +21,14 @@ pub enum FinderKind {
     Outline,
     /// Places in sections under headings, such as implementations and usages.
     Places,
+    /// What the project declares under a name: asked of `symbols` as you type.
+    Symbols,
 }
+
+/// Finds declarations by a part of their name. A hit's text is the name,
+/// then `DETAIL` and what it is.
+pub type SymbolSource = Arc<dyn Fn(&str) -> Vec<Hit> + Send + Sync>;
+pub const DETAIL: char = '\u{1f}';
 
 /// A declaration for the outline: nesting depth, label, 0-based line.
 pub struct OutlineItem {
@@ -60,6 +67,7 @@ pub struct Finder {
     last_query: String,
     regex: bool,
     mask: Option<Entity<gpui_kit::component::input::InputState>>,
+    symbols: Option<SymbolSource>,
 }
 
 const FILE_LIMIT: usize = 100;
@@ -93,7 +101,7 @@ impl Finder {
         cx: &mut App,
     ) {
         let sections = sections.into_iter().filter(|(_, hits)| !hits.is_empty()).collect();
-        Self::open_inner(FinderKind::Places, root, Arc::default(), Vec::new(), sections, title, task, window, cx)
+        Self::open_inner(FinderKind::Places, root, Arc::default(), Vec::new(), sections, title, None, task, window, cx)
     }
 
     /// The outline of `path`, from items already extracted.
@@ -112,6 +120,11 @@ impl Finder {
         Self::open_with(FinderKind::Outline, root, Arc::default(), hits, task, window, cx)
     }
 
+    /// Go to a class, a function, a type anywhere in the project.
+    pub fn open_symbols(root: PathBuf, symbols: SymbolSource, task: WeakEntity<TaskView>, window: &mut Window, cx: &mut App) {
+        Self::open_inner(FinderKind::Symbols, root, Arc::default(), Vec::new(), Vec::new(), String::new(), Some(symbols), task, window, cx)
+    }
+
     fn open_with(
         kind: FinderKind,
         root: PathBuf,
@@ -121,7 +134,7 @@ impl Finder {
         window: &mut Window,
         cx: &mut App,
     ) {
-        Self::open_inner(kind, root, files, outline, Vec::new(), String::new(), task, window, cx)
+        Self::open_inner(kind, root, files, outline, Vec::new(), String::new(), None, task, window, cx)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -132,6 +145,7 @@ impl Finder {
         outline: Vec<Hit>,
         sections: Vec<(String, Vec<Hit>)>,
         title: String,
+        symbols: Option<SymbolSource>,
         task: WeakEntity<TaskView>,
         window: &mut Window,
         cx: &mut App,
@@ -150,6 +164,7 @@ impl Finder {
             last_query: String::new(),
             regex: false,
             mask: None,
+            symbols,
         });
         if kind == FinderKind::Grep {
             use gpui_kit::component::input::{InputEvent, InputState};
@@ -192,6 +207,7 @@ impl Finder {
                         FinderKind::Grep => "Find in files…".to_string(),
                         FinderKind::Outline => "Go to declaration…".to_string(),
                         FinderKind::Places => title.clone(),
+                        FinderKind::Symbols => "Go to class, function, type…".to_string(),
                     })
                     .min_h(px(420.))
                     .max_h(px(420.));
@@ -311,6 +327,14 @@ impl Finder {
                     let _ = this.update(cx, |f, cx| f.set_hits(hits, cx));
                 });
             }
+            FinderKind::Symbols => {
+                let Some(symbols) = self.symbols.clone() else { return };
+                self._search = cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(Duration::from_millis(150)).await;
+                    let hits = cx.background_spawn(async move { symbols(&query) }).await;
+                    let _ = this.update(cx, |f, cx| f.set_hits(hits, cx));
+                });
+            }
             FinderKind::Grep => {
                 if query.len() < 2 {
                     self.set_hits(Vec::new(), cx);
@@ -357,6 +381,7 @@ fn item(hit: &Hit, kind: FinderKind) -> CommandItem {
     let label = match kind {
         FinderKind::Files => hit.path.clone(),
         FinderKind::Outline => hit.text.clone(),
+        FinderKind::Symbols => format!("{} {}:{}", hit.text, hit.path, hit.line),
         FinderKind::Grep | FinderKind::Places => format!("{}:{} {}", hit.path, hit.line, hit.text),
     };
     CommandItem::new().label(label).child(move |_, cx| {
@@ -378,6 +403,17 @@ fn item(hit: &Hit, kind: FinderKind) -> CommandItem {
                 )
                 .child(div().text_xs().text_color(cx.theme().muted_foreground).child(format!(":{}", hit.line)))
                 .into_any_element(),
+            FinderKind::Symbols => {
+                let (symbol, detail) = hit.text.split_once(DETAIL).unwrap_or((&hit.text, ""));
+                h_flex()
+                    .gap_3()
+                    .min_w_0()
+                    .child(div().flex_none().font_family(cx.theme().mono_font_family.clone()).text_sm().child(symbol.to_string()))
+                    .child(div().flex_none().text_xs().text_color(cx.theme().muted_foreground).child(detail.to_string()))
+                    .child(div().flex_1())
+                    .child(div().truncate().text_xs().text_color(cx.theme().muted_foreground).child(format!("{}:{}", hit.path, hit.line)))
+                    .into_any_element()
+            }
             FinderKind::Files => h_flex()
                 .gap_2()
                 .min_w_0()
@@ -424,6 +460,21 @@ fn highlighted(hit: &Hit, cx: &App) -> StyledText {
         })
         .collect();
     StyledText::new(text).with_highlights(ranges)
+}
+
+/// The declarations whose name has `query` in it, whatever the case: those
+/// it begins first, short names before long ones.
+pub fn match_symbols(all: &[Hit], query: &str, limit: usize) -> Vec<Hit> {
+    let needle = query.to_lowercase();
+    let mut found: Vec<(bool, usize, &Hit)> = all
+        .iter()
+        .filter_map(|hit| {
+            let name = hit.text.split(DETAIL).next().unwrap_or_default().to_lowercase();
+            name.contains(&needle).then(|| (!name.starts_with(&needle), name.len(), hit))
+        })
+        .collect();
+    found.sort_by_key(|(inside, len, _)| (*inside, *len));
+    found.into_iter().take(limit).map(|(_, _, hit)| hit.clone()).collect()
 }
 
 /// Subsequence match, scored so that consecutive characters, matches in the

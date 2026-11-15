@@ -116,7 +116,6 @@ impl Lsp {
         };
 
         let provider = provider.clone();
-        let legend = provider.legend();
         let text = text.clone();
         // Fetch the whole document; results are cached and filtered to the
         // viewport at paint time (mirrors `update_document_colors`), so a
@@ -130,12 +129,16 @@ impl Lsp {
                 .timer(Duration::from_millis(100))
                 .await;
 
+            let legend_of = provider.clone();
             let task_result = cx
                 .update(|window, cx| provider.semantic_tokens(&text, range, window, cx))
                 .ok();
 
             if let Some(task) = task_result {
                 if let Ok(tokens) = task.await {
+                    // ideae patch: the legend is read with the answer. A server
+                    // still starting has none when the request is made.
+                    let legend = legend_of.legend();
                     let decoded = decode_semantic_tokens(&tokens, &legend);
                     let _ = input_state.update(cx, |input_state, cx| {
                         if decoded != input_state.extras.lsp.semantic_tokens {

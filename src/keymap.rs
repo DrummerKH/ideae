@@ -3,7 +3,7 @@
 
 use gpui_kit::{Action, App, KeyBinding, NoAction};
 
-use crate::{FindInFiles, GoToFile, NewTask, OpenSettings, Quit, keys, palette, task};
+use crate::{FindInFiles, GoToFile, GoToSymbol, NewTask, OpenSettings, Quit, keys, palette, task};
 
 /// Where a shortcut works.
 #[derive(Clone, Copy, PartialEq)]
@@ -39,6 +39,7 @@ pub static SHORTCUTS: &[Shortcut] = &[
     shortcut!("next_waiting", "Next waiting task", "alt-down", Everywhere, palette::NextWaiting),
     shortcut!("new_task", "New task", "ctrl-shift-t", Everywhere, NewTask),
     shortcut!("go_to_file", "Go to file", "ctrl-shift-n", Everywhere, GoToFile),
+    shortcut!("go_to_symbol", "Go to class or symbol", "ctrl-n", NotInTerminal, GoToSymbol),
     shortcut!("find_in_files", "Find in files", "ctrl-shift-f", Everywhere, FindInFiles),
     shortcut!("find_in_terminal", "Find in terminal", "ctrl-f", Terminal, task::FindInTerminal),
     shortcut!("agent", "Agent", "ctrl-1", Everywhere, task::ShowView(0)),
@@ -72,6 +73,11 @@ pub static SHORTCUTS: &[Shortcut] = &[
     shortcut!("quick_fix", "Quick fixes", "alt-enter", Editor, gpui_kit::component::input::ToggleCodeActions),
     shortcut!("rename", "Rename", "shift-f6", Editor, task::RenameSymbol),
     shortcut!("format", "Reformat file", "ctrl-alt-l", Editor, task::FormatFile),
+    shortcut!("fold", "Fold", "ctrl--", Editor, task::Fold),
+    shortcut!("unfold", "Unfold", "ctrl-=", Editor, task::Unfold),
+    shortcut!("fold_all", "Fold all", "ctrl-shift--", Editor, task::FoldAll),
+    shortcut!("unfold_all", "Unfold all", "ctrl-shift-=", Editor, task::UnfoldAll),
+    shortcut!("parameter_info", "Parameter info", "ctrl-p", Editor, task::ParameterInfo),
     // Ctrl+Y is the line's: the editor's own Redo moves here.
     shortcut!("redo", "Redo", "ctrl-shift-z", Editor, gpui_kit::component::input::Redo),
     shortcut!("settings", "Settings", "ctrl-,", Everywhere, OpenSettings),

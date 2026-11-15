@@ -14,7 +14,7 @@ use gpui_kit::component::{
     scroll::ScrollableElement as _,
     button::{Button, ButtonVariants as _},
     diff::{Diff, DiffAnnotation, DiffEvent, DiffFile, DiffFileStatus, DiffLinePosition, DiffLineRange, DiffMode, DiffSide, DiffState},
-    input::{CodeActionProvider, CompletionProvider, DefinitionProvider, Editor, EditorState, HoverProvider, InputEvent, Position, Rope, RopeExt as _},
+    input::{CodeActionProvider, CompletionProvider, DefinitionProvider, DocumentRangeSemanticTokensProvider, Editor, EditorState, HoverProvider, InputEvent, Position, Rope, RopeExt as _},
     resizable::{h_resizable, resizable_panel},
     tab::{Tab, TabBar},
     list::ListItem,
@@ -292,7 +292,7 @@ fn shell_quote(s: &str) -> String {
 // ---------------------------------------------------------------- file
 
 actions!(ideae_file, [SaveFile, ExpandSelection, ShrinkSelection, ToggleComment, ShowOutline, ShowUsages, SendToAgent]);
-actions!(ideae_edit, [DeleteLine, DuplicateLine, MoveLineUp, MoveLineDown, JoinLines, ToggleCase, NextOccurrence, GoToLine, RenameSymbol, FormatFile]);
+actions!(ideae_edit, [DeleteLine, DuplicateLine, MoveLineUp, MoveLineDown, JoinLines, ToggleCase, NextOccurrence, GoToLine, RenameSymbol, FormatFile, Fold, Unfold, FoldAll, UnfoldAll, ParameterInfo]);
 actions!(ideae_task, [ToggleZoom, SendDiffToAgent, CommentOnDiff, FindInTerminal]);
 
 actions!(ideae_task, [NextTab, PrevTab, NavigateBack, NavigateForward]);
@@ -360,6 +360,10 @@ pub struct FileView {
     /// The count of the language server's reports when its problems were
     /// last put into the editor.
     problems_seen: u64,
+    /// The signature shown above the cursor: its text, the parameter being
+    /// written, the line it was asked on.
+    signature: Option<(String, Option<std::ops::Range<usize>>, u32)>,
+    _signature: Task<()>,
     _poll: Task<()>,
 }
 
@@ -445,6 +449,15 @@ impl FileView {
     fn on_edit(&mut self, cx: &mut Context<Self>) {
         self.edit_version += 1;
         self.mark_changes(true, cx);
+        let typed = {
+            let state = self.editor.read(cx);
+            let (text, cursor) = (state.text(), state.cursor());
+            // The character before the cursor starts one to four bytes back.
+            (1..=4).find_map(|back| text.char_at(cursor.checked_sub(back)?))
+        };
+        if self.signature.is_some() || matches!(typed, Some('(' | ',')) {
+            self.parameter_info(cx);
+        }
         let dirty = !same_text(self.editor.read(cx).text(), &self.saved);
         if dirty != self.dirty {
             self.dirty = dirty;
@@ -712,6 +725,72 @@ impl FileView {
         }
     }
 
+    /// Ctrl+P, and by itself after `(` and `,`: the signature of the call
+    /// being written, from the language server.
+    fn parameter_info(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.lsp_client.clone() else { return };
+        let (path, text, pos) = {
+            let state = self.editor.read(cx);
+            (self.path.clone(), state.value().to_string(), state.cursor_position())
+        };
+        self._signature = cx.spawn(async move |this, cx| {
+            let uri = lsp::path_to_uri(&path);
+            let help = cx
+                .background_spawn(async move {
+                    client.did_change(&path, 0, &text)?;
+                    client.signature_help(&uri, pos)
+                })
+                .await;
+            let shown = help.ok().flatten().and_then(|help| lsp::signature_shown(&help)).map(|(label, active)| (label, active, pos.line));
+            let _ = this.update(cx, |file, cx| {
+                file.signature = shown;
+                cx.notify();
+            });
+        });
+    }
+
+    /// The signature above the cursor, while the cursor is on the line it
+    /// was asked for.
+    fn render_signature(&self, cx: &App) -> Option<AnyElement> {
+        let (label, active, line) = self.signature.as_ref()?;
+        let state = self.editor.read(cx);
+        if state.cursor_position().line != *line {
+            return None;
+        }
+        let cursor = state.cursor();
+        let text = state.value();
+        let before = text.get(..cursor).and_then(|t| t.char_indices().next_back()).map_or(cursor, |(at, _)| at);
+        let at = state.range_to_bounds(&(before..cursor)).or_else(|| state.range_to_bounds(&(cursor..cursor)))?;
+        let strong = HighlightStyle { font_weight: Some(FontWeight::BOLD), color: Some(cx.theme().primary), ..Default::default() };
+        let highlights: Vec<_> = active.clone().map(|range| (range, strong)).into_iter().collect();
+        Some(
+            deferred(
+                anchored().position(at.origin).anchor(gpui_kit::Anchor::BottomLeft).snap_to_window().child(
+                    div()
+                        .mb_1()
+                        .px_2()
+                        .py_1()
+                        .max_w(px(720.))
+                        .rounded_md()
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .bg(cx.theme().popover)
+                        .shadow_md()
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .text_sm()
+                        .child(StyledText::new(label.clone()).with_highlights(highlights)),
+                ),
+            )
+            .into_any_element(),
+        )
+    }
+
+    fn fold(&mut self, fold: bool, all: bool, cx: &mut Context<Self>) {
+        self.editor.update(cx, |state, cx| {
+            state.fold(fold, all, cx);
+        });
+    }
+
     /// The language server's latest word on what is wrong in the file, into
     /// the editor: underlined there, with the fixes it offers.
     fn show_problems(&mut self, cx: &mut Context<Self>) {
@@ -952,6 +1031,11 @@ impl Render for FileView {
             .on_action(cx.listener(|this, _: &GoToLine, window, cx| this.go_to_line_dialog(window, cx)))
             .on_action(cx.listener(|this, _: &RenameSymbol, window, cx| this.rename_dialog(window, cx)))
             .on_action(cx.listener(|this, _: &FormatFile, window, cx| this.format(window, cx)))
+            .on_action(cx.listener(|this, _: &ParameterInfo, _, cx| this.parameter_info(cx)))
+            .on_action(cx.listener(|this, _: &Fold, _, cx| this.fold(true, false, cx)))
+            .on_action(cx.listener(|this, _: &Unfold, _, cx| this.fold(false, false, cx)))
+            .on_action(cx.listener(|this, _: &FoldAll, _, cx| this.fold(true, true, cx)))
+            .on_action(cx.listener(|this, _: &UnfoldAll, _, cx| this.fold(false, true, cx)))
             .child(
                 h_flex()
                     .justify_between()
@@ -1070,7 +1154,7 @@ impl Render for FileView {
             })
             .when(self.preview, |this| this.child(self.render_preview(cx)))
             .when(!self.preview, |this| this.child(
-                div().relative().flex_1().min_h_0().child(crate::zoom::wheel(crate::zoom::Kind::Editor)).child(
+                div().relative().flex_1().min_h_0().children(self.render_signature(cx)).child(crate::zoom::wheel(crate::zoom::Kind::Editor)).child(
                     Editor::new(&self.editor)
                         // Replaces the built-in menu, so its items are listed again.
                         .context_menu(|menu, _, _| {
@@ -1128,6 +1212,32 @@ impl CompletionProvider for LspBridge {
     fn is_completion_trigger(&self, _: usize, new_text: &str, _: &mut App) -> bool {
         let Some(last) = new_text.chars().last() else { return false };
         last.is_alphanumeric() || last == '_' || self.client.completion_triggers().iter().any(|t| new_text.ends_with(t.as_str()))
+    }
+}
+
+impl DocumentRangeSemanticTokensProvider for LspBridge {
+    fn legend(&self) -> lsp_types::SemanticTokensLegend {
+        let token_types = self.client.semantic_legend().into_iter().map(lsp_types::SemanticTokenType::from).collect();
+        lsp_types::SemanticTokensLegend { token_types, token_modifiers: Vec::new() }
+    }
+
+    fn semantic_tokens(
+        &self,
+        text: &Rope,
+        range: std::ops::Range<usize>,
+        _: &mut Window,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<lsp_types::SemanticTokens>> {
+        let range = lsp_types::Range::new(text.offset_to_position(range.start), text.offset_to_position(range.end));
+        let (client, uri, path, text) = (self.client.clone(), self.uri.clone(), self.path.clone(), text.to_string());
+        cx.background_spawn(async move {
+            client.did_change(&path, 0, &text)?;
+            let tokens = client.semantic_tokens(&uri, range);
+            if std::env::var_os("IDEAE_DEBUG").is_some() {
+                eprintln!("semantic tokens {uri} -> {:?}", tokens.as_ref().map(|t| t.data.len()));
+            }
+            tokens
+        })
     }
 }
 
@@ -2905,6 +3015,10 @@ impl TaskView {
 
     pub fn open_finder(&mut self, kind: crate::finder::FinderKind, window: &mut Window, cx: &mut Context<Self>) {
         let files = self.tree_files.clone();
+        if kind == crate::finder::FinderKind::Symbols {
+            let symbols = symbol_source(self.root.clone(), self.lsp.values().cloned().collect(), files);
+            return crate::finder::Finder::open_symbols(self.root.clone(), symbols, cx.weak_entity(), window, cx);
+        }
         crate::finder::Finder::open(kind, self.root.clone(), files, cx.weak_entity(), window, cx);
     }
 
@@ -4024,7 +4138,10 @@ impl TaskView {
                 match event {
                 InputEvent::Change => this.on_edit(cx),
                 // Saved when you leave the editor, as JetBrains IDEs do.
-                InputEvent::Blur => this.autosave(cx),
+                InputEvent::Blur => {
+                    this.signature = None;
+                    this.autosave(cx)
+                }
                 _ => {}
             }})
             .detach();
@@ -4061,9 +4178,11 @@ impl TaskView {
             committed: None,
             _marks: Task::ready(()),
             problems_seen: 0,
+            signature: None,
+            _signature: Task::ready(()),
             // Re-render while the server reports progress, so the header can
             // say "indexing" instead of a misleading "ready".
-            _poll: cx.spawn(async move |this: WeakEntity<FileView>, cx| {
+            _poll: cx.spawn_in(window, async move |this: WeakEntity<FileView>, cx| {
                 let mut last = None;
                 loop {
                     cx.background_executor().timer(Duration::from_millis(500)).await;
@@ -4074,8 +4193,17 @@ impl TaskView {
                         break;
                     };
                     if busy != last {
+                        // Done with some work, indexing most of all: the server
+                        // now knows names it could not tell a moment ago.
+                        let learned = matches!((&last, &busy), (Some((Some(_), _)), Some((None, _))));
                         last = busy;
-                        if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        let told = this.update_in(cx, |f, window, cx| {
+                            if learned {
+                                f.editor.update(cx, |state, cx| state.refresh_semantic_tokens(window, cx));
+                            }
+                            cx.notify()
+                        });
+                        if told.is_err() {
                             break;
                         }
                     }
@@ -4193,6 +4321,7 @@ impl TaskView {
             lsp.hover_provider = Some(bridge.clone());
             lsp.completion_provider = Some(bridge.clone());
             lsp.code_action_providers = vec![bridge.clone()];
+            lsp.semantic_tokens_provider = Some(bridge.clone());
             lsp.definition_provider = Some(UsagesAtDeclaration::wrap(bridge, &this_path));
             lsp.show_document = Some(show_document_handler(task, this_path));
             cx.notify();
@@ -5402,6 +5531,53 @@ fn outline(path: &std::path::Path, text: &str) -> Vec<crate::finder::OutlineItem
     let mut items = Vec::new();
     collect_declarations(tree.root_node(), text, 0, &mut items);
     items
+}
+
+/// Declarations by a part of their name: from the task's language servers,
+/// which know the project; from the grammars' reading of its files where
+/// no server answers.
+fn symbol_source(root: PathBuf, clients: Vec<Arc<lsp::LspClient>>, files: Arc<Vec<String>>) -> crate::finder::SymbolSource {
+    use crate::finder::{DETAIL, Hit};
+    const LIMIT: usize = 200;
+    let declared: Arc<std::sync::OnceLock<Vec<Hit>>> = Arc::default();
+    Arc::new(move |query: &str| {
+        let mut hits = Vec::new();
+        for client in &clients {
+            for symbol in client.workspace_symbols(query).unwrap_or_default() {
+                let kind = lsp::symbol_kind(symbol.kind);
+                let detail = if symbol.container.is_empty() { kind.to_string() } else { format!("{kind} in {}", symbol.container) };
+                hits.push(Hit {
+                    path: symbol.path.strip_prefix(&root).unwrap_or(&symbol.path).to_string_lossy().into_owned(),
+                    line: symbol.line + 1,
+                    col: symbol.col,
+                    text: format!("{}{DETAIL}{}", symbol.name, detail.trim()),
+                    ranges: Vec::new(),
+                });
+            }
+        }
+        // The project's own before what its libraries declare.
+        hits.sort_by_key(|hit| std::path::Path::new(&hit.path).is_absolute());
+        if hits.is_empty() {
+            let all = declared.get_or_init(|| {
+                let mut all = Vec::new();
+                for file in files.iter().take(5000) {
+                    let path = root.join(file);
+                    if std::fs::metadata(&path).map_or(true, |m| m.len() > 300_000) {
+                        continue;
+                    }
+                    let Ok(text) = std::fs::read_to_string(&path) else { continue };
+                    all.extend(outline(&path, &text).into_iter().filter_map(|item| {
+                        let (kind, name) = item.label.rsplit_once(' ')?;
+                        Some(Hit { path: file.clone(), line: item.line + 1, col: 0, text: format!("{name}{DETAIL}{kind}"), ranges: Vec::new() })
+                    }));
+                }
+                all
+            });
+            hits = crate::finder::match_symbols(all, query, LIMIT);
+        }
+        hits.truncate(LIMIT);
+        hits
+    })
 }
 
 /// The first identifier within `depth` levels, breadth first: a Kotlin or

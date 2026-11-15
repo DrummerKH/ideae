@@ -211,6 +211,7 @@ impl Render for Workspace {
                 }
             }))
             .on_action(cx.listener(|this, _: &GoToFile, window, cx| this.finder(finder::FinderKind::Files, window, cx)))
+            .on_action(cx.listener(|this, _: &GoToSymbol, window, cx| this.finder(finder::FinderKind::Symbols, window, cx)))
             // Reached when nothing inside the task holds focus (a placeholder, a list).
             .on_action(cx.listener(|this, _: &task::ToggleZoom, window, cx| {
                 if let Some(task) = this.active_view() {
@@ -231,7 +232,7 @@ impl Render for Workspace {
     }
 }
 
-actions!(ideae, [GoToFile, FindInFiles, NewTask, Quit, OpenSettings]);
+actions!(ideae, [GoToFile, GoToSymbol, FindInFiles, NewTask, Quit, OpenSettings]);
 
 impl Workspace {
     fn finder(&mut self, kind: finder::FinderKind, window: &mut Window, cx: &mut Context<Self>) {

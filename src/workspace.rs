@@ -530,6 +530,26 @@ impl Workspace {
         })
         .detach();
 
+        // Debug aid for runs nobody types in: IDEAE_KEYS="wait:8 ctrl-n g r e"
+        // presses those keys in the window, a pause where one is asked.
+        if let Ok(keys) = std::env::var("IDEAE_KEYS") {
+            // The parser keeps what it is given: once per run, it may.
+            let keys: &'static str = keys.leak();
+            cx.spawn_in(window, async move |_, cx| {
+                for key in keys.split_whitespace() {
+                    let pause = key.strip_prefix("wait:").and_then(|secs| secs.parse::<f32>().ok());
+                    cx.background_executor().timer(std::time::Duration::from_secs_f32(pause.unwrap_or(0.08))).await;
+                    if let (None, Ok(stroke)) = (pause, Keystroke::parse(key)) {
+                        let handled = cx.update(|window, cx| window.dispatch_keystroke(stroke, cx));
+                        if std::env::var_os("IDEAE_DEBUG").is_some() {
+                            eprintln!("key {key} -> {handled:?}");
+                        }
+                    }
+                }
+            })
+            .detach();
+        }
+
         if let Some(view) = this.active_view() {
             view.update(cx, |t, cx| {
                 // Debug aid for headless screenshots: IDEAE_OPEN=path:line.

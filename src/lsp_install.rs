@@ -80,6 +80,10 @@ pub fn installed(program: &str) -> Option<PathBuf> {
 /// `initializationOptions` an installed copy needs: typescript-language-server
 /// runs the TypeScript installed beside it when the project has none.
 pub fn init_options(program: &str, command: &Path) -> serde_json::Value {
+    if program == "rust-analyzer" {
+        // Go to symbol finds functions and fields too: by itself it knows only types.
+        return serde_json::json!({ "workspace": { "symbol": { "search": { "kind": "all_symbols" } } } });
+    }
     let ours = root().join(program);
     if program != "typescript-language-server" || !command.starts_with(&ours) {
         return serde_json::Value::Null;

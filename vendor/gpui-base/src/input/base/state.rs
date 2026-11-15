@@ -12405,6 +12405,47 @@ impl InputBaseState<crate::input::EditorMode> {
         cx.notify();
     }
 
+    /// ideae patch: asks the semantic tokens again, as when the language
+    /// server has learned more of the project than it knew for its last answer.
+    pub fn refresh_semantic_tokens(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.text.clone();
+        self.extras.lsp.update_semantic_tokens(&text, window, cx);
+    }
+
+    /// ideae patch: folding from the keyboard. `all` folds or opens every
+    /// range; otherwise the innermost one around the cursor that is still
+    /// open is folded, or the outermost folded one there is opened. Whether
+    /// anything changed.
+    pub fn fold(&mut self, fold: bool, all: bool, cx: &mut Context<Self>) -> bool {
+        let line = self.text.offset_to_point(self.cursor()).row;
+        let around = |range: &crate::input::FoldRange| line >= range.start_line && line <= range.end_line;
+        let starts: Vec<usize> = match (fold, all) {
+            (true, true) => self.display_map.fold_candidates().iter().map(|c| c.start_line).collect(),
+            (false, true) => self.display_map.folded_ranges().iter().map(|c| c.start_line).collect(),
+            (true, false) => {
+                let folded: Vec<usize> = self.display_map.folded_ranges().iter().map(|f| f.start_line).collect();
+                let open = self.display_map.fold_candidates().iter().filter(|c| around(c) && !folded.contains(&c.start_line));
+                open.max_by_key(|c| c.start_line).map(|c| c.start_line).into_iter().collect()
+            }
+            (false, false) => {
+                let folded = self.display_map.folded_ranges().iter().filter(|f| around(f));
+                folded.min_by_key(|f| f.start_line).map(|f| f.start_line).into_iter().collect()
+            }
+        };
+        for start in &starts {
+            self.display_map.set_folded(*start, fold);
+        }
+        if fold && !all {
+            // The cursor would be on a hidden line: it goes to the line that stays.
+            if let Some(start) = starts.first().filter(|start| **start < line) {
+                let end = self.text.line_end_offset(*start);
+                self.move_to(end, None, cx);
+            }
+        }
+        cx.notify();
+        !starts.is_empty()
+    }
+
     /// Unfold any folded ranges that hide the given position.
     ///
     /// Use this to reveal a position before acting on it (e.g. before

@@ -164,6 +164,12 @@ impl DisplayMap {
         self.fold_map.folded_ranges()
     }
 
+    /// ideae patch: what can be folded, for folding from the keyboard.
+    #[inline]
+    pub fn fold_candidates(&self) -> &[FoldRange] {
+        self.fold_map.fold_candidates()
+    }
+
     /// Clear all folds
     pub fn clear_folds(&mut self) {
         self.fold_map.clear_folds();

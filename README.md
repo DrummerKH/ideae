@@ -60,7 +60,12 @@ Windows build exists and is being tried out (see [Windows](#windows)).
   added, blue by those changed, red where some are gone. With a language
   server the editor also completes as you type, underlines what the server
   finds wrong, offers its fixes (Alt+Enter), renames a symbol everywhere
-  (Shift+F6) and reformats the file (Ctrl+Alt+L). Markdown has a Preview
+  (Shift+F6) and reformats the file (Ctrl+Alt+L); names are colored by
+  what the server knows them to be, Ctrl+P shows the parameters of the call
+  being written, and Ctrl+N goes to a class, function or type anywhere in
+  the project (without a server, to what the grammars find declared).
+  Blocks fold from the gutter and with Ctrl+− / Ctrl+=, all of them with
+  Shift. Markdown has a Preview
   in its header.
 - **Git.** Changes with stage/unstage/discard, commit, push, PR (`gh`), the
   branch against its base, history, safe pull. Each hunk of a diff can be

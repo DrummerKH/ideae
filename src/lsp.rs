@@ -33,6 +33,89 @@ struct ImportState {
     failed: Option<String>,
 }
 
+/// The kinds of names a server tells apart, and the theme's name for the
+/// color of each. Only what a grammar cannot know: whether a name is a
+/// type, a parameter, a method. Strings, comments and keywords stay the
+/// grammar's, which sees more in them (escapes, doc comments).
+const SEMANTIC_TYPES: [(&str, &str); 16] = [
+    ("namespace", ""),
+    ("type", "type"),
+    ("class", "type"),
+    ("struct", "type"),
+    ("interface", "type"),
+    ("typeParameter", "type"),
+    ("enum", "enum"),
+    ("enumMember", "constant"),
+    ("parameter", "variable.special"),
+    ("variable", "variable"),
+    ("property", "property"),
+    ("function", "function"),
+    ("method", "function"),
+    ("macro", "preproc"),
+    ("decorator", "attribute"),
+    ("event", "property"),
+];
+
+/// The signature of the call being written, and where in it the parameter
+/// the cursor is at stands.
+pub fn signature_shown(help: &lsp_types::SignatureHelp) -> Option<(String, Option<std::ops::Range<usize>>)> {
+    let signature = help.signatures.get(help.active_signature.unwrap_or(0) as usize).or(help.signatures.first())?;
+    let active = signature.active_parameter.or(help.active_parameter).unwrap_or(0) as usize;
+    let label = &signature.label;
+    let range = signature.parameters.as_ref().and_then(|all| all.get(active)).and_then(|parameter| match &parameter.label {
+        lsp_types::ParameterLabel::Simple(name) => label.find(name.as_str()).map(|start| start..start + name.len()),
+        lsp_types::ParameterLabel::LabelOffsets([start, end]) => {
+            // Counted in UTF-16 units, as the protocol does.
+            let byte = |units: u32| {
+                let mut seen = 0;
+                label.char_indices().find(|(_, c)| {
+                    let here = seen >= units;
+                    seen += c.len_utf16() as u32;
+                    here
+                })
+                .map_or(label.len(), |(at, _)| at)
+            };
+            Some(byte(*start)..byte(*end))
+        }
+    });
+    Some((label.clone(), range.filter(|r| r.start < r.end)))
+}
+
+/// What a declaration is, from LSP's SymbolKind.
+pub fn symbol_kind(kind: u32) -> &'static str {
+    match kind {
+        2 => "module",
+        3 => "namespace",
+        4 => "package",
+        5 => "class",
+        6 => "method",
+        7 => "property",
+        8 => "field",
+        9 => "constructor",
+        10 => "enum",
+        11 => "interface",
+        12 => "function",
+        13 => "variable",
+        14 => "constant",
+        22 => "enum member",
+        23 => "struct",
+        26 => "type parameter",
+        _ => "",
+    }
+}
+
+/// A declaration somewhere in the project, as `workspace/symbol` names it.
+#[derive(Clone, Debug)]
+pub struct Symbol {
+    pub name: String,
+    /// LSP's SymbolKind: 5 a class, 12 a function, 23 a struct.
+    pub kind: u32,
+    pub container: String,
+    pub path: PathBuf,
+    pub line: u32,
+    pub col: u32,
+}
+
 pub struct LspClient {
     stdin: Arc<Mutex<ChildStdin>>,
     pending: Pending,
@@ -407,8 +490,28 @@ impl LspClient {
                         },
                         "rename": {},
                         "formatting": {},
+                        "signatureHelp": {
+                            "signatureInformation": {
+                                "documentationFormat": ["plaintext", "markdown"],
+                                "parameterInformation": { "labelOffsetSupport": true },
+                                "activeParameterSupport": true,
+                            },
+                        },
+                        "semanticTokens": {
+                            "requests": { "range": true, "full": true },
+                            "tokenTypes": SEMANTIC_TYPES.map(|(name, _)| name),
+                            "tokenModifiers": [],
+                            "formats": ["relative"],
+                            "overlappingTokenSupport": false,
+                            "multilineTokenSupport": false,
+                        },
                     },
-                    "workspace": { "workspaceFolders": true, "configuration": true, "workspaceEdit": { "documentChanges": true } },
+                    "workspace": {
+                        "workspaceFolders": true,
+                        "configuration": true,
+                        "workspaceEdit": { "documentChanges": true },
+                        "symbol": {},
+                    },
                     "window": { "workDoneProgress": true },
                 },
             }),
@@ -602,6 +705,64 @@ impl LspClient {
     pub fn resolve_code_action(&self, action: &lsp_types::CodeAction) -> Result<lsp_types::CodeAction> {
         self.wait_ready()?;
         Ok(serde_json::from_value(self.raw_request("codeAction/resolve", serde_json::to_value(action)?)?)?)
+    }
+
+    /// workspace/symbol: what the project declares under a name like `query`.
+    pub fn workspace_symbols(&self, query: &str) -> Result<Vec<Symbol>> {
+        self.wait_ready()?;
+        let value = self.raw_request("workspace/symbol", json!({ "query": query }))?;
+        let found = value.as_array().map(Vec::as_slice).unwrap_or_default();
+        Ok(found
+            .iter()
+            .filter_map(|symbol| {
+                let location = &symbol["location"];
+                Some(Symbol {
+                    name: symbol["name"].as_str()?.to_string(),
+                    kind: symbol["kind"].as_u64().unwrap_or(0) as u32,
+                    container: symbol["containerName"].as_str().unwrap_or_default().to_string(),
+                    path: uri_to_path(location["uri"].as_str()?)?,
+                    line: location["range"]["start"]["line"].as_u64().unwrap_or(0) as u32,
+                    col: location["range"]["start"]["character"].as_u64().unwrap_or(0) as u32,
+                })
+            })
+            .collect())
+    }
+
+    /// textDocument/signatureHelp: the call the position is in, its
+    /// parameters and which of them is being written.
+    pub fn signature_help(&self, uri: &str, pos: lsp_types::Position) -> Result<Option<lsp_types::SignatureHelp>> {
+        self.wait_ready()?;
+        Ok(serde_json::from_value(self.raw_request("textDocument/signatureHelp", position_params(uri, pos))?)?)
+    }
+
+    /// The server's token types, each under the name the editor's theme
+    /// colors it by; empty for those left to the grammar, and no types at
+    /// all when the server has no semantic tokens to give.
+    pub fn semantic_legend(&self) -> Vec<String> {
+        let capabilities = self.capabilities.lock().unwrap();
+        let themed = |name: &str| SEMANTIC_TYPES.iter().find(|(lsp, _)| *lsp == name).map_or("", |(_, theme)| theme).to_string();
+        capabilities["semanticTokensProvider"]["legend"]["tokenTypes"]
+            .as_array()
+            .map(|types| types.iter().map(|t| themed(t.as_str().unwrap_or_default())).collect())
+            .unwrap_or_default()
+    }
+
+    /// textDocument/semanticTokens: what each name in a range is, as the
+    /// server knows it and a grammar cannot. For the whole file where the
+    /// server answers only for that.
+    pub fn semantic_tokens(&self, uri: &str, range: lsp_types::Range) -> Result<lsp_types::SemanticTokens> {
+        self.wait_ready()?;
+        let ranged = {
+            let capabilities = self.capabilities.lock().unwrap();
+            let range = &capabilities["semanticTokensProvider"]["range"];
+            range.as_bool().unwrap_or(range.is_object())
+        };
+        let value = if ranged {
+            self.raw_request("textDocument/semanticTokens/range", json!({ "textDocument": { "uri": uri }, "range": range }))?
+        } else {
+            self.raw_request("textDocument/semanticTokens/full", json!({ "textDocument": { "uri": uri } }))?
+        };
+        Ok(serde_json::from_value::<Option<lsp_types::SemanticTokens>>(value)?.unwrap_or_default())
     }
 
     /// textDocument/rename: every edit that gives the symbol its new name.
@@ -914,6 +1075,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_parameter_being_written_is_found_in_the_signature() {
+        let help = |label: &str, parameters: Vec<lsp_types::ParameterLabel>, active: u32| lsp_types::SignatureHelp {
+            signatures: vec![lsp_types::SignatureInformation {
+                label: label.into(),
+                documentation: None,
+                parameters: Some(parameters.into_iter().map(|label| lsp_types::ParameterInformation { label, documentation: None }).collect()),
+                active_parameter: None,
+            }],
+            active_signature: Some(0),
+            active_parameter: Some(active),
+        };
+        let offsets = |start, end| lsp_types::ParameterLabel::LabelOffsets([start, end]);
+        let (label, range) = signature_shown(&help("fn put(key: &str, value: u32)", vec![offsets(7, 16), offsets(18, 28)], 1)).unwrap();
+        assert_eq!(&label[range.unwrap()], "value: u32");
+        // Offsets are in UTF-16 units: `é` is one, two bytes.
+        let (label, range) = signature_shown(&help("fn é(a: u8, b: u8)", vec![offsets(5, 10), offsets(12, 17)], 1)).unwrap();
+        assert_eq!(&label[range.unwrap()], "b: u8");
+        let named = lsp_types::ParameterLabel::Simple("b int".into());
+        let (label, range) = signature_shown(&help("func f(a int, b int)", vec![lsp_types::ParameterLabel::Simple("a int".into()), named], 1)).unwrap();
+        assert_eq!(&label[range.unwrap()], "b int");
+        assert_eq!(signature_shown(&help("fn none()", vec![], 0)).unwrap().1, None);
+    }
+
+    #[test]
     fn edits_apply_from_the_end() {
         let at = |line: u32, from: u32, to: u32, new: &str| lsp_types::TextEdit {
             range: lsp_types::Range::new(lsp_types::Position::new(line, from), lsp_types::Position::new(line, to)),
@@ -1030,6 +1215,21 @@ mod tests {
             None => client.resolve_code_action(&actions[0]).unwrap(),
         };
         assert!(action.edit.is_some(), "{action:?}");
+
+        let found = client.workspace_symbols("greet").unwrap();
+        assert!(found.iter().any(|s| s.name == "greeting" && s.kind == 12 && s.line == 0), "{found:?}");
+        let typed = text.replace("greeting();", "greeting(");
+        client.did_change(&file, 0, &typed).unwrap();
+        let help = client.signature_help(&uri, lsp_types::Position::new(5, 31)).unwrap().expect("inside a call");
+        assert!(help.signatures[0].label.contains("fn greeting() -> String"), "{help:?}");
+        client.did_change(&file, 0, text).unwrap();
+        let legend = client.semantic_legend();
+        assert!(legend.iter().any(|name| name == "function"), "{legend:?}");
+        let all = lsp_types::Range::new(lsp_types::Position::new(0, 0), lsp_types::Position::new(9, 0));
+        let tokens = client.semantic_tokens(&uri, all).unwrap();
+        // `fn greeting`: the first token named is the function, at 0:3.
+        let first = tokens.data.iter().find(|t| legend[t.token_type as usize] == "function").unwrap();
+        assert_eq!((first.delta_start, first.length), (3, 8));
         let _ = std::fs::remove_dir_all(&root);
     }
 
