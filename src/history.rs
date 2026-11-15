@@ -24,6 +24,8 @@ pub struct HistoryView {
     first_lines: Rc<std::collections::HashMap<String, u32>>,
     scroll: UniformListScrollHandle,
     task: WeakEntity<TaskView>,
+    /// HEAD moved since the commits were read.
+    stale: bool,
     _load: Task<()>,
     _show: Task<()>,
 }
@@ -45,6 +47,7 @@ impl HistoryView {
             first_lines: Rc::default(),
             scroll: UniformListScrollHandle::new(),
             task,
+            stale: false,
             _load: Task::ready(()),
             _show: Task::ready(()),
         }
@@ -56,6 +59,13 @@ impl HistoryView {
             return;
         }
         self.head = head.to_string();
+        // Read when the tab is drawn: every task has a history, and few are looked at.
+        self.stale = true;
+        cx.notify();
+    }
+
+    fn load(&mut self, cx: &mut Context<Self>) {
+        self.stale = false;
         let root = self.root.clone();
         self._load = cx.spawn(async move |this, cx| {
             let commits = cx.background_spawn(async move { git::history(&root, LIMIT) }).await;
@@ -197,6 +207,9 @@ impl HistoryView {
 
 impl Render for HistoryView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.stale {
+            self.load(cx);
+        }
         let commit = self.selected.and_then(|ix| self.commits.get(ix)).cloned();
         let root = self.root.clone();
         let task = self.task.clone();

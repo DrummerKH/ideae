@@ -90,7 +90,7 @@ impl Render for Workspace {
                                 .gap_3()
                                 // Not read while saving power, so not shown: its numbers would be old.
                                 .when(!lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed), |row| {
-                                    row.child(div().mr_2().child(sysmon::SysMon::render_widget(&self.sysmon, cx)))
+                                    row.child(div().mr_2().child(self.sysmon.clone()))
                                 })
                                 .children(self.render_update(cx))
                                 .children(self.render_new_build(cx))

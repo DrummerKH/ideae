@@ -452,9 +452,7 @@ impl Workspace {
             shots: Default::default(),
             reading_variants: false,
             sysmon: {
-                let mon = cx.new(crate::sysmon::SysMon::new);
-                cx.observe(&mon, |_, _, cx| cx.notify()).detach();
-                mon
+                cx.new(crate::sysmon::SysMon::new)
             },
             last_saved: Default::default(),
             save_seq: 0,
@@ -918,10 +916,19 @@ impl Workspace {
             .filter(|p| p.tasks.iter().filter(|t| !t.main).count() > 1)
             .flat_map(|p| p.tasks.iter().filter(|t| !t.main && t.busy.is_none()).map(|t| t.path.clone()))
             .collect();
+        // A loaded task has read its changes already: git is asked for the others.
+        let mut known = Vec::new();
+        let mut ask = Vec::new();
+        for path in due {
+            match self.find(&path).and_then(|(pi, ti)| self.projects[pi].tasks[ti].view.clone()) {
+                Some(view) => known.extend(view.read(cx).touched(cx).map(|files| (files, path))),
+                None => ask.push(path),
+            }
+        }
         cx.spawn_in(window, async move |this, cx| {
             let found = cx
                 .background_spawn(async move {
-                    due.into_iter()
+                    ask.into_iter()
                         .filter_map(|path| {
                             let base = git::base_ref(&path)?;
                             Some((git::touched_files(&path, &base)?, path))
@@ -930,7 +937,7 @@ impl Workspace {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                let touched: std::collections::HashMap<_, _> = found.into_iter().map(|(files, path)| (path, files)).collect();
+                let touched: std::collections::HashMap<_, _> = found.into_iter().chain(known).map(|(files, path)| (path, files)).collect();
                 if touched != this.touched {
                     this.touched = touched;
                     cx.notify();
@@ -1691,11 +1698,16 @@ impl Workspace {
         let more_coming = turn_over && view.read(cx).has_queued_message();
         view.update(cx, |t, cx| {
             t.set_agent_status(status.clone(), seen, cx);
+            let before = t.agent_shown();
             t.follow_agent(&event.event, event.file.as_deref());
             match event.event.as_str() {
                 "PreToolUse" => t.agent_activity = event.message.clone(),
                 "UserPromptSubmit" => t.agent_activity = Some("Thinking".into()),
                 _ => {}
+            }
+            if t.agent_shown() != before {
+                cx.emit(TaskEvent::Changed);
+                cx.notify();
             }
             if turn_over && !event.replayed {
                 t.deliver_queued(window, cx);
@@ -1737,7 +1749,10 @@ impl Workspace {
                 });
             }
         }
-        cx.notify();
+        // The rest reaches the list through the task, when it shows another way.
+        if status != was || turn_over {
+            cx.notify();
+        }
     }
 
     /// Power saving: stops every language server and starts none until

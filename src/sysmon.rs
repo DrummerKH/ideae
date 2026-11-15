@@ -635,9 +635,14 @@ impl SysMon {
         Self { snap: Rc::default(), _poll: poll }
     }
 
-    /// The title bar readout; the tooltip has the rest.
-    pub fn render_widget(mon: &Entity<SysMon>, cx: &App) -> impl IntoElement {
-        let s = mon.read(cx).snap.clone();
+}
+
+/// The title bar readout; the tooltip has the rest. A view of its own: a
+/// sample every two seconds draws these few numbers again, not the window.
+impl Render for SysMon {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let s = self.snap.clone();
+        let mon = cx.entity();
         let muted = cx.theme().muted_foreground;
         let mem_pct = if s.mem_total > 0 { 100. * s.mem_used as f32 / s.mem_total as f32 } else { 0. };
         let bar = |pct: f32, cx: &App| {
@@ -649,7 +654,7 @@ impl SysMon {
                 .bg(muted.opacity(0.25))
                 .child(div().h_full().rounded_sm().w(px(28. * pct.clamp(0., 100.) / 100.)).bg(color))
         };
-        let tip = mon.clone();
+        let tip = mon;
         h_flex()
             .id("sysmon")
             .gap_1p5()

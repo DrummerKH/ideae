@@ -102,12 +102,12 @@ const DIFF_ARGS: &[&str] = &[
 pub fn working_patch(root: &Path) -> String {
     let untracked = git(root, &["ls-files", "--others", "--exclude-standard", "-z"]).unwrap_or_default();
     let untracked: Vec<&str> = untracked.split('\0').filter(|f| !f.is_empty()).collect();
-    tracked_patch(root, "HEAD") + &new_files_patch(root, &untracked)
+    tracked_patch(root, "HEAD", false) + &new_files_patch(root, &untracked)
 }
 
 /// The tracked files of the worktree against `rev`.
-fn tracked_patch(root: &Path, rev: &str) -> String {
-    let mut args = vec!["diff", rev];
+fn tracked_patch(root: &Path, rev: &str, light: bool) -> String {
+    let mut args = light_args(light, &["diff", rev]);
     args.extend_from_slice(DIFF_ARGS);
     git(root, &args).unwrap_or_default()
 }
@@ -354,6 +354,7 @@ pub fn first_changed_lines(patch: &str) -> std::collections::HashMap<String, u32
 }
 
 /// Tracked and untracked-but-not-ignored files, relative to `root`.
+#[cfg(test)]
 pub fn files(root: &Path) -> Vec<String> {
     let out = git(root, &["ls-files", "--cached", "--others", "--exclude-standard", "-z"]).unwrap_or_default();
     let mut files: Vec<String> = out.split('\0').filter(|f| !f.is_empty()).map(str::to_string).collect();
@@ -387,10 +388,17 @@ struct Status {
     oid: String,
     states: std::collections::HashMap<String, FileState>,
     untracked: Vec<String>,
+    /// The tracked files that changed, with where a renamed one was.
+    changed: Vec<String>,
 }
 
-fn status(root: &Path) -> Status {
-    parse_status(&git(root, &["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"]).unwrap_or_default())
+/// With `light` git reads the worktree on one thread, not ten: the same
+/// answer for a sixth of the processor's time and a little more of the
+/// clock's, which is the better trade for a task nobody looks at.
+fn light_args<'a>(light: bool, args: &[&'a str]) -> Vec<&'a str> {
+    let mut all = if light { vec!["-c", "core.preloadIndex=false"] } else { Vec::new() };
+    all.extend_from_slice(args);
+    all
 }
 
 fn parse_status(out: &str) -> Status {
@@ -424,13 +432,15 @@ fn parse_status(out: &str) -> Status {
             let fields = match entry.as_bytes().first() {
                 Some(b'1') => 8,
                 Some(b'2') => {
-                    entries.next(); // the original path of a rename or copy
+                    // The original path of a rename or copy.
+                    status.changed.extend(entries.next().map(str::to_string));
                     9
                 }
                 Some(b'u') => 10,
                 _ => continue,
             };
             if let Some((x, y, path)) = changed(fields) {
+                status.changed.push(path.clone());
                 status.states.insert(path, FileState { staged: x != b'.', unstaged: y != b'.' });
             }
         }
@@ -438,9 +448,19 @@ fn parse_status(out: &str) -> Status {
     status
 }
 
+/// A file's time and size: whether it is the one seen before.
+type Stamp = Option<(std::time::SystemTime, u64)>;
+
+fn stamp(path: &Path) -> Stamp {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
 /// What a refresh need not ask git every time: where the repository keeps
-/// itself, whether it has an origin, the branch work starts from. Asked
-/// again now and then, since a remote can be added and a default changed.
+/// itself, whether it has an origin, the branch work starts from (asked
+/// again now and then, since a remote can be added and a default changed),
+/// and the answers of the last refresh that still hold, each with what it
+/// was read from.
 #[derive(Default)]
 pub struct Known {
     age: u32,
@@ -448,6 +468,31 @@ pub struct Known {
     refs: Option<PathBuf>,
     has_origin: bool,
     base: Option<String>,
+    /// The tracked files, by the index they were listed from.
+    tracked: Option<(Stamp, Vec<String>)>,
+    /// What only a new commit or a moved base changes.
+    history: Option<(HistoryKey, History)>,
+    /// What the patches last given were made of.
+    patches: Option<u64>,
+}
+
+/// HEAD, the branch compared with, and the files its ref can be in.
+#[derive(PartialEq)]
+struct HistoryKey {
+    oid: String,
+    base: Option<String>,
+    compared: Option<String>,
+    refs: Vec<Stamp>,
+}
+
+#[derive(Clone, Default)]
+struct History {
+    behind_base: u32,
+    ahead_of_base: u32,
+    last_hash: String,
+    last_subject: String,
+    /// Where the branch left the one it is compared with.
+    fork: Option<String>,
 }
 
 impl Known {
@@ -462,6 +507,31 @@ impl Known {
         }
         self.age += 1;
     }
+
+    /// The tracked files: listed again only when the index is another one.
+    fn tracked(&mut self, root: &Path) -> &[String] {
+        // Stamped before it is read: an index written meanwhile is read again next time.
+        let now = self.git_dir.as_ref().and_then(|dir| stamp(&dir.join("index")));
+        if now.is_none() || self.tracked.as_ref().is_none_or(|(seen, _)| *seen != now) {
+            let out = git(root, &["ls-files", "--cached", "-z"]).unwrap_or_default();
+            self.tracked = Some((now, out.split('\0').filter(|f| !f.is_empty()).map(str::to_string).collect()));
+        }
+        self.tracked.as_ref().map_or(&[], |(_, files)| files)
+    }
+
+    /// The files a ref named `name` can be read from, as they are now. None
+    /// where refs are not kept in files that tell (reftable): ask every time.
+    fn ref_stamps(&self, names: &[Option<&str>]) -> Option<Vec<Stamp>> {
+        let common = self.refs.as_ref()?.parent()?;
+        if common.join("reftable").exists() {
+            return None;
+        }
+        let mut stamps = vec![stamp(&common.join("packed-refs"))];
+        for name in names.iter().flatten() {
+            stamps.extend([stamp(&common.join("refs/remotes").join(name)), stamp(&common.join("refs/heads").join(name)), stamp(&common.join("refs").join(name))]);
+        }
+        Some(stamps)
+    }
 }
 
 /// All a task shows of its worktree, read in one go.
@@ -470,56 +540,128 @@ pub struct Refreshed {
     pub watch: (std::collections::BTreeSet<PathBuf>, Vec<PathBuf>),
     pub info: BranchInfo,
     pub states: std::collections::HashMap<String, FileState>,
+    /// The branch compared with.
+    pub base: Option<String>,
+    /// None when they are the ones of the refresh before.
+    pub patches: Option<Patches>,
+}
+
+pub struct Patches {
     /// The uncommitted changes, untracked files included.
     pub working: String,
-    /// The branch compared with, and the changes since it forked from it.
-    pub base: Option<String>,
+    /// The changes since the branch forked from the one compared with.
     pub branch: String,
     /// What is staged; asked for only when something is.
     pub staged: String,
 }
 
 /// `picked`: the branch to compare with when not the one work starts from.
-pub fn refresh(root: &Path, picked: Option<String>, known: &mut Known) -> Refreshed {
+/// `light`: for a task out of view, see `light_args`.
+pub fn refresh(root: &Path, picked: Option<String>, light: bool, known: &mut Known) -> Refreshed {
+    use std::hash::{Hash as _, Hasher as _};
     known.fresh(root);
-    let files = files(root);
-    let mut flat: std::collections::BTreeSet<PathBuf> = files.iter().filter_map(|file| file.rsplit_once('/')).map(|(dir, _)| root.join(dir)).collect();
+    let raw = git(root, &light_args(light, &["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"])).unwrap_or_default();
+    let Status { mut info, oid, states, untracked, changed } = parse_status(&raw);
+
+    // Every file: the tracked ones and, from the status, those that are new.
+    let mut files: Vec<String> = known.tracked(root).iter().chain(&untracked).cloned().collect();
+    files.sort();
+    files.dedup();
+    let mut flat: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+    let mut last = "";
+    for dir in files.iter().filter_map(|file| file.rsplit_once('/')).map(|(dir, _)| dir) {
+        // Sorted: a directory's files come together.
+        if dir != last {
+            flat.insert(root.join(dir));
+            last = dir;
+        }
+    }
     flat.insert(root.to_path_buf());
     flat.extend(known.git_dir.clone());
     let watch = (flat, known.refs.clone().into_iter().collect());
 
-    let Status { mut info, oid, states, untracked } = status(root);
     info.has_origin = known.has_origin;
     // Not for the base branch itself (main, tracking origin/main).
-    if let Some(base) = known.base.clone().filter(|b| b.rsplit('/').next() != Some(info.head.as_str())) {
-        info.behind_base = git(root, &["rev-list", "--count", &format!("HEAD..{base}")]).and_then(|n| n.trim().parse().ok()).unwrap_or(0);
+    let base = known.base.clone().filter(|b| b.rsplit('/').next() != Some(info.head.as_str()));
+    // On the base branch itself the comparison is the uncommitted diff again.
+    let compared = picked.or_else(|| known.base.clone().filter(|base| *base != info.head));
+    let key = known.ref_stamps(&[base.as_deref(), compared.as_deref()]).map(|refs| HistoryKey { oid: oid.clone(), base: base.clone(), compared: compared.clone(), refs });
+    let history = match (&key, &known.history) {
+        (Some(key), Some((seen, history))) if key == seen => history.clone(),
+        _ => {
+            let count = |range: String| git(root, &["rev-list", "--count", &range]).and_then(|n| n.trim().parse().ok()).unwrap_or(0);
+            let mut history = History::default();
+            if let Some(base) = &base {
+                history.behind_base = count(format!("HEAD..{base}"));
+                history.ahead_of_base = count(format!("{base}..HEAD"));
+            }
+            if let Some(last) = git(root, &["log", "-1", "--format=%h%x1f%s"]) {
+                if let Some((hash, subject)) = last.trim_end().split_once('\x1f') {
+                    (history.last_hash, history.last_subject) = (hash.to_string(), subject.to_string());
+                }
+            }
+            history.fork = compared.as_ref().and_then(|base| git(root, &["merge-base", "HEAD", base])).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            known.history = key.map(|key| (key, history.clone()));
+            history
+        }
+    };
+    if base.is_some() {
+        info.behind_base = history.behind_base;
         // Not published yet: its own commits are the ones ahead.
         if info.upstream.is_none() {
-            info.ahead = git(root, &["rev-list", "--count", &format!("{base}..HEAD")]).and_then(|n| n.trim().parse().ok()).unwrap_or(0);
+            info.ahead = history.ahead_of_base;
         }
-        info.base = Some(base);
+        info.base = base;
     }
-    if let Some(last) = git(root, &["log", "-1", "--format=%h%x1f%s"]) {
-        if let Some((hash, subject)) = last.trim_end().split_once('\x1f') {
-            info.last_hash = hash.to_string();
-            info.last_subject = subject.to_string();
-        }
+    (info.last_hash, info.last_subject) = (history.last_hash, history.last_subject);
+
+    // The patches are of what the status tells, the files it names as they
+    // are on disk, and where the branch forked: the same of all three, the
+    // same patches, and git is not asked.
+    let mut made_of = std::collections::hash_map::DefaultHasher::new();
+    (&raw, &history.fork, &compared).hash(&mut made_of);
+    for path in changed.iter().chain(&untracked) {
+        stamp(&root.join(path)).hash(&mut made_of);
     }
+    let made_of = made_of.finish();
+    let base = compared.filter(|_| history.fork.is_some());
+    if known.patches == Some(made_of) {
+        return Refreshed { files, watch, info, states, base, patches: None };
+    }
+    known.patches = Some(made_of);
 
     let untracked: Vec<&str> = untracked.iter().map(String::as_str).collect();
     let new_files = new_files_patch(root, &untracked);
-    let working = tracked_patch(root, "HEAD") + &new_files;
-    // On the base branch itself the comparison is the uncommitted diff again.
-    let base = picked.or_else(|| known.base.clone().filter(|base| *base != info.head));
-    let fork = base.as_ref().and_then(|base| git(root, &["merge-base", "HEAD", base])).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-    let (base, branch) = match fork {
+    let working = changed_patch(root, &changed, light) + &new_files;
+    let branch = match &history.fork {
         // No commit of its own yet: the same patch, not asked for twice.
-        Some(fork) if fork == oid => (base, working.clone()),
-        Some(fork) => (base, tracked_patch(root, &fork) + &new_files),
-        None => (None, String::new()),
+        Some(fork) if *fork == oid => working.clone(),
+        Some(fork) => tracked_patch(root, fork, light) + &new_files,
+        None => String::new(),
     };
     let staged = if states.values().any(|state| state.staged) { git(root, &["diff", "--cached"]).unwrap_or_default() } else { String::new() };
-    Refreshed { files, watch, info, states, working, base, branch, staged }
+    Refreshed { files, watch, info, states, base, patches: Some(Patches { working, branch, staged }) }
+}
+
+/// The most changed files `git diff` is told by name. More, and naming
+/// them costs more than it saves (and a command line has an end).
+const NAMED_PATHS: usize = 50;
+
+/// The tracked files against HEAD, when the status has told which changed:
+/// none, and git is not asked; a few, and it looks at those and not at
+/// every file of the worktree.
+fn changed_patch(root: &Path, changed: &[String], light: bool) -> String {
+    if changed.is_empty() {
+        return String::new();
+    }
+    if changed.len() > NAMED_PATHS {
+        return tracked_patch(root, "HEAD", light);
+    }
+    let mut args = vec!["--literal-pathspecs", "diff", "HEAD"];
+    args.extend_from_slice(DIFF_ARGS);
+    args.push("--");
+    args.extend(changed.iter().map(String::as_str));
+    git(root, &args).unwrap_or_default()
 }
 
 #[derive(Clone, Debug)]
@@ -702,7 +844,7 @@ pub fn touched_files(root: &Path, base: &str) -> Option<std::collections::BTreeS
     )
 }
 
-fn is_lockfile(path: &str) -> bool {
+pub fn is_lockfile(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
     name.ends_with(".lock") || matches!(name, "package-lock.json" | "pnpm-lock.yaml" | "go.sum")
 }
@@ -1442,12 +1584,12 @@ mod variant_tests {
         // Its neighbour in the same hunk is staged after it, then the first is taken out again.
         stage_change(&repo, &left[0], true).unwrap();
         assert_eq!(git(&repo, &["diff", "--cached", "--numstat"]).unwrap().trim(), "3\t1\tn.txt");
-        assert_eq!(hunks(&refresh(&repo, None, &mut Known::default()).staged).len(), 2);
+        assert_eq!(hunks(&refresh(&repo, None, false, &mut Known::default()).patches.unwrap().staged).len(), 2);
         stage_change(&repo, &found[2], false).unwrap();
         assert_eq!(git(&repo, &["diff", "--cached", "--numstat"]).unwrap().trim(), "1\t1\tn.txt", "the changed line stays staged");
         assert!(stage_change(&repo, &found[2], false).is_err(), "it is not staged any more");
         stage_change(&repo, &left[0], false).unwrap();
-        assert_eq!(refresh(&repo, None, &mut Known::default()).staged, "", "nothing staged: not asked for");
+        assert_eq!(refresh(&repo, None, false, &mut Known::default()).patches.unwrap().staged, "", "nothing staged: not asked for");
         apply_hunk(&repo, &left[0].patch, true, false).unwrap();
         assert_eq!(numbers(&repo), "1 2 3 4 5 6 six and a half 7 8 9 10 11 12 ");
         sh(&repo, "rm untracked.txt");
@@ -1525,7 +1667,8 @@ mod refresh_tests {
             head -c 700000 /dev/zero | tr '\\0' 'x' > big.txt");
         let root = base.join("a").canonicalize().unwrap();
         let mut known = Known::default();
-        let read = refresh(&root, None, &mut known);
+        let mut read = refresh(&root, None, false, &mut known);
+        let Patches { working, branch, .. } = read.patches.take().unwrap();
 
         assert_eq!((read.info.head.as_str(), read.info.base.as_deref(), read.info.has_origin, read.info.ahead), ("task", Some("origin/main"), true, 0));
         assert!(!read.info.last_hash.is_empty() && read.info.last_subject == "base");
@@ -1534,9 +1677,27 @@ mod refresh_tests {
         assert_eq!(read.watch.1, vec![root.join(".git/refs")]);
         let state = |path: &str| read.states.get(path).map(|s| (s.staged, s.unstaged));
         assert_eq!((state("f.txt"), state("src/staged.txt"), state("new one.txt")), (Some((false, true)), Some((true, false)), Some((false, true))));
-        assert_eq!((read.base.as_deref(), read.branch == read.working), (Some("origin/main"), true), "no commit of its own: one patch");
+        assert_eq!((read.base.as_deref(), branch == working), (Some("origin/main"), true), "no commit of its own: one patch");
+        assert_eq!(read.files, files(&root), "the tracked files and the new ones of the status are all of them");
 
-        let ours = DiffFile::parse(&read.working).unwrap();
+        // Nothing changed: git is not asked for the patches again, by a task in view or out of it.
+        let again = refresh(&root, None, false, &mut known);
+        assert!(again.patches.is_none() && again.files == read.files && again.info == read.info && again.states == read.states);
+        assert!(refresh(&root, None, true, &mut known).patches.is_none());
+        // The patches of a task out of view, and those of the few files named to git, are the same.
+        let light = refresh(&root, None, true, &mut Known::default()).patches.unwrap();
+        assert!(light.working == working && light.branch == branch);
+        let named = changed_patch(&root, &["f.txt".to_string(), "src/staged.txt".to_string()], false);
+        assert_eq!(named, tracked_patch(&root, "HEAD", false));
+        // A changed file changes again, the status the same: asked.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        sh(&root, "echo four >> f.txt");
+        let changed = refresh(&root, None, false, &mut known).patches.expect("another patch");
+        assert!(changed.working.contains("+four") && changed.working != working);
+        sh(&root, "printf 'one\\ntwo\\nthree\\n' > f.txt");
+        let working = refresh(&root, None, false, &mut known).patches.unwrap().working;
+
+        let ours = DiffFile::parse(&working).unwrap();
         // The same files as git makes them, one process each.
         let mut theirs = git(&root, &["diff", "HEAD"]).unwrap();
         for file in ["big.txt", "data.bin", "empty.txt", "link", "new one.txt", "run.sh", "src/tail.txt"] {
@@ -1554,18 +1715,29 @@ mod refresh_tests {
         assert_eq!((big.1, big.2), (true, 0));
         big.2 = 1;
         assert_eq!(ours, theirs);
-        assert!(read.working.len() < 10_000, "the large file is not in the patch");
-        assert_eq!(first_changed_lines(&read.working).get("new one.txt"), Some(&1));
+        assert!(working.len() < 10_000, "the large file is not in the patch");
+        assert_eq!(first_changed_lines(&working).get("new one.txt"), Some(&1));
+
+        // A renamed file, staged: named to git with where it was, it is a rename as in the whole diff.
+        sh(&root, "git mv f.txt g.txt");
+        let renamed = refresh(&root, None, false, &mut known).patches.unwrap().working;
+        assert!(renamed.contains("rename from f.txt") && renamed.starts_with(&tracked_patch(&root, "HEAD", false)));
+        sh(&root, "git mv g.txt f.txt");
 
         // A commit of its own: the branch's patch has it, the working one does not.
         sh(&root, "git commit -qm task");
-        let read = refresh(&root, None, &mut known);
-        assert_eq!(read.info.ahead, 1);
-        let (working, branch) = (DiffFile::parse(&read.working).unwrap(), DiffFile::parse(&read.branch).unwrap());
+        let mut read = refresh(&root, None, false, &mut known);
+        assert_eq!((read.info.ahead, read.info.last_subject.as_str()), (1, "task"), "the commit is seen, what was known of the one before is not kept");
+        let patches = read.patches.take().unwrap();
+        let (working, branch) = (DiffFile::parse(&patches.working).unwrap(), DiffFile::parse(&patches.branch).unwrap());
         assert!(!working.iter().any(|f| f.path().as_ref() == "src/staged.txt") && branch.iter().any(|f| f.path().as_ref() == "src/staged.txt"));
         assert!(branch.iter().any(|f| f.path().as_ref() == "new one.txt"), "untracked files are in both");
         // Compared with a branch picked by hand.
-        assert_eq!(refresh(&root, Some("main".into()), &mut known).base.as_deref(), Some("main"));
+        assert_eq!(refresh(&root, Some("main".into()), false, &mut known).base.as_deref(), Some("main"));
+        // The base moves (a fetch): how far behind it is, is counted again.
+        sh(&base, "git clone -q remote.git c 2>/dev/null; cd c; git config user.email t@t; git config user.name t; echo z > z.txt; git add z.txt; git commit -qm more; git push -q origin main");
+        sh(&root, "git fetch -q");
+        assert_eq!(refresh(&root, None, false, &mut known).info.behind_base, 1);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

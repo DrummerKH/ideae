@@ -2061,6 +2061,8 @@ pub struct TaskView {
     /// The first changed line of each file, per scope, for "open".
     uncommitted_lines: Rc<HashMap<String, u32>>,
     branch_lines: Rc<HashMap<String, u32>>,
+    /// The files the branch changed since its base, lock files aside.
+    branch_paths: Rc<BTreeSet<String>>,
     /// The single changes of each, to take back or stage one alone.
     uncommitted_hunks: Rc<Vec<git::Hunk>>,
     branch_hunks: Rc<Vec<git::Hunk>>,
@@ -2194,21 +2196,30 @@ impl TaskView {
                 let root = poll_root.clone();
                 let picked = poll_base.lock().unwrap().clone();
                 let Ok((open, open_known)) = this.update(cx, |this, cx| this.open_files_known(cx)) else { break };
-                let (read, patch, branch, staged, on_disk, now_seen, now_known) = cx
+                let Ok(light) = this.read_with(cx, |this, _| !this.visible) else { break };
+                let (read, patch, branch, shared, staged, on_disk, now_seen, now_known) = cx
                     .background_spawn(async move {
-                        let read = git::refresh(&root, picked, &mut known);
-                        // Nothing committed on the branch yet: one patch, parsed once.
-                        let same = read.branch == read.working;
-                        let patch = parse_patch(read.working.clone(), &mut seen.0);
-                        let branch = match &patch {
-                            Some(patch) if same => {
-                                seen.1 = seen.0;
-                                Some(patch.clone())
+                        let mut read = git::refresh(&root, picked, light, &mut known);
+                        // None of them when the patches are those of the refresh before.
+                        let (patch, branch, shared, staged) = match read.patches.take() {
+                            Some(git::Patches { working, branch, staged }) => {
+                                // Nothing committed on the branch yet: one patch, parsed
+                                // once and kept once (`shared`).
+                                let same = branch == working;
+                                let patch = parse_patch(working, &mut seen.0);
+                                let (branch, shared) = match &patch {
+                                    Some(_) if same => {
+                                        seen.1 = seen.0;
+                                        (None, true)
+                                    }
+                                    _ => (parse_patch(branch, &mut seen.1), false),
+                                };
+                                let staged: HashSet<(String, String)> = git::hunks(&staged).into_iter().map(|hunk| (hunk.path, hunk.changes)).collect();
+                                (patch, branch, shared, Some(staged))
                             }
-                            _ => parse_patch(read.branch.clone(), &mut seen.1),
+                            None => (None, None, false, None),
                         };
-                        let staged: HashSet<(String, String)> = git::hunks(&read.staged).into_iter().map(|hunk| (hunk.path, hunk.changes)).collect();
-                        (read, patch, branch, staged, changed_on_disk(open_known), seen, known)
+                        (read, patch, branch, shared, staged, changed_on_disk(open_known), seen, known)
                     })
                     .await;
                 let git::Refreshed { files, watch, info, states, base, .. } = read;
@@ -2227,13 +2238,13 @@ impl TaskView {
                     if let Some(patch) = patch {
                         this.apply_patch(patch, cx);
                     }
-                    if this.changes.read(cx).staged.as_ref() != &staged {
+                    if let Some(staged) = staged.filter(|staged| this.changes.read(cx).staged.as_ref() != staged) {
                         this.changes.update(cx, |changes, cx| {
                             changes.staged = Rc::new(staged);
                             cx.notify();
                         });
                     }
-                    this.apply_branch_patch(base, branch, cx);
+                    this.apply_branch_patch(base, branch, shared, cx);
                     this.apply_files(files, cx);
                     this.apply_branch(info, cx);
                     this.sync_watches(watch);
@@ -2299,6 +2310,7 @@ impl TaskView {
             branch_diff: Vec::new(),
             uncommitted_lines: Rc::default(),
             branch_lines: Rc::default(),
+            branch_paths: Rc::default(),
             uncommitted_hunks: Rc::default(),
             branch_hunks: Rc::default(),
             diff_stale: false,
@@ -3207,15 +3219,27 @@ impl TaskView {
         }
     }
 
+    /// What of the agent's work the task and its row show, to tell a report
+    /// that changes it from one that does not.
+    pub fn agent_shown(&self) -> (Option<SharedString>, Option<SharedString>, usize) {
+        (self.agent_activity.clone().map(SharedString::from), self.agent_editing.clone(), self.agent_touched.len())
+    }
+
     pub fn set_agent_status(&mut self, status: crate::agent::AgentStatus, seen: bool, cx: &mut Context<Self>) {
+        // An agent at work reports every tool it uses: drawn again only for
+        // what shows another way than before.
+        let before = (self.unseen, self.agent_activity.is_some(), self.agent_editing.is_some());
         self.unseen = status.is_attention() && !seen;
         if status != crate::agent::AgentStatus::Working {
             self.agent_activity = None;
             self.agent_editing = None;
         }
+        let changed = status != self.agent_status || before != (self.unseen, self.agent_activity.is_some(), self.agent_editing.is_some());
         self.agent_status = status;
-        cx.emit(TaskEvent::Changed);
-        cx.notify();
+        if changed {
+            cx.emit(TaskEvent::Changed);
+            cx.notify();
+        }
     }
 
     /// Keeps up with what the agent writes: `file` is what a tool call is
@@ -3250,6 +3274,12 @@ impl TaskView {
                 file.update(cx, |f, cx| f.load_blame(cx));
             }
         }
+    }
+
+    /// The files this task changed since it left its base, as its refresh
+    /// read them; None on the base branch itself.
+    pub fn touched(&self, cx: &App) -> Option<BTreeSet<String>> {
+        self.changes.read(cx).base.as_ref().map(|_| (*self.branch_paths).clone())
     }
 
     pub fn change_count(&self) -> usize {
@@ -3516,12 +3546,20 @@ impl TaskView {
     }
 
     /// The diff against `base`; `parsed` when it is another one than before.
-    fn apply_branch_patch(&mut self, base: Option<String>, parsed: Option<ParsedPatch>, cx: &mut Context<Self>) {
+    /// `shared`: the branch has no commit of its own, and its diff is the
+    /// uncommitted one just applied, kept once for both.
+    fn apply_branch_patch(&mut self, base: Option<String>, parsed: Option<ParsedPatch>, shared: bool, cx: &mut Context<Self>) {
         let base_changed = self.changes.read(cx).base != base;
-        if parsed.is_none() && !base_changed {
+        if parsed.is_none() && !shared && !base_changed {
             return;
         }
-        if let Some(parsed) = parsed {
+        let paths = |files: &[DiffFile]| Rc::new(files.iter().map(|f| f.path().to_string()).filter(|path| !git::is_lockfile(path)).collect());
+        if shared {
+            self.branch_paths = paths(&self.uncommitted_diff);
+            self.branch_diff = self.uncommitted_diff.clone();
+            (self.branch_lines, self.branch_hunks) = (self.uncommitted_lines.clone(), self.uncommitted_hunks.clone());
+        } else if let Some(parsed) = parsed {
+            self.branch_paths = paths(&parsed.files);
             self.branch_diff = parsed.files;
             self.branch_lines = Rc::new(parsed.first_lines);
             self.branch_hunks = Rc::new(parsed.hunks);
@@ -5302,7 +5340,6 @@ fn build_tree(files: &[String], expanded: &HashSet<SharedString>) -> Vec<TreeIte
 }
 
 /// A `git diff` as the panels need it, made off the UI thread.
-#[derive(Clone)]
 struct ParsedPatch {
     files: Vec<DiffFile>,
     first_lines: HashMap<String, u32>,
