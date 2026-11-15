@@ -157,7 +157,20 @@ impl Bridge {
         let pid = std::process::id();
         // Agents in the daemon outlive this window, and Claude reads the
         // file again later: on unix it stays, at a path every run shares.
-        let settings = if cfg!(unix) { dir.join("hooks.json") } else { dir.join(format!("hooks-{pid}.json")) };
+        let settings = if cfg!(test) {
+            std::env::temp_dir().join(format!("ideae-test-hooks-{pid}.json"))
+        } else if let Some(state) = std::env::var_os("IDEAE_STATE") {
+            // A run with its own state (tests, experiments) must not rewrite
+            // the file the user's agents read.
+            use std::hash::{Hash as _, Hasher as _};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            state.hash(&mut h);
+            dir.join(format!("hooks-{:016x}.json", h.finish()))
+        } else if cfg!(unix) {
+            dir.join("hooks.json")
+        } else {
+            dir.join(format!("hooks-{pid}.json"))
+        };
         let (socket, socket_file, incoming) = listen(&dir, pid)?;
 
         std::thread::Builder::new().name("hook-listener".into()).spawn(move || {
@@ -171,9 +184,21 @@ impl Bridge {
             }
         })?;
 
+        let bridge = Self { socket, socket_file, settings };
+        bridge.write_settings()?;
+        Ok(bridge)
+    }
+
+    /// The hooks, and with Settings' "Agents' language servers" off, the
+    /// user's LSP plugins turned off. Agents started later read it.
+    pub fn write_settings(&self) -> std::io::Result<()> {
         let exe = std::env::current_exe()?;
-        std::fs::write(&settings, serde_json::to_vec_pretty(&hooks_settings(&exe))?)?;
-        Ok(Self { socket, socket_file, settings })
+        let mut value = hooks_settings(&exe);
+        if !crate::state::settings().agent_lsp {
+            let off: serde_json::Map<String, Value> = lsp_plugins().into_iter().map(|p| (p, Value::Bool(false))).collect();
+            value["enabledPlugins"] = Value::Object(off);
+        }
+        std::fs::write(&self.settings, serde_json::to_vec_pretty(&value)?)
     }
 
     /// The shell command for the agent tab: continue the last conversation in
@@ -247,6 +272,27 @@ fn hook_command(exe: &Path, event: &str) -> String {
     } else {
         format!("{} --hook {event}", shell_quote(&exe.display().to_string()))
     }
+}
+
+/// The LSP plugins the user's Claude Code settings enable
+/// ("rust-analyzer-lsp@claude-plugins-official" and the like).
+fn lsp_plugins() -> Vec<String> {
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(std::path::PathBuf::from);
+    let config = std::env::var_os("CLAUDE_CONFIG_DIR").map(std::path::PathBuf::from).or_else(|| home.map(|h| h.join(".claude")));
+    let Some(config) = config else { return Vec::new() };
+    let mut out = Vec::new();
+    for file in ["settings.json", "settings.local.json"] {
+        let Ok(text) = std::fs::read_to_string(config.join(file)) else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
+        if let Some(plugins) = v["enabledPlugins"].as_object() {
+            for (name, on) in plugins {
+                if on.as_bool() == Some(true) && name.split('@').next().is_some_and(|n| n.ends_with("-lsp")) && !out.contains(name) {
+                    out.push(name.clone());
+                }
+            }
+        }
+    }
+    out
 }
 
 fn hooks_settings(exe: &Path) -> Value {

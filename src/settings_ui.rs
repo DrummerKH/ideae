@@ -100,6 +100,12 @@ impl Workspace {
                                 cx,
                             ))
                             .child(row(
+                                "Agents' language servers",
+                                "Claude Code's LSP plugins, a rust-analyzer and the like per agent. Off saves much memory; agents lose go-to-definition. For agents started after Save.",
+                                toggle("agent-lsp", d.agent_lsp, |s, v| s.agent_lsp = v),
+                                cx,
+                            ))
+                            .child(row(
                                 "Notifications",
                                 "A desktop notification when an agent out of view needs you or finishes.",
                                 toggle("notifications", d.notifications, |s, v| s.notifications = v),

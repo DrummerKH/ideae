@@ -1294,6 +1294,11 @@ impl Workspace {
         let old = state::settings();
         state::set_settings(new.clone());
         self.agent = Self::agent_command(&self.agent_override, self._bridge.as_ref());
+        if old.agent_lsp != new.agent_lsp {
+            if let Some(bridge) = &self._bridge {
+                let _ = bridge.write_settings();
+            }
+        }
         if old.lsp_off != new.lsp_off {
             for view in self.views() {
                 view.update(cx, |t, cx| {

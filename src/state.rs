@@ -38,6 +38,8 @@ pub struct Settings {
     pub pr_status: bool,
     /// Release builds ask GitHub for newer releases.
     pub check_updates: bool,
+    /// Agents keep Claude Code's LSP plugins (a rust-analyzer per agent…).
+    pub agent_lsp: bool,
 }
 
 impl Default for Settings {
@@ -50,6 +52,7 @@ impl Default for Settings {
             copy_env: true,
             pr_status: true,
             check_updates: true,
+            agent_lsp: true,
         }
     }
 }
