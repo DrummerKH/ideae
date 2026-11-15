@@ -337,6 +337,8 @@ impl Finder {
             }
             FinderKind::Grep => {
                 if query.len() < 2 {
+                    // The search for what was typed before must not land after this.
+                    self._search = Task::ready(());
                     self.set_hits(Vec::new(), cx);
                     return;
                 }

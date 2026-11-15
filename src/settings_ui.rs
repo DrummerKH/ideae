@@ -106,7 +106,7 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
                 .item(switch(
                     draft,
                     "Agents' language servers",
-                    "Claude Code's LSP plugins, a rust-analyzer and the like per agent. Off saves much memory; agents lose go-to-definition. For agents started after Save.",
+                    "Claude Code's LSP plugins, a rust-analyzer and the like per agent: much memory for every agent that runs, for go-to-definition in what it reads. For agents started after Save.",
                     |s| s.agent_lsp,
                     |s, v| s.agent_lsp = v,
                 )),

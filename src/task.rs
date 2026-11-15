@@ -458,11 +458,10 @@ impl FileView {
         if self.signature.is_some() || matches!(typed, Some('(' | ',')) {
             self.parameter_info(cx);
         }
-        let dirty = !same_text(self.editor.read(cx).text(), &self.saved);
-        if dirty != self.dirty {
-            self.dirty = dirty;
-            cx.notify();
-        }
+        // Told on every change, not only when it turns dirty: the Structure
+        // panel follows the text.
+        self.dirty = !same_text(self.editor.read(cx).text(), &self.saved);
+        cx.notify();
         // Tell the language server after typing pauses, so hover and
         // definitions see the edited text. The text is taken then, not on
         // every key: it is a copy of the whole file.
@@ -736,10 +735,10 @@ impl FileView {
         self._signature = cx.spawn(async move |this, cx| {
             let uri = lsp::path_to_uri(&path);
             let help = cx
-                .background_spawn(async move {
+                .background_spawn(crate::procs::on_thread(move || {
                     client.did_change(&path, 0, &text)?;
                     client.signature_help(&uri, pos)
-                })
+                }))
                 .await;
             let shown = help.ok().flatten().and_then(|help| lsp::signature_shown(&help)).map(|(label, active)| (label, active, pos.line));
             let _ = this.update(cx, |file, cx| {
@@ -852,10 +851,10 @@ impl FileView {
         cx.spawn_in(window, async move |this, cx| {
             let uri = lsp::path_to_uri(&path);
             let answer = cx
-                .background_spawn(async move {
+                .background_spawn(crate::procs::on_thread(move || {
                     client.did_change(&path, 0, &text)?;
                     ask(&client, &uri, pos)
-                })
+                }))
                 .await;
             let _ = this.update_in(cx, |this, window, cx| match answer {
                 Ok(answer) => then(this, answer, window, cx),
@@ -1201,11 +1200,18 @@ impl CompletionProvider for LspBridge {
         cx: &mut App,
     ) -> Task<anyhow::Result<lsp_types::CompletionResponse>> {
         let pos = text.offset_to_position(offset);
-        let (client, uri, path, text) = (self.client.clone(), self.uri.clone(), self.path.clone(), text.to_string());
-        cx.background_spawn(async move {
-            // The server answers about the text it has: this one, typed a moment ago.
-            client.did_change(&path, 0, &text)?;
-            client.completion(&uri, pos, trigger.trigger_character)
+        // The rope is shared, not copied: asked on every letter, and the
+        // text is made of it where the server is told.
+        let (client, uri, path, text) = (self.client.clone(), self.uri.clone(), self.path.clone(), text.clone());
+        cx.spawn(async move |cx| {
+            // The next letter drops this before it has cost anything.
+            cx.background_executor().timer(Duration::from_millis(60)).await;
+            cx.background_spawn(crate::procs::on_thread(move || {
+                // The server answers about the text it has: this one, typed a moment ago.
+                client.did_change(&path, 0, &text.to_string())?;
+                client.completion(&uri, pos, trigger.trigger_character)
+            }))
+            .await
         })
     }
 
@@ -1229,15 +1235,15 @@ impl DocumentRangeSemanticTokensProvider for LspBridge {
         cx: &mut App,
     ) -> Task<anyhow::Result<lsp_types::SemanticTokens>> {
         let range = lsp_types::Range::new(text.offset_to_position(range.start), text.offset_to_position(range.end));
-        let (client, uri, path, text) = (self.client.clone(), self.uri.clone(), self.path.clone(), text.to_string());
-        cx.background_spawn(async move {
-            client.did_change(&path, 0, &text)?;
+        let (client, uri, path, text) = (self.client.clone(), self.uri.clone(), self.path.clone(), text.clone());
+        cx.background_spawn(crate::procs::on_thread(move || {
+            client.did_change(&path, 0, &text.to_string())?;
             let tokens = client.semantic_tokens(&uri, range);
             if std::env::var_os("IDEAE_DEBUG").is_some() {
                 eprintln!("semantic tokens {uri} -> {:?}", tokens.as_ref().map(|t| t.data.len()));
             }
             tokens
-        })
+        }))
     }
 }
 
@@ -1255,13 +1261,13 @@ impl CodeActionProvider for LspBridge {
     ) -> Task<anyhow::Result<Vec<lsp_types::CodeAction>>> {
         let (text, range) = {
             let text = state.read(cx).text();
-            (text.to_string(), lsp_types::Range::new(text.offset_to_position(range.start), text.offset_to_position(range.end)))
+            (text.clone(), lsp_types::Range::new(text.offset_to_position(range.start), text.offset_to_position(range.end)))
         };
         let (client, uri, path) = (self.client.clone(), self.uri.clone(), self.path.clone());
-        cx.background_spawn(async move {
-            client.did_change(&path, 0, &text)?;
+        cx.background_spawn(crate::procs::on_thread(move || {
+            client.did_change(&path, 0, &text.to_string())?;
             client.code_actions(&uri, range)
-        })
+        }))
     }
 
     fn perform_code_action(
@@ -1276,7 +1282,7 @@ impl CodeActionProvider for LspBridge {
         window.spawn(cx, async move |cx| {
             let action = match action.edit {
                 Some(_) => action,
-                None => cx.background_spawn(async move { client.resolve_code_action(&action) }).await?,
+                None => cx.background_spawn(crate::procs::on_thread(move || client.resolve_code_action(&action))).await?,
             };
             let Some(edit) = action.edit else { return Ok(()) };
             file.update_in(cx, |file, window, cx| {
@@ -2658,7 +2664,7 @@ impl TaskView {
             TermView::end(&view, cx);
             let env = crate::services::task_env(&self.services, self.port_slot);
             let tab = Self::make_terminal(&self.root, self.hook_socket.as_ref(), "agent", 0, Some(command), env, None, window, cx);
-            self.tabs[ix].kind = tab.kind;
+            (self.tabs[ix].kind, self.tabs[ix].shown) = (tab.kind, tab.shown);
         } else {
             let enter = if cfg!(windows) { "\r" } else { "\n" };
             view.update(cx, |v, _| v.ran = false);
@@ -3250,6 +3256,7 @@ impl TaskView {
             // What it skipped while out of view.
             let _ = self.refresh_tx.try_send(());
             self.show_diff_if_seen(cx);
+            self.fill_tree(cx);
             self.focus_active(window, cx);
             if self.right == RightPane::Run && self._listening_poll.is_none() {
                 self.refresh_services(cx);
@@ -3619,7 +3626,7 @@ impl TaskView {
     /// The Files panel's tree, built when the panel is the one shown: it
     /// holds every path again, several times over, in every open task.
     fn fill_tree(&mut self, cx: &mut Context<Self>) {
-        if self.tree_stale && self.right == RightPane::Files {
+        if self.tree_stale && self.visible && self.right == RightPane::Files {
             self.tree_stale = false;
             let items = build_tree(&self.tree_files, &self.expanded);
             self.tree.update(cx, |t, cx| t.set_items(items, cx));
@@ -6336,8 +6343,13 @@ impl TaskView {
         editor.update(cx, |state, cx| {
             let lsp = state.lsp_mut();
             if replace {
+                // All of them: one left would keep the ended server's client,
+                // and ask it on every key.
                 lsp.hover_provider = None;
                 lsp.definition_provider = None;
+                lsp.completion_provider = None;
+                lsp.code_action_providers.clear();
+                lsp.semantic_tokens_provider = None;
             }
             if lsp.definition_provider.is_none() {
                 lsp.definition_provider = Some(search);

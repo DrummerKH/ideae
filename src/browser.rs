@@ -232,12 +232,15 @@ impl Drop for OpenPage {
         if PAGES.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) != 1 {
             return;
         }
-        std::thread::spawn(|| {
+        // The idle time counts from the last page closed, not an earlier last one.
+        static CLOSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let this = CLOSED.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        std::thread::spawn(move || {
             std::thread::sleep(CHROME_IDLE);
             let Some(slot) = CHROME.get() else { return };
             let mut slot = slot.lock().unwrap();
             // Under the lock a new page waits for: it finds Chrome there, or starts one.
-            if PAGES.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            if PAGES.load(std::sync::atomic::Ordering::SeqCst) == 0 && CLOSED.load(std::sync::atomic::Ordering::SeqCst) == this {
                 PORT.store(0, std::sync::atomic::Ordering::Relaxed);
                 *slot = None;
             }
@@ -333,6 +336,7 @@ fn run_page(url: &str, in_tx: &async_channel::Sender<In>, out_rx: mpsc::Receiver
 /// load and a moment more, for what it draws once loaded. Not for the UI
 /// thread.
 pub fn shot(url: &str, width: u32, height: u32, out: &std::path::Path) -> Result<()> {
+    let _open = OpenPage::new();
     let chrome = chrome()?;
     let (ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{}{}", chrome.port, chrome.ws_path))?;
     let mut socket = Socket { ws, next_id: 0, session: None };
@@ -650,7 +654,9 @@ impl BrowserView {
             self.sent_size.set((0, 0, 0));
             self._sharpen = Task::ready(());
             if let Some(old) = self.frame.take() {
-                cx.drop_image(old, None);
+                // Once this update is over: a window in the middle of one is
+                // passed over, and its texture of the frame would stay.
+                cx.defer(move |cx| cx.drop_image(old, None));
             }
         }
         cx.notify();

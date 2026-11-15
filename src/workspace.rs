@@ -1591,6 +1591,7 @@ impl Workspace {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
+                let restoring = this.restoring.clone();
                 for (worktrees, repo) in lists {
                     let Some(p) = this.projects.iter_mut().find(|p| p.path == repo) else { continue };
                     // Not readable now (unmounted, git missing): leave it be.
@@ -1628,8 +1629,10 @@ impl Workspace {
                     if let Some(main) = p.tasks.iter_mut().find(|t| t.main) {
                         main.branch = worktrees[0].branch.clone();
                     }
+                    // One of the last run not loaded yet is as good as loaded:
+                    // dropped here, its terminals would be ended as nobody's.
                     p.tasks.retain(|t| {
-                        t.main || t.busy.is_some() || t.view.is_some() || worktrees.iter().any(|w| w.path == t.path)
+                        t.main || t.busy.is_some() || t.view.is_some() || restoring.contains(&t.path) || worktrees.iter().any(|w| w.path == t.path)
                     });
                 }
                 this.dissolve_lonely_groups();

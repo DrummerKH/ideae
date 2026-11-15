@@ -67,7 +67,7 @@ impl Default for Settings {
             check_updates: true,
             hump_words: false,
             gutter_since_base: false,
-            agent_lsp: true,
+            agent_lsp: false,
             keys: std::collections::BTreeMap::new(),
         }
     }
