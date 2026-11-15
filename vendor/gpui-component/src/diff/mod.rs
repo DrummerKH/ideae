@@ -227,6 +227,7 @@ pub struct Diff {
     change_indicator: DiffChangeIndicator,
     change_background: bool,
     soft_wrap: bool,
+    code_font_size: Option<Pixels>,
     header: HeaderSlots,
     annotations: Rc<Annotations>,
     annotation_content: Option<AnnotationRenderer>,
@@ -256,6 +257,7 @@ impl Diff {
             change_indicator: DiffChangeIndicator::default(),
             change_background: true,
             soft_wrap: false,
+            code_font_size: None,
             header: HeaderSlots::default(),
             annotations: Rc::default(),
             annotation_content: None,
@@ -303,6 +305,12 @@ impl Diff {
     /// Default is false.
     pub fn soft_wrap(mut self, value: bool) -> Self {
         self.soft_wrap = value;
+        self
+    }
+    /// ideae patch: draws code at this size instead of the theme's `mono_font_size`,
+    /// scaled by the rem size as the theme's is.
+    pub fn code_font_size(mut self, size: Pixels) -> Self {
+        self.code_font_size = Some(size);
         self
     }
     /// Supplies annotations with stable identities and targets.
@@ -469,7 +477,8 @@ fn render_diff(
     state.set_window(window.window_handle().window_id());
     state.ensure_presentation(cx);
     let rem = window.rem_size();
-    let font_size = rem * (f32::from(cx.theme().mono_font_size) / 16.);
+    let code_size = props.code_font_size.unwrap_or(cx.theme().mono_font_size);
+    let font_size = rem * (f32::from(code_size) / 16.);
     let font_family = cx.theme().mono_font_family.clone();
     let row_height = font_size * 1.6;
     let digits = state

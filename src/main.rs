@@ -16,6 +16,7 @@ mod state;
 mod task;
 mod theme;
 mod workspace;
+mod zoom;
 
 use std::path::PathBuf;
 

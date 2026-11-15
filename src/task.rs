@@ -39,7 +39,26 @@ pub struct TermView {
 impl TermView {
     fn new(id: SharedString, state: Entity<TerminalState>, cx: &mut Context<Self>) -> Self {
         cx.observe(&state, |_, _, cx| cx.notify()).detach();
+        // One size for every terminal: the shared one when this one starts and
+        // whenever it changes, and this one's own zoom keys (Ctrl+=) set it.
+        Self::follow_zoom(&state, cx);
+        cx.observe_global::<crate::zoom::Zoom>(|this, cx| Self::follow_zoom(&this.state, cx)).detach();
+        cx.subscribe(&state, |_, state, event: &TerminalEvent, cx| {
+            if let TerminalEvent::FontSizeChanged = event {
+                let size = f32::from(state.read(cx).font_size(cx));
+                crate::zoom::set(crate::zoom::Kind::Terminal, Some(size), cx);
+            }
+        })
+        .detach();
         Self { id, state }
+    }
+
+    fn follow_zoom(state: &Entity<TerminalState>, cx: &mut App) {
+        let size = crate::zoom::current(cx).terminal;
+        state.update(cx, |state, cx| match size {
+            Some(size) => state.set_font_size(px(size), cx),
+            None => state.reset_font_size(cx),
+        });
     }
 }
 
@@ -48,6 +67,7 @@ impl Render for TermView {
         let highlight = cx.theme().primary.opacity(0.15);
         div()
             .id("terminal-drop")
+            .relative()
             .size_full()
             // Files dropped from a file manager: their paths, typed in as text.
             .drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(highlight))
@@ -57,6 +77,7 @@ impl Render for TermView {
                 this.state.update(cx, |s, cx| s.paste_text(format!("{text} "), cx));
                 this.state.read(cx).focus_handle().clone().focus(window, cx);
             }))
+            .child(crate::zoom::wheel(crate::zoom::Kind::Terminal))
             .child(Terminal::new(self.id.clone(), &self.state))
     }
 }
@@ -421,7 +442,7 @@ impl Render for FileView {
                 this.child(div().px_3().py_1().text_xs().text_color(gpui_kit::red()).child(error))
             })
             .child(
-                div().flex_1().min_h_0().child(
+                div().relative().flex_1().min_h_0().child(crate::zoom::wheel(crate::zoom::Kind::Editor)).child(
                     Editor::new(&self.editor)
                         // Replaces the built-in menu, so its items are listed again.
                         .context_menu(|menu, _, _| {
@@ -442,7 +463,7 @@ impl Render for FileView {
                         .p_0()
                         .h_full()
                         .font_family(cx.theme().mono_font_family.clone())
-                        .text_size(cx.theme().mono_font_size),
+                        .text_size(crate::zoom::size(crate::zoom::Kind::Editor, cx)),
                 ),
             )
     }
@@ -667,7 +688,8 @@ impl Render for ChangesView {
                             .child("Ctrl+click a line to open the file there"),
                     ),
             )
-            .child(div().id("changes-diff").flex_1().min_h_0()
+            .child(div().id("changes-diff").relative().flex_1().min_h_0()
+                .child(crate::zoom::wheel(crate::zoom::Kind::Changes))
                 .on_action(cx.listener(|this, _: &SendDiffToAgent, window, cx| this.send_selection(window, cx)))
                 .context_menu(|menu, _, _| menu.menu("Send selected lines to Agent", Box::new(SendDiffToAgent)))
                 .map(|this| {
@@ -680,6 +702,7 @@ impl Render for ChangesView {
                 } else {
                     this.child(
                         Diff::new(&self.diff)
+                            .code_font_size(crate::zoom::size(crate::zoom::Kind::Changes, cx))
                             .line_number(true)
                             .render_header_suffix({
                                 let (root, task, lines) = (self.root.clone(), self.task.clone(), self.first_lines.clone());

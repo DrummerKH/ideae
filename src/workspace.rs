@@ -94,6 +94,7 @@ impl Workspace {
         if let Some(width) = saved.side_panel_width {
             cx.set_global(SidePanelWidth(px(width)));
         }
+        crate::zoom::init(saved.zoom, cx);
 
         let (hook_tx, hook_rx) = async_channel::unbounded::<agent::HookEvent>();
         let bridge = agent::Bridge::start(move |event| {
@@ -297,6 +298,7 @@ impl Workspace {
             side_panel_width: cx.try_global::<SidePanelWidth>().map(|w| f32::from(w.0)),
             active_collapsed: self.active_collapsed,
             active_task: self.active.clone(),
+            zoom: crate::zoom::current(cx),
             projects: self
                 .projects
                 .iter()

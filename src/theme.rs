@@ -1,4 +1,4 @@
-//! Ayu for the UI and the terminals, light/dark/auto.
+//! Ayu for the UI and the terminals, light/dark/auto; Fira Code for code.
 
 use gpui_cn::terminal::TerminalColors;
 use gpui_kit::component::{Theme, ThemeMode, ThemeRegistry};
@@ -44,8 +44,27 @@ impl Appearance {
     }
 }
 
-/// Registers Ayu as the light and dark theme.
+/// The code font of the editor, diffs and lists of code; terminals keep
+/// gpui-cn's JetBrains Mono, which they draw without ligatures anyway.
+/// Embedded (SIL OFL 1.1, `assets/fonts/OFL-FiraCode.txt`), so the machine
+/// need not have it. Ligatures are on: GPUI shapes with `calt` by default.
+pub const CODE_FONT: &str = "Fira Code";
+
+fn register_code_font(cx: &mut App) {
+    use std::borrow::Cow;
+    let fonts = vec![
+        Cow::Borrowed(include_bytes!("../assets/fonts/FiraCode-Regular.ttf").as_slice()),
+        Cow::Borrowed(include_bytes!("../assets/fonts/FiraCode-Bold.ttf").as_slice()),
+    ];
+    match cx.text_system().add_fonts(fonts) {
+        Ok(()) => Theme::global_mut(cx).mono_font_family = CODE_FONT.into(),
+        Err(error) => eprintln!("{CODE_FONT}: {error:#}"),
+    }
+}
+
+/// Registers Ayu as the light and dark theme, and the code font.
 pub fn init(cx: &mut App) {
+    register_code_font(cx);
     if let Err(error) = ThemeRegistry::global_mut(cx).load_themes_from_str(include_str!("../themes/ayu.json")) {
         eprintln!("ayu theme: {error:#}");
         return;

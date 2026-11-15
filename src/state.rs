@@ -13,6 +13,8 @@ pub struct State {
     pub side_panel_width: Option<f32>,
     pub active_collapsed: bool,
     pub active_task: Option<PathBuf>,
+    /// Text size per kind of view.
+    pub zoom: crate::zoom::Zoom,
     pub projects: Vec<ProjectState>,
 }
 
