@@ -2530,7 +2530,17 @@ impl TaskView {
             Ok(server) => server,
             Err(reason) => return set_status(file, Some(false), reason, cx),
         };
-        let project = lsp::project_root(program, path, &self.root);
+        let project = if path.starts_with(&self.root) {
+            lsp::project_root(program, path, &self.root)
+        } else {
+            // A library file (std, the registry, a jump target): the task's own
+            // server for the language reads it; one more would index it all again.
+            self.lsp
+                .keys()
+                .find(|(p, _)| *p == program)
+                .map(|(_, root)| root.clone())
+                .unwrap_or_else(|| lsp::project_root(program, &self.root.join("_"), &self.root))
+        };
         let key = (program, project.clone());
         let client = match self.lsp.get(&key) {
             Some(client) => client.clone(),

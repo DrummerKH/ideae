@@ -115,7 +115,9 @@ pub fn on_path(program: &str) -> bool {
 
 /// The directory a server should treat as its workspace: the nearest ancestor
 /// of `file` holding one of the server's project markers, no higher than
-/// `limit`. A monorepo root is rarely what rust-analyzer or tsserver want.
+/// `limit`. A monorepo root is rarely what tsserver wants. Rust takes the
+/// outermost crate instead: its server covers the path dependencies (vendored
+/// crates) too, and each extra rust-analyzer costs gigabytes.
 pub fn project_root(program: &str, file: &Path, limit: &Path) -> PathBuf {
     let markers: &[&str] = match program {
         "gopls" => &["go.work", "go.mod"],
@@ -125,17 +127,22 @@ pub fn project_root(program: &str, file: &Path, limit: &Path) -> PathBuf {
         "kotlin-lsp" => &["settings.gradle.kts", "settings.gradle"],
         _ => &[],
     };
+    let outermost = program == "rust-analyzer";
+    let mut found = None;
     let mut dir = file.parent();
     while let Some(d) = dir {
         if markers.iter().any(|m| d.join(m).is_file()) {
-            return d.to_path_buf();
+            found = Some(d.to_path_buf());
+            if !outermost {
+                break;
+            }
         }
         if d == limit {
             break;
         }
         dir = d.parent();
     }
-    limit.to_path_buf()
+    found.unwrap_or_else(|| limit.to_path_buf())
 }
 
 /// Highlighter language name for the editor, the same table gpui-kit's diff
@@ -547,6 +554,29 @@ fn read_loop(stdout: impl Read, stdin: Arc<Mutex<ChildStdin>>, pending: Pending,
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod root_tests {
+    use super::project_root;
+    use std::path::Path;
+
+    #[test]
+    fn rust_takes_the_outermost_crate() {
+        let base = std::env::temp_dir().join(format!("ideae-root-{}", std::process::id()));
+        let vendored = base.join("vendor/dep/src");
+        std::fs::create_dir_all(&vendored).unwrap();
+        std::fs::write(base.join("Cargo.toml"), "").unwrap();
+        std::fs::write(base.join("vendor/dep/Cargo.toml"), "").unwrap();
+        std::fs::create_dir_all(base.join("web")).unwrap();
+        std::fs::write(base.join("package.json"), "").unwrap();
+        std::fs::write(base.join("web/package.json"), "").unwrap();
+        let file = vendored.join("lib.rs");
+        assert_eq!(project_root("rust-analyzer", &file, &base), base);
+        assert_eq!(project_root("typescript-language-server", &base.join("web/a.ts"), &base), base.join("web"));
+        assert_eq!(project_root("rust-analyzer", &base.join("_"), Path::new(&base)), base);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
 
