@@ -113,6 +113,12 @@ pub struct Run {
     pub output: String,
     /// More of it, for the judge: a failing test is named above the end.
     log: String,
+    /// For the judge: what its verdicts on this group took in all, and how
+    /// many it has given.
+    #[serde(default)]
+    pub tokens: u64,
+    #[serde(default)]
+    pub asked: u32,
 }
 
 /// The check that runs: its group, its process, and what drives it.
@@ -134,7 +140,7 @@ impl Run {
     }
 
     fn new(what: &str, state: RunState) -> Self {
-        Self { what: what.to_string(), state, seconds: 0., output: String::new(), log: String::new() }
+        Self { what: what.to_string(), state, seconds: 0., output: String::new(), log: String::new(), tokens: 0, asked: 0 }
     }
 
     /// "passed in 12.4 s", "failed with exit 1 after 8.1 s".
@@ -296,7 +302,8 @@ fn judge_can(agent: &str) -> bool {
 fn judge_command(agent: &str, folders: &[PathBuf]) -> String {
     let quote = |text: &str| if cfg!(windows) { format!("\"{text}\"") } else { format!("'{}'", text.replace('\'', r"'\''")) };
     let words: Vec<&str> = agent.split_whitespace().collect();
-    let mut line = format!("{} -p --no-session-persistence --tools {}", quote(words.first().copied().unwrap_or("claude")), quote("Read,Grep,Glob"));
+    // As JSON: with the answer comes what it took.
+    let mut line = format!("{} -p --no-session-persistence --output-format json --tools {}", quote(words.first().copied().unwrap_or("claude")), quote("Read,Grep,Glob"));
     if let Some(model) = words.iter().position(|w| *w == "--model").and_then(|at| words.get(at + 1)) {
         line.push_str(&format!(" --model {}", quote(model)));
     }
@@ -304,6 +311,15 @@ fn judge_command(agent: &str, folders: &[PathBuf]) -> String {
         line.push_str(&format!(" --add-dir {}", quote(&folder.to_string_lossy())));
     }
     line
+}
+
+/// The judge's answer and the tokens it took, of what `claude -p
+/// --output-format json` prints; what is no such thing is the answer itself.
+fn judge_answer(printed: &str) -> (String, u64) {
+    let Ok(told) = serde_json::from_str::<serde_json::Value>(printed.trim()) else { return (printed.trim().to_string(), 0) };
+    let Some(answer) = told["result"].as_str() else { return (printed.trim().to_string(), 0) };
+    let used = |key: &str| told["usage"][key].as_u64().unwrap_or(0);
+    (answer.trim().to_string(), used("input_tokens") + used("cache_creation_input_tokens") + used("output_tokens"))
 }
 
 /// The letter after the judge's `KEEP:`, when it names one.
@@ -1164,7 +1180,9 @@ impl Workspace {
                 site: t.view.as_ref().filter(|v| !v.read(cx).running_services(cx).is_empty()).and_then(|v| v.read(cx).site()),
             })
             .collect();
-        self.judges.insert(group.to_string(), Run::new("", RunState::Running));
+        // What the verdicts before this one took stays counted.
+        let (tokens, asked) = self.judges.get(group).map_or((0, 0), |run| (run.tokens, run.asked));
+        self.judges.insert(group.to_string(), Run { tokens, asked, ..Run::new("", RunState::Running) });
         let (slot, socket, group) = (RunSlot::default(), self.hook_socket.clone(), group.to_string());
         let (job_slot, job_group) = (slot.clone(), group.clone());
         let task = cx.spawn_in(window, async move |this, cx| {
@@ -1205,7 +1223,9 @@ impl Workspace {
                 if this.judging.get(&job_group).is_some_and(|(slot, _)| Arc::ptr_eq(slot, &job_slot)) {
                     this.judging.remove(&job_group);
                     if let Some(run) = this.judges.get_mut(&job_group) {
-                        (run.state, run.seconds, run.output) = (state, seconds, output.trim().to_string());
+                        let (answer, took) = judge_answer(&output);
+                        (run.state, run.seconds, run.output) = (state, seconds, answer);
+                        (run.tokens, run.asked) = (run.tokens + took, run.asked + u32::from(state != RunState::Stopped));
                     }
                     for (path, picture) in pictures {
                         // Drawn again: the file is the same, what is in it is not.
@@ -1745,8 +1765,13 @@ impl Workspace {
             head.prompt.clone()
         };
         let mut about = vec![format!("{} variants", members.len()), self.projects[pi].name.clone()];
-        if used > 0 {
-            about.push(format!("{} tokens in all", tokens(used)));
+        // The judge's verdicts are part of what the task cost.
+        let (judged, asked) = self.judges.get(group).map_or((0, 0), |run| (run.tokens, run.asked));
+        if used + judged > 0 {
+            about.push(format!("{} tokens in all", tokens(used + judged)));
+        }
+        if judged > 0 {
+            about.push(format!("the judge {} of them in {asked} verdict{}", tokens(judged), if asked == 1 { "" } else { "s" }));
         }
         div()
             .id("variants")
@@ -2026,8 +2051,11 @@ pub(crate) mod tests {
         // Of the agent command, the program and the model: not what lets it act unasked or go on with a talk.
         let line = judge_command("claude --continue --model opus --permission-mode bypass", &["/w/fix a".into()]);
         if cfg!(unix) {
-            assert_eq!(line, "'claude' -p --no-session-persistence --tools 'Read,Grep,Glob' --model 'opus' --add-dir '/w/fix a'");
+            assert_eq!(line, "'claude' -p --no-session-persistence --output-format json --tools 'Read,Grep,Glob' --model 'opus' --add-dir '/w/fix a'");
         }
+        let printed = r#"{"type":"result","result":"B is the one.\n\nKEEP: B\n","usage":{"input_tokens":1200,"cache_creation_input_tokens":300,"cache_read_input_tokens":9000,"output_tokens":80}}"#;
+        assert_eq!(super::judge_answer(printed), ("B is the one.\n\nKEEP: B".to_string(), 1580), "the answer, and what it took: not what was read from the cache again");
+        assert_eq!(super::judge_answer("Plain words.\n"), ("Plain words.".to_string(), 0), "an agent that prints no JSON");
         assert_eq!(judge_pick("**KEEP: C**").as_deref(), Some("C"));
         assert_eq!(super::without_keep("B is the one.\n\nKEEP: B\n"), "B is the one.");
         assert_eq!(super::without_keep("No verdict."), "No verdict.");
