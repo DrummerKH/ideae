@@ -1042,6 +1042,34 @@ pub fn rebase_onto(root: &Path, base: &str) -> Result<String, RebaseError> {
     }
 }
 
+/// What the worktree `theirs` has that `ours` has not, in the files named:
+/// a patch as `git diff` makes one, of two folders as they are on disk,
+/// files no commit knows of among them. Files the same in both are left out.
+pub fn between(ours: &Path, theirs: &Path, files: &[String]) -> String {
+    let mut patch = String::new();
+    for file in files {
+        let (a, b) = (std::fs::read(ours.join(file)).ok(), std::fs::read(theirs.join(file)).ok());
+        if a == b {
+            continue;
+        }
+        patch.push_str(&format!("diff --git a/{file} b/{file}\n"));
+        match (&a, &b) {
+            (None, _) => patch.push_str("new file mode 100644\n"),
+            (_, None) => patch.push_str("deleted file mode 100644\n"),
+            _ => {}
+        }
+        let text = |side: &Option<Vec<u8>>| String::from_utf8(side.clone().unwrap_or_default()).ok().filter(|text| !text.contains('\0'));
+        let (Some(old), Some(new)) = (text(&a), text(&b)) else {
+            patch.push_str(&format!("Binary files a/{file} and b/{file} differ\n"));
+            continue;
+        };
+        let (from, to) = (if a.is_some() { format!("a/{file}") } else { "/dev/null".into() }, if b.is_some() { format!("b/{file}") } else { "/dev/null".into() });
+        let diff = similar::TextDiff::from_lines(&old, &new);
+        patch.push_str(&diff.unified_diff().context_radius(3).header(&from, &to).to_string());
+    }
+    patch
+}
+
 /// The files that would be left in conflict by taking in the upstream:
 /// the merge is made of trees only, nothing in the worktree or the index
 /// moves. What is not committed counts as it is on disk. None when git is
@@ -1172,7 +1200,7 @@ mod lock_tests {
 // They script repositories with bash, which Windows lacks or has as WSL's.
 #[cfg(all(test, unix))]
 mod pull_tests {
-    use super::{conflict_marked, pull_conflicts, pull_safe, working_patch};
+    use super::{between, conflict_marked, hunks, pull_conflicts, pull_safe, working_patch};
     use std::{path::Path, process::Command};
 
     fn sh(dir: &Path, script: &str) {
@@ -1224,6 +1252,28 @@ mod pull_tests {
         assert_eq!(conflict_marked(&working_patch(&b)), [("f.txt".to_string(), 2)]);
         std::fs::write(b.join("f.txt"), "one\n    let marker = \"<<<<<<< \";\n>>>>>>> alone\nthree\n").unwrap();
         assert!(conflict_marked(&working_patch(&b)).is_empty(), "a marker in code, or one without its pair, is no conflict");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Two folders compared as they are: what differs is a patch git itself
+    /// applies, what is the same in both is not in it.
+    #[test]
+    fn two_worktrees_compare_file_by_file() {
+        let base = setup("between");
+        let (a, b) = (base.join("a"), base.join("b"));
+        sh(&base, "cd a; printf 'one\\nTWO\\nthree\\n' > f.txt; echo same > s.txt; echo only-a > gone.txt
+            cd ../b; echo same > s.txt; echo new > made.txt; printf '\\000\\001' > blob.bin");
+        let files: Vec<String> = ["f.txt", "s.txt", "gone.txt", "made.txt", "blob.bin", "nowhere.txt"].map(String::from).to_vec();
+        let patch = between(&a, &b, &files);
+        assert!(!patch.contains("s.txt") && !patch.contains("nowhere.txt"), "the same in both, or in neither:\n{patch}");
+        assert!(patch.contains("Binary files a/blob.bin and b/blob.bin differ"));
+        assert_eq!(hunks(&patch).iter().map(|h| (h.path.as_str(), h.line)).collect::<Vec<_>>(), [("f.txt", 2)], "one change; whole files are no hunks");
+        // Git takes it: a's files become b's.
+        let text: String = patch.split_inclusive("diff --git ").filter(|part| !part.contains("blob.bin")).collect();
+        std::fs::write(base.join("ab.patch"), text.trim_end_matches("diff --git ")).unwrap();
+        sh(&a, "git apply ../ab.patch");
+        assert_eq!(std::fs::read_to_string(a.join("f.txt")).unwrap(), "one\ntwo\nthree\n");
+        assert!(!a.join("gone.txt").exists() && std::fs::read_to_string(a.join("made.txt")).unwrap() == "new\n");
         let _ = std::fs::remove_dir_all(&base);
     }
 

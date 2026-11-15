@@ -26,7 +26,9 @@ Windows build exists and is being tried out (see [Windows](#windows)).
   not asked in each. They show
   as one group. Its screen has, for each variant, what its agent says it
   did, what it changed and what it cost, and which variant changed which
-  file; a message goes to all of them at once. A command typed there
+  file; any two of them can be compared with each other, file by file
+  (A ↔ B), and going from one to the next keeps the file you were
+  looking at in front; a message goes to all of them at once. A command typed there
   (tests, a benchmark) runs in every variant, one after another so that
   their times compare; with Auto it runs by itself when all of them
   have finished. Then a judge, one more Claude Code run that can only
