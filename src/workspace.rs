@@ -63,9 +63,12 @@ pub struct TaskEntry {
     pub done_at: u64,
     /// The commit a variant was made from: what its diff is counted against.
     pub base: String,
+    /// A worktree an agent made for itself (side.rs), not a task of the user's.
+    pub side: Option<side::Side>,
 }
 
 pub mod present;
+pub mod side;
 pub mod spaces;
 pub mod variants;
 
@@ -161,6 +164,9 @@ pub struct Workspace {
     pub active_group: Option<String>,
     /// Groups folded in the sidebar.
     pub collapsed_groups: std::collections::HashSet<String>,
+    /// The agents' worktrees shown under a task (or a project's path, for
+    /// those in temporary places): folded until opened.
+    pub open_sides: std::collections::HashSet<PathBuf>,
     /// What the group's screen shows of each variant, by worktree path.
     pub variant_info: std::collections::HashMap<PathBuf, variants::VariantInfo>,
     /// What each task's agent has used, by worktree, with when the
@@ -462,6 +468,7 @@ impl Workspace {
             },
             active_group: None,
             collapsed_groups: Default::default(),
+            open_sides: Default::default(),
             variant_info: Default::default(),
             usage: Default::default(),
             reading_usage: false,
@@ -674,6 +681,7 @@ impl Workspace {
                     created: t.created,
                     done_at: t.done_at,
                     base: t.base.clone(),
+                    side: None,
                 })
                 .collect();
             self.projects.push(project);
@@ -811,7 +819,15 @@ impl Workspace {
         self.restoring.retain(|p| p != path);
         let socket = self.hook_socket.clone();
         let variant = self.find(path).is_some_and(|(pi, ti)| !self.projects[pi].tasks[ti].group.is_empty());
-        let agent = if variant { Self::agent_command_for(&self.agent_override, self._bridge.as_ref(), true) } else { self.agent.clone() };
+        let side = self.find(path).is_some_and(|(pi, ti)| self.projects[pi].tasks[ti].side.is_some());
+        // An agent's own worktree gets none of its own: a shell, for looking.
+        let agent = if side {
+            None
+        } else if variant {
+            Self::agent_command_for(&self.agent_override, self._bridge.as_ref(), true)
+        } else {
+            self.agent.clone()
+        };
         let entry = self.entry_mut(path)?;
         if let Some(view) = &entry.view {
             return Some(view.clone());
@@ -1721,12 +1737,32 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let lists = cx
                 .background_spawn(async move {
-                    repos.into_iter().map(|r| (git::worktrees(&r), r)).collect::<Vec<_>>()
+                    repos
+                        .into_iter()
+                        .map(|r| {
+                            let worktrees = git::worktrees(&r);
+                            let all: Vec<PathBuf> = worktrees.iter().map(|w| w.path.clone()).collect();
+                            // An agent's worktrees, with what they hold beyond the branch they came from.
+                            let sides: std::collections::HashMap<PathBuf, side::Side> = worktrees
+                                .iter()
+                                .skip(1)
+                                .filter(|w| !w.in_use())
+                                .filter_map(|w| {
+                                    let parent = side::made_by_agent(&w.path, &all)?;
+                                    let from = parent.as_ref().unwrap_or(&all[0]);
+                                    let base = worktrees.iter().find(|o| &o.path == from).map(|o| o.branch.clone()).unwrap_or_default();
+                                    let (ahead, dirty) = git::work_beyond(&w.path, &base);
+                                    Some((w.path.clone(), side::Side { parent, ahead, dirty }))
+                                })
+                                .collect();
+                            (worktrees, sides, r)
+                        })
+                        .collect::<Vec<_>>()
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 let restoring = this.restoring.clone();
-                for (worktrees, repo) in lists {
+                for (worktrees, mut sides, repo) in lists {
                     let Some(p) = this.projects.iter_mut().find(|p| p.path == repo) else { continue };
                     // Not readable now (unmounted, git missing): leave it be.
                     if worktrees.first().is_none_or(|w| w.path != repo) {
@@ -1736,10 +1772,13 @@ impl Workspace {
                     // are that process's for now: not tasks.
                     let worktrees: Vec<_> = worktrees.into_iter().enumerate().filter(|(i, w)| *i == 0 || !w.in_use()).map(|(_, w)| w).collect();
                     for wt in worktrees.iter().skip(1) {
+                        // One the user made a task of keeps being theirs.
+                        let side = sides.remove(&wt.path);
                         match p.tasks.iter_mut().find(|t| t.path == wt.path) {
                             Some(t) => {
                                 t.branch = wt.branch.clone();
                                 t.locked = wt.locked.clone();
+                                t.side = side.filter(|_| t.title.is_empty() && t.group.is_empty() && t.prompt.is_empty());
                             }
                             None => p.tasks.push(TaskEntry {
                                 path: wt.path.clone(),
@@ -1756,6 +1795,7 @@ impl Workspace {
                                 pr: None,
                                 pr_checked: None,
                                 port_slot: 0,
+                                side,
                                 ..Default::default()
                             }),
                         }

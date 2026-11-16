@@ -101,6 +101,9 @@ pub struct Settings {
     pub complete_as_typed: bool,
     pub semantic_colors: bool,
     pub format_on_save: bool,
+    /// The worktrees agents make for themselves are listed, folded under
+    /// the task they came from.
+    pub show_side_worktrees: bool,
     /// A file opened to look at (a jump, a search result) takes the place of
     /// the one opened that way before, until it is edited.
     pub preview_tabs: bool,
@@ -132,6 +135,7 @@ impl Default for Settings {
             pr_status: true,
             fetch_minutes: 5,
             preview_tabs: true,
+            show_side_worktrees: true,
             tab_limit: 12,
             check_updates: true,
             hump_words: false,

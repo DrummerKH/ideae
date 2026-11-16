@@ -175,6 +175,13 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
                     |s| s.context_dial,
                     |s, v| s.context_dial = v,
                 ))
+                .item(switch(
+                    draft,
+                    "Worktrees agents made",
+                    "Those an agent made for itself (Claude Code's subagents, a try in a temporary folder), folded under the task they came from, opened without an agent. Off, they are not listed.",
+                    |s| s.show_side_worktrees,
+                    |s, v| s.show_side_worktrees = v,
+                ))
                 .item(
                     SettingItem::new("The narrow sidebar opens after", rail_open)
                         .description("Dragged as narrow as it goes, the sidebar is a rail of tasks to click. The whole of it opens over the task when the pointer rests on the rail this long."),

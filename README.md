@@ -17,7 +17,10 @@ Windows build exists and is being tried out (see [Windows](#windows)).
   other text a slug with a random suffix). The task gets a worktree in
   `<repo>.worktrees/<branch>`, branched from the remote's default branch,
   with the main checkout's ignored `.env*` files copied in. Worktrees made
-  outside the app show up as tasks too.
+  outside the app show up as tasks too. Those an agent made for itself
+  (Claude Code's subagents in `.claude/worktrees/`, a try in a temporary
+  folder) are folded under the task they came from, with the commits and
+  changes they hold, and open with a shell, not an agent.
 - **Variants.** A hard task can be started as up to four variants: the
   same prompt to as many agents, each in a worktree of its own from the
   same commit, with a line for each one alone if you like (a click

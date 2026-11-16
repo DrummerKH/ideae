@@ -66,6 +66,14 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
     Some(String::from_utf8(output.stdout).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
 }
 
+/// What a worktree has that `base` has not: commits, and whether anything
+/// is not committed.
+pub fn work_beyond(path: &Path, base: &str) -> (u32, bool) {
+    let ahead = git(path, &["rev-list", "--count", &format!("{base}..HEAD"), "--"]).and_then(|n| n.trim().parse().ok()).unwrap_or(0);
+    let dirty = git(path, &["status", "--porcelain"]).is_some_and(|s| !s.trim().is_empty());
+    (ahead, dirty)
+}
+
 /// Every worktree of the repository containing `path`, main one first.
 pub fn worktrees(path: &Path) -> Vec<Worktree> {
     let Some(out) = git(path, &["worktree", "list", "--porcelain"]) else {

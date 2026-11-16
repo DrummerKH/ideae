@@ -177,6 +177,15 @@ impl Workspace {
             let tasks: Vec<usize> = (0..p.tasks.len())
                 .filter(|&ti| self.shows(pi, ti) && (project_hit || self.task_matches(pi, ti, &query, cx)))
                 .collect();
+            // The agents' own worktrees go under the task they came from, or
+            // at the end, folded; a search lists them as it finds them.
+            let show_sides = crate::state::with_settings(|s| s.show_side_worktrees);
+            let (sides, tasks): (Vec<usize>, Vec<usize>) = tasks.into_iter().partition(|&ti| p.tasks[ti].side.is_some());
+            let sides: Vec<usize> = if show_sides { sides } else { Vec::new() };
+            let tasks: Vec<usize> = if query.is_empty() { tasks } else { tasks.into_iter().chain(sides.iter().copied()).collect() };
+            let sides = if query.is_empty() { sides } else { Vec::new() };
+            let parents: std::collections::HashSet<&std::path::Path> = tasks.iter().map(|&ti| p.tasks[ti].path.as_path()).collect();
+            let side_parent = |ti: usize| p.tasks[ti].side.as_ref().and_then(|s| s.parent.as_deref()).filter(|parent| parents.contains(parent));
             // A project with nothing to show is not shown: of another space, while presenting, or when the search has no hit in it.
             if !self.in_space(pi) || (tasks.is_empty() && (self.is_presenting() || (!query.is_empty() && !project_hit))) {
                 continue;
@@ -191,6 +200,8 @@ impl Workspace {
                     // A search lists its hits one by one.
                     if group.is_empty() || !query.is_empty() {
                         list = list.child(self.render_task(pi, ti, false, cx));
+                        let under: Vec<usize> = sides.iter().copied().filter(|&s| side_parent(s) == Some(p.tasks[ti].path.as_path())).collect();
+                        list = self.render_sides(list, pi, p.tasks[ti].path.clone(), "", under, cx);
                     } else if groups.insert(group.clone()) {
                         list = list.child(self.render_group_row(pi, group, false, cx));
                         if !self.collapsed_groups.contains(group) {
@@ -200,6 +211,8 @@ impl Workspace {
                         }
                     }
                 }
+                let elsewhere: Vec<usize> = sides.iter().copied().filter(|&s| side_parent(s).is_none()).collect();
+                list = self.render_sides(list, pi, p.path.clone(), "temporary ", elsewhere, cx);
             }
         }
         // Dropping below the last project moves it to the end.
@@ -284,7 +297,7 @@ impl Workspace {
         let dialed = crate::state::with_settings(|s| s.context_dial);
         let mut rail = v_flex().id("sidebar-rail").w(RAIL).h_full().flex_none().items_center().py_2().gap_0p5().overflow_hidden().border_r_1().border_color(cx.theme().border);
         for (pi, project) in self.projects.iter().enumerate() {
-            let tasks: Vec<usize> = (0..project.tasks.len()).filter(|&ti| self.shows(pi, ti)).collect();
+            let tasks: Vec<usize> = (0..project.tasks.len()).filter(|&ti| self.shows(pi, ti) && project.tasks[ti].side.is_none()).collect();
             if tasks.is_empty() {
                 continue;
             }
@@ -572,6 +585,48 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// The agents' worktrees of one task, or of the project for those in
+    /// temporary places (`what`): one folded row, and theirs when opened.
+    fn render_sides(&self, mut list: Stateful<Div>, pi: usize, key: PathBuf, what: &str, sides: Vec<usize>, cx: &mut Context<Self>) -> Stateful<Div> {
+        if sides.is_empty() {
+            return list;
+        }
+        let tasks = &self.projects[pi].tasks;
+        let open = self.open_sides.contains(&key);
+        let changed = sides.iter().filter(|&&ti| tasks[ti].side.as_ref().is_some_and(|s| s.dirty || s.ahead > 0)).count();
+        let mut text = format!("{} {} {what}agent worktree{}", if open { "▾" } else { "▸" }, sides.len(), if sides.len() == 1 { "" } else { "s" });
+        if changed > 0 {
+            text.push_str(&format!(" · {changed} with work"));
+        }
+        let fold = key.clone();
+        list = list.child(
+            div()
+                .id(SharedString::from(format!("sides-{}", key.display())))
+                .pl(px(26.))
+                .pr_3()
+                .py_0p5()
+                .text_xs()
+                .truncate()
+                .text_color(cx.theme().muted_foreground)
+                .cursor_pointer()
+                .hover(|s| s.text_color(cx.theme().foreground))
+                .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Worktrees agents made for themselves: opened without an agent").build(window, cx))
+                .child(text)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if !this.open_sides.remove(&fold) {
+                        this.open_sides.insert(fold.clone());
+                    }
+                    cx.notify();
+                })),
+        );
+        if open {
+            for ti in sides {
+                list = list.child(self.render_task(pi, ti, false, cx));
+            }
+        }
+        list
+    }
+
     fn render_task(&self, pi: usize, ti: usize, in_active: bool, cx: &mut Context<Self>) -> AnyElement {
         let project = &self.projects[pi];
         let t = &project.tasks[ti];
@@ -645,6 +700,15 @@ impl Workspace {
         if t.locked.is_some() {
             details.push("locked".into());
         }
+        // What an agent's own worktree holds beyond where it came from.
+        if let Some(side) = &t.side {
+            if side.ahead > 0 {
+                details.push(format!("{} commit{} ahead", side.ahead, if side.ahead == 1 { "" } else { "s" }));
+            }
+            if side.dirty {
+                details.push("uncommitted".into());
+            }
+        }
         if let Some(busy) = &t.busy {
             details.push(busy.to_string());
         }
@@ -704,7 +768,7 @@ impl Workspace {
         let id = SharedString::from(format!("{}task-{}", if in_active { "active-" } else { "" }, path.display()));
         let mut row = v_flex()
             .id(id)
-            .pl(if listed { px(26.) } else { px(12.) })
+            .pl(if listed || (t.side.is_some() && !in_active) { px(26.) } else { px(12.) })
             .pr_3()
             .py_0p5()
             .cursor_pointer()
