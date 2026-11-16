@@ -11,7 +11,16 @@ src/main.rs        CLI, key bindings, title bar, window
 src/workspace.rs   projects and tasks: load, switch, create/close/delete, state, hooks
 src/workspace/variants.rs  several tries at one task as a group: create, compare, keep one
 src/sidebar.rs     left sidebar (inbox, projects, tasks, drag and drop)
-src/task.rs        one task: tabs, panes, editor, terminals, changes, git UI, session save/restore
+src/task/          one task, a module: what is private to it is seen by all of its files (`use super::*`)
+  mod.rs           the task itself: tabs, panes, the refresh, git UI, navigation
+  file.rs          an open file: editor, save and reload, blame, the language server's bridge
+  changes.rs       the Changes tab: the diff, review notes, single changes
+  term.rs          a terminal tab
+  session.rs       session save/restore, language servers asleep
+  services.rs      the Run panel
+  pr.rs            pull request feedback
+  change_tree.rs   the changed files as a tree
+  helpers.rs       patches parsed for the panels, outline, symbol search, definition providers
 src/state.rs       state.json; APP_ID (ideae vs ideae-dev)
 src/agent.rs       Claude Code hooks bridge (unix socket, `ideae --hook`)
 src/crash.rs       what a panic leaves: crashes.log next to the state, told at the next start
