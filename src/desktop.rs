@@ -157,8 +157,10 @@ pub fn pin() -> Result<(), String> {
     Ok(())
 }
 
+/// Writes the list back only when the app was in it: a list read from
+/// elsewhere (another session's settings) never replaces the user's.
 pub fn unpin() {
-    if let Some(mut list) = favorites() {
+    if let Some(mut list) = favorites().filter(|list| list.contains(&desktop_id())) {
         list.retain(|s| *s != desktop_id());
         set_favorites(&list);
     }
