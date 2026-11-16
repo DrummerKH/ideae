@@ -51,6 +51,11 @@ Windows build exists and is being tried out (see [Windows](#windows)).
   fires when a task out of view wants you. The Changes and Files panels
   mark the file the agent is writing to and those it wrote to since your
   last prompt.
+- **Files panel.** File and folder icons as JetBrains' new UI draws them.
+  A name has the color of what git says of it: blue changed, green added,
+  red-brown not added, olive ignored; a folder, of what is in it. An
+  ignored folder (`target/`, `node_modules/`) is read from disk when it is
+  opened. The Changes list colors its files the same, a deleted one gray.
 - **Themes.** Ayu, Catppuccin, Gruvbox, Solarized, Everforest and
   Flexoki, each with a light and a dark side (the switch in the title
   bar: auto, light, dark). Theme… in the menu lists them and draws each
@@ -259,6 +264,11 @@ closed products too; changes to its files stay open under the same license.
 `vendor/` holds patched copies of `gpui-component`, `gpui-base` and
 `gpui-cn` (Apache-2.0, licenses kept in each directory). Changed places are
 marked `ideae patch`.
+
+`assets/file-icons` holds file type icons from
+[IntelliJ IDEA Community Edition](https://github.com/JetBrains/intellij-community)
+(Apache-2.0, unchanged; its NOTICE and the license kept beside them); the Go,
+PHP and Rust ones were drawn for ideae in their style.
 
 `vendor/tree-sitter-twig` is the generated parser of
 [tree-sitter-twig](https://github.com/gbprod/tree-sitter-twig) (MIT, license
