@@ -35,7 +35,7 @@ pub fn exe() -> std::io::Result<PathBuf> {
 
 fn entry(exe: &std::path::Path) -> String {
     format!(
-        "[Desktop Entry]\nType=Application\nName={name}\nComment=IDE for the agentic age\nExec=\"{}\" %F\nIcon={APP_ID}\nTerminal=false\nCategories=Development;\nStartupWMClass={APP_ID}\n",
+        "[Desktop Entry]\nType=Application\nName={name}\nComment=IDE in the agentic era\nExec=\"{}\" %F\nIcon={APP_ID}\nTerminal=false\nCategories=Development;\nStartupWMClass={APP_ID}\n",
         exe.display(),
         name = if cfg!(debug_assertions) { "ideae (dev)" } else { "ideae" },
     )

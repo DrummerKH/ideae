@@ -414,6 +414,36 @@ impl TaskView {
         }
     }
 
+    /// A file marked viewed folds to its header, once: unfolded by hand it
+    /// stays so. Changed after (and so no longer viewed), it unfolds again.
+    pub(super) fn fold_viewed(&mut self, diff: &Entity<DiffState>, cx: &mut Context<Self>) {
+        let paths: Vec<SharedString> = diff.read(cx).files().iter().map(|file| file.path().clone()).collect();
+        let mut fold = Vec::new();
+        for path in paths {
+            let viewed = self.files.iter().find(|f| f.path == path).map(|f| f.hash).filter(|hash| self.viewed.get(path.as_ref()) == Some(hash));
+            let done = self.folded_viewed.get(path.as_ref()).copied();
+            match (viewed, done) {
+                (Some(hash), Some(Some(folded))) if hash == folded => {}
+                (Some(hash), _) => {
+                    fold.push((path.clone(), true));
+                    self.folded_viewed.insert(path.to_string(), Some(hash));
+                }
+                (None, Some(Some(_))) => {
+                    fold.push((path.clone(), false));
+                    self.folded_viewed.insert(path.to_string(), None);
+                }
+                _ => {}
+            }
+        }
+        if !fold.is_empty() {
+            diff.update(cx, |state, cx| {
+                for (path, folded) in fold {
+                    state.set_file_collapsed(&path, folded, cx);
+                }
+            });
+        }
+    }
+
     pub(super) fn is_viewed(&self, ix: usize) -> bool {
         let file = &self.files[ix];
         self.viewed.get(file.path.as_ref()) == Some(&file.hash)
@@ -430,6 +460,8 @@ impl TaskView {
         } else {
             self.viewed.insert(path.to_string(), file.hash);
         }
+        let diff = self.changes.read(cx).diff.clone();
+        self.fold_viewed(&diff, cx);
         self.changes.update(cx, |_, cx| cx.notify());
         cx.emit(TaskEvent::Changed);
         cx.notify();

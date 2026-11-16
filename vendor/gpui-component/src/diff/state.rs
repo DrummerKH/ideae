@@ -746,6 +746,22 @@ impl DiffState {
         cx.notify();
     }
 
+    /// ideae patch: collapses every file to its header, or expands them
+    /// all, laid out again once.
+    pub fn set_all_collapsed(&mut self, collapsed: bool, cx: &mut Context<Self>) {
+        let before = self.collapsed.len();
+        if collapsed {
+            let paths: Vec<_> = self.files.iter().map(|file| file.path().clone()).collect();
+            self.collapsed.extend(paths);
+        } else {
+            self.collapsed.clear();
+        }
+        if self.collapsed.len() != before {
+            self.rebuild_at_anchor();
+            cx.notify();
+        }
+    }
+
     /// Collapses the file at `path` to its header, or expands it, without
     /// emitting a user event.
     pub fn set_file_collapsed(&mut self, path: &str, collapsed: bool, cx: &mut Context<Self>) {

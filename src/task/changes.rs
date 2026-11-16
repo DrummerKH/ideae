@@ -291,6 +291,15 @@ impl ChangesView {
         self.first_lines = lines;
         self.hunks = hunks;
         self.diff.update(cx, |d, cx| d.set_files(files, cx));
+        // The other scope's files: those viewed fold there too.
+        let diff = self.diff.clone();
+        let task = self.task.clone();
+        cx.defer(move |cx| {
+            let _ = task.update(cx, |task, cx| {
+                task.folded_viewed.clear();
+                task.fold_viewed(&diff, cx);
+            });
+        });
         cx.notify();
     }
 
@@ -374,6 +383,14 @@ impl Render for ChangesView {
                         |(id, label, to, tip)| {
                             Button::new(id).small().ghost().label(label).tooltip(tip).selected(mode == to).on_click(cx.listener(move |this, _, _, cx| {
                                 this.diff.update(cx, |d, cx| d.set_mode(to, cx));
+                            }))
+                        },
+                    ))
+                    .child(div().w(px(1.)).h(px(16.)).bg(cx.theme().border))
+                    .children([("fold-all", "Collapse all", true, "Every file to its header"), ("unfold-all", "Expand all", false, "Every file open, those viewed too")].map(
+                        |(id, label, folded, tip)| {
+                            Button::new(id).small().ghost().label(label).tooltip(tip).on_click(cx.listener(move |this, _, _, cx| {
+                                this.diff.update(cx, |d, cx| d.set_all_collapsed(folded, cx));
                             }))
                         },
                     ))

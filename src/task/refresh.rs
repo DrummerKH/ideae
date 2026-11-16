@@ -114,6 +114,7 @@ impl TaskView {
             });
             state.update_files(keyed, cx)
         });
+        self.fold_viewed(&diff, cx);
         self.changes.update(cx, |c, cx| {
             // Lines picked in a file that is another patch now are not those lines any more.
             let key_of = |keys: &HashMap<String, u64>, range: &DiffLineRange| keys.get(range.path().as_ref()).copied();

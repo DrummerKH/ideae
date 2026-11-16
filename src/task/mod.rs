@@ -370,6 +370,9 @@ pub struct TaskView {
     tree_gone: Rc<HashSet<String>>,
     /// Presenting with ignored files hidden: none in the tree.
     tree_hides_ignored: bool,
+    /// The files of the diff folded for being viewed, with the version of
+    /// them that was; none for one unfolded when it changed after.
+    folded_viewed: HashMap<String, Option<u64>>,
     /// Folders folded in the Changes tree, as "staged:dir" / "changes:dir".
     folded_changes: HashSet<String>,
     /// Out of view long enough (or never shown): no language servers run;
@@ -645,6 +648,7 @@ impl TaskView {
             ignored_reading: HashSet::new(),
             tree_gone: Rc::default(),
             tree_hides_ignored: false,
+            folded_viewed: HashMap::new(),
             folded_changes: HashSet::new(),
             lsp_asleep: false,
             file_states: HashMap::new(),

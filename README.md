@@ -1,6 +1,6 @@
 # ideae
 
-An IDE for the agentic age: one window for running AI coding agents
+An IDE in the agentic era: one window for running AI coding agents
 (Claude Code by default), one task per git worktree.
 
 Every task gets the agent in a terminal, more terminals, an editor, the diff
