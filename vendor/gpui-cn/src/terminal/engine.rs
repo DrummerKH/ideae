@@ -707,6 +707,23 @@ pub(crate) fn spawn(
     std::thread::Builder::new()
         .name("gpui-cn-terminal".to_owned())
         .spawn(move || {
+            // ideae patch: a panic on this thread would leave the terminal as
+            // it was, taking nothing more and saying nothing, and what feeds
+            // it waiting for room. It is closed and says so.
+            struct Ended<'a>(&'a Shared, &'a FrameSink);
+            impl Drop for Ended<'_> {
+                fn drop(&mut self) {
+                    if std::thread::panicking() {
+                        self.0.set_closing();
+                        self.1.publish(Arc::new(TerminalSnapshot {
+                            status: TerminalStatus::Failed("the terminal stopped unexpectedly".to_string()),
+                            ..TerminalSnapshot::default()
+                        }));
+                    }
+                }
+            }
+            let guarded = shared.clone();
+            let _ended = Ended(&guarded, &sink);
             let mut owner = match Owner::start(source, byte_sink, config, shared.clone(), &sink) {
                 Ok(owner) => owner,
                 Err(error) => {

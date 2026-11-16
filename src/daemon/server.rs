@@ -494,10 +494,17 @@ mod handover {
     /// Old side: sends everything to a new daemon from `exe` and exits once
     /// it took over; on any failure it keeps serving.
     pub(super) fn give(shared: &Shared, exe: &Path) {
-        let s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut state = Handovers { hooks: s.hooks.values().cloned().collect(), ..Default::default() };
         let mut fds: Vec<OwnedFd> = Vec::new();
-        for (id, session) in &s.sessions {
+        for (id, session) in s.sessions.iter_mut() {
+            // What the session printed and no window was sent yet goes along
+            // too: left here, it would be shown by nobody.
+            for chunk in session.sink.next(Duration::ZERO).output {
+                session.replay.extend(chunk);
+            }
+            let excess = session.replay.len().saturating_sub(super::REPLAY_BYTES);
+            session.replay.drain(..excess);
             let Some((fd, pid)) = session.handle.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pty() else { continue };
             // SAFETY: dup returns a new descriptor this side owns.
             let copy = unsafe { libc::dup(fd) };
