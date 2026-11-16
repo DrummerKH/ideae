@@ -276,8 +276,12 @@ impl CodeActionMenu {
         self.offset = offset;
         self.open = true;
         self.list.update(cx, |this, cx| {
+            // ideae patch: the menu is as wide as its longest title, as the
+            // completion menu is; measured by the first one, the others were cut.
+            let longest_ix = items.iter().enumerate().max_by_key(|(_, item)| item.action.title.chars().count()).map_or(0, |(ix, _)| ix);
             this.delegate_mut().set_items(items);
             this.set_selected_index(Some(IndexPath::new(0)), window, cx);
+            this.set_item_to_measure_index(IndexPath::new(longest_ix), window, cx);
         });
 
         cx.notify();
