@@ -76,6 +76,8 @@ pub static SHORTCUTS: &[Shortcut] = &[
     shortcut!("complete", "Complete here", "ctrl-space", Editor, gpui_kit::component::input::ShowCompletions),
     shortcut!("quick_fix", "Quick fixes", "alt-enter", Editor, gpui_kit::component::input::ToggleCodeActions),
     shortcut!("rename", "Rename", "shift-f6", Editor, task::RenameSymbol),
+    shortcut!("next_problem", "Next problem", "f2", Editor, task::NextProblem),
+    shortcut!("prev_problem", "Previous problem", "shift-f2", Editor, task::PrevProblem),
     shortcut!("format", "Reformat file", "ctrl-alt-l", Editor, task::FormatFile),
     shortcut!("fold", "Fold", "ctrl--", Editor, task::Fold),
     shortcut!("unfold", "Unfold", "ctrl-=", Editor, task::Unfold),

@@ -40,6 +40,8 @@ pub use gpui_base::input::{
     WrappingIndent, highlight_characters, highlight_contains, highlight_prefix,
 };
 pub use gpui_base::input::{EditorMode, InputMode, InputModeKind, TextareaMode};
+// ideae patch: what the editor holds of a language server's problems, to step through them.
+pub use gpui_base::input::{DiagnosticEntry, DiagnosticSeverity};
 #[doc(hidden)]
 mod editor;
 mod group;

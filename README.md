@@ -235,6 +235,7 @@ a release build needs a Windows host for `fxc.exe`.
 | Ctrl+B / Ctrl+click | Go to definition; on a declaration, its usages |
 | Ctrl+Alt+B | Implementations, then usages |
 | Ctrl+F12 | File structure |
+| F2 / Shift+F2 | Next / previous problem in the file |
 | Alt+1 / Alt+2 / Alt+3 | Changes / Files / Structure panel |
 | Ctrl+F4 / Ctrl+Shift+F4 | Close tab / reopen the last closed (more on a tab's right click) |
 | Shift+Esc | Focus mode |

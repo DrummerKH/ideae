@@ -4,7 +4,7 @@ use super::*;
 
 actions!(ideae_git, [ShowBranches]);
 actions!(ideae_file, [SaveFile, ExpandSelection, ShrinkSelection, ToggleComment, ShowOutline, ShowUsages, SendToAgent, CompareFileWith]);
-actions!(ideae_edit, [DeleteLine, DuplicateLine, MoveLineUp, MoveLineDown, JoinLines, ToggleCase, NextOccurrence, GoToLine, RenameSymbol, FormatFile, Fold, Unfold, FoldAll, UnfoldAll, ParameterInfo]);
+actions!(ideae_edit, [DeleteLine, DuplicateLine, MoveLineUp, MoveLineDown, JoinLines, ToggleCase, NextOccurrence, GoToLine, RenameSymbol, FormatFile, Fold, Unfold, FoldAll, UnfoldAll, ParameterInfo, NextProblem, PrevProblem]);
 actions!(ideae_task, [ToggleZoom, SendDiffToAgent, CommentOnDiff, FindInTerminal]);
 
 actions!(ideae_task, [NextTab, PrevTab, NavigateBack, NavigateForward, CloseTab, ReopenClosedTab]);
@@ -834,6 +834,32 @@ impl FileView {
         self.editor.read(cx).focus_handle(cx).focus(window, cx);
     }
 
+    /// F2 / Shift+F2: the next or previous problem the language server
+    /// reported, errors before warnings, round the end of the file; what it
+    /// says is shown there.
+    pub(super) fn go_to_problem(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let state = self.editor.read(cx);
+        let Some(set) = state.diagnostics() else { return };
+        let at = state.cursor_position();
+        let at = (at.line, at.character);
+        let worst = set.iter().map(|d| problem_rank(d.severity)).max();
+        let Some(worst) = worst.filter(|&r| r > 0) else { return };
+        let starts = |d: &&gpui_kit::component::input::DiagnosticEntry| (d.diagnostic.range.start.line, d.diagnostic.range.start.character);
+        let of_rank = || set.iter().filter(|d| problem_rank(d.severity) == worst);
+        let picked = if forward {
+            of_rank().find(|d| starts(d) > at).or_else(|| of_rank().next())
+        } else {
+            of_rank().filter(|d| starts(d) < at).last().or_else(|| of_rank().last())
+        };
+        let Some(entry) = picked.cloned() else { return };
+        let start = entry.diagnostic.range.start;
+        self.editor.update(cx, |state, cx| {
+            state.jump_to_position(start, JUMP_AT, window, cx);
+            state.present_diagnostic(entry, cx);
+        });
+        self.editor.read(cx).focus_handle(cx).focus(window, cx);
+    }
+
     /// As `go_to_line`, the keyboard left where it is.
     pub(super) fn jump(&mut self, line: u32, col: u32, window: &mut Window, cx: &mut Context<Self>) {
         self.editor.update(cx, |state, cx| {
@@ -920,6 +946,8 @@ impl Render for FileView {
             .on_action(cx.listener(|this, _: &NextOccurrence, _, cx| this.select_next_occurrence(cx)))
             .on_action(cx.listener(|this, _: &GoToLine, window, cx| this.go_to_line_dialog(window, cx)))
             .on_action(cx.listener(|this, _: &RenameSymbol, window, cx| this.rename_dialog(window, cx)))
+            .on_action(cx.listener(|this, _: &NextProblem, window, cx| this.go_to_problem(true, window, cx)))
+            .on_action(cx.listener(|this, _: &PrevProblem, window, cx| this.go_to_problem(false, window, cx)))
             .on_action(cx.listener(|this, _: &FormatFile, window, cx| this.format(window, cx)))
             .on_action(cx.listener(|this, _: &ParameterInfo, _, cx| this.parameter_info(cx)))
             .on_action(cx.listener(|this, _: &Fold, _, cx| this.fold(true, false, cx)))
@@ -1246,5 +1274,15 @@ impl DefinitionProvider for LspBridge {
             }
             result
         }))
+    }
+}
+
+/// Errors first, then warnings; hints and notes are no stops for F2.
+fn problem_rank(severity: gpui_kit::component::input::DiagnosticSeverity) -> u8 {
+    use gpui_kit::component::input::DiagnosticSeverity as S;
+    match severity {
+        S::Error => 2,
+        S::Warning => 1,
+        _ => 0,
     }
 }
