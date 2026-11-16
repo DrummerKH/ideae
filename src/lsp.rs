@@ -1398,9 +1398,11 @@ mod write_tests {
         let dir = std::env::temp_dir().join(format!("ideae-lsp-group-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (script, pid_file) = (dir.join("server.sh"), dir.join("child.pid"));
-        std::fs::write(&script, format!("#!/bin/sh\nsleep 300 &\necho $! > '{}'\ncat >/dev/null\n", pid_file.display())).unwrap();
-        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-        let client = LspClient::spawn("test-server", &script, &[], &dir, Value::Null).unwrap();
+        std::fs::write(&script, format!("sleep 300 &\necho $! > '{}'\ncat >/dev/null\n", pid_file.display())).unwrap();
+        // Read by sh, not run itself: a file just written, run while another
+        // test's fork still holds it open, fails with "Text file busy".
+        let script_arg = script.to_string_lossy().into_owned();
+        let client = LspClient::spawn("test-server", std::path::Path::new("/bin/sh"), &[script_arg.as_str()], &dir, Value::Null).unwrap();
         let started = std::time::Instant::now();
         let child = loop {
             match std::fs::read_to_string(&pid_file).ok().and_then(|pid| pid.trim().parse::<u32>().ok()) {
