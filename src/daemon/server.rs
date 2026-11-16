@@ -452,7 +452,8 @@ fn shutdown(shared: &Shared) -> ! {
 /// No window to show it: an agent that wants the user says so on the desktop.
 fn notify(hook: &Hook) {
     // The window may have changed it since this daemon started.
-    if !crate::state::load().settings.notifications {
+    let saved = crate::state::load();
+    if !saved.settings.notifications || !saved.tells_of(std::path::Path::new(&hook.task)) {
         return;
     }
     let event = crate::agent::HookEvent {

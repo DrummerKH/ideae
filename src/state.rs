@@ -17,6 +17,10 @@ pub struct State {
     /// A presentation that was on: it is on again after a restart, or the
     /// restart would show everything.
     pub presenting: Option<PresentingState>,
+    /// The spaces projects are sorted into, and the one in the window;
+    /// none for all of them.
+    pub spaces: Vec<crate::workspace::spaces::Space>,
+    pub space: Option<String>,
     pub power_saving: bool,
     pub window: Option<WindowPlace>,
     pub settings: Settings,
@@ -31,6 +35,20 @@ pub struct State {
 pub struct PresentingState {
     pub kept: Vec<PathBuf>,
     pub since: u64,
+}
+
+impl State {
+    /// Whether a task is one to tell of, as the window was left: of the
+    /// space that was in it, and not left out of a presentation.
+    pub fn tells_of(&self, task: &std::path::Path) -> bool {
+        let project = self.projects.iter().find(|p| p.tasks.iter().any(|t| t.path == task));
+        let in_space = match (&self.space, project.and_then(|p| p.space.as_ref())) {
+            (Some(shown), Some(its)) => shown == its,
+            _ => true,
+        };
+        let presented = self.presenting.as_ref().is_none_or(|p| p.kept.iter().any(|kept| kept == task));
+        in_space && presented
+    }
 }
 
 /// What the user set in Settings (Ctrl+,).
@@ -181,6 +199,8 @@ pub struct WindowPlace {
 pub struct ProjectState {
     /// The main worktree.
     pub path: PathBuf,
+    /// The space it is sorted into, by its name; none, and it is in every one.
+    pub space: Option<String>,
     pub collapsed: bool,
     pub tasks: Vec<TaskState>,
     /// The command last run in every variant of a task, and whether it
@@ -341,4 +361,25 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 pub fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+#[cfg(test)]
+mod spaces_tests {
+    use super::{PresentingState, ProjectState, State, TaskState};
+    use std::path::{Path, PathBuf};
+
+    /// With the window closed, a task is told of as the window was left:
+    /// of the space in it, and not left out of a presentation.
+    #[test]
+    fn what_is_out_of_the_window_is_not_told_of() {
+        let task = |path: &str| TaskState { path: path.into(), ..Default::default() };
+        let project = |space: Option<&str>, path: &str| ProjectState { space: space.map(str::to_string), tasks: vec![task(path)], ..Default::default() };
+        let mut state = State { projects: vec![project(Some("Work"), "/w/a"), project(Some("Home"), "/h/b"), project(None, "/n/c")], ..Default::default() };
+        let told = |state: &State| ["/w/a", "/h/b", "/n/c", "/elsewhere"].map(|path| state.tells_of(Path::new(path)));
+        assert_eq!(told(&state), [true, true, true, true], "all of them in the window");
+        state.space = Some("Work".into());
+        assert_eq!(told(&state), [true, false, true, true], "one sorted into no space is in every one");
+        state.presenting = Some(PresentingState { kept: vec![PathBuf::from("/n/c")], since: 0 });
+        assert_eq!(told(&state), [false, false, true, false], "and of those, the ones chosen to present");
+    }
 }

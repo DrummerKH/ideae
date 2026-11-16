@@ -145,6 +145,7 @@ impl Render for Workspace {
                                             this.finder(finder::FinderKind::Grep, window, cx)
                                         })),
                                 )
+                                .child(self.render_space_switch(cx))
                                 .child(self.render_appearance(cx)),
                         ),
                 ),
@@ -299,7 +300,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &palette::RecentPlaces, window, cx| this.recent_tasks(window, cx)))
             .on_action(cx.listener(|this, _: &palette::NextWaiting, window, cx| this.next_waiting(window, cx)))
             .on_action(cx.listener(|this, _: &NewTask, window, cx| {
-                if let Some(project) = this.active_project().or((!this.projects.is_empty()).then_some(0)) {
+                if let Some(project) = this.active_project().or(this.first_project()) {
                     this.new_task_dialog(project, window, cx);
                 }
             }))
@@ -471,7 +472,7 @@ impl Workspace {
     }
 
     fn render_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let project = self.active_project().or((!self.projects.is_empty()).then_some(0));
+        let project = self.active_project().or(self.first_project());
         v_flex()
             .size_full()
             .items_center()

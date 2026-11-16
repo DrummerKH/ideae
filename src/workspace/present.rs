@@ -54,6 +54,10 @@ impl Workspace {
     /// Whether a task is to be seen: always, unless a presentation is on
     /// and the task was not chosen for it.
     pub fn shows(&self, pi: usize, ti: usize) -> bool {
+        // First of all, of the space in the window.
+        if !self.in_space(pi) {
+            return false;
+        }
         let Some(presenting) = &self.presenting else { return true };
         let (project, task) = (&self.projects[pi], &self.projects[pi].tasks[ti]);
         presenting.kept.contains(&task.path) || (task.created >= presenting.since && project.tasks.iter().any(|t| presenting.kept.contains(&t.path)))
@@ -78,6 +82,8 @@ impl Workspace {
             .projects
             .iter()
             .enumerate()
+            // Of the space in the window: the others are not there to be shown.
+            .filter(|(pi, _)| self.in_space(*pi))
             .map(|(pi, p)| (p.name.clone(), (0..p.tasks.len()).map(|ti| (p.tasks[ti].path.clone(), self.task_title(pi, ti, cx))).collect()))
             .collect();
         let chosen: HashSet<PathBuf> = here.map(|pi| self.projects[pi].tasks.iter().map(|t| t.path.clone()).collect()).unwrap_or_default();
@@ -164,6 +170,7 @@ impl Workspace {
         ON.store(on, std::sync::atomic::Ordering::Relaxed);
         let factor = if on { state::with_settings(|s| s.present_zoom.clamp(50, 300)) as f32 / 100. } else { 1. };
         crate::zoom::set_scale(factor, cx);
+        self.tell_what_is_hidden();
         for view in self.views() {
             view.update(cx, |task, cx| task.veil_ignored(cx));
         }

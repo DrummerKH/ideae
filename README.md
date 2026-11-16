@@ -53,6 +53,14 @@ Windows build exists and is being tried out (see [Windows](#windows)).
   bar: auto, light, dark). Theme… in the menu lists them and draws each
   as you go through the list: Enter keeps it, Esc goes back. Terminals take
   the theme's colors too.
+- **Spaces.** Projects can be sorted into spaces: work, personal, a
+  client (a project's menu in the sidebar; the spaces themselves under
+  the mark at the right of the title bar). The one chosen there is all
+  the window shows: the list, the search, what waits for you, the
+  notifications, the tokens. The agents of the others go on working and
+  nothing of them is told, but for a number by the mark when some wait;
+  "All" shows everything. A filter and no more: accounts and the git
+  identity are the same in every space.
 - **Presenting.** Before the window is shown to others, ☰ → Enter
   presentation mode asks which tasks to leave in it. The rest leave the
   list, the search and the notifications and go on working; the load and

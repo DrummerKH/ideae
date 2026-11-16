@@ -688,6 +688,10 @@ impl SysTooltip {
 
 const TREE_ROWS: usize = 60;
 
+/// The tasks not in the window, by the name of their folder, as the
+/// workspace last said: they are not listed by name here either.
+pub static OUT_OF_WINDOW: std::sync::Mutex<std::collections::BTreeSet<String>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+
 impl Render for SysTooltip {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let s = self.mon.read(cx).snap.clone();
@@ -726,8 +730,11 @@ impl Render for SysTooltip {
                 row(div().child(label).into_any_element(), mem, cpu)
             })))
             .when(!s.by_task.is_empty(), |el| {
-                el.child(div().text_color(muted).child("BY TASK"))
-                    .child(v_flex().children(s.by_task.iter().map(|(task, cpu, mem)| row(div().child(task.clone()).into_any_element(), *mem, *cpu))))
+                // Not the tasks out of the window: another space's, or left out of a presentation.
+                let out = OUT_OF_WINDOW.lock().unwrap();
+                el.child(div().text_color(muted).child("BY TASK")).child(
+                    v_flex().children(s.by_task.iter().filter(|(task, ..)| !out.contains(task)).map(|(task, cpu, mem)| row(div().child(task.clone()).into_any_element(), *mem, *cpu))),
+                )
             })
             .child(div().text_color(muted).child("PROCESSES"))
             .child(

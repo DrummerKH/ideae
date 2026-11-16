@@ -66,6 +66,7 @@ pub struct TaskEntry {
 }
 
 pub mod present;
+pub mod spaces;
 pub mod variants;
 
 impl TaskEntry {
@@ -77,6 +78,8 @@ impl TaskEntry {
 pub struct Project {
     pub path: PathBuf,
     pub name: String,
+    /// The space it is sorted into; none, and it is in every one.
+    pub space: Option<String>,
     pub collapsed: bool,
     pub tasks: Vec<TaskEntry>,
     /// The command last run in every variant of a task: tests, a benchmark;
@@ -88,7 +91,7 @@ pub struct Project {
 impl Project {
     fn new(path: PathBuf) -> Self {
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
-        Self { path, name, collapsed: false, tasks: Vec::new(), check: String::new(), check_auto: false }
+        Self { path, name, space: None, collapsed: false, tasks: Vec::new(), check: String::new(), check_auto: false }
     }
 }
 
@@ -99,6 +102,11 @@ pub struct Workspace {
     pub active_collapsed: bool,
     /// Set while the window is shown to others: what is left in it.
     pub presenting: Option<present::Presenting>,
+    /// The spaces, the one in the window (none: all of them), and the
+    /// task last looked at in each.
+    pub spaces: Vec<spaces::Space>,
+    pub space: Option<String>,
+    last_in_space: std::collections::HashMap<Option<String>, PathBuf>,
     agent: Option<String>,
     /// The agent given on the command line, over Settings.
     agent_override: Option<Option<String>>,
@@ -391,6 +399,8 @@ impl Workspace {
                     let often = if saving { 100 } else { 10 };
                     if n % often == 0 {
                         this.sync_worktrees(window, cx);
+                        // Tasks come and go with their worktrees.
+                        this.tell_what_is_hidden();
                     }
                     if n % 10 == 0 {
                         this.sleep_idle_language_servers(cx);
@@ -417,6 +427,9 @@ impl Workspace {
             active: None,
             active_collapsed: saved.active_collapsed,
             presenting: saved.presenting.as_ref().map(|p| present::Presenting::new(p.kept.iter().cloned().collect(), p.since)),
+            spaces: saved.spaces.clone(),
+            space: saved.space.clone().filter(|name| saved.spaces.iter().any(|s| &s.name == name)),
+            last_in_space: Default::default(),
             agent,
             agent_override,
             hook_socket,
@@ -497,6 +510,7 @@ impl Workspace {
             build: crate::build_watch::BuildWatch::new(),
         };
         this.restore(&saved, window, cx);
+        this.tell_what_is_hidden();
         // A presentation that was on is on again, with all that goes with it.
         if this.presenting.is_some() {
             this.apply_presenting(cx);
@@ -617,6 +631,7 @@ impl Workspace {
     fn restore(&mut self, saved: &State, window: &mut Window, cx: &mut Context<Self>) {
         for p in &saved.projects {
             let mut project = Project::new(p.path.clone());
+            project.space = p.space.clone().filter(|name| saved.spaces.iter().any(|s| &s.name == name));
             project.collapsed = p.collapsed;
             project.check = p.check.clone();
             project.check_auto = p.check_auto;
@@ -711,6 +726,8 @@ impl Workspace {
             side_panel_width: cx.try_global::<SidePanelWidth>().map(|w| f32::from(w.0)),
             active_collapsed: self.active_collapsed,
             presenting: self.presenting.as_ref().map(|p| state::PresentingState { kept: p.kept.iter().cloned().collect(), since: p.since }),
+            spaces: self.spaces.clone(),
+            space: self.space.clone(),
             power_saving: crate::lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed),
             window: self.window_place.clone(),
             settings: state::settings(),
@@ -721,6 +738,7 @@ impl Workspace {
                 .iter()
                 .map(|p| ProjectState {
                     path: p.path.clone(),
+                    space: p.space.clone(),
                     collapsed: p.collapsed,
                     check: p.check.clone(),
                     check_auto: p.check_auto,
@@ -826,6 +844,21 @@ impl Workspace {
         let slot = (1..).find(|s| !taken.contains(s)).unwrap_or(1);
         self.projects[pi].tasks[ti].port_slot = slot;
         slot
+    }
+
+    /// No task in the window: the one in hand goes out of view, and goes on.
+    pub fn leave_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.active_group = None;
+        if let Some(old) = self.active_view() {
+            old.update(cx, |t, cx| {
+                t.autosave_all(cx);
+                t.set_visible(false, window, cx)
+            });
+        }
+        if let Some(old) = self.active.take().and_then(|a| self.entry_mut(&a)) {
+            old.left_view = Some(std::time::Instant::now());
+        }
+        cx.notify();
     }
 
     pub fn switch(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
@@ -1129,7 +1162,15 @@ impl Workspace {
         }
         if self.active.as_deref() == Some(path) {
             self.active = None;
-            let next = self.projects.iter().flat_map(|p| &p.tasks).filter(|t| t.view.is_some()).max_by_key(|t| t.last_active);
+            // Not one of a space out of the window.
+            let next = self
+                .projects
+                .iter()
+                .enumerate()
+                .filter(|(pi, _)| self.in_space(*pi))
+                .flat_map(|(_, p)| &p.tasks)
+                .filter(|t| t.view.is_some())
+                .max_by_key(|t| t.last_active);
             if let Some(next) = next.map(|t| t.path.clone()) {
                 self.switch(&next, window, cx);
             }
@@ -1599,7 +1640,10 @@ impl Workspace {
         if let Some(ix) = self.projects.iter().position(|p| p.path == root) {
             return ix;
         }
-        self.projects.push(Project::new(root));
+        // A project added while a space is in the window is one of that space.
+        let mut project = Project::new(root);
+        project.space = self.space.clone();
+        self.projects.push(project);
         self.projects.len() - 1
     }
 
@@ -1882,7 +1926,8 @@ impl Workspace {
 
     /// What all the tasks' agents took in the last day.
     pub fn tokens_of_the_day(&self) -> u64 {
-        self.usage.values().map(|(_, usage)| usage.recent).sum()
+        // Of the space in the window: what the others took is theirs to show.
+        self.usage.iter().filter(|(path, _)| self.find(path).is_none_or(|(pi, _)| self.in_space(pi))).map(|(_, (_, usage))| usage.recent).sum()
     }
 
     pub fn toggle_power_saving(&mut self, cx: &mut Context<Self>) {

@@ -276,6 +276,22 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
             .description("Click a shortcut and press the new keys: Esc leaves them, Backspace removes them.")
             .default_open(true)
             .groups(key_groups(draft, recording, catcher)),
+        SettingPage::new("Spaces")
+            .description("Projects sorted into sets (work, personal, a client), one of them in the window at a time. The mark at the right of the title bar goes from one to another.")
+            .group(SettingGroup::new().item(
+                SettingItem::new(
+                    "The spaces",
+                    SettingField::render(|_, _, _| {
+                        Button::new("edit-spaces").small().outline().label("Edit spaces…").on_click(|_, window, cx| {
+                            // The list is the workspace's and kept as it is typed: it has a window of its own.
+                            if let Some(edit) = EDIT_SPACES.with(|edit| edit.borrow().clone()) {
+                                edit(window, cx);
+                            }
+                        })
+                    }),
+                )
+                .description("Add, name, mark and remove them. Which space a project is of is set from its menu in the sidebar."),
+            )),
         SettingPage::new("Presentation")
             .description("For showing the window to others: ☰ → Enter presentation mode leaves in it only the tasks you tick.")
             .group(
@@ -314,6 +330,11 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
 /// Where the shortcuts are among the pages.
 pub const KEYS_PAGE: usize = 5;
 
+thread_local! {
+    /// What opens the list of spaces, for the page that has a button for it.
+    static EDIT_SPACES: RefCell<Option<Rc<dyn Fn(&mut Window, &mut App)>>> = const { RefCell::new(None) };
+}
+
 impl Workspace {
     pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_settings_at(0, window, cx)
@@ -322,6 +343,12 @@ impl Workspace {
     /// Settings, open at one of its pages.
     pub fn open_settings_at(&mut self, page: usize, window: &mut Window, cx: &mut Context<Self>) {
         let this = cx.weak_entity();
+        let spaces = this.clone();
+        EDIT_SPACES.with(|edit| {
+            *edit.borrow_mut() = Some(Rc::new(move |window, cx| {
+                let _ = spaces.update(cx, |w, cx| w.spaces_dialog(window, cx));
+            }))
+        });
         open(state::settings(), page, window, cx, move |settings, cx| {
             let _ = this.update(cx, |w, cx| w.apply_settings(settings, cx));
         });
@@ -507,7 +534,7 @@ mod tests {
     #[gpui_kit::test]
     fn every_page_draws(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
-        for page in 0..7 {
+        for page in 0..8 {
             let handle = window(cx);
             cx.update_window(handle, |_, window, cx| {
                 open(state::Settings::default(), page, window, cx, |_, _| {});

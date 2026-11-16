@@ -224,7 +224,22 @@ impl Workspace {
         let (presenting, saving) = (self.is_presenting(), crate::lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed));
         // In the order of the menu: what to start, where to go, the task's
         // views, git, the editor, the window, the app.
-        let entries = vec![
+        // The spaces to go to, when there are some.
+        let mut to_spaces: Vec<Entry> = Vec::new();
+        if !self.spaces.is_empty() {
+            let go = |label: String, to: Option<String>| {
+                let this = this.clone();
+                Entry::new(label, move |window, cx| {
+                    let to = to.clone();
+                    let _ = this.update(cx, |w, cx| w.switch_space(to, window, cx));
+                })
+                .detail("space: the projects in the window")
+            };
+            to_spaces.push(go("All spaces".into(), None));
+            to_spaces.extend(self.spaces.iter().map(|space| go(format!("Space: {}", space.name), Some(space.name.clone()))));
+        }
+        to_spaces.push(own("Spaces…", "space: add, name, remove", |w, window, cx| w.spaces_dialog(window, cx)));
+        let mut entries = vec![
             keyed("New task…", "new_task", "task"),
             keyed("Next waiting task", "next_waiting", "task: an agent that asks or is done"),
             key(own("Recent tasks", "task", |w, window, cx| w.recent_tasks(window, cx)), "recent"),
@@ -288,6 +303,9 @@ impl Workspace {
             own("Restart", "app", |w, window, cx| w.restart(window, cx)),
             keyed("Quit", "quit", "app"),
         ];
+        // With the window's own: before the app's.
+        let app = entries.iter().position(|entry| entry.label.as_ref() == "Settings…").unwrap_or(entries.len());
+        entries.splice(app..app, to_spaces);
         open("Run a command…", entries, None, window, cx);
     }
 

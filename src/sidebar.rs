@@ -177,8 +177,8 @@ impl Workspace {
             let tasks: Vec<usize> = (0..p.tasks.len())
                 .filter(|&ti| self.shows(pi, ti) && (project_hit || self.task_matches(pi, ti, &query, cx)))
                 .collect();
-            // A project with nothing to show is not shown: while presenting, or when the search has no hit in it.
-            if tasks.is_empty() && (self.is_presenting() || (!query.is_empty() && !project_hit)) {
+            // A project with nothing to show is not shown: of another space, while presenting, or when the search has no hit in it.
+            if !self.in_space(pi) || (tasks.is_empty() && (self.is_presenting() || (!query.is_empty() && !project_hit))) {
                 continue;
             }
             list = list.child(self.render_project(pi, shown == 0, cx));
@@ -408,7 +408,10 @@ impl Workspace {
         let group = SharedString::from(format!("project-group-{pi}"));
         let muted = cx.theme().muted_foreground;
         let this = cx.weak_entity();
+        let spaces: Vec<(String, String)> = self.spaces.iter().map(|s| (s.name.clone(), s.mark())).collect();
+        let in_space = p.space.clone();
         let menu = move |menu: PopupMenu, this: WeakEntity<Workspace>| {
+            let (spaces, in_space) = (spaces.clone(), in_space.clone());
             let (a, b, c, d) = (this.clone(), this.clone(), this.clone(), this);
             menu.item(PopupMenuItem::new("Open main thread").on_click(move |_, window, cx| {
                 let _ = a.update(cx, |w, cx| w.open_main(pi, window, cx));
@@ -420,6 +423,24 @@ impl Workspace {
                 let _ = d.update(cx, |w, cx| w.clean_up_merged(pi, window, cx));
             }))
             .separator()
+            // Which space it is of: one of them, or none, which is all.
+            .map(|mut menu| {
+                for (name, mark) in &spaces {
+                    let (to, w) = (name.clone(), c.clone());
+                    menu = menu.item(PopupMenuItem::new(format!("{mark}  In {name}")).checked(in_space.as_ref() == Some(name)).on_click(move |_, window, cx| {
+                        let to = to.clone();
+                        let _ = w.update(cx, |w, cx| w.set_project_space(pi, Some(to), window, cx));
+                    }));
+                }
+                if spaces.is_empty() {
+                    return menu;
+                }
+                let w = c.clone();
+                menu.item(PopupMenuItem::new("In no space").checked(in_space.is_none()).on_click(move |_, window, cx| {
+                    let _ = w.update(cx, |w, cx| w.set_project_space(pi, None, window, cx));
+                }))
+                .separator()
+            })
             .item(PopupMenuItem::new("Remove from list…").on_click(move |_, window, cx| {
                 let _ = c.update(cx, |w, cx| w.remove_project(pi, window, cx));
             }))

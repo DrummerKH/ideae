@@ -1009,6 +1009,10 @@ impl Workspace {
         if !state::settings().notifications || (self.active_group.as_deref() == Some(group) && window.is_window_active()) {
             return;
         }
+        // Nothing is told of what is out of the window: another space's, or left out of a presentation.
+        if !members.iter().any(|&(pi, ti)| self.shows(pi, ti)) {
+            return;
+        }
         let head = &self.projects[pi].tasks[first];
         let pick = self.judges.get(group).filter(|run| run.state == RunState::Passed).and_then(|run| judge_pick(&run.output));
         let body = match pick {
@@ -2356,6 +2360,63 @@ pub(crate) mod tests {
             (w.sidebar_rail, w.sidebar_peek) = (false, false);
             cx.notify();
         });
+        // Spaces: the project is sorted into one; in another nothing of it is in the window or told, in all of them it is back.
+        step(cx, &mut |w, window, cx| {
+            let space = |name: &str| crate::workspace::spaces::Space { name: name.into(), ..Default::default() };
+            w.set_spaces(vec![space("Work"), space("Home")], &[], window, cx);
+            w.set_project_space(0, Some("Work".into()), window, cx);
+            w.switch(&paths[0], window, cx);
+            w.switch_space(Some("Work".into()), window, cx);
+        });
+        workspace.update(cx, |w, cx| {
+            assert!(w.in_space(0) && w.active.as_deref() == Some(paths[0].as_path()), "its own space: as before");
+            assert_eq!(w.waiting_elsewhere(cx), 0);
+        });
+        step(cx, &mut |w, window, cx| w.switch_space(Some("Home".into()), window, cx));
+        step(cx, &mut |w, window, cx| {
+            w.on_hook(hook(&paths[1], "UserPromptSubmit"), window, cx);
+            w.on_hook(hook(&paths[1], "Stop"), window, cx);
+        });
+        workspace.update(cx, |w, cx| {
+            let b = w.find(&paths[1]).unwrap();
+            assert!(!w.in_space(0) && !w.shows(b.0, b.1) && w.active.is_none(), "another space: its task left the window");
+            assert!(w.waiting_elsewhere(cx) >= 1, "that one waits there is a number by the switch");
+            assert_eq!(w.tokens_of_the_day(), 0, "what its agents took is not this space's");
+            let saved = w.snapshot(cx);
+            assert_eq!((saved.space.as_deref(), saved.projects[0].space.as_deref()), (Some("Home"), Some("Work")));
+            assert!(!saved.tells_of(&paths[1]), "nor is it told of with the window closed");
+            let folder = paths[1].file_name().unwrap().to_string_lossy().into_owned();
+            assert!(crate::sysmon::OUT_OF_WINDOW.lock().unwrap().contains(&folder), "nor named in the load readout");
+            let long = crate::workspace::spaces::Space { name: "Client".into(), icon: "CLIENT".into(), color: 2 };
+            assert_eq!((long.mark(), crate::workspace::spaces::Space { name: "home".into(), ..Default::default() }.mark()), ("CLI".to_string(), "H".to_string()));
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("space-switch").visible());
+        })
+        .unwrap();
+        // Renamed, the space keeps its projects; removed, they are in none and in every one.
+        step(cx, &mut |w, window, cx| {
+            let space = |name: &str| crate::workspace::spaces::Space { name: name.into(), ..Default::default() };
+            w.set_spaces(vec![space("Job"), space("Home")], &[("Work".into(), "Job".into())], window, cx);
+        });
+        workspace.update(cx, |w, _| assert_eq!(w.projects[0].space.as_deref(), Some("Job")));
+        step(cx, &mut |w, window, cx| w.switch_space(None, window, cx));
+        workspace.update(cx, |w, _| assert!(w.in_space(0) && w.active.is_some(), "all of them: a task is in hand again"));
+        step(cx, &mut |w, window, cx| w.set_spaces(Vec::new(), &[], window, cx));
+        workspace.update(cx, |w, cx| {
+            assert!(w.projects[0].space.is_none() && w.space.is_none() && w.snapshot(cx).tells_of(&paths[1]));
+            assert!(crate::sysmon::OUT_OF_WINDOW.lock().unwrap().is_empty(), "all in the window: all named");
+        });
+        step(cx, &mut |w, window, cx| w.spaces_dialog(window, cx));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("space-add").visible());
+            assert!(window.try_find("space-projects").is_none(), "no spaces: nothing to sort the projects into");
+            window.close_all_dialogs(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
         // A theme gone to in the list is drawn at once and is the one set; the list itself draws.
         step(cx, &mut |w, window, cx| w.use_theme("Gruvbox", window, cx));
         cx.update(|cx| assert_eq!((crate::theme::family(cx), crate::state::settings().theme.as_str()), ("Gruvbox", "Gruvbox")));
