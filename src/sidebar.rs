@@ -52,6 +52,12 @@ fn section_header(label: &'static str, cx: &App) -> Div {
 /// yellow when it will soon be squeezed, red when that is about to happen.
 fn context_dial(fill: f32, muted: Hsla, cx: &App) -> impl IntoElement {
     let color = if fill >= 0.9 { gpui_kit::red() } else if fill >= 0.75 { gpui_kit::yellow() } else { cx.theme().primary };
+    dial("context-dial", fill, color, muted)
+}
+
+/// A ring of 12 px, filled clockwise from the top by `fill` of a turn in
+/// `color`, on a faint whole ring: a share of something, at a glance.
+pub(crate) fn dial(id: &'static str, fill: f32, color: Hsla, muted: Hsla) -> impl IntoElement {
     let dial = canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
@@ -75,7 +81,7 @@ fn context_dial(fill: f32, muted: Hsla, cx: &App) -> impl IntoElement {
             arc(0., fill.clamp(0.03, 1.), px(2.), color);
         },
     );
-    div().id("context-dial").test_support().flex_none().size(px(12.)).child(dial.size_full())
+    div().id(id).test_support().flex_none().size(px(12.)).child(dial.size_full())
 }
 
 /// "now", "5m", "3h", "2d", "2w", "4mo".
