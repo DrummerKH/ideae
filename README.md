@@ -48,6 +48,11 @@ Windows build exists and is being tried out (see [Windows](#windows)).
   fires when a task out of view wants you. The Changes and Files panels
   mark the file the agent is writing to and those it wrote to since your
   last prompt.
+- **Themes.** Ayu, Catppuccin, Gruvbox, Solarized, Everforest and
+  Flexoki, each with a light and a dark side (the switch in the title
+  bar: auto, light, dark). Theme… in the menu lists them and draws each
+  as you go through the list: Enter keeps it, Esc goes back. Terminals take
+  the theme's colors too.
 - **Presenting.** Before the window is shown to others, ☰ → Enter
   presentation mode asks which tasks to leave in it. The rest leave the
   list, the search and the notifications and go on working; the load and

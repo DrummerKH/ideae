@@ -7,6 +7,10 @@ pub fn key(linux: &str) -> String {
     if !cfg!(target_os = "macos") {
         return linux.to_string();
     }
+    // Keys pressed one after another are each put the platform's way.
+    if linux.contains(' ') {
+        return linux.split(' ').map(key).collect::<Vec<_>>().join(" ");
+    }
     match linux {
         // Cmd+` switches windows on macOS.
         "ctrl-`" => "ctrl-`",
@@ -73,6 +77,15 @@ fn chord(linux: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{key, label};
+
+    #[test]
+    fn every_key_of_a_sequence_is_the_macs() {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        assert_eq!(key("ctrl-k ctrl-t"), "cmd-k cmd-t", "not the first alone");
+        assert_eq!(key("ctrl-shift-n"), "cmd-shift-o");
+    }
 
     #[test]
     fn linux_keys_stay() {

@@ -2356,6 +2356,17 @@ pub(crate) mod tests {
             (w.sidebar_rail, w.sidebar_peek) = (false, false);
             cx.notify();
         });
+        // A theme gone to in the list is drawn at once and is the one set; the list itself draws.
+        step(cx, &mut |w, window, cx| w.use_theme("Gruvbox", window, cx));
+        cx.update(|cx| assert_eq!((crate::theme::family(cx), crate::state::settings().theme.as_str()), ("Gruvbox", "Gruvbox")));
+        step(cx, &mut |w, window, cx| w.theme_picker(window, cx));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.has_active_dialog(cx));
+            window.close_all_dialogs(cx);
+        })
+        .unwrap();
+        step(cx, &mut |w, window, cx| w.use_theme("Ayu", window, cx));
         // The question of what to leave in the window draws, with its way on.
         step(cx, &mut |w, window, cx| w.presentation_dialog(window, cx));
         cx.update_window(handle.into(), |_, window, cx| {

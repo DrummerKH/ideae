@@ -211,61 +211,82 @@ impl Workspace {
                 }
             }
         };
-        let w = this.clone();
-        let w2 = this.clone();
-        let w3 = this.clone();
-        let w4 = this.clone();
-        let w5 = this.clone();
+        // A command of the workspace, with the word that says what kind it is.
+        let own = |label: &str, kind: &str, run: fn(&mut Workspace, &mut Window, &mut Context<Workspace>)| {
+            let this = this.clone();
+            Entry::new(label.to_string(), move |window, cx| {
+                let _ = this.update(cx, |w, cx| run(w, window, cx));
+            })
+            .detail(kind.to_string())
+        };
+        let key = |entry: Entry, id: &str| entry.keys(crate::keymap::label(id));
+        let keyed = |label: &str, id: &str, kind: &str| Entry::shortcut(label, id).detail(kind.to_string());
+        let (presenting, saving) = (self.is_presenting(), crate::lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed));
+        // In the order of the menu: what to start, where to go, the task's
+        // views, git, the editor, the window, the app.
         let entries = vec![
-            Entry::shortcut("New task…", "new_task"),
-            Entry::shortcut("Go to file…", "go_to_file"),
-            Entry::shortcut("Find in files…", "find_in_files"),
-            Entry::shortcut("Find in terminal…", "find_in_terminal").detail("the scrollback"),
-            Entry::shortcut("Next waiting task", "next_waiting").detail("an agent that asks or is done"),
-            Entry::new("Recent tasks", move |window, cx| {
-                let _ = w.update(cx, |w, cx| w.recent_tasks(window, cx));
-            })
-            .keys(crate::keymap::label("recent")),
-            Entry::new("Recent files", move |window, cx| {
-                let _ = w2.update(cx, |w, cx| w.recent_files(window, cx));
-            })
-            .keys({
+            keyed("New task…", "new_task", "task"),
+            keyed("Next waiting task", "next_waiting", "task: an agent that asks or is done"),
+            key(own("Recent tasks", "task", |w, window, cx| w.recent_tasks(window, cx)), "recent"),
+            own("Recent files", "go to", |w, window, cx| w.recent_files(window, cx)).keys({
                 let e = crate::keymap::label("recent");
                 if e.is_empty() { e } else { format!("{e} {e}") }
             }),
-            Entry::shortcut("Agent", "agent"),
-            Entry::shortcut("Changes", "changes").detail("the diff"),
-            Entry::shortcut("History", "history").detail("the branch's commits"),
-            Entry::shortcut("Shell", "shell").detail("terminal"),
-            Entry::new("New terminal", with_task(task::TaskView::new_terminal)),
-            Entry::new("New browser tab", with_task(task::TaskView::new_browser)).detail("web"),
-            Entry::new("Restart agent", with_task(task::TaskView::restart_agent)),
-            Entry::shortcut("Changes panel", "changes_panel"),
-            Entry::shortcut("Files panel", "files_panel").detail("project tree"),
-            Entry::shortcut("Structure panel", "structure_panel"),
-            Entry::shortcut("Run panel", "run_panel").detail("services: dev servers, workers"),
-            Entry::shortcut("File structure", "outline").detail("declarations of the open file"),
-            Entry::shortcut("Next tab", "next_tab"),
-            Entry::shortcut("Previous tab", "prev_tab"),
-            Entry::shortcut("Back", "back").detail("navigate"),
-            Entry::shortcut("Forward", "forward").detail("navigate"),
-            Entry::shortcut("Focus mode", "focus_mode").detail("zoom the pane"),
-            Entry::new("Add project…", move |window, cx| {
-                let _ = w3.update(cx, |w, cx| w.add_project_dialog(window, cx));
+            own("Add project…", "task", |w, window, cx| w.add_project_dialog(window, cx)),
+            own("Clean up merged tasks…", "task", |w, window, cx| {
+                if let Some(project) = w.active_project() {
+                    w.clean_up_merged(project, window, cx);
+                }
             }),
-            Entry::new("Clean up merged tasks…", move |window, cx| {
-                let _ = w4.update(cx, |w, cx| {
-                    if let Some(project) = w.active_project() {
-                        w.clean_up_merged(project, window, cx);
-                    }
-                });
+            keyed("Go to file…", "go_to_file", "go to"),
+            keyed("Go to class or symbol…", "go_to_symbol", "go to: anywhere in the project"),
+            keyed("Find in files…", "find_in_files", "go to"),
+            keyed("Find in terminal…", "find_in_terminal", "go to: the scrollback"),
+            keyed("Go to line…", "go_to_line", "go to"),
+            keyed("File structure", "outline", "go to: declarations of the open file"),
+            keyed("Go to definition", "definition", "go to"),
+            keyed("Implementations and usages", "usages", "go to"),
+            keyed("Back", "back", "go to"),
+            keyed("Forward", "forward", "go to"),
+            keyed("Agent", "agent", "view"),
+            keyed("Changes", "changes", "view: the diff"),
+            keyed("History", "history", "view: the branch's commits"),
+            keyed("Shell", "shell", "view: terminal"),
+            Entry::new("New terminal", with_task(task::TaskView::new_terminal)).detail("view"),
+            Entry::new("New browser tab", with_task(task::TaskView::new_browser)).detail("view: web"),
+            Entry::new("Restart agent", with_task(task::TaskView::restart_agent)).detail("view"),
+            keyed("Next tab", "next_tab", "view"),
+            keyed("Previous tab", "prev_tab", "view"),
+            keyed("Focus mode", "focus_mode", "view: zoom the pane"),
+            keyed("Changes panel", "changes_panel", "panel"),
+            keyed("Files panel", "files_panel", "panel: project tree"),
+            keyed("Structure panel", "structure_panel", "panel"),
+            keyed("Run panel", "run_panel", "panel: services, dev servers, workers"),
+            keyed("Branches…", "branches", "git: open as a task, compare, delete"),
+            Entry::new("Compare with a branch, tag or commit…", with_task(|t, window, cx| t.compare_with_dialog(None, window, cx))).detail("git: the working tree"),
+            Entry::new("Compare this file with…", with_task(|t, window, cx| t.compare_open_file(window, cx))).detail("git: the file in the editor"),
+            keyed("Complete here", "complete", "editor"),
+            keyed("Quick fixes", "quick_fix", "editor: what the language server offers"),
+            keyed("Rename…", "rename", "editor: the symbol, everywhere"),
+            keyed("Reformat file", "format", "editor"),
+            keyed("Parameter info", "parameter_info", "editor: the call being written"),
+            keyed("Fold", "fold", "editor"),
+            keyed("Unfold", "unfold", "editor"),
+            keyed("Fold all", "fold_all", "editor"),
+            keyed("Unfold all", "unfold_all", "editor"),
+            key(own("Theme…", "window: each is drawn as you go through them", |w, window, cx| w.theme_picker(window, cx)), "theme"),
+            own("Light theme", "window", |w, window, cx| w.set_appearance(crate::theme::Appearance::Light, window, cx)),
+            own("Dark theme", "window", |w, window, cx| w.set_appearance(crate::theme::Appearance::Dark, window, cx)),
+            own("Theme as the system", "window: light by day, dark by night", |w, window, cx| w.set_appearance(crate::theme::Appearance::Auto, window, cx)),
+            own("Text of its usual size", "window: editor, diff and terminal", |_, _, cx| crate::zoom::reset_all(cx)),
+            own(if presenting { "End presentation" } else { "Enter presentation mode…" }, "window: only the tasks chosen", |w, window, cx| {
+                if w.is_presenting() { w.end_presentation(window, cx) } else { w.presentation_dialog(window, cx) }
             }),
-            Entry::new("Language servers on/off", move |_, cx| {
-                let _ = w5.update(cx, |w, cx| w.toggle_power_saving(cx));
-            })
-            .detail("power saving"),
-            Entry::shortcut("Settings", "settings"),
-            Entry::shortcut("Quit", "quit"),
+            own(if saving { "Leave power saving" } else { "Save power" }, "window: language servers and background work", |w, _, cx| w.toggle_power_saving(cx)),
+            keyed("Settings…", "settings", "app"),
+            own("Keyboard shortcuts…", "app", |w, window, cx| w.open_settings_at(crate::settings_ui::KEYS_PAGE, window, cx)),
+            own("Restart", "app", |w, window, cx| w.restart(window, cx)),
+            keyed("Quit", "quit", "app"),
         ];
         open("Run a command…", entries, None, window, cx);
     }

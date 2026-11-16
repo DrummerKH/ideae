@@ -94,6 +94,12 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
         })
         .default_value(SharedString::from(default.rail_open_ms.to_string()))
     };
+    let theme = {
+        let (read, write) = (draft.clone(), draft.clone());
+        let options = crate::theme::FAMILIES.iter().map(|family| (SharedString::from(family.name), SharedString::from(family.name))).collect();
+        SettingField::dropdown(options, move |_| read.borrow().theme.clone().into(), move |value, _| write.borrow_mut().theme = value.to_string())
+            .default_value(SharedString::from(default.theme.clone()))
+    };
     let servers = lsp::SERVERS.iter().map(|def| {
         let program = def.program;
         let (read, write) = (draft.clone(), draft.clone());
@@ -126,6 +132,11 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
                     |s| s.check_updates,
                     |s, v| s.check_updates = v,
                 )),
+        ).group(
+            SettingGroup::new().title("Look").item(
+                SettingItem::new("Theme", theme)
+                    .description("Each has a light and a dark side: which of the two is drawn is the switch in the title bar. Theme… in the menu shows them one after another as you go through the list."),
+            ),
         ).group(
             SettingGroup::new().title("Title bar")
                 .item(switch(

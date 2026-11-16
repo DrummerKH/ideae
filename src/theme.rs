@@ -1,4 +1,4 @@
-//! Ayu for the UI and the terminals, light/dark/auto; Fira Code for code.
+//! The themes of the UI and the terminals, each light/dark/auto; Fira Code for code.
 
 use gpui_cn::terminal::TerminalColors;
 use gpui_kit::component::{Theme, ThemeMode, ThemeRegistry};
@@ -62,21 +62,67 @@ fn register_code_font(cx: &mut App) {
     }
 }
 
-/// Registers Ayu as the light and dark theme, and the code font.
+/// A theme to choose: a light and a dark one that go together, by the
+/// names they have in their file.
+pub struct Family {
+    pub name: &'static str,
+    light: &'static str,
+    dark: &'static str,
+    file: &'static str,
+}
+
+/// The themes built in; the first is the one to start with. All but Ayu
+/// are the files of gpui-component (Apache-2.0), as they are there.
+pub const FAMILIES: [Family; 6] = [
+    Family { name: "Ayu", light: "Ayu Light", dark: "Ayu Dark", file: include_str!("../themes/ayu.json") },
+    Family { name: "Catppuccin", light: "Catppuccin Latte", dark: "Catppuccin Mocha", file: include_str!("../themes/catppuccin.json") },
+    Family { name: "Gruvbox", light: "Gruvbox Light", dark: "Gruvbox Dark", file: include_str!("../themes/gruvbox.json") },
+    Family { name: "Solarized", light: "Solarized Light", dark: "Solarized Dark", file: include_str!("../themes/solarized.json") },
+    Family { name: "Everforest", light: "Everforest Light", dark: "Everforest Dark", file: include_str!("../themes/everforest.json") },
+    Family { name: "Flexoki", light: "Flexoki Light", dark: "Flexoki Dark", file: include_str!("../themes/flexoki.json") },
+];
+
+/// The family in use.
+struct Chosen(&'static str);
+impl Global for Chosen {}
+
+pub fn family(cx: &App) -> &'static str {
+    cx.try_global::<Chosen>().map_or(FAMILIES[0].name, |chosen| chosen.0)
+}
+
+/// Registers the themes and the code font; Ayu until another is chosen.
 pub fn init(cx: &mut App) {
     register_code_font(cx);
-    if let Err(error) = ThemeRegistry::global_mut(cx).load_themes_from_str(include_str!("../themes/ayu.json")) {
-        eprintln!("ayu theme: {error:#}");
-        return;
+    for family in &FAMILIES {
+        if let Err(error) = ThemeRegistry::global_mut(cx).load_themes_from_str(family.file) {
+            eprintln!("{} theme: {error:#}", family.name);
+        }
     }
+    choose(FAMILIES[0].name, cx);
+}
+
+/// Makes `name` the light and dark theme; one not known leaves the first.
+/// What is on the screen follows at the next [`apply`].
+pub fn choose(name: &str, cx: &mut App) {
+    let family = FAMILIES.iter().find(|family| family.name == name).unwrap_or(&FAMILIES[0]);
     let themes = ThemeRegistry::global(cx).themes();
-    let (light, dark) = (themes.get("Ayu Light").cloned(), themes.get("Ayu Dark").cloned());
+    let (light, dark) = (themes.get(family.light).cloned(), themes.get(family.dark).cloned());
+    cx.set_global(Chosen(family.name));
     let theme = Theme::global_mut(cx);
     if let Some(light) = light {
         theme.light_theme = light;
     }
     if let Some(dark) = dark {
         theme.dark_theme = dark;
+    }
+}
+
+/// The same where there is no window at hand: the theme chosen in Settings.
+pub fn apply_everywhere(appearance: Appearance, cx: &mut App) {
+    match appearance {
+        Appearance::Auto => Theme::sync_system_appearance(None, cx),
+        Appearance::Light => Theme::change(ThemeMode::Light, None, cx),
+        Appearance::Dark => Theme::change(ThemeMode::Dark, None, cx),
     }
 }
 
@@ -93,7 +139,21 @@ pub fn apply(appearance: Appearance, window: &mut Window, cx: &mut App) {
 /// (Ghostty's "Ayu" / "Ayu Light").
 pub fn terminal_colors(cx: &App) -> TerminalColors {
     let theme = Theme::global(cx);
-    let palette = if theme.mode.is_dark() { AYU_DARK } else { AYU_LIGHT };
+    let palette = match (family(cx), theme.mode.is_dark()) {
+        ("Ayu", true) => AYU_DARK.to_string(),
+        ("Ayu", false) => AYU_LIGHT.to_string(),
+        // The theme's own six colors, and their bright ones where it has them.
+        _ => {
+            let dim = theme.muted_foreground;
+            let colors = [
+                theme.background, theme.red, theme.green, theme.yellow, theme.blue, theme.magenta, theme.cyan, dim,
+                dim, theme.red_light, theme.green_light, theme.yellow_light, theme.blue_light, theme.magenta_light, theme.cyan_light, theme.foreground,
+            ];
+            let mut palette: String = colors.iter().enumerate().map(|(n, color)| format!("palette = {n}={}\n", hex(*color))).collect();
+            palette.push_str(&format!("cursor-color = {}\nselection-background = {}\n", hex(theme.primary), hex(theme.selection)));
+            palette
+        }
+    };
     let text = format!(
         "background = {}\nforeground = {}\n{palette}",
         hex(theme.background),
@@ -149,3 +209,41 @@ palette = 15=#d1d1d1
 cursor-color = #ffaa33
 selection-background = #d1e4f4
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::{Appearance, FAMILIES, apply_everywhere, choose, family, hex, init, terminal_colors};
+    use gpui_cn::terminal::TerminalColors;
+    use gpui_kit::TestAppContext;
+    use gpui_kit::component::{Theme, ThemeRegistry};
+
+    /// Every family is in its file under the names it is asked for, has a
+    /// light and a dark side of its own, and colors for the terminals.
+    #[gpui_kit::test]
+    fn every_theme_has_both_sides_and_a_terminal_palette(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            init(cx);
+            let mut grounds = Vec::new();
+            for family in &FAMILIES {
+                let themes = ThemeRegistry::global(cx).themes();
+                assert!(themes.contains_key(family.light) && themes.contains_key(family.dark), "{}", family.name);
+                choose(family.name, cx);
+                assert_eq!(super::family(cx), family.name);
+                for appearance in [Appearance::Light, Appearance::Dark] {
+                    apply_everywhere(appearance, cx);
+                    let theme = Theme::global(cx);
+                    assert_eq!(theme.mode.is_dark(), appearance == Appearance::Dark, "{}", family.name);
+                    grounds.push(hex(theme.background));
+                    let palette = format!("background = {}\nforeground = {}\n", hex(theme.background), hex(theme.foreground));
+                    assert!(TerminalColors::from_ghostty_theme(&palette).is_ok());
+                    let _ = terminal_colors(cx);
+                }
+            }
+            let distinct: std::collections::HashSet<&String> = grounds.iter().collect();
+            assert_eq!(distinct.len(), grounds.len(), "each side of each family draws on a ground of its own: {grounds:?}");
+            choose("No such theme", cx);
+            assert_eq!(family(cx), "Ayu", "one not known is the first");
+        });
+    }
+}

@@ -3,7 +3,7 @@
 
 use gpui_kit::{Action, App, KeyBinding, NoAction};
 
-use crate::{FindInFiles, GoToFile, GoToSymbol, NewTask, OpenSettings, Quit, keys, palette, task};
+use crate::{FindInFiles, GoToFile, GoToSymbol, NewTask, SwitchTheme, OpenSettings, Quit, keys, palette, task};
 
 /// Where a shortcut works.
 #[derive(Clone, Copy, PartialEq)]
@@ -82,6 +82,8 @@ pub static SHORTCUTS: &[Shortcut] = &[
     shortcut!("parameter_info", "Parameter info", "ctrl-p", Editor, task::ParameterInfo),
     // Ctrl+Y is the line's: the editor's own Redo moves here.
     shortcut!("redo", "Redo", "ctrl-shift-z", Editor, gpui_kit::component::input::Redo),
+    // No keys of its own: a theme is seldom changed, and the menu has it.
+    shortcut!("theme", "Switch theme", "", Everywhere, SwitchTheme),
     shortcut!("settings", "Settings", "ctrl-,", Everywhere, OpenSettings),
     shortcut!("quit", "Exit", "ctrl-q", Everywhere, Quit),
 ];

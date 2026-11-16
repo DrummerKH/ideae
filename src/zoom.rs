@@ -101,6 +101,13 @@ pub fn set(kind: Kind, size: Option<f32>, cx: &mut App) {
     cx.refresh_windows();
 }
 
+/// Every kind back to the theme's size.
+pub fn reset_all(cx: &mut App) {
+    for kind in [Kind::Editor, Kind::Changes, Kind::Terminal] {
+        set(kind, None, cx);
+    }
+}
+
 /// Steps the size of `kind` by `points`.
 pub fn step(kind: Kind, points: f32, cx: &mut App) {
     set(kind, Some(chosen(kind, cx) + points), cx);

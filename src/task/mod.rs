@@ -1690,11 +1690,7 @@ impl Render for TaskView {
             .on_action(cx.listener(|this, _: &ShowUsages, window, cx| this.show_usages_at_cursor(window, cx)))
             .on_action(cx.listener(|this, _: &SendToAgent, window, cx| this.send_editor_selection(window, cx)))
             .on_action(cx.listener(|this, _: &ShowBranches, window, cx| this.branches_dialog(window, cx)))
-            .on_action(cx.listener(|this, _: &CompareFileWith, window, cx| {
-                let Some(TabKind::File(file)) = this.focused_ix().map(|ix| &this.tabs[ix].kind) else { return };
-                let Ok(file) = file.read(cx).path.strip_prefix(&this.root).map(|path| path.to_string_lossy().into_owned()) else { return };
-                this.compare_with_dialog(Some(file), window, cx)
-            }))
+            .on_action(cx.listener(|this, _: &CompareFileWith, window, cx| this.compare_open_file(window, cx)))
             .child(
                 h_resizable("task")
                     .on_resize(|state, _, cx| {

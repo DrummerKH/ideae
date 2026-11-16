@@ -273,6 +273,13 @@ impl TaskView {
         !self.tree_files.is_empty() && !self.tree_files.iter().any(|file| *file == inside)
     }
 
+    /// The file in the editor against a branch, tag or commit to choose.
+    pub fn compare_open_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(TabKind::File(file)) = self.focused_ix().map(|ix| &self.tabs[ix].kind) else { return };
+        let Ok(file) = file.read(cx).path.strip_prefix(&self.root).map(|path| path.to_string_lossy().into_owned()) else { return };
+        self.compare_with_dialog(Some(file), window, cx)
+    }
+
     /// Marks the open files git ignores: while presenting they show a
     /// notice in place of what they hold, until asked for.
     pub fn veil_ignored(&mut self, cx: &mut Context<Self>) {

@@ -285,6 +285,7 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &GoToFile, window, cx| this.finder(finder::FinderKind::Files, window, cx)))
             .on_action(cx.listener(|this, _: &GoToSymbol, window, cx| this.finder(finder::FinderKind::Symbols, window, cx)))
+            .on_action(cx.listener(|this, _: &SwitchTheme, window, cx| this.theme_picker(window, cx)))
             // Reached when nothing inside the task holds focus (a placeholder, a list).
             .on_action(cx.listener(|this, _: &task::ToggleZoom, window, cx| {
                 if let Some(task) = this.active_view() {
@@ -305,7 +306,7 @@ impl Render for Workspace {
     }
 }
 
-actions!(ideae, [GoToFile, GoToSymbol, FindInFiles, NewTask, Quit, OpenSettings]);
+actions!(ideae, [GoToFile, GoToSymbol, FindInFiles, NewTask, Quit, OpenSettings, SwitchTheme]);
 
 impl Workspace {
     fn finder(&mut self, kind: finder::FinderKind, window: &mut Window, cx: &mut Context<Self>) {
@@ -429,6 +430,8 @@ impl Workspace {
             menu = entry(menu, if presenting { "End presentation" } else { "Enter presentation mode…" }, None, |w, window, cx| {
                 if w.is_presenting() { w.end_presentation(window, cx) } else { w.presentation_dialog(window, cx) }
             });
+            menu = entry(menu, "Theme…", Some("theme"), |w, window, cx| w.theme_picker(window, cx));
+            menu = entry(menu, "Text of its usual size", None, |_, _, cx| zoom::reset_all(cx));
             menu = entry(menu, if saving { "Leave power saving" } else { "Save power" }, None, |w, _, cx| w.toggle_power_saving(cx)).separator();
             menu = entry(menu, "Settings…", Some("settings"), |w, window, cx| w.open_settings(window, cx));
             menu = entry(menu, "Keyboard shortcuts…", None, |w, window, cx| w.open_settings_at(settings_ui::KEYS_PAGE, window, cx)).separator();

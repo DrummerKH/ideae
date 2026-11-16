@@ -69,6 +69,8 @@ pub struct Settings {
     /// Milliseconds the pointer rests on the sidebar's rail before the
     /// whole sidebar opens; 0 for never.
     pub rail_open_ms: u32,
+    /// The theme, by the name of its family: "Ayu", "Gruvbox"…
+    pub theme: String,
     /// The title bar shows the machine's load, and what the agents took.
     pub show_load: bool,
     pub show_tokens: bool,
@@ -112,6 +114,7 @@ impl Default for Settings {
             token_warn_k: 0,
             present_zoom: 125,
             rail_open_ms: 750,
+            theme: "Ayu".into(),
             show_load: true,
             show_tokens: true,
             context_dial: true,

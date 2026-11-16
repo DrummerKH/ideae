@@ -211,6 +211,7 @@ impl Workspace {
         let appearance = appearance
             .or_else(|| saved.appearance.as_deref().and_then(Appearance::parse))
             .unwrap_or(Appearance::Auto);
+        theme::choose(&saved.settings.theme, cx);
         theme::apply(appearance, window, cx);
         crate::lsp::POWER_SAVING.store(saved.power_saving, std::sync::atomic::Ordering::Relaxed);
         gpui_kit::base::input::HUMP_WORDS.store(saved.settings.hump_words, std::sync::atomic::Ordering::Relaxed);
@@ -1935,6 +1936,10 @@ impl Workspace {
         let old = state::settings();
         state::set_settings(new.clone());
         gpui_kit::base::input::HUMP_WORDS.store(new.hump_words, std::sync::atomic::Ordering::Relaxed);
+        if old.theme != new.theme {
+            theme::choose(&new.theme, cx);
+            theme::apply_everywhere(self.appearance, cx);
+        }
         if old.gutter_since_base != new.gutter_since_base {
             for view in self.views() {
                 view.update(cx, |t, cx| t.reload_gutters(cx));
@@ -2071,6 +2076,56 @@ impl Workspace {
                 window.push_notification(Notification::error(e.to_string()).title("Restart"), cx)
             }
         }
+    }
+
+    /// Draws with a theme at once, and keeps it as the one set: for the
+    /// list that shows each as it is gone through.
+    pub fn use_theme(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        theme::choose(name, cx);
+        theme::apply(self.appearance, window, cx);
+        let mut settings = state::settings();
+        if settings.theme != theme::family(cx) {
+            settings.theme = theme::family(cx).to_string();
+            state::set_settings(settings);
+            self.save_later(cx);
+        }
+        cx.notify();
+    }
+
+    /// The themes in a list: each shows as it is gone through; Enter
+    /// keeps the one reached, Esc goes back to the one there was.
+    pub fn theme_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui_kit::component::command::{Command, CommandItem, CommandState};
+        let before = theme::family(cx);
+        let command = cx.new(|cx| CommandState::new(window, cx));
+        let this = cx.weak_entity();
+        let focused = Rc::new(std::cell::Cell::new(false));
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (command, this, focused) = (command.clone(), this.clone(), focused.clone());
+            dialog.close_button(false).p_0().w(px(360.)).content(move |content, window, cx| {
+                if !focused.replace(true) {
+                    let command = command.clone();
+                    window.defer(cx, move |window, cx| command.read(cx).focus_handle(cx).focus(window, cx));
+                }
+                let now = theme::family(cx);
+                let (shown, back) = (this.clone(), this.clone());
+                content.child(
+                    Command::new(&command)
+                        .bordered(false)
+                        .placeholder("Theme…")
+                        .items(theme::FAMILIES.iter().map(|family| CommandItem::new().label(family.name).checked(family.name == now)))
+                        .on_select(move |index, window, cx| {
+                            if let Some(family) = theme::FAMILIES.get(index.row) {
+                                let _ = shown.update(cx, |w, cx| w.use_theme(family.name, window, cx));
+                            }
+                        })
+                        .on_confirm(|_, window, cx| window.close_dialog(cx))
+                        .on_cancel(move |window, cx| {
+                            let _ = back.update(cx, |w, cx| w.use_theme(before, window, cx));
+                        }),
+                )
+            })
+        });
     }
 
     pub fn set_appearance(&mut self, appearance: Appearance, window: &mut Window, cx: &mut Context<Self>) {
