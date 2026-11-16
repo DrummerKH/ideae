@@ -613,7 +613,7 @@ impl Workspace {
                 if let Ok(spec) = std::env::var("IDEAE_OPEN") {
                     let (path, line) = spec.rsplit_once(':').unwrap_or((spec.as_str(), "1"));
                     let line = line.parse::<u32>().unwrap_or(1).saturating_sub(1);
-                    t.open_file(path.into(), line, window, cx);
+                    t.open_file_as(path.into(), line, 0, crate::task::OpenAs::Kept, window, cx);
                 }
                 // Debug aid for headless screenshots: IDEAE_URL opens a browser tab.
                 if let Ok(url) = std::env::var("IDEAE_URL") {

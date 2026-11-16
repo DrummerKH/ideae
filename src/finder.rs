@@ -402,7 +402,9 @@ impl Finder {
         }
         let path = self.root.join(&hit.path);
         let line = hit.line.saturating_sub(1);
-        let _ = self.task.update(cx, |t, cx| t.open_file_at(path, line, hit.col, window, cx));
+        // Go to file is for a file to work in; the other lists are places to look at.
+        let how = if self.kind == FinderKind::Files { crate::task::OpenAs::Kept } else { crate::task::OpenAs::Preview };
+        let _ = self.task.update(cx, |t, cx| t.open_file_as(path, line, hit.col, how, window, cx));
     }
 }
 

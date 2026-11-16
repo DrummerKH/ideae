@@ -20,7 +20,12 @@ impl TaskView {
                 this.activate(ix, window, cx);
                 if double {
                     this.last_tab_click = None;
-                    this.toggle_zoom(right, window, cx);
+                    // A preview tab double-clicked is kept, as in other editors.
+                    if std::mem::take(&mut this.tabs[ix].preview) {
+                        cx.notify();
+                    } else {
+                        this.toggle_zoom(right, window, cx);
+                    }
                 }
             }))
             .suffix(
@@ -117,7 +122,7 @@ impl TaskView {
                             .tooltip(move |_, cx| cx.new(|cx| crate::usage::UsageTooltip::new(root.clone(), cx)).into()),
                     )
                 } else {
-                    Tab::new().label(label)
+                    Tab::new().label(label).when(tab.preview, |tab| tab.italic())
                 };
                 let item = item
                     .on_mouse_down(

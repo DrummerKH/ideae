@@ -101,6 +101,11 @@ pub struct Settings {
     pub complete_as_typed: bool,
     pub semantic_colors: bool,
     pub format_on_save: bool,
+    /// A file opened to look at (a jump, a search result) takes the place of
+    /// the one opened that way before, until it is edited.
+    pub preview_tabs: bool,
+    /// File tabs kept open; past it, those left longest close. 0 for no limit.
+    pub tab_limit: u32,
     /// The Changes tab starts with old and new one under the other.
     pub diff_unified: bool,
     /// A pull, rebase, pick or revert that would conflict asks the agent
@@ -126,6 +131,8 @@ impl Default for Settings {
             copy_env: true,
             pr_status: true,
             fetch_minutes: 5,
+            preview_tabs: true,
+            tab_limit: 12,
             check_updates: true,
             hump_words: false,
             gutter_since_base: false,
@@ -291,6 +298,8 @@ pub struct TabSession {
     pub line: u32,
     pub url: Option<String>,
     pub right: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub preview: bool,
 }
 
 /// Debug builds are a separate app: their own data, sockets, window class

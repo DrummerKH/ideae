@@ -64,6 +64,17 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
         })
         .default_value(SharedString::from(default.fetch_minutes.to_string()))
     };
+    let tab_limit = {
+        let (read, write) = (draft.clone(), draft.clone());
+        let options = [(8, "8"), (10, "10"), (12, "12"), (15, "15"), (20, "20"), (30, "30"), (0, "No limit")]
+            .into_iter()
+            .map(|(n, label)| (SharedString::from(n.to_string()), SharedString::from(label)))
+            .collect();
+        SettingField::dropdown(options, move |_| read.borrow().tab_limit.to_string().into(), move |value, _| {
+            write.borrow_mut().tab_limit = value.parse().unwrap_or(0)
+        })
+        .default_value(SharedString::from(default.tab_limit.to_string()))
+    };
     let token_warn = {
         let (read, write) = (draft.clone(), draft.clone());
         let options = [(0, "Never"), (500, "500k tokens"), (1000, "1M tokens"), (2000, "2M tokens"), (5000, "5M tokens"), (10000, "10M tokens")]
@@ -211,6 +222,18 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
                     "Ctrl+S has the language server reformat the file first. Not the save made when you leave a file.",
                     |s| s.format_on_save,
                     |s, v| s.format_on_save = v,
+                )),
+        ).group(
+            SettingGroup::new().title("Tabs")
+                .item(switch(
+                    draft,
+                    "Preview tab",
+                    "A file opened to look at (a jump to a definition or a usage, a search result, a click in Files) opens in one tab, shown in italics, that the next one takes over. Editing it or double-clicking it keeps it.",
+                    |s| s.preview_tabs,
+                    |s, v| s.preview_tabs = v,
+                ))
+                .item(SettingItem::new("File tabs open at most", tab_limit).description(
+                    "Past this many, the file tabs left longest close. Files with unsaved edits stay.",
                 )),
         ).group(
             SettingGroup::new().title("Shown in the code")

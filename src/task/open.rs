@@ -5,13 +5,22 @@ impl TaskView {
         self.open_file_at(path, line, 0, window, cx)
     }
 
-    /// Opens `path` (or its tab) with the cursor at 0-based `line`, `col`.
+    /// Opens `path` (or its tab) with the cursor at 0-based `line`, `col`,
+    /// in the preview tab.
     pub fn open_file_at(&mut self, path: PathBuf, line: u32, col: u32, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_file_as(path, line, col, OpenAs::Preview, window, cx)
+    }
+
+    pub fn open_file_as(&mut self, path: PathBuf, line: u32, col: u32, how: OpenAs, window: &mut Window, cx: &mut Context<Self>) {
         self.record_nav(cx);
         if let Some(ix) = self.tabs.iter().position(|t| match &t.kind {
             TabKind::File(f) => f.read(cx).path == path,
+            TabKind::Binary(b) => b.read(cx).path == path,
             _ => false,
         }) {
+            if how != OpenAs::Preview {
+                self.tabs[ix].preview = false;
+            }
             self.activate(ix, window, cx);
             if let TabKind::File(file) = &self.tabs[ix].kind {
                 let visible = self.visible;
@@ -33,10 +42,7 @@ impl TaskView {
                 };
                 let title = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 let view = cx.new(|_| BinaryView { path: path.clone(), reason });
-                let mut tab = TabItem::new(title, TabKind::Binary(view));
-                tab.right = self.focus_right && self.is_split();
-                self.tabs.push(tab);
-                self.activate(self.tabs.len() - 1, window, cx);
+                self.place_tab(TabItem::new(title, TabKind::Binary(view)), how, window, cx);
                 return;
             }
         };
@@ -152,7 +158,8 @@ impl TaskView {
             let dirty = file.read(cx).dirty;
             let Some(tab) = this.tabs.iter_mut().find(|t| matches!(&t.kind, TabKind::File(f) if *f == file)) else { return };
             let follows = this.right == RightPane::Structure && this.structure_file == Some(tab.id);
-            if std::mem::replace(&mut tab.dirty, dirty) != dirty || follows {
+            let kept = dirty && std::mem::take(&mut tab.preview);
+            if std::mem::replace(&mut tab.dirty, dirty) != dirty || follows || kept {
                 cx.notify();
             }
         })
@@ -162,10 +169,59 @@ impl TaskView {
         self.use_search_definitions(&path, &editor, false, cx);
 
         let title = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let mut tab = TabItem::new(title, TabKind::File(file));
-        tab.right = self.focus_right && self.is_split();
-        self.tabs.push(tab);
-        self.activate(self.tabs.len() - 1, window, cx);
+        self.place_tab(TabItem::new(title, TabKind::File(file)), how, window, cx);
+    }
+
+    /// A new file tab goes in the place of the pane's preview tab when it is
+    /// one too, and the file tabs over the limit that were left longest
+    /// close.
+    fn place_tab(&mut self, mut tab: TabItem, how: OpenAs, window: &mut Window, cx: &mut Context<Self>) {
+        let right = self.focus_right && self.is_split();
+        tab.right = right;
+        tab.preview = how == OpenAs::Preview && crate::state::settings().preview_tabs;
+        let id = tab.id;
+        let replaced = tab.preview.then(|| self.tabs.iter().position(|t| t.preview && t.right == right)).flatten();
+        match replaced {
+            Some(ix) => {
+                self.tabs.insert(ix + 1, tab);
+                self.activate(ix + 1, window, cx);
+                self.remove_tab(ix, window, cx);
+            }
+            None => {
+                self.tabs.push(tab);
+                self.activate(self.tabs.len() - 1, window, cx);
+            }
+        }
+        if how != OpenAs::Restored {
+            self.close_over_limit(id, window, cx);
+        }
+    }
+
+    fn close_over_limit(&mut self, opened: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let limit = crate::state::settings().tab_limit as usize;
+        if limit == 0 {
+            return;
+        }
+        loop {
+            let files = self.tabs.iter().filter(|t| matches!(t.kind, TabKind::File(_) | TabKind::Binary(_)));
+            if files.clone().count() <= limit {
+                return;
+            }
+            let shown = [Some(self.left_active), self.right_active, Some(opened)];
+            let busy = |t: &TabItem| match &t.kind {
+                TabKind::File(f) => f.read(cx).dirty || f.read(cx).saving.is_some(),
+                _ => false,
+            };
+            let Some(oldest) = files
+                .filter(|t| !busy(t) && !shown.contains(&Some(t.id)))
+                .min_by_key(|t| t.used)
+                .map(|t| t.id)
+            else {
+                return;
+            };
+            let Some(ix) = self.ix_of(oldest) else { return };
+            self.remove_tab(ix, window, cx);
+        }
     }
 
     pub(super) fn attach_lsp(

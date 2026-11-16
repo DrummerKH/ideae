@@ -170,7 +170,7 @@ impl TaskView {
                 return;
             }
         }
-        self.open_file(path, 0, window, cx);
+        self.open_file_as(path, 0, 0, OpenAs::Kept, window, cx);
     }
 
     /// Every few seconds while the Run panel is in view: the ports the

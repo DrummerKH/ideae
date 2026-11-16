@@ -175,13 +175,45 @@ struct TabItem {
     shown: SharedString,
     dirty: bool,
     service: Option<String>,
+    /// A file opened to look at, not to work in: the next one opened that
+    /// way takes its place. Editing it, double-clicking it or moving it to
+    /// the other pane keeps it.
+    preview: bool,
+    /// When it was last brought to the front, for closing the file tabs
+    /// left longest when there are more than the limit.
+    used: u64,
+}
+
+fn use_tick() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl TabItem {
     fn new(title: impl Into<SharedString>, kind: TabKind) -> Self {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
-        Self { id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed), title: title.into(), kind, right: false, shown: SharedString::default(), dirty: false, service: None }
+        Self {
+            id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            title: title.into(),
+            kind,
+            right: false,
+            shown: SharedString::default(),
+            dirty: false,
+            service: None,
+            preview: false,
+            used: use_tick(),
+        }
     }
+}
+
+/// How a file is opened: to look at (a jump, a search result, a click in
+/// the tree), to keep, or back from the last run, when its tabs are not to
+/// be closed for the limit while they are coming back.
+#[derive(Clone, Copy, PartialEq)]
+pub enum OpenAs {
+    Preview,
+    Kept,
+    Restored,
 }
 
 struct ChangedFile {
@@ -750,6 +782,7 @@ impl TaskView {
         }
         let tab = &mut self.tabs[ix];
         tab.right = !tab.right;
+        tab.preview = false;
         let (id, right) = (tab.id, tab.right);
         if right {
             self.right_active = Some(id);
@@ -916,7 +949,7 @@ impl TaskView {
     /// Files dropped on the window from a file manager open as tabs.
     pub fn open_dropped(&mut self, paths: &[PathBuf], window: &mut Window, cx: &mut Context<Self>) {
         for path in paths.iter().filter(|p| p.is_file()) {
-            self.open_file(path.clone(), 0, window, cx);
+            self.open_file_as(path.clone(), 0, 0, OpenAs::Kept, window, cx);
         }
     }
 
@@ -1256,6 +1289,7 @@ impl TaskView {
             self.record_nav(cx);
             self.note_recent(cx);
         }
+        self.tabs[ix].used = use_tick();
         let tab = &self.tabs[ix];
         if matches!(tab.kind, TabKind::File(_)) {
             self.structure_file = Some(tab.id);
@@ -1315,7 +1349,7 @@ impl TaskView {
             }
             None => {
                 let (line, col) = self.recent.iter().find(|(p, _, _)| *p == path).map_or((0, 0), |(_, l, c)| (*l, *c));
-                self.open_file_at(path, line, col, window, cx);
+                self.open_file_as(path, line, col, OpenAs::Kept, window, cx);
             }
         }
     }
@@ -1638,12 +1672,13 @@ impl TaskView {
                             .when(is_changed && agent.is_none(), |this| this.child(div().text_xs().text_color(gpui_kit::green()).child("●")))
                             .when_some(agent, |this, mark| this.child(div().text_xs().text_color(gpui_kit::blue()).child(mark))),
                     )
-                    .on_click(move |_, window, cx| {
+                    .on_click(move |event, window, cx| {
                         if folder {
                             return;
                         }
                         let path = path.clone();
-                        let _ = view.update(cx, |t, cx| t.open_file(path, 0, window, cx));
+                        let how = if event.click_count() > 1 { OpenAs::Kept } else { OpenAs::Preview };
+                        let _ = view.update(cx, |t, cx| t.open_file_as(path, 0, 0, how, window, cx));
                     })
             })
             .size_full(),
@@ -1975,6 +2010,38 @@ mod open_file_scenario {
         .unwrap();
         task.update(cx, |t, _| assert!(!t.diff_stale, "in front again, with the diff of now"));
         assert_eq!(shown(cx), 2);
+
+        // Files opened to look at share one tab; one opened to keep, or
+        // edited, has its own; past the limit, the one left longest closes.
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(repo.join(name), "x\n").unwrap();
+        }
+        let open = |cx: &mut TestAppContext, name: &str, how: super::OpenAs| {
+            cx.update_window(handle.into(), |_, window, cx| task.update(cx, |t, cx| t.open_file_as(repo.join(name), 0, 0, how, window, cx))).unwrap();
+            cx.run_until_parked();
+        };
+        let open_files = |cx: &mut TestAppContext| {
+            task.update(cx, |t, cx| {
+                t.tabs
+                    .iter()
+                    .filter_map(|tab| match &tab.kind {
+                        TabKind::File(f) => Some(format!("{}{}", f.read(cx).path.file_name().unwrap().to_string_lossy(), if tab.preview { "?" } else { "" })),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(open_files(cx), ["f.txt"], "edited, so kept");
+        open(cx, "a.txt", super::OpenAs::Preview);
+        open(cx, "b.txt", super::OpenAs::Preview);
+        assert_eq!(open_files(cx), ["f.txt", "b.txt?"]);
+        open(cx, "b.txt", super::OpenAs::Kept);
+        open(cx, "a.txt", super::OpenAs::Preview);
+        assert_eq!(open_files(cx), ["f.txt", "b.txt", "a.txt?"]);
+        crate::state::set_settings(crate::state::Settings { notifications: false, pr_status: false, tab_limit: 2, ..Default::default() });
+        open(cx, "c.txt", super::OpenAs::Kept);
+        assert_eq!(open_files(cx), ["a.txt?", "c.txt"], "f.txt, then b.txt, were left longest");
+        crate::state::set_settings(crate::state::Settings { notifications: false, pr_status: false, ..Default::default() });
 
         task.update(cx, |t, cx| t.shut_down(cx));
         cx.update_window(handle.into(), |_, window, _| window.remove_window()).ok();

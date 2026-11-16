@@ -17,7 +17,7 @@ impl TaskView {
             .tabs
             .iter()
             .map(|tab| {
-                let mut s = TabSession { right: tab.right, ..Default::default() };
+                let mut s = TabSession { right: tab.right, preview: tab.preview, ..Default::default() };
                 match &tab.kind {
                     // The task's first terminal: the agent, or the shell without one.
                     TabKind::Terminal(_) if tab.title == "agent" || tab.title == "shell" => s.kind = "agent".into(),
@@ -96,7 +96,7 @@ impl TaskView {
                     if let Some(path) = &saved.path {
                         let path = self.root.join(path);
                         if path.exists() {
-                            self.open_file(path, saved.line, window, cx);
+                            self.open_file_as(path, saved.line, 0, OpenAs::Restored, window, cx);
                         }
                     }
                 }
@@ -106,6 +106,7 @@ impl TaskView {
             let new = self.tabs.iter_mut().find(|t| !before.contains(&t.id));
             ids.push(new.map(|tab| {
                 tab.right = saved.right;
+                tab.preview = saved.preview;
                 tab.id
             }));
         }

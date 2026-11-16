@@ -60,7 +60,8 @@ impl Workspace {
         }
         let Some(presenting) = &self.presenting else { return true };
         let (project, task) = (&self.projects[pi], &self.projects[pi].tasks[ti]);
-        presenting.kept.contains(&task.path) || (task.created >= presenting.since && project.tasks.iter().any(|t| presenting.kept.contains(&t.path)))
+        // Seconds: one made in the second the presentation began is one of before.
+        presenting.kept.contains(&task.path) || (task.created > presenting.since && project.tasks.iter().any(|t| presenting.kept.contains(&t.path)))
     }
 
     pub fn shows_path(&self, path: &Path) -> bool {
