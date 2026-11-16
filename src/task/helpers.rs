@@ -340,6 +340,56 @@ pub(super) fn first_identifier(node: tree_sitter::Node, depth: usize) -> Option<
     None
 }
 
+/// The line a declaration is read by: past the annotations above it
+/// (`@Obfuscate` on a line of its own before a Kotlin class).
+fn head_line(node: tree_sitter::Node) -> usize {
+    fn first_token(node: tree_sitter::Node) -> Option<usize> {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            let kind = child.kind();
+            if ["annotation", "decorator", "attribute", "comment"].iter().any(|k| kind.contains(k)) {
+                continue;
+            }
+            if kind == "modifiers" {
+                match first_token(child) {
+                    Some(row) => return Some(row),
+                    None => continue,
+                }
+            }
+            return Some(child.start_position().row);
+        }
+        None
+    }
+    first_token(node).unwrap_or(node.start_position().row)
+}
+
+/// A YAML block ends past its last line break, at the start of the next.
+fn last_line(node: tree_sitter::Node) -> usize {
+    let end = node.end_position();
+    if end.column == 0 && end.row > node.start_position().row { end.row - 1 } else { end.row }
+}
+
+/// Keys of YAML and JSON mappings and XML elements: what their files are
+/// made of, where code has declarations.
+fn data_name(node: tree_sitter::Node, text: &str) -> Option<(String, String)> {
+    let first_line = |n: tree_sitter::Node| text.get(n.byte_range()).map(|t| t.lines().next().unwrap_or(t).trim().to_string());
+    match node.kind() {
+        "block_mapping_pair" | "flow_pair" | "pair" => {
+            let key = first_line(node.child_by_field_name("key")?)?;
+            let key = key.trim_matches(|c| c == '"' || c == '\'').to_string();
+            (!key.is_empty()).then(|| ("key".to_string(), key))
+        }
+        "element" => {
+            let mut cursor = node.walk();
+            let tag = node.named_children(&mut cursor).find(|c| c.kind() == "STag" || c.kind() == "EmptyElemTag")?;
+            let mut cursor = tag.walk();
+            let name = tag.named_children(&mut cursor).find(|c| c.kind() == "Name")?;
+            Some(("tag".to_string(), first_line(name)?))
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn collect_declarations(node: tree_sitter::Node, text: &str, depth: usize, items: &mut Vec<crate::finder::OutlineItem>) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -363,7 +413,7 @@ pub(super) fn collect_declarations(node: tree_sitter::Node, text: &str, depth: u
             .flatten()
             .and_then(|n| text.get(n.byte_range()))
             .map(|n| n.lines().next().unwrap_or(n).to_string());
-        match name {
+        let named = match name {
             Some(name) => {
                 let short = kind
                     .trim_end_matches("_declaration")
@@ -371,11 +421,17 @@ pub(super) fn collect_declarations(node: tree_sitter::Node, text: &str, depth: u
                     .trim_end_matches("_item")
                     .trim_end_matches("_spec")
                     .replace('_', " ");
+                Some((short, name))
+            }
+            None => data_name(child, text),
+        };
+        match named {
+            Some((short, name)) => {
                 items.push(crate::finder::OutlineItem {
                     depth,
                     label: format!("{short} {name}"),
-                    line: child.start_position().row as u32,
-                    end: child.end_position().row as u32,
+                    line: head_line(child) as u32,
+                    end: last_line(child) as u32,
                 });
                 collect_declarations(child, text, depth + 1, items);
             }
@@ -478,6 +534,28 @@ mod outline_tests {
         let kt = "class A {\n    val count: Int = 1\n    fun run() {}\n}\n";
         let labels: Vec<String> = outline(Path::new("a.kt"), kt).into_iter().map(|i| i.label).collect();
         assert!(labels.iter().any(|l| l.ends_with("count")), "{labels:?}");
+    }
+
+    fn lines(path: &str, text: &str) -> Vec<(String, u32, u32)> {
+        crate::grammars::register();
+        outline(Path::new(path), text).into_iter().map(|i| (format!("{}{}", "  ".repeat(i.depth), i.label), i.line, i.end)).collect()
+    }
+
+    #[test]
+    fn an_annotated_class_starts_at_its_name() {
+        let text = "@Obfuscate\nabstract class App : Base() {\n    @Suppress(\"x\")\n    fun run() {\n    }\n}\n";
+        assert_eq!(lines("a.kt", text)[0].1, 1);
+        assert!(lines("a.kt", text).iter().any(|(l, line, _)| l.ends_with("function run") && *line == 3), "{:?}", lines("a.kt", text));
+    }
+
+    #[test]
+    fn yaml_json_and_xml_have_their_keys_and_tags() {
+        let yaml = lines("a.yml", "services:\n  web:\n    image: x\n");
+        assert_eq!(yaml, [("key services".into(), 0, 2), ("  key web".into(), 1, 2), ("    key image".into(), 2, 2)]);
+        let json = lines("a.json", "{\n  \"a\": {\n    \"b\": 1\n  }\n}\n");
+        assert_eq!(json, [("key a".into(), 1, 3), ("  key b".into(), 2, 2)]);
+        let xml = lines("a.xml", "<?xml version=\"1.0\"?>\n<project>\n  <dependency/>\n</project>\n");
+        assert_eq!(xml, [("tag project".into(), 1, 3), ("  tag dependency".into(), 2, 2)]);
     }
 }
 
@@ -881,3 +959,4 @@ pub(super) fn show_document_handler(task: WeakEntity<TaskView>, this_path: PathB
         task.update(cx, |task, cx| task.open_file(target, line, window, cx)).is_ok()
     })
 }
+
