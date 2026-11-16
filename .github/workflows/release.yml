@@ -155,5 +155,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.version.outputs.tag }}
         run: |
+          # GitHub refuses this token a tag on a commit whose workflows are
+          # not those of main (as for a change to them). main has moved on
+          # then, and the newer commit makes its own release.
+          moved=$(gh api "repos/$GITHUB_REPOSITORY/compare/$SHA...main" \
+            --jq '[.files[]?.filename | select(startswith(".github/workflows/"))] | length')
+          if [ "$moved" != 0 ]; then
+            echo "::notice::Not released: main changed the workflows since $SHA; a newer commit will be."
+            exit 0
+          fi
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$SHA" \
             --title "$TAG" --generate-notes ideae-* scripts/install.sh scripts/install.ps1
