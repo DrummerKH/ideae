@@ -10,8 +10,13 @@ use serde::{Deserialize, Serialize};
 pub struct State {
     pub appearance: Option<String>,
     pub sidebar_width: Option<f32>,
+    /// The sidebar is a narrow rail that opens under the pointer.
+    pub sidebar_rail: bool,
     pub side_panel_width: Option<f32>,
     pub active_collapsed: bool,
+    /// A presentation that was on: it is on again after a restart, or the
+    /// restart would show everything.
+    pub presenting: Option<PresentingState>,
     pub power_saving: bool,
     pub window: Option<WindowPlace>,
     pub settings: Settings,
@@ -19,6 +24,13 @@ pub struct State {
     /// Text size per kind of view.
     pub zoom: crate::zoom::Zoom,
     pub projects: Vec<ProjectState>,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct PresentingState {
+    pub kept: Vec<PathBuf>,
+    pub since: u64,
 }
 
 /// What the user set in Settings (Ctrl+,).
@@ -52,6 +64,32 @@ pub struct Settings {
     /// A session that has used this many thousand tokens is told of, once;
     /// 0 for never.
     pub token_warn_k: u32,
+    /// While presenting, code and terminals are this many percent of their size.
+    pub present_zoom: u32,
+    /// Milliseconds the pointer rests on the sidebar's rail before the
+    /// whole sidebar opens; 0 for never.
+    pub rail_open_ms: u32,
+    /// The title bar shows the machine's load, and what the agents took.
+    pub show_load: bool,
+    pub show_tokens: bool,
+    /// A task in the sidebar shows how full its agent's context is.
+    pub context_dial: bool,
+    /// The language server's completions come up as you type, not only
+    /// when asked for; its colors for names are drawn; a file is
+    /// reformatted when saved by hand.
+    pub complete_as_typed: bool,
+    pub semantic_colors: bool,
+    pub format_on_save: bool,
+    /// The Changes tab starts with old and new one under the other.
+    pub diff_unified: bool,
+    /// A pull, rebase, pick or revert that would conflict asks the agent
+    /// to do it and resolve the conflicts.
+    pub conflicts_to_agent: bool,
+    /// While presenting: the sidebar is a rail, the files git ignores are
+    /// not shown, the load and token readouts are hidden.
+    pub present_rail: bool,
+    pub present_veil: bool,
+    pub present_hide_readouts: bool,
     /// Shortcuts set by hand, by id (keymap.rs): keystrokes such as
     /// "ctrl-e", empty for none.
     pub keys: std::collections::BTreeMap<String, String>,
@@ -72,6 +110,19 @@ impl Default for Settings {
             gutter_since_base: false,
             agent_lsp: false,
             token_warn_k: 0,
+            present_zoom: 125,
+            rail_open_ms: 750,
+            show_load: true,
+            show_tokens: true,
+            context_dial: true,
+            complete_as_typed: true,
+            semantic_colors: true,
+            format_on_save: false,
+            diff_unified: false,
+            conflicts_to_agent: true,
+            present_rail: true,
+            present_veil: true,
+            present_hide_readouts: true,
             keys: std::collections::BTreeMap::new(),
         }
     }

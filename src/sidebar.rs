@@ -99,6 +99,11 @@ pub(crate) fn dial(id: &'static str, fill: f32, color: Hsla, ink: Hsla) -> impl 
     div().id(id).test_support().flex_none().size(px(12.)).child(dial.size_full())
 }
 
+/// The width of the sidebar as a rail, and how narrow the whole one is
+/// dragged to become it.
+pub const RAIL: Pixels = px(86.);
+pub const RAIL_BELOW: Pixels = px(120.);
+
 /// "now", "5m", "3h", "2d", "2w", "4mo".
 pub(crate) fn ago(secs: u64) -> String {
     if secs == 0 {
@@ -170,9 +175,10 @@ impl Workspace {
             let p = &self.projects[pi];
             let project_hit = query.is_empty() || p.name.to_lowercase().contains(&query);
             let tasks: Vec<usize> = (0..p.tasks.len())
-                .filter(|&ti| project_hit || self.task_matches(pi, ti, &query, cx))
+                .filter(|&ti| self.shows(pi, ti) && (project_hit || self.task_matches(pi, ti, &query, cx)))
                 .collect();
-            if !query.is_empty() && !project_hit && tasks.is_empty() {
+            // A project with nothing to show is not shown: while presenting, or when the search has no hit in it.
+            if tasks.is_empty() && (self.is_presenting() || (!query.is_empty() && !project_hit)) {
                 continue;
             }
             list = list.child(self.render_project(pi, shown == 0, cx));
@@ -188,7 +194,7 @@ impl Workspace {
                     } else if groups.insert(group.clone()) {
                         list = list.child(self.render_group_row(pi, group, false, cx));
                         if !self.collapsed_groups.contains(group) {
-                            for (_, ti) in self.members(group).into_iter().filter(|m| m.0 == pi) {
+                            for (_, ti) in self.members(group).into_iter().filter(|m| m.0 == pi && self.shows(m.0, m.1)) {
                                 list = list.child(self.render_task(pi, ti, false, cx));
                             }
                         }
@@ -226,16 +232,100 @@ impl Workspace {
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .child(div().flex_1().child(Input::new(&self.search).xsmall().appearance(false).cleanable(true)))
-                    .child(
-                        Button::new("add-project")
-                            .xsmall()
-                            .ghost()
-                            .label("+")
-                            .tooltip("Add project")
-                            .on_click(cx.listener(|this, _, window, cx| this.add_project_dialog(window, cx))),
-                    ),
+                    // Not while presenting: the window shows what was chosen, and nothing is added to it by a stray click.
+                    .when(!self.is_presenting(), |row| {
+                        row.child(
+                            Button::new("add-project")
+                                .xsmall()
+                                .ghost()
+                                .label("+")
+                                .tooltip("Add project")
+                                .on_click(cx.listener(|this, _, window, cx| this.add_project_dialog(window, cx))),
+                        )
+                    }),
             )
             .child(list)
+    }
+
+    /// The sidebar as a rail when it was dragged that narrow, and while
+    /// presenting: the tasks are there, their names are not.
+    pub fn sidebar_is_rail(&self) -> bool {
+        self.sidebar_rail || (self.is_presenting() && crate::state::with_settings(|s| s.present_rail))
+    }
+
+    /// Opens or closes the whole sidebar over the task, after a while: the
+    /// pointer that crosses the rail, or clicks a task on it, opens
+    /// nothing, and one that slips off the edge for an instant closes nothing.
+    pub fn peek_sidebar(&mut self, open: bool, window: &Window, cx: &mut Context<Self>) {
+        // Not closed under a search being typed.
+        let searching = !open && self.search.read(cx).focus_handle(cx).is_focused(window);
+        let rest = crate::state::with_settings(|s| s.rail_open_ms);
+        // Set never to open: the rail alone, for going from task to task.
+        if open == self.sidebar_peek || searching || (open && rest == 0) {
+            self.peek_wait = Task::ready(());
+            return;
+        }
+        // A while on the rail before it opens: until then the rail is for
+        // going from task to task, and nothing moves under the pointer.
+        let wait = std::time::Duration::from_millis(if open { u64::from(rest) } else { 300 });
+        self.peek_wait = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            let _ = this.update(cx, |this, cx| {
+                this.sidebar_peek = open;
+                cx.notify();
+            });
+        });
+    }
+
+    /// The rail: a mark for each task that is shown, the one in hand lit,
+    /// and how its agent is and how full its context.
+    pub fn render_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
+        let dialed = crate::state::with_settings(|s| s.context_dial);
+        let mut rail = v_flex().id("sidebar-rail").w(RAIL).h_full().flex_none().items_center().py_2().gap_0p5().overflow_hidden().border_r_1().border_color(cx.theme().border);
+        for (pi, project) in self.projects.iter().enumerate() {
+            let tasks: Vec<usize> = (0..project.tasks.len()).filter(|&ti| self.shows(pi, ti)).collect();
+            if tasks.is_empty() {
+                continue;
+            }
+            // The start of each name: enough to tell which is which.
+            let start = |name: &str, most: usize| name.chars().take(most).collect::<String>();
+            rail = rail.child(div().w_full().px_2().pt_1().text_size(px(10.)).text_color(muted).child(start(&project.name, 9)));
+            for ti in tasks {
+                let task = &project.tasks[ti];
+                let path = task.path.clone();
+                let glyph = task.view.as_ref().and_then(|view| crate::task::status_glyph(&view.read(cx).agent_status));
+                let fill = self.usage.get(&path).map_or(0., |(_, usage)| usage.fill());
+                let in_hand = self.active.as_deref() == Some(path.as_path());
+                rail = rail.child(
+                    h_flex()
+                        .id(SharedString::from(format!("rail-{}", path.display())))
+                        .w_full()
+                        .h(px(24.))
+                        .px_2()
+                        .gap_1()
+                        .cursor_pointer()
+                        .border_l_2()
+                        .border_color(if in_hand { cx.theme().primary } else { transparent_black() })
+                        .when(in_hand, |row| row.bg(cx.theme().accent))
+                        .child(div().w(px(10.)).text_xs().map(|mark| match glyph {
+                            Some((glyph, color)) => mark.text_color(color).child(glyph),
+                            None => mark.text_color(muted).child("○"),
+                        }))
+                        .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_size(px(12.)).child(start(&self.task_title(pi, ti, cx), 5)))
+                        .when(dialed && fill > 0., |row| row.child(context_dial(fill, cx)))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            // Gone to a task: the rail did its work, and does not open over it.
+                            this.peek_wait = Task::ready(());
+                            this.switch(&path, window, cx);
+                            if let Some(view) = this.active_view() {
+                                view.update(cx, |t, cx| t.show_view(0, window, cx));
+                            }
+                        })),
+                );
+            }
+        }
+        rail.test_support().on_hover(cx.listener(|this, hovered: &bool, window, cx| this.peek_sidebar(*hovered, window, cx)))
     }
 
     fn task_matches(&self, pi: usize, ti: usize, query: &str, cx: &App) -> bool {
@@ -279,7 +369,7 @@ impl Workspace {
                 });
                 let in_view = self.active.as_deref() == Some(t.path.as_path())
                     || (!t.group.is_empty() && self.active_group.as_deref() == Some(t.group.as_str()));
-                if waiting && !in_view {
+                if waiting && !in_view && self.shows(pi, ti) {
                     rows.push((pi, ti));
                 }
             }
@@ -354,7 +444,7 @@ impl Workspace {
             .child(
                 div()
                     .opacity(0.)
-                    .group_hover(group, |s| s.opacity(1.))
+                    .when(!self.is_presenting(), |s| s.group_hover(group, |s| s.opacity(1.)))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
                         Button::new(SharedString::from(format!("project-add-{pi}")))
@@ -527,6 +617,7 @@ impl Workspace {
         }
         // How full its agent's context is, once that is worth knowing.
         let fill = self.usage.get(&path).map_or(0., |(_, usage)| usage.fill());
+        let dialed = crate::state::with_settings(|s| s.context_dial);
         if t.starred {
             fixed.push("★".into());
         }
@@ -623,7 +714,7 @@ impl Workspace {
                             .child(label.clone()),
                     )
                     // How full the agent's context is, as a dial.
-                    .when(fill > 0., |s| s.child(context_dial(fill, cx)))
+                    .when(dialed && fill > 0., |s| s.child(context_dial(fill, cx)))
                     .when(unpushed > 0, |s| {
                         s.child(
                             div()

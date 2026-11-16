@@ -48,7 +48,8 @@ pub(super) fn load_branches<T: 'static>(root: PathBuf, known: Rc<std::cell::RefC
 
 impl ChangesView {
     pub(super) fn new(root: PathBuf, task: WeakEntity<TaskView>, cx: &mut Context<Self>) -> Self {
-        let diff = cx.new(|cx| DiffState::new([], cx).with_mode(DiffMode::Split));
+        let mode = if crate::state::with_settings(|s| s.diff_unified) { DiffMode::Unified } else { DiffMode::Split };
+        let diff = cx.new(|cx| DiffState::new([], cx).with_mode(mode));
         cx.observe(&diff, |_, _, cx| cx.notify()).detach();
         cx.subscribe(&diff, |this, _, event: &DiffEvent, cx| match event {
             DiffEvent::SelectionEnded(range) => {
@@ -368,22 +369,14 @@ impl Render for ChangesView {
                             })
                     })
                     .child(div().w(px(1.)).h(px(16.)).bg(cx.theme().border))
-                    .child(
-                        Button::new("mode")
-                            .small()
-                            .ghost()
-                            .label(if mode == DiffMode::Split { "Split" } else { "Unified" })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.diff.update(cx, |d, cx| {
-                                    let next = if d.mode() == DiffMode::Split {
-                                        DiffMode::Unified
-                                    } else {
-                                        DiffMode::Split
-                                    };
-                                    d.set_mode(next, cx);
-                                });
-                            })),
-                    )
+                    // Both named, the one in use lit: one word alone read as a label, not as a switch.
+                    .children([("mode-split", "Split", DiffMode::Split, "Old and new side by side"), ("mode-unified", "Unified", DiffMode::Unified, "Old and new one under the other")].map(
+                        |(id, label, to, tip)| {
+                            Button::new(id).small().ghost().label(label).tooltip(tip).selected(mode == to).on_click(cx.listener(move |this, _, _, cx| {
+                                this.diff.update(cx, |d, cx| d.set_mode(to, cx));
+                            }))
+                        },
+                    ))
                     .when_some(self.selection.clone(), |this, range| {
                         this.child(
                             Button::new("open-at-line")

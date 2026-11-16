@@ -54,13 +54,39 @@ pub fn init(saved: Zoom, cx: &mut App) {
     cx.set_global(saved);
 }
 
+/// A factor on every kind's size while it is set: text made larger for
+/// an audience, the sizes chosen left as they are for afterwards.
+#[derive(Clone, Copy)]
+struct Scale(f32);
+impl Global for Scale {}
+
+pub fn scale(cx: &App) -> f32 {
+    cx.try_global::<Scale>().map_or(1., |scale| scale.0)
+}
+
+pub fn set_scale(factor: f32, cx: &mut App) {
+    if scale(cx) == factor {
+        return;
+    }
+    cx.set_global(Scale(factor));
+    // Those that follow the sizes follow this too.
+    let zoom = current(cx);
+    cx.set_global(zoom);
+    cx.refresh_windows();
+}
+
+/// The size chosen for `kind`, the factor not applied.
+fn chosen(kind: Kind, cx: &App) -> f32 {
+    current(cx).get(kind).unwrap_or(f32::from(cx.theme().mono_font_size))
+}
+
 pub fn current(cx: &App) -> Zoom {
     cx.try_global::<Zoom>().copied().unwrap_or_default()
 }
 
 /// The size a view of `kind` draws code with.
 pub fn size(kind: Kind, cx: &App) -> Pixels {
-    current(cx).get(kind).map(px).unwrap_or(cx.theme().mono_font_size)
+    px((chosen(kind, cx) * scale(cx)).round())
 }
 
 /// Sets the size for every view of `kind`; `None` goes back to the theme's.
@@ -77,8 +103,7 @@ pub fn set(kind: Kind, size: Option<f32>, cx: &mut App) {
 
 /// Steps the size of `kind` by `points`.
 pub fn step(kind: Kind, points: f32, cx: &mut App) {
-    let now = f32::from(size(kind, cx));
-    set(kind, Some(now + points), cx);
+    set(kind, Some(chosen(kind, cx) + points), cx);
 }
 
 /// Scroll left over from touchpad deltas too small to make a step.

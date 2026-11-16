@@ -275,7 +275,7 @@ impl Workspace {
         let mut tasks: Vec<(u64, PathBuf, String, String)> = Vec::new();
         for (pi, p) in self.projects.iter().enumerate() {
             for (ti, t) in p.tasks.iter().enumerate() {
-                if self.active.as_deref() == Some(t.path.as_path()) || t.busy.is_some() {
+                if self.active.as_deref() == Some(t.path.as_path()) || t.busy.is_some() || !self.shows(pi, ti) {
                     continue;
                 }
                 let when = crate::sidebar::ago(t.last_active);

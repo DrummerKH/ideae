@@ -38,7 +38,12 @@ impl TermView {
         cx.subscribe(&state, |this, state, event: &TerminalEvent, cx| match event {
             TerminalEvent::FontSizeChanged => {
                 let size = f32::from(state.read(cx).font_size(cx));
-                crate::zoom::set(crate::zoom::Kind::Terminal, Some(size), cx);
+                // The size this view was just given is not one chosen in it: kept
+                // as chosen, it would be made larger again, and again.
+                let given = f32::from(crate::zoom::size(crate::zoom::Kind::Terminal, cx));
+                if (size - given).abs() >= 0.5 {
+                    crate::zoom::set(crate::zoom::Kind::Terminal, Some(size / crate::zoom::scale(cx)), cx);
+                }
             }
             TerminalEvent::ForegroundChanged => {
                 if state.read(cx).foreground().is_some_and(|p| !p.is_shell()) {
@@ -209,10 +214,12 @@ impl TermView {
     }
 
     pub(super) fn follow_zoom(state: &Entity<TerminalState>, cx: &mut App) {
-        let size = crate::zoom::current(cx).terminal;
-        state.update(cx, |state, cx| match size {
-            Some(size) => state.set_font_size(px(size), cx),
-            None => state.reset_font_size(cx),
+        // The theme's size when none is chosen and nothing makes it larger.
+        let own = crate::zoom::current(cx).terminal.is_some() || crate::zoom::scale(cx) != 1.;
+        let size = crate::zoom::size(crate::zoom::Kind::Terminal, cx);
+        state.update(cx, |state, cx| match own {
+            true => state.set_font_size(size, cx),
+            false => state.reset_font_size(cx),
         });
     }
 }

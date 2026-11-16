@@ -133,12 +133,12 @@ impl TaskView {
                             if !files.is_empty() {
                                 let list = files.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n");
                                 let upstream = this.branch_info.upstream.clone().unwrap_or_else(|| "the upstream".into());
-                                this.paste_to_agent(
+                                let told = this.ask_about_conflict(
                                     format!("Take in {upstream} (fetch, then rebase or merge as this branch does). With the work here, committed or not, it conflicts in:\n{list}\n\nResolve the conflicts keeping what both sides meant, and check that it builds and the tests pass."),
                                     window,
                                     cx,
                                 );
-                                this.action = Some((false, format!("Pull: {} file(s) would conflict, nothing changed; the agent's prompt has a request", files.len())));
+                                this.action = Some((false, format!("Pull: {} file(s) would conflict, nothing changed{told}", files.len())));
                                 return cx.notify();
                             }
                             this.run_action("Pull", |root| git::pull_safe(&root), false, window, cx)

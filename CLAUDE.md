@@ -10,6 +10,7 @@ One Rust binary on GPUI (`gpui-kit`), Linux first, Windows too.
 src/main.rs        CLI, key bindings, title bar, window
 src/workspace.rs   projects and tasks: load, switch, create/close/delete, state, hooks
 src/workspace/variants.rs  several tries at one task as a group: create, compare, keep one
+src/workspace/present.rs   presenting: only the tasks chosen stay in the window, the rest out of the list and the notifications
 src/sidebar.rs     left sidebar (inbox, projects, tasks, drag and drop)
 src/task/          one task, a module: what is private to it is seen by all of its files (`use super::*`)
   mod.rs           the task itself: its state, the refresh loop, tabs and panes

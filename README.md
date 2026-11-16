@@ -48,6 +48,18 @@ Windows build exists and is being tried out (see [Windows](#windows)).
   fires when a task out of view wants you. The Changes and Files panels
   mark the file the agent is writing to and those it wrote to since your
   last prompt.
+- **Presenting.** Before the window is shown to others, ☰ → Enter
+  presentation mode asks which tasks to leave in it. The rest leave the
+  list, the search and the notifications and go on working; the load and
+  token readouts are hidden, the buttons that add projects and tasks
+  too. Files, diffs and terminals are drawn larger (Settings, 125% to
+  start with), the sidebar becomes a rail, and a file git ignores (keys,
+  local settings) shows a notice in place of what it holds until you ask
+  for it. Ending it brings everything back and tells which tasks asked
+  for you meanwhile. It stays on over a restart.
+- **Sidebar as a rail.** Dragged as narrow as it goes, the sidebar
+  becomes a rail of marks, one a task; it opens whole over the task while
+  the pointer is on it, and "keep open" there makes it stay again.
 - **Tokens.** By a task in the sidebar, a small dial of how full its
   agent's context is (yellow from three quarters, red from nine tenths;
   the numbers when the pointer rests on the task); in the title
@@ -65,9 +77,10 @@ Windows build exists and is being tried out (see [Windows](#windows)).
   camelCase and the underscores of snake_case (Settings, Editor). The
   gutter marks what differs from the last commit: green by the lines
   added, blue by those changed, red where some are gone. With a language
-  server the editor also completes as you type, underlines what the server
+  server the editor also completes as you type (or on Ctrl+Space alone,
+  when set so), underlines what the server
   finds wrong, offers its fixes (Alt+Enter), renames a symbol everywhere
-  (Shift+F6) and reformats the file (Ctrl+Alt+L); names are colored by
+  (Shift+F6) and reformats the file (Ctrl+Alt+L, or on save when set); names are colored by
   what the server knows them to be, Ctrl+P shows the parameters of the call
   being written, and Ctrl+N goes to a class, function or type anywhere in
   the project (without a server, to what the grammars find declared).

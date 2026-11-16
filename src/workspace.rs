@@ -65,6 +65,7 @@ pub struct TaskEntry {
     pub base: String,
 }
 
+pub mod present;
 pub mod variants;
 
 impl TaskEntry {
@@ -96,6 +97,8 @@ pub struct Workspace {
     /// The task in view, by worktree path.
     pub active: Option<PathBuf>,
     pub active_collapsed: bool,
+    /// Set while the window is shown to others: what is left in it.
+    pub presenting: Option<present::Presenting>,
     agent: Option<String>,
     /// The agent given on the command line, over Settings.
     agent_override: Option<Option<String>>,
@@ -104,6 +107,11 @@ pub struct Workspace {
     _bridge: Option<agent::Bridge>,
     pub appearance: Appearance,
     pub sidebar_width: Pixels,
+    /// The sidebar drawn as a narrow rail, dragged that narrow; and whether
+    /// the whole of it is open over the task for the pointer on it.
+    pub sidebar_rail: bool,
+    pub sidebar_peek: bool,
+    pub(crate) peek_wait: Task<()>,
     /// In the GNOME dash; asked once, not while the menu opens.
     pub pinned: bool,
     pub sysmon: Entity<crate::sysmon::SysMon>,
@@ -407,12 +415,16 @@ impl Workspace {
             projects: Vec::new(),
             active: None,
             active_collapsed: saved.active_collapsed,
+            presenting: saved.presenting.as_ref().map(|p| present::Presenting::new(p.kept.iter().cloned().collect(), p.since)),
             agent,
             agent_override,
             hook_socket,
             _bridge: bridge,
             appearance,
             sidebar_width: px(saved.sidebar_width.unwrap_or(260.)),
+            sidebar_rail: saved.sidebar_rail,
+            sidebar_peek: false,
+            peek_wait: Task::ready(()),
             pinned: false,
             search: {
                 let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search tasks…"));
@@ -484,6 +496,10 @@ impl Workspace {
             build: crate::build_watch::BuildWatch::new(),
         };
         this.restore(&saved, window, cx);
+        // A presentation that was on is on again, with all that goes with it.
+        if this.presenting.is_some() {
+            this.apply_presenting(cx);
+        }
 
         // Repositories named on the command line join the list; the first one
         // comes into view when nothing else is.
@@ -690,8 +706,10 @@ impl Workspace {
         State {
             appearance: Some(self.appearance.label().to_lowercase()),
             sidebar_width: Some(f32::from(self.sidebar_width)),
+            sidebar_rail: self.sidebar_rail,
             side_panel_width: cx.try_global::<SidePanelWidth>().map(|w| f32::from(w.0)),
             active_collapsed: self.active_collapsed,
+            presenting: self.presenting.as_ref().map(|p| state::PresentingState { kept: p.kept.iter().cloned().collect(), since: p.since }),
             power_saving: crate::lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed),
             window: self.window_place.clone(),
             settings: state::settings(),
@@ -1776,7 +1794,12 @@ impl Workspace {
                 }
             }
         }
-        if status.is_attention() && !seen && status != was && !event.replayed && state::settings().notifications {
+        // Out of sight while presenting: nothing is told now, all of it at the end.
+        let hidden = !self.shows(pi, ti);
+        if hidden && status.is_attention() && status != was && !event.replayed {
+            self.hold_notice(&event.task);
+        }
+        if status.is_attention() && !seen && !hidden && status != was && !event.replayed && state::settings().notifications {
             let body = match (&status, &group) {
                 (agent::AgentStatus::NeedsInput(message), Some(_)) => {
                     label = format!("{label} · {variant}");
@@ -1840,7 +1863,7 @@ impl Workspace {
                     if this.usage.get(&path).is_some_and(|(_, before)| before.spent() > usage.spent()) {
                         this.usage_warned.remove(&path);
                     }
-                    if limit > 0 && usage.spent() >= limit && this.usage_warned.insert(path.clone()) {
+                    if limit > 0 && usage.spent() >= limit && this.shows_path(&path) && this.usage_warned.insert(path.clone()) {
                         let name = this.find(&path).map(|(pi, ti)| format!("{} · {}", this.projects[pi].name, this.projects[pi].tasks[ti].label())).unwrap_or_default();
                         let told = format!("{name}: its agent has used {} tokens in this session.", crate::usage::tokens(usage.spent()));
                         window.push_notification(gpui_kit::component::notification::Notification::warning(told.clone()).title("Tokens"), cx);

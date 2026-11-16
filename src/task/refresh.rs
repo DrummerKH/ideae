@@ -157,6 +157,9 @@ impl TaskView {
         }));
         self.tree_files = files;
         self.tree_stale = true;
+        if crate::workspace::present::on() {
+            self.veil_ignored(cx);
+        }
         self.fill_tree(cx);
     }
 

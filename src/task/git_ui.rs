@@ -632,12 +632,12 @@ impl TaskView {
                     Err(git::RebaseError::Failed(e)) => (false, format!("{label}: {e}")),
                     Err(git::RebaseError::Conflicts(files)) => {
                         let list = files.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n");
-                        this.paste_to_agent(
+                        let told = this.ask_about_conflict(
                             format!("{asked} It conflicts in:\n{list}\n\nResolve the conflicts keeping what both sides meant, check that it builds and the tests pass, then finish it."),
                             window,
                             cx,
                         );
-                        (false, format!("{label}: {} conflicting file(s), nothing changed; the agent's prompt has a request", files.len()))
+                        (false, format!("{label}: {} conflicting file(s), nothing changed{told}", files.len()))
                     }
                 });
                 let _ = this.refresh_tx.try_send(());
@@ -645,6 +645,16 @@ impl TaskView {
             });
         })
         .detach();
+    }
+
+    /// Hands a conflict to the agent as a request in its prompt, when that
+    /// is wanted (Settings). What to add to what the user is told.
+    pub(super) fn ask_about_conflict(&mut self, request: String, window: &mut Window, cx: &mut Context<Self>) -> &'static str {
+        if !crate::state::with_settings(|s| s.conflicts_to_agent) {
+            return "";
+        }
+        self.paste_to_agent(request, window, cx);
+        "; the agent's prompt has a request"
     }
 
     /// Rebase onto the base; conflicts go to the agent as a request.
@@ -667,14 +677,14 @@ impl TaskView {
                     Err(git::RebaseError::Failed(e)) => (false, format!("Rebase: {e}")),
                     Err(git::RebaseError::Conflicts(files)) => {
                         let list = files.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n");
-                        this.paste_to_agent(
+                        let told = this.ask_about_conflict(
                             format!(
                                 "Rebase this branch onto {base} (`git fetch` first). It conflicts in:\n{list}\n\nResolve the conflicts keeping what both sides meant, check that it builds and the tests pass, then finish the rebase."
                             ),
                             window,
                             cx,
                         );
-                        (false, format!("Rebase: {} conflicting file(s), nothing changed; the agent's prompt has a request", files.len()))
+                        (false, format!("Rebase: {} conflicting file(s), nothing changed{told}", files.len()))
                     }
                 });
                 let _ = this.refresh_tx.try_send(());

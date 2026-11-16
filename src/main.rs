@@ -54,6 +54,17 @@ impl Render for Workspace {
         // Focus mode: the task's zoomed pane floats over the whole window, a
         // few pixels in from its edges so the rest still shows around it.
         let zoomed_pane = self.active_view().and_then(|task| task.update(cx, |t, cx| t.render_zoomed(cx)));
+        let presenting = self.is_presenting();
+        let shown = state::settings();
+        // What the machine and the agents do is not for an audience.
+        let quiet = presenting && shown.present_hide_readouts;
+        let rail = self.sidebar_is_rail();
+        let content = match (self.active_group.clone(), self.active_view()) {
+            (Some(group), _) => self.render_group(&group, cx),
+            // A variant has its siblings above it.
+            (None, Some(view)) => v_flex().size_full().children(self.render_variant_strip(cx)).child(div().flex_1().min_h_0().child(view)).into_any_element(),
+            (None, None) => self.render_empty(cx).into_any_element(),
+        };
         v_flex()
             .relative()
             .size_full()
@@ -90,11 +101,13 @@ impl Render for Workspace {
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .on_click(|_, _, cx| cx.stop_propagation())
                                 .gap_3()
+                                .children(self.render_presenting(cx))
                                 // Not read while saving power, so not shown: its numbers would be old.
-                                .when(!lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed), |row| {
+                                // Nor while presenting: what the machine and the agents do is not for the audience.
+                                .when(shown.show_load && !quiet && !lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed), |row| {
                                     row.child(div().mr_2().child(self.sysmon.clone()))
                                 })
-                                .when(self.tokens_of_the_day() > 0, |row| {
+                                .when(shown.show_tokens && !quiet && self.tokens_of_the_day() > 0, |row| {
                                     row.child(
                                         div()
                                             .id("tokens-day")
@@ -109,8 +122,8 @@ impl Render for Workspace {
                                             }),
                                     )
                                 })
-                                .children(self.render_update(cx))
-                                .children(self.render_new_build(cx))
+                                .children(self.render_update(cx).filter(|_| !presenting))
+                                .children(self.render_new_build(cx).filter(|_| !presenting))
                                 .child(self.render_power_saving(cx))
                                 .child(
                                     Button::new("go-to-file")
@@ -138,34 +151,77 @@ impl Render for Workspace {
             )
             .child(
                 div().relative().flex_1().min_h_0().child(
-                    h_resizable("workspace")
-                        .on_resize({
-                            let this = cx.weak_entity();
-                            move |state, _, cx| {
-                                if let Some(width) = state.read(cx).sizes().first().copied() {
-                                    let _ = this.update(cx, |w, _| w.sidebar_width = width);
+                    if rail {
+                        // The tasks as a rail, the task next to it; the whole sidebar opens over the task for the pointer.
+                        h_flex().size_full().child(self.render_rail(cx)).child(div().flex_1().min_w_0().h_full().child(content)).into_any_element()
+                    } else {
+                        h_resizable("workspace")
+                            .on_resize({
+                                let this = cx.weak_entity();
+                                move |state, _, cx| {
+                                    if let Some(width) = state.read(cx).sizes().first().copied() {
+                                        let _ = this.update(cx, |w, cx| {
+                                            // Dragged as narrow as it goes: it is a rail from here, and the width it had is kept for when it opens.
+                                            if width < sidebar::RAIL_BELOW {
+                                                w.sidebar_rail = true;
+                                                cx.notify();
+                                            } else {
+                                                w.sidebar_width = width;
+                                            }
+                                        });
+                                    }
                                 }
-                            }
-                        })
-                        .child(
-                            resizable_panel()
-                                .size(self.sidebar_width)
-                                .size_range(px(150.)..px(520.))
-                                // Keeps its width when the window resizes.
-                                .fixed()
-                                .child(self.render_sidebar(cx)),
-                        )
-                        .child(resizable_panel().child(match (self.active_group.clone(), self.active_view()) {
-                            (Some(group), _) => self.render_group(&group, cx),
-                            // A variant has its siblings above it.
-                            (None, Some(view)) => v_flex()
-                                .size_full()
-                                .children(self.render_variant_strip(cx))
-                                .child(div().flex_1().min_h_0().child(view))
-                                .into_any_element(),
-                            (None, None) => self.render_empty(cx).into_any_element(),
-                        })),
+                            })
+                            .child(
+                                resizable_panel()
+                                    .size(self.sidebar_width)
+                                    .size_range(px(100.)..px(520.))
+                                    // Keeps its width when the window resizes.
+                                    .fixed()
+                                    .child(self.render_sidebar(cx)),
+                            )
+                            .child(resizable_panel().child(content))
+                            .into_any_element()
+                    },
                 )
+                // The whole sidebar over the task, while the pointer is on the rail or on it.
+                .when(rail && self.sidebar_peek, |body| {
+                    body.child(
+                        div()
+                            .id("sidebar-peek")
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .bottom_0()
+                            .w(self.sidebar_width.max(px(220.)))
+                            .bg(cx.theme().background)
+                            .border_r_1()
+                            .border_color(cx.theme().border)
+                            .shadow_lg()
+                            .occlude()
+                            .test_support()
+                            .on_hover(cx.listener(|this, hovered: &bool, window, cx| this.peek_sidebar(*hovered, window, cx)))
+                            .child(
+                                v_flex()
+                                    .size_full()
+                                    // The way back to a sidebar that stays; not while presenting, where the rail is the point.
+                                    .when(!presenting, |peek| {
+                                        peek.child(h_flex().flex_none().justify_end().px_2().pt_1().child(
+                                            Button::new("sidebar-keep")
+                                                .xsmall()
+                                                .ghost()
+                                                .label("keep open")
+                                                .tooltip("The sidebar stays, as before it was dragged narrow")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    (this.sidebar_rail, this.sidebar_peek) = (false, false);
+                                                    cx.notify();
+                                                })),
+                                        ))
+                                    })
+                                    .child(div().flex_1().min_h_0().child(self.render_sidebar(cx))),
+                            ),
+                    )
+                })
             .when_some(zoomed_pane, |body, pane| {
                     body.child(
                         div()
@@ -333,52 +389,66 @@ impl Workspace {
             .on_click(cx.listener(move |this, _, window, cx| this.set_appearance(next, window, cx)))
     }
 
+    /// The app's menu, in the order one comes to it: what to start, where
+    /// to go, how the window is, the app itself.
     fn render_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+        use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
         let this = cx.weak_entity();
         let project = self.active_project();
         let pinned = self.pinned;
+        let presenting = self.is_presenting();
+        let saving = lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed);
         Button::new("app-menu").xsmall().ghost().label("☰").dropdown_menu(move |menu, _, _| {
-            let (a, b, c, d) = (this.clone(), this.clone(), this.clone(), this.clone());
-            let e = this.clone();
-            menu.item(PopupMenuItem::new("Add project…").on_click(move |_, window, cx| {
-                let _ = a.update(cx, |w, cx| w.add_project_dialog(window, cx));
-            }))
-            .when_some(project, |menu, project| {
-                menu.item(PopupMenuItem::new(format!("New task…  {}", keymap::label("new_task"))).on_click(move |_, window, cx| {
-                    let _ = b.update(cx, |w, cx| w.new_task_dialog(project, window, cx));
+            // One line of the menu: its words, its keys when it has some, what it does.
+            let entry = |menu: PopupMenu, label: &str, key: Option<&str>, act: fn(&mut Workspace, &mut Window, &mut Context<Workspace>)| {
+                let this = this.clone();
+                let label = match key {
+                    Some(key) => format!("{label}  {}", keymap::label(key)),
+                    None => label.to_string(),
+                };
+                menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                    let _ = this.update(cx, |w, cx| act(w, window, cx));
                 }))
-            })
-            .separator()
-            .item(PopupMenuItem::new(format!("Settings…  {}", keymap::label("settings"))).on_click({
-                let s = this.clone();
-                move |_, window, cx| {
-                    let _ = s.update(cx, |w, cx| w.open_settings(window, cx));
+            };
+            let mut menu = menu;
+            // Not while presenting: nothing is added to the window by a stray click.
+            if !presenting {
+                if project.is_some() {
+                    menu = entry(menu, "New task…", Some("new_task"), |w, window, cx| {
+                        if let Some(project) = w.active_project() {
+                            w.new_task_dialog(project, window, cx)
+                        }
+                    });
                 }
-            }))
-            .when(desktop::can_pin(), |menu| menu.item(PopupMenuItem::new(if pinned { "Unpin from dash" } else { "Pin to dash" }).on_click(
-                move |_, window, cx| {
+                menu = entry(menu, "Add project…", None, |w, window, cx| w.add_project_dialog(window, cx)).separator();
+            }
+            menu = entry(menu, "Go to file…", Some("go_to_file"), |w, window, cx| w.finder(finder::FinderKind::Files, window, cx));
+            menu = entry(menu, "Go to class or symbol…", Some("go_to_symbol"), |w, window, cx| w.finder(finder::FinderKind::Symbols, window, cx));
+            menu = entry(menu, "Find in files…", Some("find_in_files"), |w, window, cx| w.finder(finder::FinderKind::Grep, window, cx));
+            menu = entry(menu, "Run a command…", Some("command_palette"), |w, window, cx| w.command_palette(window, cx)).separator();
+            menu = entry(menu, if presenting { "End presentation" } else { "Enter presentation mode…" }, None, |w, window, cx| {
+                if w.is_presenting() { w.end_presentation(window, cx) } else { w.presentation_dialog(window, cx) }
+            });
+            menu = entry(menu, if saving { "Leave power saving" } else { "Save power" }, None, |w, _, cx| w.toggle_power_saving(cx)).separator();
+            menu = entry(menu, "Settings…", Some("settings"), |w, window, cx| w.open_settings(window, cx));
+            menu = entry(menu, "Keyboard shortcuts…", None, |w, window, cx| w.open_settings_at(settings_ui::KEYS_PAGE, window, cx)).separator();
+            if desktop::can_pin() {
+                let pin = this.clone();
+                menu = menu.item(PopupMenuItem::new(if pinned { "Unpin from dash" } else { "Pin to dash" }).on_click(move |_, window, cx| {
                     let result = if pinned { Ok(desktop::unpin()) } else { desktop::pin() };
                     match result {
                         Ok(()) => {
-                            let _ = e.update(cx, |w, cx| {
+                            let _ = pin.update(cx, |w, cx| {
                                 w.pinned = !pinned;
                                 cx.notify();
                             });
                         }
-                        Err(err) => window.push_notification(
-                            gpui_kit::component::notification::Notification::error(err).title("Pin to dash"),
-                            cx,
-                        ),
+                        Err(err) => window.push_notification(gpui_kit::component::notification::Notification::error(err).title("Pin to dash"), cx),
                     }
-                },
-            )))
-            .item(PopupMenuItem::new("Restart").on_click(move |_, window, cx| {
-                let _ = c.update(cx, |w, cx| w.restart(window, cx));
-            }))
-            .item(PopupMenuItem::new(format!("Exit  {}", keymap::label("quit"))).on_click(move |_, window, cx| {
-                let _ = d.update(cx, |w, cx| w.request_quit(window, cx));
-            }))
+                }));
+            }
+            menu = entry(menu, "Restart", None, |w, window, cx| w.restart(window, cx));
+            entry(menu, "Exit", Some("quit"), |w, window, cx| w.request_quit(window, cx))
         })
     }
 

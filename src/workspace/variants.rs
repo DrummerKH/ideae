@@ -1517,7 +1517,8 @@ impl Workspace {
     /// The group's screen: what each variant came to, side by side in
     /// words, and what can be done with them together.
     pub fn render_group(&self, group: &str, cx: &mut Context<Self>) -> AnyElement {
-        let members = self.members(group);
+        // While presenting, the variants chosen for it and no others.
+        let members: Vec<(usize, usize)> = self.members(group).into_iter().filter(|&(pi, ti)| self.shows(pi, ti)).collect();
         let Some(&(pi, first)) = members.first() else { return div().into_any_element() };
         let head = &self.projects[pi].tasks[first];
         let muted = cx.theme().muted_foreground;
@@ -2300,6 +2301,70 @@ pub(crate) mod tests {
             }
         })
         .unwrap();
+
+        // Presenting with A alone: B leaves the window, and what it asks meanwhile is told at the end.
+        step(cx, &mut |w, window, cx| {
+            w.switch(&paths[1], window, cx);
+            w.present([paths[0].clone()].into(), window, cx);
+        });
+        workspace.update(cx, |w, _| {
+            let (a, b) = (w.find(&paths[0]).unwrap(), w.find(&paths[1]).unwrap());
+            assert!(w.shows(a.0, a.1) && !w.shows(b.0, b.1));
+            assert_eq!(w.active.as_deref(), Some(paths[0].as_path()), "the task in hand was not one to show");
+        });
+        step(cx, &mut |w, window, cx| {
+            w.on_hook(hook(&paths[1], "UserPromptSubmit"), window, cx);
+            w.on_hook(hook(&paths[1], "Stop"), window, cx);
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("presenting").visible(), "that it is on, and the way out");
+            assert_eq!(crate::zoom::scale(cx), 1.25, "text of the size for an audience");
+            assert_eq!(crate::zoom::current(cx).terminal, None, "the terminals drawn larger, their own size not taken for a new choice");
+            assert!(window.find("sidebar-rail").visible() && window.try_find("sidebar-peek").is_none(), "the tasks as a rail, their names out of sight");
+            assert!(crate::workspace::present::on());
+            assert!(window.try_find("tokens-day").is_none(), "what the agents took is not for the audience");
+        })
+        .unwrap();
+        workspace.update(cx, |w, cx| {
+            let saved = w.snapshot(cx);
+            assert_eq!(saved.presenting.map(|p| p.kept), Some(vec![paths[0].clone()]), "on again after a restart");
+        });
+        step(cx, &mut |w, window, cx| w.end_presentation(window, cx));
+        workspace.update(cx, |w, _| {
+            let b = w.find(&paths[1]).unwrap();
+            assert!(!w.is_presenting() && w.shows(b.0, b.1));
+        });
+        cx.update(|cx| {
+            assert_eq!(crate::zoom::scale(cx), 1., "and of your own size again");
+            assert_eq!(crate::zoom::current(cx).terminal, None);
+        });
+        assert!(!crate::workspace::present::on());
+        // Dragged narrow, the sidebar is a rail; the whole of it opens over the task, with the way back.
+        workspace.update(cx, |w, cx| {
+            (w.sidebar_rail, w.sidebar_peek) = (true, true);
+            cx.notify();
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            for id in ["sidebar-rail", "sidebar-peek", "sidebar-keep"] {
+                assert!(window.find(id).visible(), "{id}");
+            }
+        })
+        .unwrap();
+        workspace.update(cx, |w, cx| {
+            (w.sidebar_rail, w.sidebar_peek) = (false, false);
+            cx.notify();
+        });
+        // The question of what to leave in the window draws, with its way on.
+        step(cx, &mut |w, window, cx| w.presentation_dialog(window, cx));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("present-go").visible());
+            window.close_all_dialogs(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
 
         // B is kept: A goes, parked; B gets the clean branch name.
         step(cx, &mut |w, window, cx| w.settle_group(&group, Some(&paths[1]), &super::pushed_of(&w.member_paths(&group)), window, cx));

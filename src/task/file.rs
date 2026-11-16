@@ -62,6 +62,8 @@ pub struct FileView {
     pub(super) lsp_missing: Option<&'static str>,
     /// Markdown shown as it reads instead of its source.
     pub(super) preview: bool,
+    /// Git ignores it: while presenting it is not shown until asked for.
+    pub(super) veiled: bool,
     /// The text whose next occurrence was added to the selection last,
     /// and where that one ends.
     pub(super) occurrence: Option<(String, usize)>,
@@ -628,8 +630,16 @@ impl FileView {
 
     /// Formats the file as its language server would.
     pub(super) fn format(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.ask_server(window, cx, |client, uri, _| client.formatting(uri, 4, true), |this, edits, window, cx| {
+        self.format_then(false, window, cx)
+    }
+
+    /// Reformats, and with `save` writes the file once that is done.
+    fn format_then(&mut self, save: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.ask_server(window, cx, |client, uri, _| client.formatting(uri, 4, true), move |this, edits, window, cx| {
             this.edit(window, cx, |text, selection| crate::edit::rewrite(text, &lsp::apply_edits(text, &edits), selection.start));
+            if save {
+                this.save(cx);
+            }
         });
     }
 
@@ -780,10 +790,17 @@ impl FileView {
 
 impl Render for FileView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let veil = self.veiled && crate::workspace::present::on() && crate::state::with_settings(|s| s.present_veil);
         let warning = hsla(0.08, 0.9, 0.55, 1.);
         v_flex()
             .size_full()
-            .on_action(cx.listener(|this, _: &SaveFile, _, cx| this.save(cx)))
+            .on_action(cx.listener(|this, _: &SaveFile, window, cx| {
+                // Saved by hand, and asked to be tidied first: saved when the server has answered, or as it is when there is none.
+                if crate::state::with_settings(|s| s.format_on_save) && this.lsp_client.is_some() {
+                    return this.format_then(true, window, cx);
+                }
+                this.save(cx)
+            }))
             .on_action(cx.listener(|this, _: &ExpandSelection, _, cx| this.expand_selection(cx)))
             .on_action(cx.listener(|this, _: &ShrinkSelection, _, cx| this.shrink_selection(cx)))
             .on_action(cx.listener(|this, _: &ToggleComment, window, cx| this.toggle_comment(window, cx)))
@@ -918,8 +935,23 @@ impl Render for FileView {
             .when_some(self.error.clone(), |this, error| {
                 this.child(div().px_3().py_1().text_xs().text_color(gpui_kit::red()).child(error))
             })
-            .when(self.preview, |this| this.child(self.render_preview(cx)))
-            .when(!self.preview, |this| this.child(
+            .when(veil, |this| {
+                this.child(
+                    v_flex()
+                        .flex_1()
+                        .items_center()
+                        .justify_center()
+                        .gap_3()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Git ignores this file: it is not shown while presenting.")
+                        .child(Button::new("unveil").small().outline().label("Show it anyway").on_click(cx.listener(|this, _, _, cx| {
+                            this.veiled = false;
+                            cx.notify();
+                        }))),
+                )
+            })
+            .when(self.preview && !veil, |this| this.child(self.render_preview(cx)))
+            .when(!self.preview && !veil, |this| this.child(
                 div().relative().flex_1().min_h_0().children(self.render_signature(cx)).child(crate::zoom::wheel(crate::zoom::Kind::Editor)).child(
                     Editor::new(&self.editor)
                         // Replaces the built-in menu, so its items are listed again.
@@ -985,6 +1017,10 @@ impl CompletionProvider for LspBridge {
 
     fn is_completion_trigger(&self, _: usize, new_text: &str, _: &mut App) -> bool {
         let Some(last) = new_text.chars().last() else { return false };
+        // Off: only when asked for, which does not come this way.
+        if !crate::state::with_settings(|s| s.complete_as_typed) {
+            return false;
+        }
         last.is_alphanumeric() || last == '_' || self.client.completion_triggers().iter().any(|t| new_text.ends_with(t.as_str()))
     }
 }
@@ -1002,6 +1038,9 @@ impl DocumentRangeSemanticTokensProvider for LspBridge {
         _: &mut Window,
         cx: &mut App,
     ) -> Task<anyhow::Result<lsp_types::SemanticTokens>> {
+        if !crate::state::with_settings(|s| s.semantic_colors) {
+            return Task::ready(Ok(lsp_types::SemanticTokens::default()));
+        }
         let range = lsp_types::Range::new(text.offset_to_position(range.start), text.offset_to_position(range.end));
         let (client, uri, path, text) = (self.client.clone(), self.uri.clone(), self.path.clone(), text.clone());
         cx.background_spawn(crate::procs::on_thread(move || {

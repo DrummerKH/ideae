@@ -400,6 +400,8 @@ impl Render for HistoryView {
                             Diff::new(&self.diff)
                                 .line_number(true)
                                 .soft_wrap(true)
+                                // The size of the Changes tab's diff: Ctrl+wheel there and the presentation's size reach this one too.
+                                .code_font_size(crate::zoom::size(crate::zoom::Kind::Changes, cx))
                                 .render_header_suffix({
                                     let (root, task, lines) = (self.root.clone(), self.task.clone(), self.first_lines.clone());
                                     move |file, _, _| crate::task::open_file_button(&root, &task, file, &lines)

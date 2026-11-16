@@ -41,6 +41,7 @@ impl TaskView {
             }
         };
         let language = lsp::language_for(&path);
+        let veiled = self.ignores(&path);
         let editor = cx.new(|cx| {
             EditorState::new(window, cx)
                 .language(language)
@@ -107,6 +108,7 @@ impl TaskView {
             lsp_program: String::new(),
             lsp_missing: None,
             preview: false,
+            veiled,
             occurrence: None,
             committed: None,
             _marks: Task::ready(()),
@@ -259,5 +261,33 @@ impl TaskView {
             lsp.show_document = Some(show_document_handler(task, this_path));
             cx.notify();
         });
+    }
+}
+
+impl TaskView {
+    /// Whether git ignores a file of this task: it is in the worktree and
+    /// not among the files git lists. Not known before those are read.
+    pub(super) fn ignores(&self, path: &std::path::Path) -> bool {
+        let Ok(inside) = path.strip_prefix(&self.root) else { return false };
+        let inside = inside.to_string_lossy().replace('\\', "/");
+        !self.tree_files.is_empty() && !self.tree_files.iter().any(|file| *file == inside)
+    }
+
+    /// Marks the open files git ignores: while presenting they show a
+    /// notice in place of what they hold, until asked for.
+    pub fn veil_ignored(&mut self, cx: &mut Context<Self>) {
+        let files: Vec<Entity<FileView>> = self.tabs.iter().filter_map(|tab| match &tab.kind {
+            TabKind::File(file) => Some(file.clone()),
+            _ => None,
+        }).collect();
+        for file in files {
+            let veiled = self.ignores(&file.read(cx).path);
+            file.update(cx, |file, cx| {
+                if file.veiled != veiled {
+                    file.veiled = veiled;
+                    cx.notify();
+                }
+            });
+        }
     }
 }

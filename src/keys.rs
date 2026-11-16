@@ -10,6 +10,8 @@ pub fn key(linux: &str) -> String {
     match linux {
         // Cmd+` switches windows on macOS.
         "ctrl-`" => "ctrl-`",
+        // Cmd+Space is Spotlight's; JetBrains completes on Ctrl+Space there too.
+        "ctrl-space" => "ctrl-space",
         "ctrl-pagedown" => "cmd-shift-]",
         "ctrl-pageup" => "cmd-shift-[",
         // Opt+arrows move by word in an editor there.

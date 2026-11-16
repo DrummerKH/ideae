@@ -75,6 +75,25 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
         })
         .default_value(SharedString::from(default.token_warn_k.to_string()))
     };
+    let present_zoom = {
+        let (read, write) = (draft.clone(), draft.clone());
+        let options = [100, 110, 125, 150, 175, 200].into_iter().map(|p| (SharedString::from(p.to_string()), SharedString::from(format!("{p}%")))).collect();
+        SettingField::dropdown(options, move |_| read.borrow().present_zoom.to_string().into(), move |value, _| {
+            write.borrow_mut().present_zoom = value.parse().unwrap_or(100)
+        })
+        .default_value(SharedString::from(default.present_zoom.to_string()))
+    };
+    let rail_open = {
+        let (read, write) = (draft.clone(), draft.clone());
+        let options = [(250, "A quarter of a second"), (500, "Half a second"), (750, "750 ms"), (1000, "A second"), (1500, "A second and a half"), (0, "Never")]
+            .into_iter()
+            .map(|(ms, label)| (SharedString::from(ms.to_string()), SharedString::from(label)))
+            .collect();
+        SettingField::dropdown(options, move |_| read.borrow().rail_open_ms.to_string().into(), move |value, _| {
+            write.borrow_mut().rail_open_ms = value.parse().unwrap_or(750)
+        })
+        .default_value(SharedString::from(default.rail_open_ms.to_string()))
+    };
     let servers = lsp::SERVERS.iter().map(|def| {
         let program = def.program;
         let (read, write) = (draft.clone(), draft.clone());
@@ -92,7 +111,7 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
     });
     vec![
         SettingPage::new("General").group(
-            SettingGroup::new()
+            SettingGroup::new().title("Notices")
                 .item(switch(
                     draft,
                     "Notifications",
@@ -107,9 +126,38 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
                     |s| s.check_updates,
                     |s, v| s.check_updates = v,
                 )),
+        ).group(
+            SettingGroup::new().title("Title bar")
+                .item(switch(
+                    draft,
+                    "Load",
+                    "CPU, memory, and what the app and its tasks hold; the tooltip has every process.",
+                    |s| s.show_load,
+                    |s, v| s.show_load = v,
+                ))
+                .item(switch(
+                    draft,
+                    "Tokens",
+                    "What the agents of the tasks open here took in the last 24 hours.",
+                    |s| s.show_tokens,
+                    |s, v| s.show_tokens = v,
+                )),
+        ).group(
+            SettingGroup::new().title("Sidebar")
+                .item(switch(
+                    draft,
+                    "Context dial on tasks",
+                    "By a task in the sidebar, how full its agent's context is.",
+                    |s| s.context_dial,
+                    |s, v| s.context_dial = v,
+                ))
+                .item(
+                    SettingItem::new("The narrow sidebar opens after", rail_open)
+                        .description("Dragged as narrow as it goes, the sidebar is a rail of tasks to click. The whole of it opens over the task when the pointer rests on the rail this long."),
+                ),
         ),
         SettingPage::new("Agent").group(
-            SettingGroup::new()
+            SettingGroup::new().title("Command")
                 .item(
                     SettingItem::new("Agent command", agent)
                         .description("Runs in each task's agent tab; empty for a plain shell. New tasks use it."),
@@ -120,34 +168,65 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
                     "Claude Code's LSP plugins, a rust-analyzer and the like per agent: much memory for every agent that runs, for go-to-definition in what it reads. For agents started after Save.",
                     |s| s.agent_lsp,
                     |s, v| s.agent_lsp = v,
-                ))
+                )),
+        ).group(
+            SettingGroup::new().title("Tokens")
                 .item(
                     SettingItem::new("Tell me when a session has used", token_warn)
                         .description("A notification, once for a session, when its agent has used this much: input not read from the cache, and output. The agent is not stopped."),
                 ),
         ),
-        SettingPage::new("Editor").group(SettingGroup::new().item(switch(
-            draft,
-            "CamelHumps words",
-            "Moving, selecting and deleting by word stops at the humps of camelCase and at the underscores of snake_case.",
-            |s| s.hump_words,
-            |s, v| s.hump_words = v,
-        )).item(switch(
-            draft,
-            "Gutter marks against the base branch",
-            "The marks beside the line numbers show what the task changed since it left its base branch, not only since the last commit.",
-            |s| s.gutter_since_base,
-            |s, v| s.gutter_since_base = v,
-        ))),
+        SettingPage::new("Editor").group(
+            SettingGroup::new().title("Typing")
+                .item(switch(
+                    draft,
+                    "CamelHumps words",
+                    "Moving, selecting and deleting by word stops at the humps of camelCase and at the underscores of snake_case.",
+                    |s| s.hump_words,
+                    |s, v| s.hump_words = v,
+                ))
+                .item(switch(
+                    draft,
+                    "Completions as you type",
+                    "The language server's suggestions come up while you type. Off, they come when asked for (Ctrl+Space).",
+                    |s| s.complete_as_typed,
+                    |s, v| s.complete_as_typed = v,
+                ))
+                .item(switch(
+                    draft,
+                    "Reformat on save",
+                    "Ctrl+S has the language server reformat the file first. Not the save made when you leave a file.",
+                    |s| s.format_on_save,
+                    |s, v| s.format_on_save = v,
+                )),
+        ).group(
+            SettingGroup::new().title("Shown in the code")
+                .item(switch(
+                    draft,
+                    "Colors from the language server",
+                    "Names are colored by what the server knows them to be (a type, a parameter, a method), over the grammar's colors.",
+                    |s| s.semantic_colors,
+                    |s, v| s.semantic_colors = v,
+                ))
+                .item(switch(
+                    draft,
+                    "Gutter marks against the base branch",
+                    "The marks beside the line numbers show what the task changed since it left its base branch, not only since the last commit.",
+                    |s| s.gutter_since_base,
+                    |s, v| s.gutter_since_base = v,
+                )),
+        ),
         SettingPage::new("Tasks").group(
-            SettingGroup::new()
+            SettingGroup::new().title("New tasks")
                 .item(switch(
                     draft,
                     "Copy .env files",
                     "New worktrees get the main checkout's ignored .env* files.",
                     |s| s.copy_env,
                     |s, v| s.copy_env = v,
-                ))
+                )),
+        ).group(
+            SettingGroup::new().title("Git in the background")
                 .item(SettingItem::new("Fetch the base branch", fetch).description(
                     "Brings origin's main branch up to date in the background, so tasks show how far behind they are and what they share.",
                 ))
@@ -157,6 +236,22 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
                     "Ask gh about each task's PR and show it on the row.",
                     |s| s.pr_status,
                     |s, v| s.pr_status = v,
+                )),
+        ).group(
+            SettingGroup::new().title("Changes")
+                .item(switch(
+                    draft,
+                    "Unified diff",
+                    "The Changes tab starts with the old and the new one under the other, not side by side.",
+                    |s| s.diff_unified,
+                    |s, v| s.diff_unified = v,
+                ))
+                .item(switch(
+                    draft,
+                    "Conflicts go to the agent",
+                    "A pull, rebase, cherry-pick or revert that would conflict changes nothing, and the agent's prompt gets the request to do it and resolve the conflicts. Off, you are only told.",
+                    |s| s.conflicts_to_agent,
+                    |s, v| s.conflicts_to_agent = v,
                 )),
         ),
         SettingPage::new("Language servers").default_open(true).groups([
@@ -170,13 +265,53 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
             .description("Click a shortcut and press the new keys: Esc leaves them, Backspace removes them.")
             .default_open(true)
             .groups(key_groups(draft, recording, catcher)),
+        SettingPage::new("Presentation")
+            .description("For showing the window to others: ☰ → Enter presentation mode leaves in it only the tasks you tick.")
+            .group(
+                SettingGroup::new().title("Shown larger").item(
+                    SettingItem::new("Text size", present_zoom)
+                        .description("Files, diffs and terminals are drawn this much larger while presenting; the sizes you chose come back when it ends."),
+                ),
+            )
+            .group(
+                SettingGroup::new().title("Kept out of sight")
+                    .item(switch(
+                        draft,
+                        "Sidebar as a rail",
+                        "The tasks left in the window show as a narrow rail: the start of their names, the whole list when the pointer rests on it.",
+                        |s| s.present_rail,
+                        |s, v| s.present_rail = v,
+                    ))
+                    .item(switch(
+                        draft,
+                        "Hide files git ignores",
+                        "A file git ignores (keys, local settings) shows a notice in place of what it holds, until you ask for it.",
+                        |s| s.present_veil,
+                        |s, v| s.present_veil = v,
+                    ))
+                    .item(switch(
+                        draft,
+                        "Hide load and tokens",
+                        "The title bar's readouts are not shown while presenting.",
+                        |s| s.present_hide_readouts,
+                        |s, v| s.present_hide_readouts = v,
+                    )),
+            ),
     ]
 }
 
+/// Where the shortcuts are among the pages.
+pub const KEYS_PAGE: usize = 5;
+
 impl Workspace {
     pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings_at(0, window, cx)
+    }
+
+    /// Settings, open at one of its pages.
+    pub fn open_settings_at(&mut self, page: usize, window: &mut Window, cx: &mut Context<Self>) {
         let this = cx.weak_entity();
-        open(state::settings(), 0, window, cx, move |settings, cx| {
+        open(state::settings(), page, window, cx, move |settings, cx| {
             let _ = this.update(cx, |w, cx| w.apply_settings(settings, cx));
         });
     }
@@ -361,12 +496,12 @@ mod tests {
     #[gpui_kit::test]
     fn every_page_draws(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
-        for page in 0..6 {
+        for page in 0..7 {
             let handle = window(cx);
             cx.update_window(handle, |_, window, cx| {
                 open(state::Settings::default(), page, window, cx, |_, _| {});
                 window.render_frame(cx);
-                assert_eq!(window.try_find("key-row-quit").is_some(), page == 5, "page {page}");
+                assert_eq!(window.try_find("key-row-quit").is_some(), page == super::KEYS_PAGE, "page {page}");
             })
             .unwrap();
         }

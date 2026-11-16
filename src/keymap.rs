@@ -71,6 +71,7 @@ pub static SHORTCUTS: &[Shortcut] = &[
     shortcut!("toggle_case", "Upper / lower case", "ctrl-shift-u", Editor, task::ToggleCase),
     shortcut!("next_occurrence", "Select next occurrence", "alt-j", Editor, task::NextOccurrence),
     shortcut!("go_to_line", "Go to line", "ctrl-g", Editor, task::GoToLine),
+    shortcut!("complete", "Complete here", "ctrl-space", Editor, gpui_kit::component::input::ShowCompletions),
     shortcut!("quick_fix", "Quick fixes", "alt-enter", Editor, gpui_kit::component::input::ToggleCodeActions),
     shortcut!("rename", "Rename", "shift-f6", Editor, task::RenameSymbol),
     shortcut!("format", "Reformat file", "ctrl-alt-l", Editor, task::FormatFile),
