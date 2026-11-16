@@ -265,28 +265,49 @@ impl TaskView {
             .flex_1()
             .min_h_0()
             .child(div().px_3().py_1().text_xs().text_color(cx.theme().muted_foreground).child(name))
-            .children(items.iter().enumerate().map(|(ix, item)| {
-                let (file, line) = (file.clone(), item.line);
+            .child(
                 div()
-                    .id(("decl", ix))
-                    .pl(px(12. + 14. * item.depth as f32))
-                    .pr_2()
-                    .py_0p5()
-                    .text_sm()
-                    .truncate()
-                    .cursor_pointer()
-                    .when(Some(ix) == current, |d| d.bg(cx.theme().accent))
-                    .when(keyboard && ix == self.side_selected, |d| d.border_l_2().border_color(cx.theme().primary))
-                    .hover(|d| d.bg(cx.theme().accent))
-                    .child(item.label.clone())
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        if let Some(ix) = this.tabs.iter().position(|t| t.id == id) {
-                            this.activate(ix, window, cx);
-                        }
-                        file.update(cx, |f, cx| f.go_to_line(line, 0, window, cx));
-                    }))
-            }))
-            .overflow_y_scrollbar()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    // Only the declarations in view are laid out: a file can have thousands.
+                    .child(
+                        uniform_list(
+                            "declarations",
+                            items.len(),
+                            cx.processor(move |this: &mut Self, range: std::ops::Range<usize>, _, cx| {
+                                range
+                                    .map(|ix| {
+                                        let item = &items[ix];
+                                        let (file, line) = (file.clone(), item.line);
+                                        div()
+                                            .id(("decl", ix))
+                                            .w_full()
+                                            .pl(px(12. + 14. * item.depth as f32))
+                                            .pr_2()
+                                            .py_0p5()
+                                            .text_sm()
+                                            .truncate()
+                                            .cursor_pointer()
+                                            .when(Some(ix) == current, |d| d.bg(cx.theme().accent))
+                                            .when(keyboard && ix == this.side_selected, |d| d.border_l_2().border_color(cx.theme().primary))
+                                            .hover(|d| d.bg(cx.theme().accent))
+                                            .child(item.label.clone())
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                if let Some(ix) = this.tabs.iter().position(|t| t.id == id) {
+                                                    this.activate(ix, window, cx);
+                                                }
+                                                file.update(cx, |f, cx| f.go_to_line(line, 0, window, cx));
+                                            }))
+                                    })
+                                    .collect::<Vec<_>>()
+                            }),
+                        )
+                        .size_full()
+                        .track_scroll(&self.structure_scroll),
+                    )
+                    .child(gpui_kit::component::scroll::Scrollbar::vertical(&self.structure_scroll)),
+            )
             .into_any_element()
     }
 }

@@ -38,6 +38,9 @@ pub struct HistoryView {
     _typing: Task<()>,
     _load: Task<()>,
     _show: Task<()>,
+    /// A commit shown from elsewhere that the list does not reach: put back
+    /// when the list is read again while it is the one looked at.
+    brought: Option<git::Commit>,
 }
 
 /// The whole history: `git log` of 6k commits takes 30 ms and the list is
@@ -67,6 +70,7 @@ impl HistoryView {
             _typing: Task::ready(()),
             _load: Task::ready(()),
             _show: Task::ready(()),
+            brought: None,
         }
     }
 
@@ -89,6 +93,13 @@ impl HistoryView {
             let _ = this.update(cx, |this, cx| {
                 // Keep the selection on the same commit when it is still listed.
                 let selected_hash = this.selected.and_then(|ix| this.commits.get(ix)).map(|c| c.hash.clone());
+                let mut commits = commits;
+                // One brought from beyond the list is still the one looked at: it stays first.
+                if let Some(brought) = this.brought.clone().filter(|b| selected_hash.as_ref() == Some(&b.hash)) {
+                    if !commits.iter().any(|c| c.hash == brought.hash) {
+                        commits.insert(0, brought);
+                    }
+                }
                 this.commits = Rc::new(commits);
                 let ix = selected_hash
                     .and_then(|h| this.commits.iter().position(|c| c.hash == h))
@@ -117,6 +128,7 @@ impl HistoryView {
             let Some(commit) = cx.background_spawn(async move { git::commit_info(&root, &hash) }).await else { return };
             let _ = this.update(cx, |this, cx| {
                 let mut commits = (*this.commits).clone();
+                this.brought = Some(commit.clone());
                 commits.insert(0, commit);
                 this.commits = Rc::new(commits);
                 this.selected = None;

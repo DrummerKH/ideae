@@ -112,7 +112,9 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
             cx.refresh_windows();
         })
         .default_value(true);
-        let missing = if def.available() { "" } else { ", not installed" };
+        // Looked for on disk once while the dialog is open: this runs with every frame of it.
+        let there = INSTALLED.with(|known| *known.borrow_mut().entry(program).or_insert_with(|| def.available()));
+        let missing = if there { "" } else { ", not installed" };
         SettingItem::new(program, field).description(format!("{}{missing}", def.extensions()))
     });
     vec![
@@ -331,6 +333,8 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
 pub const KEYS_PAGE: usize = 5;
 
 thread_local! {
+    /// Which language servers are there, as found when the dialog asked first.
+    static INSTALLED: RefCell<std::collections::HashMap<&'static str, bool>> = RefCell::default();
     /// What opens the list of spaces, for the page that has a button for it.
     static EDIT_SPACES: RefCell<Option<Rc<dyn Fn(&mut Window, &mut App)>>> = const { RefCell::new(None) };
 }
@@ -358,6 +362,7 @@ impl Workspace {
 /// The dialog over `current`, at the page `first`; Save hands `save` the result.
 fn open(current: state::Settings, first: usize, window: &mut Window, cx: &mut App, save: impl Fn(state::Settings, &mut App) + 'static) {
     let draft: Draft = Rc::new(RefCell::new(current));
+    INSTALLED.with(|known| known.borrow_mut().clear());
     // The shortcut waiting for keys, and what catches them before any
     // binding does.
     let recording: Rc<Cell<Option<&'static str>>> = Rc::default();

@@ -1,6 +1,7 @@
 use std::{
     path::{Path, PathBuf},
 };
+use std::sync::Arc;
 #[cfg(test)]
 use std::process::Command;
 
@@ -533,13 +534,24 @@ pub struct Known {
     has_origin: bool,
     base: Option<String>,
     /// The tracked files, by the index they were listed from.
-    tracked: Option<(Stamp, Vec<String>)>,
+    tracked: Option<(Stamp, Arc<Vec<String>>)>,
+    /// Every file and the directories to watch, as made from the tracked
+    /// files and the new ones last: made again only when one of the two is
+    /// another, and one list for all who read it.
+    listed: Option<Listed>,
     /// What only a new commit or a moved base changes.
     history: Option<(HistoryKey, History)>,
     /// What the patches last given were made of.
     patches: Option<u64>,
     /// The stashes, by the log they were listed from.
     stashes: (Stamp, Vec<Stash>),
+}
+
+struct Listed {
+    tracked: Arc<Vec<String>>,
+    untracked: Vec<String>,
+    files: Arc<Vec<String>>,
+    flat: Arc<std::collections::BTreeSet<PathBuf>>,
 }
 
 /// HEAD, the branch compared with, and the files its ref can be in.
@@ -575,14 +587,14 @@ impl Known {
     }
 
     /// The tracked files: listed again only when the index is another one.
-    fn tracked(&mut self, root: &Path) -> &[String] {
+    fn tracked(&mut self, root: &Path) -> Arc<Vec<String>> {
         // Stamped before it is read: an index written meanwhile is read again next time.
         let now = self.git_dir.as_ref().and_then(|dir| stamp(&dir.join("index")));
         if now.is_none() || self.tracked.as_ref().is_none_or(|(seen, _)| *seen != now) {
             let out = git(root, &["ls-files", "--cached", "-z"]).unwrap_or_default();
-            self.tracked = Some((now, out.split('\0').filter(|f| !f.is_empty()).map(str::to_string).collect()));
+            self.tracked = Some((now, Arc::new(out.split('\0').filter(|f| !f.is_empty()).map(str::to_string).collect())));
         }
-        self.tracked.as_ref().map_or(&[], |(_, files)| files)
+        self.tracked.as_ref().map(|(_, files)| files.clone()).unwrap_or_default()
     }
 
     /// The files a ref named `name` can be read from, as they are now. None
@@ -602,8 +614,8 @@ impl Known {
 
 /// All a task shows of its worktree, read in one go.
 pub struct Refreshed {
-    pub files: Vec<String>,
-    pub watch: (std::collections::BTreeSet<PathBuf>, Vec<PathBuf>),
+    pub files: Arc<Vec<String>>,
+    pub watch: (Arc<std::collections::BTreeSet<PathBuf>>, Vec<PathBuf>),
     pub info: BranchInfo,
     pub states: std::collections::HashMap<String, FileState>,
     /// The branch compared with.
@@ -636,14 +648,23 @@ pub struct Stash {
     pub what: String,
     /// "2 hours ago".
     pub when: String,
+    /// Its commit: the name is a place in the list, which every worktree
+    /// of the repository adds to and takes from.
+    pub id: String,
+}
+
+/// Where a stash is in the list now: an action is for the one that was
+/// shown, not for whatever has its place since.
+fn stash_now(root: &Path, stash: &Stash) -> Result<String, String> {
+    stashes(root).into_iter().find(|now| now.id == stash.id).map(|now| now.name).ok_or_else(|| format!("{} ({}) is no longer in the list", stash.name, stash.what))
 }
 
 pub fn stashes(root: &Path) -> Vec<Stash> {
-    let list = git(root, &["stash", "list", "--format=%gd%x1f%gs%x1f%cr"]).unwrap_or_default();
+    let list = git(root, &["stash", "list", "--format=%gd%x1f%gs%x1f%cr%x1f%H"]).unwrap_or_default();
     list.lines()
         .filter_map(|line| {
             let mut parts = line.split('\x1f');
-            Some(Stash { name: parts.next()?.to_string(), what: parts.next()?.to_string(), when: parts.next()?.to_string() })
+            Some(Stash { name: parts.next()?.to_string(), what: parts.next()?.to_string(), when: parts.next()?.to_string(), id: parts.next()?.to_string() })
         })
         .collect()
 }
@@ -659,7 +680,8 @@ pub fn stash(root: &Path, message: &str) -> Result<String, String> {
 
 /// Brings a stash back into the worktree; with `drop` it leaves the list
 /// when that went without a conflict. On a conflict it stays.
-pub fn stash_apply(root: &Path, name: &str, drop: bool) -> Result<String, String> {
+pub fn stash_apply(root: &Path, stash: &Stash, drop: bool) -> Result<String, String> {
+    let name = &stash_now(root, stash)?;
     // Not tried when it would not go in: a stash applied halfway leaves its conflict in the files.
     if let Some(files) = merge_conflicts(root, Some(&format!("{name}^1")), name).filter(|files| !files.is_empty()) {
         return Err(format!("would conflict in {} (the stash is kept)", files.join(", ")));
@@ -674,7 +696,8 @@ pub fn stash_apply(root: &Path, name: &str, drop: bool) -> Result<String, String
     Ok(format!("Brought back {name}"))
 }
 
-pub fn stash_drop(root: &Path, name: &str) -> Result<String, String> {
+pub fn stash_drop(root: &Path, stash: &Stash) -> Result<String, String> {
+    let name = &stash_now(root, stash)?;
     run(root, "git", &["stash", "drop", name]).map(|_| format!("Dropped {name}"))
 }
 
@@ -694,20 +717,31 @@ pub fn refresh(root: &Path, picked: Option<String>, light: bool, known: &mut Kno
     let Status { mut info, oid, states, untracked, changed } = parse_status(&raw);
 
     // Every file: the tracked ones and, from the status, those that are new.
-    let mut files: Vec<String> = known.tracked(root).iter().chain(&untracked).cloned().collect();
-    files.sort();
-    files.dedup();
-    let mut flat: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
-    let mut last = "";
-    for dir in files.iter().filter_map(|file| file.rsplit_once('/')).map(|(dir, _)| dir) {
-        // Sorted: a directory's files come together.
-        if dir != last {
-            flat.insert(root.join(dir));
-            last = dir;
+    let tracked = known.tracked(root);
+    if !known.listed.as_ref().is_some_and(|listed| Arc::ptr_eq(&listed.tracked, &tracked) && listed.untracked == untracked) {
+        // With nothing new the tracked files are all of them, as git lists them: in order.
+        let files = if untracked.is_empty() && tracked.is_sorted() {
+            tracked.clone()
+        } else {
+            let mut files: Vec<String> = tracked.iter().chain(&untracked).cloned().collect();
+            files.sort();
+            files.dedup();
+            Arc::new(files)
+        };
+        let mut flat: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+        let mut last = "";
+        for dir in files.iter().filter_map(|file| file.rsplit_once('/')).map(|(dir, _)| dir) {
+            // Sorted: a directory's files come together.
+            if dir != last {
+                flat.insert(root.join(dir));
+                last = dir;
+            }
         }
+        flat.insert(root.to_path_buf());
+        flat.extend(known.git_dir.clone());
+        known.listed = Some(Listed { tracked, untracked: untracked.clone(), files, flat: Arc::new(flat) });
     }
-    flat.insert(root.to_path_buf());
-    flat.extend(known.git_dir.clone());
+    let (files, flat) = known.listed.as_ref().map(|listed| (listed.files.clone(), listed.flat.clone())).unwrap_or_default();
     let watch = (flat, known.refs.clone().into_iter().collect());
 
     info.has_origin = known.has_origin;
@@ -1022,9 +1056,11 @@ pub fn unstage(root: &Path, paths: &[String]) -> Result<String, String> {
     run(root, "git", &args)
 }
 
-/// Commits what is staged; with nothing staged, everything (`git add -A` first).
-pub fn commit(root: &Path, message: &str, all: bool) -> Result<String, String> {
-    if all {
+/// Commits what is staged; with nothing staged, everything (`git add -A`
+/// first). Asked of git here: what the window last read may be from before
+/// a change was staged.
+pub fn commit(root: &Path, message: &str) -> Result<String, String> {
+    if git(root, &["diff", "--cached", "--name-only"]).is_some_and(|staged| staged.trim().is_empty()) {
         run(root, "git", &["add", "-A"])?;
     }
     run(root, "git", &["commit", "-m", message])
@@ -1591,17 +1627,25 @@ mod pull_tests {
         assert!(patch.contains("+TWO") && patch.contains("new.txt"), "{patch}");
         // The line it changed is changed again and committed: it cannot simply go back.
         sh(&b, "printf 'one\\n2\\nthree\\n' > f.txt; git commit -qam two");
-        let refused = stash_apply(&b, "stash@{0}", true).unwrap_err();
+        let put_away = listed[0].clone();
+        let refused = stash_apply(&b, &put_away, true).unwrap_err();
         assert!(refused.ends_with("(the stash is kept)"), "{refused}");
         assert_eq!(refresh(&b, None, false, &mut Known::default()).stashes.len(), 1);
         assert!(refused.starts_with("would conflict in f.txt"), "{refused}");
         assert_eq!(std::fs::read_to_string(b.join("f.txt")).unwrap(), "one\n2\nthree\n", "and nothing was touched");
         sh(&b, "git reset -q --hard HEAD~1");
-        stash_apply(&b, "stash@{0}", true).unwrap();
+        // Another worktree put something away since: the one shown is one further down, and still the one brought back.
+        sh(&b, "echo other > other.txt; git stash push -q --include-untracked -m other");
+        stash_apply(&b, &put_away, true).unwrap();
+        assert!(!b.join("other.txt").exists(), "not the one that has its place now");
+        let other = refresh(&b, None, false, &mut Known::default()).stashes.remove(0);
+        assert!(stash_drop(&b, &put_away).unwrap_err().contains("no longer in the list"));
+        stash_drop(&b, &other).unwrap();
         assert_eq!(std::fs::read_to_string(b.join("f.txt")).unwrap(), "one\nTWO\nthree\n");
         assert!(b.join("new.txt").exists() && refresh(&b, None, false, &mut Known::default()).stashes.is_empty(), "back, and off the list");
         stash(&b, "").unwrap();
-        stash_drop(&b, "stash@{0}").unwrap();
+        let last = refresh(&b, None, false, &mut Known::default()).stashes.remove(0);
+        stash_drop(&b, &last).unwrap();
         assert!(refresh(&b, None, false, &mut Known::default()).stashes.is_empty());
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -2364,11 +2408,12 @@ mod refresh_tests {
         let state = |path: &str| read.states.get(path).map(|s| (s.staged, s.unstaged));
         assert_eq!((state("f.txt"), state("src/staged.txt"), state("new one.txt")), (Some((false, true)), Some((true, false)), Some((false, true))));
         assert_eq!((read.base.as_deref(), branch == working), (Some("origin/main"), true), "no commit of its own: one patch");
-        assert_eq!(read.files, files(&root), "the tracked files and the new ones of the status are all of them");
+        assert_eq!(*read.files, files(&root), "the tracked files and the new ones of the status are all of them");
 
         // Nothing changed: git is not asked for the patches again, by a task in view or out of it.
         let again = refresh(&root, None, false, &mut known);
         assert!(again.patches.is_none() && again.files == read.files && again.info == read.info && again.states == read.states);
+        assert!(Arc::ptr_eq(&again.files, &read.files) && Arc::ptr_eq(&again.watch.0, &read.watch.0), "no file came or went: the list is the one made before, not another like it");
         assert!(refresh(&root, None, true, &mut known).patches.is_none());
         // The patches of a task out of view, and those of the few files named to git, are the same.
         let light = refresh(&root, None, true, &mut Known::default()).patches.unwrap();

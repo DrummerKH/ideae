@@ -23,7 +23,7 @@ pub struct FileView {
     pub(super) path: PathBuf,
     pub(super) editor: Entity<EditorState>,
     /// The text as last read from or written to disk, and that file's mtime.
-    pub(super) saved: SharedString,
+    pub(super) saved: Print,
     pub(super) disk_mtime: Option<std::time::SystemTime>,
     pub dirty: bool,
     /// Changed on disk while it had unsaved edits: the user picks a side.
@@ -38,7 +38,7 @@ pub struct FileView {
     /// orders it with a later one.
     pub(super) saving: Option<u64>,
     pub(super) save_seq: u64,
-    pub(super) write_gate: Arc<std::sync::Mutex<u64>>,
+    pub(super) write_gate: Arc<WriteGate>,
     pub(super) _save: Task<()>,
     /// The task's worktree (for git) and the task, to open a blamed commit.
     pub(super) root: PathBuf,
@@ -88,6 +88,32 @@ pub(super) fn mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
+/// A text as it was saved, without the text: its length and a hash. The
+/// editor has the text already; a second copy of every open file is not
+/// kept to tell whether it was edited.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(super) struct Print {
+    len: usize,
+    hash: u64,
+}
+
+impl Print {
+    fn add(hash: u64, bytes: &[u8]) -> u64 {
+        // FNV-1a: the same whatever pieces the text comes in.
+        bytes.iter().fold(hash, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3))
+    }
+
+    pub(super) fn of(text: &str) -> Self {
+        Self { len: text.len(), hash: Self::add(0xcbf2_9ce4_8422_2325, text.as_bytes()) }
+    }
+
+    /// Whether the editor holds that text. Read through only when it is as
+    /// long: while typing it seldom is.
+    pub(super) fn is(&self, rope: &Rope) -> bool {
+        rope.len() == self.len && rope.chunks().fold(0xcbf2_9ce4_8422_2325, |hash, chunk| Self::add(hash, chunk.as_bytes())) == self.hash
+    }
+}
+
 /// Whether the editor holds exactly `text`, without copying it out.
 pub(super) fn same_text(rope: &Rope, text: &str) -> bool {
     let mut rest = text.as_bytes();
@@ -99,28 +125,47 @@ pub(super) fn same_text(rope: &Rope, text: &str) -> bool {
         })
 }
 
+/// The file was written by another since it was last read: not written over.
+#[derive(Debug, PartialEq)]
+pub(super) struct ChangedOnDisk;
+
+/// The last write made of a file, and the file's time after it.
+pub(super) type WriteGate = std::sync::Mutex<(u64, Option<std::time::SystemTime>)>;
+
 /// Writes of one file, in the order they were asked for: a write that
 /// starts after a later one has been made is dropped. Gives the file's
-/// time once written.
-pub(super) fn write_in_order(gate: &std::sync::Mutex<u64>, seq: u64, path: &std::path::Path, bytes: &[u8]) -> std::io::Result<Option<std::time::SystemTime>> {
+/// time once written. A file that is not as `known`, nor as the last write
+/// here left it, was changed by another (the agent, git) and no refresh
+/// has seen it yet: it is left as it is.
+pub(super) fn write_in_order(
+    gate: &WriteGate,
+    seq: u64,
+    path: &std::path::Path,
+    known: Option<std::time::SystemTime>,
+    bytes: &[u8],
+) -> std::io::Result<Result<Option<std::time::SystemTime>, ChangedOnDisk>> {
     let mut latest = gate.lock().unwrap();
-    if seq > *latest {
+    if seq > latest.0 {
+        let now = mtime(path);
+        if now.is_some() && now != known && now != latest.1 {
+            return Ok(Err(ChangedOnDisk));
+        }
         std::fs::write(path, bytes)?;
-        *latest = seq;
+        *latest = (seq, mtime(path));
     }
-    Ok(mtime(path))
+    Ok(Ok(mtime(path)))
 }
 
 /// The task's file watcher and the directories it watches now: each on its
 /// own, and those under git's refs with all that is in them.
 pub(super) struct Watching {
     pub(super) watcher: Option<notify::RecommendedWatcher>,
-    pub(super) watched: (BTreeSet<PathBuf>, Vec<PathBuf>),
+    pub(super) watched: (Arc<BTreeSet<PathBuf>>, Vec<PathBuf>),
 }
 
 impl Watching {
-    pub(super) fn sync(&mut self, watch: (BTreeSet<PathBuf>, Vec<PathBuf>)) {
-        if watch == self.watched {
+    pub(super) fn sync(&mut self, watch: (Arc<BTreeSet<PathBuf>>, Vec<PathBuf>)) {
+        if (Arc::ptr_eq(&watch.0, &self.watched.0) || watch.0 == self.watched.0) && watch.1 == self.watched.1 {
             return;
         }
         let Some(watcher) = self.watcher.as_mut() else { return };
@@ -204,7 +249,7 @@ impl FileView {
         }
         // Told on every change, not only when it turns dirty: the Structure
         // panel follows the text.
-        self.dirty = !same_text(self.editor.read(cx).text(), &self.saved);
+        self.dirty = !self.saved.is(self.editor.read(cx).text());
         cx.notify();
         // Tell the language server after typing pauses, so hover and
         // definitions see the edited text. The text is taken then, not on
@@ -235,10 +280,10 @@ impl FileView {
         let text = self.editor.read(cx).value();
         self.save_seq += 1;
         self.saving = Some(self.edit_version);
-        let (seq, path, gate) = (self.save_seq, self.path.clone(), self.write_gate.clone());
+        let (seq, path, gate, known) = (self.save_seq, self.path.clone(), self.write_gate.clone(), self.disk_mtime);
         self._save = cx.spawn(async move |this, cx| {
             let bytes = text.clone();
-            let written = cx.background_spawn(async move { write_in_order(&gate, seq, &path, bytes.as_bytes()) }).await;
+            let written = cx.background_spawn(async move { write_in_order(&gate, seq, &path, known, bytes.as_bytes()) }).await;
             let _ = this.update(cx, |this, cx| {
                 if seq == this.save_seq {
                     this.saving = None;
@@ -258,15 +303,17 @@ impl FileView {
         self.save_seq += 1;
         self.saving = None;
         self._save = Task::ready(());
-        let written = write_in_order(&self.write_gate, self.save_seq, &self.path, text.as_bytes());
+        let written = write_in_order(&self.write_gate, self.save_seq, &self.path, self.disk_mtime, text.as_bytes());
         self.written(text, written, cx);
     }
 
-    pub(super) fn written(&mut self, text: SharedString, written: std::io::Result<Option<std::time::SystemTime>>, cx: &mut Context<Self>) {
+    pub(super) fn written(&mut self, text: SharedString, written: std::io::Result<Result<Option<std::time::SystemTime>, ChangedOnDisk>>, cx: &mut Context<Self>) {
         match written {
-            Ok(mtime) => {
+            // The bar asks which to keep; the next refresh reads what is there.
+            Ok(Err(ChangedOnDisk)) => self.conflict = true,
+            Ok(Ok(mtime)) => {
                 self.dirty = !same_text(self.editor.read(cx).text(), &text);
-                self.saved = text;
+                self.saved = Print::of(&text);
                 self.disk_mtime = mtime;
                 self.conflict = false;
                 self.error = None;
@@ -300,7 +347,11 @@ impl FileView {
             return;
         }
         self.disk_mtime = Some(change.now);
-        if change.content.as_str() == self.saved.as_ref() {
+        if Print::of(&change.content) == self.saved {
+            // Touched and no more: nothing to choose between.
+            if std::mem::take(&mut self.conflict) {
+                cx.notify();
+            }
             return;
         }
         if self.dirty {
@@ -313,7 +364,7 @@ impl FileView {
 
     pub(super) fn reload(&mut self, content: String, window: &mut Window, cx: &mut Context<Self>) {
         self.edit_version += 1;
-        self.saved = content.clone().into();
+        self.saved = Print::of(&content);
         self.conflict = false;
         let content_for_lsp = content.clone();
         self.editor.update(cx, |state, cx| {
@@ -351,8 +402,7 @@ impl FileView {
                 cx.background_spawn(async move { (git::blame(&root, &path), git::committed_text(&root, &path, since_base)) }).await;
             let _ = this.update(cx, |this, cx| {
                 this.blame = Rc::new(blame);
-                // A file with nothing changed is one text, not two.
-                this.committed = committed.map(|text| if text == this.saved.as_ref() { this.saved.clone().into() } else { Arc::from(text) });
+                this.committed = committed.map(Arc::from);
                 this.mark_changes(false, cx);
                 cx.notify();
             });
@@ -475,15 +525,21 @@ impl FileView {
     /// being written, from the language server.
     pub(super) fn parameter_info(&mut self, cx: &mut Context<Self>) {
         let Some(client) = self.lsp_client.clone() else { return };
-        let (path, text, pos) = {
-            let state = self.editor.read(cx);
-            (self.path.clone(), state.value().to_string(), state.cursor_position())
-        };
+        let path = self.path.clone();
         self._signature = cx.spawn(async move |this, cx| {
+            // After the keys of a burst, not each of them; and the text as it is then.
+            cx.background_executor().timer(std::time::Duration::from_millis(80)).await;
+            let Ok((text, pos)) = this.update(cx, |file, cx| {
+                let state = file.editor.read(cx);
+                (state.text().clone(), state.cursor_position())
+            }) else {
+                return;
+            };
             let uri = lsp::path_to_uri(&path);
             let help = cx
                 .background_spawn(crate::procs::on_thread(move || {
-                    client.did_change(&path, 0, &text)?;
+                    // Made one string where there is time for it.
+                    client.did_change(&path, 0, &text.to_string())?;
                     client.signature_help(&uri, pos)
                 }))
                 .await;
@@ -504,8 +560,9 @@ impl FileView {
             return None;
         }
         let cursor = state.cursor();
-        let text = state.value();
-        let before = text.get(..cursor).and_then(|t| t.char_indices().next_back()).map_or(cursor, |(at, _)| at);
+        // The character before the cursor starts one to four bytes back.
+        let text = state.text();
+        let before = (1..=4).find_map(|back| cursor.checked_sub(back).filter(|at| text.char_at(*at).is_some())).unwrap_or(cursor);
         let at = state.range_to_bounds(&(before..cursor)).or_else(|| state.range_to_bounds(&(cursor..cursor)))?;
         let strong = HighlightStyle { font_weight: Some(FontWeight::BOLD), color: Some(cx.theme().primary), ..Default::default() };
         let highlights: Vec<_> = active.clone().map(|range| (range, strong)).into_iter().collect();
@@ -541,11 +598,8 @@ impl FileView {
     /// the editor: underlined there, with the fixes it offers.
     pub(super) fn show_problems(&mut self, cx: &mut Context<Self>) {
         let Some(client) = &self.lsp_client else { return };
-        let (count, found) = client.problems(&lsp::path_to_uri(&self.path));
-        if count == self.problems_seen {
-            return;
-        }
-        self.problems_seen = count;
+        let Some((report, found)) = client.problems_since(&lsp::path_to_uri(&self.path), self.problems_seen) else { return };
+        self.problems_seen = report;
         self.editor.update(cx, |state, cx| {
             let text = state.text().clone();
             if let Some(shown) = state.diagnostics_mut() {
@@ -558,8 +612,15 @@ impl FileView {
 
     /// Every edit of a workspace edit: those of this file in the editor,
     /// undone there as one; those of others on disk, where their tabs pick
-    /// them up. How many files changed.
-    pub(super) fn apply_workspace_edit(&mut self, edit: &lsp_types::WorkspaceEdit, window: &mut Window, cx: &mut Context<Self>) -> usize {
+    /// them up, written off the UI thread: a name can be in hundreds of
+    /// them. `then` is told how many files changed.
+    pub(super) fn apply_workspace_edit(
+        &mut self,
+        edit: &lsp_types::WorkspaceEdit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(usize, &mut Window, &mut Context<Self>) + 'static,
+    ) {
         // Another file of it open with edits not saved: the server placed its
         // changes by what is on disk, and written there they would be at odds
         // with the tab. Nothing is applied, rather than a part of it.
@@ -569,24 +630,40 @@ impl FileView {
         if let Some(open) = by_file.iter().map(|(path, _)| path).find(|path| unsaved.contains(path)) {
             let name = open.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
             window.push_notification(Notification::info(format!("Not applied: {name} has edits that are not saved. Save it and ask again.")).title("Language server"), cx);
-            return 0;
+            return;
         }
-        let mut files = 0;
+        let mut here = 0;
+        let mut others = Vec::new();
         for (path, edits) in by_file {
             if path == self.path {
-                let before = files;
                 self.edit(window, cx, |text, selection| {
                     let rewritten = crate::edit::rewrite(text, &lsp::apply_edits(text, &edits), selection.start);
-                    files += usize::from(rewritten.is_some());
+                    here += usize::from(rewritten.is_some());
                     rewritten
                 });
-                debug_assert!(files >= before);
-            } else if let Ok(text) = std::fs::read_to_string(&path) {
-                let new = lsp::apply_edits(&text, &edits);
-                files += usize::from(new != text && std::fs::write(&path, new).is_ok());
+            } else {
+                others.push((path, edits));
             }
         }
-        files
+        if others.is_empty() {
+            return then(here, window, cx);
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            let written = cx
+                .background_spawn(async move {
+                    others
+                        .into_iter()
+                        .filter(|(path, edits)| {
+                            let Ok(text) = std::fs::read_to_string(path) else { return false };
+                            let new = lsp::apply_edits(&text, edits);
+                            new != text && std::fs::write(path, new).is_ok()
+                        })
+                        .count()
+                })
+                .await;
+            let _ = this.update_in(cx, |_, window, cx| then(here + written, window, cx));
+        })
+        .detach();
     }
 
     /// The server is told the text as it is now, then asked: the answer
@@ -598,31 +675,53 @@ impl FileView {
         ask: impl FnOnce(&lsp::LspClient, &str, lsp_types::Position) -> anyhow::Result<T> + Send + 'static,
         then: impl FnOnce(&mut Self, T, &mut Window, &mut Context<Self>) + 'static,
     ) {
+        self.ask_server_or(window, cx, ask, then, None)
+    }
+
+    /// As `ask_server`; with `without`, that is done when there is no
+    /// answer to apply, and the stale answer is not told of.
+    fn ask_server_or<T: Send + 'static>(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        ask: impl FnOnce(&lsp::LspClient, &str, lsp_types::Position) -> anyhow::Result<T> + Send + 'static,
+        then: impl FnOnce(&mut Self, T, &mut Window, &mut Context<Self>) + 'static,
+        without: Option<fn(&mut Self, &mut Context<Self>)>,
+    ) {
         let Some(client) = self.lsp_client.clone() else {
-            window.push_notification(Notification::info("No language server runs for this file."), cx);
+            match without {
+                Some(without) => without(self, cx),
+                None => window.push_notification(Notification::info("No language server runs for this file."), cx),
+            }
             return;
         };
         let (path, text, pos) = {
             let state = self.editor.read(cx);
-            (self.path.clone(), state.value().to_string(), state.cursor_position())
+            (self.path.clone(), state.text().clone(), state.cursor_position())
         };
         let asked_of = self.edit_version;
         cx.spawn_in(window, async move |this, cx| {
             let uri = lsp::path_to_uri(&path);
             let answer = cx
                 .background_spawn(crate::procs::on_thread(move || {
-                    client.did_change(&path, 0, &text)?;
+                    client.did_change(&path, 0, &text.to_string())?;
                     ask(&client, &uri, pos)
                 }))
                 .await;
             let _ = this.update_in(cx, |this, window, cx| match answer {
                 // The answer is about the text as it was: put onto the one
                 // typed since, its changes would land in the wrong places.
-                Ok(_) if this.edit_version != asked_of => {
-                    window.push_notification(Notification::info("The text changed while the language server was asked: nothing was applied. Ask again.").title("Language server"), cx)
-                }
+                Ok(_) if this.edit_version != asked_of => match without {
+                    Some(without) => without(this, cx),
+                    None => window.push_notification(Notification::info("The text changed while the language server was asked: nothing was applied. Ask again.").title("Language server"), cx),
+                },
                 Ok(answer) => then(this, answer, window, cx),
-                Err(e) => window.push_notification(Notification::error(format!("{e:#}")).title("Language server"), cx),
+                Err(e) => {
+                    window.push_notification(Notification::error(format!("{e:#}")).title("Language server"), cx);
+                    if let Some(without) = without {
+                        without(this, cx);
+                    }
+                }
             });
         })
         .detach();
@@ -635,12 +734,15 @@ impl FileView {
 
     /// Reformats, and with `save` writes the file once that is done.
     fn format_then(&mut self, save: bool, window: &mut Window, cx: &mut Context<Self>) {
-        self.ask_server(window, cx, |client, uri, _| client.formatting(uri, 4, true), move |this, edits, window, cx| {
+        // Asked to save, the file is saved whatever comes of the formatting: as it is, when the server fails or the text moved on.
+        let without: Option<fn(&mut Self, &mut Context<Self>)> = if save { Some(|this, cx| this.save(cx)) } else { None };
+        let then = move |this: &mut Self, edits: Vec<lsp_types::TextEdit>, window: &mut Window, cx: &mut Context<Self>| {
             this.edit(window, cx, |text, selection| crate::edit::rewrite(text, &lsp::apply_edits(text, &edits), selection.start));
             if save {
                 this.save(cx);
             }
-        });
+        };
+        self.ask_server_or(window, cx, |client, uri, _| client.formatting(uri, 4, true), then, without);
     }
 
     /// Asks for a new name of the symbol under the cursor and gives it that
@@ -671,13 +773,18 @@ impl FileView {
                 cx,
                 move |client, uri, pos| client.rename(uri, pos, &name),
                 |this, edit, window, cx| {
-                    let files = edit.map_or(0, |edit| this.apply_workspace_edit(&edit, window, cx));
-                    let told = match files {
-                        0 => "Nothing to rename here.".to_string(),
-                        1 => "Renamed in 1 file.".to_string(),
-                        n => format!("Renamed in {n} files."),
+                    let told = |files: usize, window: &mut Window, cx: &mut Context<Self>| {
+                        let told = match files {
+                            0 => "Nothing to rename here.".to_string(),
+                            1 => "Renamed in 1 file.".to_string(),
+                            n => format!("Renamed in {n} files."),
+                        };
+                        window.push_notification(Notification::info(told), cx);
                     };
-                    window.push_notification(Notification::info(told), cx);
+                    match edit {
+                        Some(edit) => this.apply_workspace_edit(&edit, window, cx, told),
+                        None => told(0, window, cx),
+                    }
                 },
             );
         })
@@ -1093,7 +1200,7 @@ impl CodeActionProvider for LspBridge {
             };
             let Some(edit) = action.edit else { return Ok(()) };
             file.update_in(cx, |file, window, cx| {
-                file.apply_workspace_edit(&edit, window, cx);
+                file.apply_workspace_edit(&edit, window, cx, |_, _, _| {});
             })
         })
     }

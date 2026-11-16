@@ -54,7 +54,7 @@ impl TaskView {
             state.jump_to_position(Position::new(line, col), JUMP_AT, window, cx);
         });
 
-        let saved: SharedString = content.clone().into();
+        let saved = super::file::Print::of(&content);
         let root = self.root.clone();
         let task = cx.weak_entity();
         let file = cx.new(|cx| {
@@ -270,7 +270,8 @@ impl TaskView {
     pub(super) fn ignores(&self, path: &std::path::Path) -> bool {
         let Ok(inside) = path.strip_prefix(&self.root) else { return false };
         let inside = inside.to_string_lossy().replace('\\', "/");
-        !self.tree_files.is_empty() && !self.tree_files.iter().any(|file| *file == inside)
+        // Before the files are known every one may be ignored: veiled, until the list says it is not.
+        self.tree_files.is_empty() || !self.tree_files.iter().any(|file| *file == inside)
     }
 
     /// The file in the editor against a branch, tag or commit to choose.

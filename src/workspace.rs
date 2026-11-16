@@ -153,6 +153,8 @@ pub struct Workspace {
     /// What each task changed since its fork, by worktree path: tasks of
     /// a project that touch the same files are marked before they clash.
     pub touched: std::collections::HashMap<PathBuf, std::collections::BTreeSet<String>>,
+    /// Of those, the ones two tasks of a project both changed, by task.
+    shared: std::collections::HashMap<PathBuf, Vec<(PathBuf, Vec<String>)>>,
     /// When each project's base branch was last fetched in the background.
     fetched: std::collections::HashMap<PathBuf, std::time::Instant>,
     /// The group of variants whose screen is in view, in place of a task.
@@ -506,6 +508,7 @@ impl Workspace {
             updating: false,
             keep_terminals: false,
             touched: Default::default(),
+            shared: Default::default(),
             fetched: Default::default(),
             build: crate::build_watch::BuildWatch::new(),
         };
@@ -1032,6 +1035,7 @@ impl Workspace {
                 let touched: std::collections::HashMap<_, _> = found.into_iter().chain(known).map(|(files, path)| (path, files)).collect();
                 if touched != this.touched {
                     this.touched = touched;
+                    this.find_shared();
                     cx.notify();
                 }
             });
@@ -1042,20 +1046,35 @@ impl Workspace {
     /// Other tasks of the project that changed files this one changed too,
     /// with those files.
     pub fn overlaps(&self, project: &Project, path: &Path) -> Vec<(String, Vec<String>)> {
-        let Some(mine) = self.touched.get(path).filter(|m| !m.is_empty()) else {
-            return Vec::new();
-        };
+        let Some(shared) = self.shared.get(path) else { return Vec::new() };
         // Variants of one task change the same files by design.
         let group = project.tasks.iter().find(|t| t.path == path).map(|t| t.group.as_str()).filter(|g| !g.is_empty());
         project
             .tasks
             .iter()
             .filter(|t| t.path != path && Some(t.group.as_str()) != group)
-            .filter_map(|t| {
-                let shared: Vec<String> = self.touched.get(&t.path)?.intersection(mine).cloned().collect();
-                (!shared.is_empty()).then(|| (t.label(), shared))
-            })
+            .filter_map(|t| Some((t.label(), shared.iter().find(|(other, _)| *other == t.path)?.1.clone())))
             .collect()
+    }
+
+    /// The files each task changed that another of its project changed
+    /// too: found when what they changed is read, not as the list is drawn.
+    fn find_shared(&mut self) {
+        let mut shared: std::collections::HashMap<PathBuf, Vec<(PathBuf, Vec<String>)>> = Default::default();
+        for project in &self.projects {
+            for (ix, a) in project.tasks.iter().enumerate() {
+                let Some(mine) = self.touched.get(&a.path).filter(|mine| !mine.is_empty()) else { continue };
+                for b in &project.tasks[ix + 1..] {
+                    let Some(theirs) = self.touched.get(&b.path) else { continue };
+                    let both: Vec<String> = mine.intersection(theirs).cloned().collect();
+                    if !both.is_empty() {
+                        shared.entry(a.path.clone()).or_default().push((b.path.clone(), both.clone()));
+                        shared.entry(b.path.clone()).or_default().push((a.path.clone(), both));
+                    }
+                }
+            }
+        }
+        self.shared = shared;
     }
 
     /// Deletes every task of the project whose PR was merged, after a list.
@@ -1162,14 +1181,14 @@ impl Workspace {
         }
         if self.active.as_deref() == Some(path) {
             self.active = None;
-            // Not one of a space out of the window.
+            // Not one out of the window: another space's, or left out of a presentation.
             let next = self
                 .projects
                 .iter()
                 .enumerate()
-                .filter(|(pi, _)| self.in_space(*pi))
-                .flat_map(|(_, p)| &p.tasks)
-                .filter(|t| t.view.is_some())
+                .flat_map(|(pi, p)| p.tasks.iter().enumerate().map(move |(ti, t)| (pi, ti, t)))
+                .filter(|(pi, ti, t)| t.view.is_some() && self.shows(*pi, *ti))
+                .map(|(_, _, t)| t)
                 .max_by_key(|t| t.last_active);
             if let Some(next) = next.map(|t| t.path.clone()) {
                 self.switch(&next, window, cx);
@@ -1294,16 +1313,17 @@ impl Workspace {
             }
         };
         let on_enter = apply.clone();
-        cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, window, cx| {
+        // Kept by the dialog and gone with it: detached, it would hold the input it listens to for good.
+        let listening = Rc::new(cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, window, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
                 on_enter(this, window, cx);
             }
-        })
-        .detach();
+        }));
         let this = cx.weak_entity();
         let focused = std::rc::Rc::new(std::cell::Cell::new(false));
         window.open_dialog(cx, move |dialog, _, _| {
             let (input, focused, this, apply) = (input.clone(), focused.clone(), this.clone(), apply.clone());
+            let _ = &listening;
             dialog
                 .title("Rename task")
                 .w(px(480.))
@@ -1431,15 +1451,15 @@ impl Workspace {
             }
         };
         let on_title = on_enter.clone();
-        cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, window, cx| on_title(this, event, false, window, cx))
-            .detach();
+        // Kept by the dialog and gone with it: detached, they would hold the inputs they listen to for good.
+        let mut listening = vec![cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, window, cx| on_title(this, event, false, window, cx))];
         // A ticket in the title fills the prompt, unless you wrote one yourself.
         let filled: Rc<RefCell<String>> = Rc::default();
         let fetch: Rc<RefCell<Option<Task<()>>>> = Rc::default();
         let repo = p.path.clone();
         {
             let prompt = prompt.clone();
-            cx.subscribe_in(&input, window, move |_, input, event: &InputEvent, window, cx| {
+            listening.push(cx.subscribe_in(&input, window, move |_, input, event: &InputEvent, window, cx| {
                 if !matches!(event, InputEvent::Change) {
                     return;
                 }
@@ -1480,15 +1500,15 @@ impl Workspace {
                 } else if !filled.borrow().is_empty() {
                     set(String::new(), window, cx);
                 }
-            })
-            .detach();
+            }));
         }
-        cx.subscribe_in(&prompt, window, move |this, _, event: &InputEvent, window, cx| on_enter(this, event, true, window, cx))
-            .detach();
+        listening.push(cx.subscribe_in(&prompt, window, move |this, _, event: &InputEvent, window, cx| on_enter(this, event, true, window, cx)));
+        let listening = Rc::new(listening);
         let focused = std::rc::Rc::new(std::cell::Cell::new(false));
         window.open_dialog(cx, move |dialog, _, cx| {
             let (input, prompt, submit, focused) = (input.clone(), prompt.clone(), submit.clone(), focused.clone());
             let (count, notes) = (count.clone(), notes.clone());
+            let _ = &listening;
             let many = count.get();
             let muted = cx.theme().muted_foreground;
             dialog
@@ -1610,10 +1630,10 @@ impl Workspace {
                             entry.busy = None;
                         }
                         this.switch(&path, window, cx);
-                        if !prompt.is_empty() {
-                            if let Some(view) = this.active_view() {
-                                view.update(cx, |t, cx| t.queue_prompt(prompt, false, window, cx));
-                            }
+                        // To its own agent: the task in view is another when the switch did not happen.
+                        let view = this.entry_mut(&path).and_then(|entry| entry.view.clone());
+                        if let (false, Some(view)) = (prompt.is_empty(), view) {
+                            view.update(cx, |t, cx| t.queue_prompt(prompt, false, window, cx));
                         }
                     }
                     Err(e) => {
@@ -1902,6 +1922,11 @@ impl Workspace {
             }
             let _ = this.update_in(cx, |this, window, cx| {
                 this.reading_usage = false;
+                // What is kept by task goes when the task has left the list.
+                let listed: std::collections::HashSet<PathBuf> = this.projects.iter().flat_map(|p| &p.tasks).map(|t| t.path.clone()).collect();
+                this.usage.retain(|path, _| listed.contains(path));
+                this.usage_warned.retain(|path| listed.contains(path));
+                this.last_in_space.retain(|_, path| listed.contains(path));
                 let limit = u64::from(state::with_settings(|s| s.token_warn_k)) * 1000;
                 for (path, written, usage) in read {
                     // A new session of the task starts its count again.

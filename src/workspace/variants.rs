@@ -1993,6 +1993,7 @@ pub(crate) mod tests {
                 );
                 w.touched.insert(dir.join("fix-login-1"), ["src/auth.rs".to_string()].into());
                 w.touched.insert(dir.join("fix-login-2"), ["src/auth.rs".to_string(), "src/parse.rs".to_string()].into());
+                w.find_shared();
                 w.active_group = Some("fix-login-x1".into());
             });
         });

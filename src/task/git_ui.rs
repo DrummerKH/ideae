@@ -1,5 +1,19 @@
 use super::*;
 
+/// A row of the Changes panel. They are all as high as one another, so
+/// that only those in view are laid out.
+pub(super) enum ChangeRow {
+    Head { staged: bool, title: String },
+    Nothing,
+    Dir { path: String, label: String, depth: usize, in_staged: bool, folded: bool },
+    File { ix: usize, depth: usize, in_staged: bool },
+    StashHead,
+    Stash(usize),
+}
+
+/// A file's row with its buttons is 26.5 high.
+pub(super) const CHANGE_ROW: f32 = 27.;
+
 impl TaskView {
     pub(super) fn staged_paths(&self) -> Vec<String> {
         self.files.iter().filter(|f| self.state_of(&f.path).staged).map(|f| f.path.to_string()).collect()
@@ -183,43 +197,75 @@ impl TaskView {
                         })),
                 )
         };
-        let mut list = v_flex().id("changed-files-list").flex_1().min_h_0();
+        let rows = Rc::new(self.change_rows(&staged, &unstaged));
+        let rows_len = rows.len();
+        // Only the rows in view are laid out: an agent can leave hundreds of files changed.
+        let item = cx.processor(move |this: &mut Self, range: std::ops::Range<usize>, _, cx| {
+            range
+                .map(|at| {
+                    let row = match &rows[at] {
+                        ChangeRow::Head { staged: true, title } => section("unstage-all", title.clone(), "unstage all", false, cx).into_any_element(),
+                        ChangeRow::Head { staged: false, title } => section("stage-all", title.clone(), "stage all", true, cx).into_any_element(),
+                        ChangeRow::Nothing => div().px_3().text_sm().text_color(cx.theme().muted_foreground).child("No uncommitted changes").into_any_element(),
+                        ChangeRow::StashHead => div().px_3().text_xs().text_color(cx.theme().muted_foreground).child(format!("STASHES ({})", this.stashes.len())).into_any_element(),
+                        ChangeRow::File { ix, depth, in_staged } if *ix < this.files.len() => this.render_change_row(*ix, *depth, *in_staged, cx),
+                        ChangeRow::Dir { path, label, depth, in_staged, folded } => this.render_change_dir(path, label, *depth, *in_staged, *folded, cx),
+                        ChangeRow::Stash(i) if *i < this.stashes.len() => this.render_stash_row(*i, cx),
+                        _ => div().into_any_element(),
+                    };
+                    // As high as one another: the list places them by that.
+                    div().h(px(CHANGE_ROW)).w_full().flex().flex_col().justify_end().overflow_hidden().child(row)
+                })
+                .collect::<Vec<_>>()
+        });
+        div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .child(uniform_list("changed-files-list", rows_len, item).size_full().track_scroll(&self.changes_scroll))
+            .child(gpui_kit::component::scroll::Scrollbar::vertical(&self.changes_scroll))
+    }
+
+    /// The rows of the Changes panel, top to bottom.
+    fn change_rows(&self, staged: &[usize], unstaged: &[usize]) -> Vec<ChangeRow> {
+        let mut rows = Vec::new();
         if !staged.is_empty() {
-            list = list.child(section("unstage-all", format!("STAGED ({})", staged.len()), "unstage all", false, cx));
-            list = self.render_change_tree(list, &staged, true, cx);
+            rows.push(ChangeRow::Head { staged: true, title: format!("STAGED ({})", staged.len()) });
+            self.change_tree_rows(&mut rows, staged, true);
         }
         if self.files.is_empty() {
-            list = list.child(div().p_3().text_sm().text_color(cx.theme().muted_foreground).child("No uncommitted changes"));
+            rows.push(ChangeRow::Nothing);
         } else if !unstaged.is_empty() {
             let viewed = unstaged.iter().filter(|&&ix| self.is_viewed(ix)).count();
-            let title = if viewed > 0 {
-                format!("CHANGES ({}) · {viewed} viewed", unstaged.len())
-            } else {
-                format!("CHANGES ({})", unstaged.len())
-            };
-            list = list.child(section("stage-all", title, "stage all", true, cx));
-            list = self.render_change_tree(list, &unstaged, false, cx);
+            let title = if viewed > 0 { format!("CHANGES ({}) · {viewed} viewed", unstaged.len()) } else { format!("CHANGES ({})", unstaged.len()) };
+            rows.push(ChangeRow::Head { staged: false, title });
+            self.change_tree_rows(&mut rows, unstaged, false);
         }
         if !self.stashes.is_empty() {
-            let muted = cx.theme().muted_foreground;
-            list = list.child(
-                div().px_3().pt_3().pb_1().text_xs().text_color(muted).child(format!("STASHES ({})", self.stashes.len())),
-            );
-            for (i, stash) in self.stashes.iter().enumerate() {
+            rows.push(ChangeRow::StashHead);
+            rows.extend((0..self.stashes.len()).map(ChangeRow::Stash));
+        }
+        rows
+    }
+
+    fn render_stash_row(&self, i: usize, cx: &mut Context<Self>) -> AnyElement {
+        let stash = &self.stashes[i];
+        let muted = cx.theme().muted_foreground;
+        {
                 let group = SharedString::from(format!("stash-{i}"));
-                let act = |id: &'static str, label: &'static str, tip: &'static str, name: String, cx: &mut Context<Self>| {
+                let act = |id: &'static str, label: &'static str, tip: &'static str, stash: git::Stash, cx: &mut Context<Self>| {
                     Button::new((id, i)).xsmall().ghost().label(label).tooltip(tip).on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
-                        let name = name.clone();
+                        let stash = stash.clone();
                         match id {
-                            "stash-apply" => this.run_action("Stash", move |root| git::stash_apply(&root, &name, false), false, window, cx),
-                            "stash-pop" => this.run_action("Stash", move |root| git::stash_apply(&root, &name, true), false, window, cx),
-                            _ => this.drop_stash_dialog(name, window, cx),
+                            "stash-apply" => this.run_action("Stash", move |root| git::stash_apply(&root, &stash, false), false, window, cx),
+                            "stash-pop" => this.run_action("Stash", move |root| git::stash_apply(&root, &stash, true), false, window, cx),
+                            _ => this.drop_stash_dialog(stash, window, cx),
                         }
                     }))
                 };
                 let name = stash.name.clone();
-                list = list.child(
+                (
                     h_flex()
                         .id(group.clone())
                         .group(group.clone())
@@ -242,15 +288,14 @@ impl TaskView {
                                 .bg(cx.theme().accent)
                                 .opacity(0.)
                                 .group_hover(group, |s| s.opacity(1.))
-                                .child(act("stash-apply", "apply", "Bring it back and keep it in the list", stash.name.clone(), cx))
-                                .child(act("stash-pop", "pop", "Bring it back and take it off the list", stash.name.clone(), cx))
-                                .child(act("stash-drop", "drop", "Throw it away", stash.name.clone(), cx)),
+                                .child(act("stash-apply", "apply", "Bring it back and keep it in the list", stash.clone(), cx))
+                                .child(act("stash-pop", "pop", "Bring it back and take it off the list", stash.clone(), cx))
+                                .child(act("stash-drop", "drop", "Throw it away", stash.clone(), cx)),
                         )
-                        .on_click(cx.listener(move |this, _, window, cx| this.show_stash(name.clone(), window, cx))),
-                );
-            }
+                        .on_click(cx.listener(move |this, _, window, cx| this.show_stash(name.clone(), window, cx)))
+                )
+                .into_any_element()
         }
-        list.overflow_y_scrollbar()
     }
 
     /// What a stash holds, as a diff in a dialog.
@@ -265,33 +310,34 @@ impl TaskView {
         .detach();
     }
 
-    pub(super) fn drop_stash_dialog(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
-        let what = self.stashes.iter().find(|s| s.name == name).map(|s| s.what.clone()).unwrap_or_default();
+    pub(super) fn drop_stash_dialog(&mut self, stash: git::Stash, window: &mut Window, cx: &mut Context<Self>) {
+        let (name, what) = (stash.name.clone(), stash.what.clone());
         let this = cx.weak_entity();
         window.open_alert_dialog(cx, move |dialog, _, _| {
-            let (this, name) = (this.clone(), name.clone());
+            let (this, stash) = (this.clone(), stash.clone());
             dialog
                 .confirm()
                 .title(format!("Drop {name}?"))
                 .description(format!("{what}\n\nWhat it holds is gone for good."))
                 .ok_text("Drop")
                 .on_ok(move |_, window, cx| {
-                    let name = name.clone();
-                    let _ = this.update(cx, |this, cx| this.run_action("Stash", move |root| git::stash_drop(&root, &name), false, window, cx));
+                    let stash = stash.clone();
+                    let _ = this.update(cx, |this, cx| this.run_action("Stash", move |root| git::stash_drop(&root, &stash), false, window, cx));
                     true
                 })
         });
     }
 
     /// The files as a folder tree; a folded folder hides what is under it.
-    pub(super) fn render_change_tree(&self, mut list: Stateful<Div>, files: &[usize], in_staged: bool, cx: &mut Context<Self>) -> Stateful<Div> {
+    /// The files of a section as rows of a folder tree, what is under a folded folder left out.
+    fn change_tree_rows(&self, rows: &mut Vec<ChangeRow>, files: &[usize], in_staged: bool) {
         let section = if in_staged { "staged" } else { "changes" };
         let paths: Vec<(usize, &str)> = files.iter().map(|&ix| (ix, self.files[ix].path.as_ref())).collect();
         let mut hidden_under: Option<String> = None;
         for node in change_tree(&paths) {
             let path = match &node {
-                ChangeNode::Dir { path, .. } => path.clone(),
-                ChangeNode::File { ix, .. } => self.files[*ix].path.to_string(),
+                ChangeNode::Dir { path, .. } => path.as_str(),
+                ChangeNode::File { ix, .. } => self.files[*ix].path.as_ref(),
             };
             if let Some(prefix) = &hidden_under {
                 if path.starts_with(prefix.as_str()) {
@@ -300,16 +346,26 @@ impl TaskView {
                 hidden_under = None;
             }
             match node {
-                ChangeNode::File { ix, depth } => list = list.child(self.render_change_row(ix, depth, in_staged, cx)),
+                ChangeNode::File { ix, depth } => rows.push(ChangeRow::File { ix, depth, in_staged }),
                 ChangeNode::Dir { path, label, depth } => {
-                    let key = format!("{section}:{path}");
-                    let folded = self.folded_changes.contains(&key);
+                    let folded = self.folded_changes.contains(&format!("{section}:{path}"));
                     if folded {
                         hidden_under = Some(format!("{path}/"));
                     }
+                    rows.push(ChangeRow::Dir { path, label, depth, in_staged, folded });
+                }
+            }
+        }
+    }
+
+    fn render_change_dir(&self, path: &str, label: &str, depth: usize, in_staged: bool, folded: bool, cx: &mut Context<Self>) -> AnyElement {
+        let section = if in_staged { "staged" } else { "changes" };
+        let (key, label) = (format!("{section}:{path}"), label.to_string());
+        {
+            {
                     let under = format!("{path}/");
                     let group = SharedString::from(format!("change-dir-{key}"));
-                    list = list.child(
+                    (
                         h_flex()
                             .id(SharedString::from(format!("dir-{key}")))
                             .group(group.clone())
@@ -351,12 +407,11 @@ impl TaskView {
                                     this.folded_changes.insert(key.clone());
                                 }
                                 cx.notify();
-                            })),
-                    );
-                }
+                            }))
+                    )
+                    .into_any_element()
             }
         }
-        list
     }
 
     pub(super) fn is_viewed(&self, ix: usize) -> bool {
@@ -403,6 +458,7 @@ impl TaskView {
         let view = cx.weak_entity();
         h_flex()
             .id(("file", id))
+            .test_support()
             .when(keyboard, |row| row.border_l_2().border_color(cx.theme().primary))
             .group("change-row")
             .pl(px(12. + 14. * depth as f32))
@@ -578,8 +634,7 @@ impl TaskView {
             cx.notify();
             return;
         }
-        let all = self.staged_paths().is_empty();
-        self.run_action("Commit", move |root| git::commit(&root, &message, all), false, window, cx);
+        self.run_action("Commit", move |root| git::commit(&root, &message), false, window, cx);
     }
 
     /// Runs a git/gh job off the UI thread, shows its outcome under the

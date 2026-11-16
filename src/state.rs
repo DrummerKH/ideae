@@ -40,6 +40,7 @@ pub struct PresentingState {
 impl State {
     /// Whether a task is one to tell of, as the window was left: of the
     /// space that was in it, and not left out of a presentation.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub fn tells_of(&self, task: &std::path::Path) -> bool {
         let project = self.projects.iter().find(|p| p.tasks.iter().any(|t| t.path == task));
         let in_space = match (&self.space, project.and_then(|p| p.space.as_ref())) {

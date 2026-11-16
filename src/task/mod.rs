@@ -11,7 +11,6 @@ use gpui_cn::terminal::{
 };
 use gpui_kit::component::{
     ActiveTheme as _, Sizable as _, StyledExt as _, h_flex,
-    scroll::ScrollableElement as _,
     button::{Button, ButtonVariants as _},
     diff::{Diff, DiffAnnotation, DiffEvent, DiffFile, DiffFileStatus, DiffLinePosition, DiffLineRange, DiffMode, DiffSide, DiffState},
     input::{CodeActionProvider, CompletionProvider, DefinitionProvider, DocumentRangeSemanticTokensProvider, Editor, EditorState, HoverProvider, InputEvent, Position, Rope, RopeExt as _},
@@ -288,6 +287,9 @@ pub struct TaskView {
     /// Keyboard focus of the side panel (Alt+1/3), and the row the arrows are on.
     side_focus: FocusHandle,
     side_selected: usize,
+    /// Where the Changes and Structure panels are scrolled to.
+    changes_scroll: UniformListScrollHandle,
+    structure_scroll: UniformListScrollHandle,
     /// Whether the side panel holds the keyboard, set each render.
     side_has_focus: std::cell::Cell<bool>,
     structure: std::cell::RefCell<Option<(usize, u64, Rc<Vec<crate::finder::OutlineItem>>)>>,
@@ -550,6 +552,8 @@ impl TaskView {
             structure_file: None,
             side_focus: cx.focus_handle(),
             side_selected: 0,
+            changes_scroll: UniformListScrollHandle::new(),
+            structure_scroll: UniformListScrollHandle::new(),
             side_has_focus: Default::default(),
             structure: Default::default(),
             structure_job: std::cell::RefCell::new((None, Task::ready(()))),
@@ -1767,6 +1771,10 @@ mod disk_tests {
         assert!(!same_text(&rope, &text.replacen("main", "mine", 1)), "the same length, another text");
         assert!(!same_text(&rope, &text[..text.len() - 1]));
         assert!(same_text(&Rope::from(""), ""));
+        // The same told from a print of the text, in whatever pieces the editor holds it.
+        let print = super::file::Print::of(&text);
+        assert!(print.is(&rope) && super::file::Print::of("").is(&Rope::from("")));
+        assert!(!print.is(&Rope::from(text.replacen("main", "mine", 1).as_str())) && !print.is(&Rope::from(&text[..text.len() - 1])));
     }
 
     #[test]
@@ -1775,12 +1783,22 @@ mod disk_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("a.txt");
-        let gate = std::sync::Mutex::new(0);
-        let written = write_in_order(&gate, 2, &file, b"later").unwrap();
+        let gate = super::file::WriteGate::default();
+        let written = write_in_order(&gate, 2, &file, None, b"later").unwrap().unwrap();
         assert_eq!(written, mtime(&file));
         // A write asked for earlier that only starts now.
-        write_in_order(&gate, 1, &file, b"earlier").unwrap();
+        write_in_order(&gate, 1, &file, None, b"earlier").unwrap().unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "later");
+        // One asked before the view heard of the last: the file is as that left it.
+        write_in_order(&gate, 3, &file, None, b"third").unwrap().unwrap();
+        // Another wrote it since, and no refresh has told: it is not written over.
+        let theirs = mtime(&file).unwrap() + std::time::Duration::from_secs(7);
+        std::fs::write(&file, "the agent's").unwrap();
+        std::fs::File::options().write(true).open(&file).unwrap().set_modified(theirs).unwrap();
+        assert_eq!(write_in_order(&gate, 4, &file, written, b"mine").unwrap(), Err(super::file::ChangedOnDisk));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "the agent's");
+        // Known as it is now (Keep mine), it is.
+        let written = write_in_order(&gate, 5, &file, Some(theirs), b"later").unwrap().unwrap();
 
         let gone = dir.join("gone.txt");
         let stale = written.map(|t| t - std::time::Duration::from_secs(5));
@@ -1811,6 +1829,7 @@ mod open_file_scenario {
     use crate::state::{ProjectState, State};
     use crate::workspace::Workspace;
     use gpui_kit::{AppContext as _, Bounds, Entity, Point, TestAppContext, WindowBounds, WindowOptions, px, size};
+    use gpui_kit::test::TestWindowExt as _;
     use std::time::Duration;
 
     /// A file open in a task of a real repository: typing, saving, the
@@ -1886,6 +1905,17 @@ mod open_file_scenario {
             assert_eq!(t.files.len(), 1, "one changed file");
             assert_eq!((t.uncommitted_diff.len(), t.uncommitted_lines.get("f.txt")), (1, Some(&1)));
         });
+        // The Changes panel draws it: a list of rows of which those in view are laid out.
+        cx.update_window(handle.into(), |_, window, cx| {
+            task.update(cx, |t, cx| {
+                t.right = super::RightPane::Changes;
+                cx.notify();
+            });
+            window.render_frame(cx);
+            let row = window.find(("file", 0usize));
+            assert!(row.visible() && row.bounds().size.height <= px(super::git_ui::CHANGE_ROW), "the changed file's row, whole in the room every row has: {:?}", row.bounds());
+        })
+        .unwrap();
         assert_eq!(shown(cx), "zero\none\n", "its own save is no change on disk");
 
         // The agent writes the file: a clean buffer follows.

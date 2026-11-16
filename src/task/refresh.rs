@@ -142,12 +142,12 @@ impl TaskView {
     }
 
 
-    pub(super) fn apply_files(&mut self, files: Vec<String>, cx: &mut Context<Self>) {
-        if files == *self.tree_files {
+    pub(super) fn apply_files(&mut self, files: Arc<Vec<String>>, cx: &mut Context<Self>) {
+        // The list read is the one held unless a file came or went: nothing to compare then.
+        if Arc::ptr_eq(&files, &self.tree_files) || *files == *self.tree_files {
             return;
         }
         // One list, shared by the tree, the finder and the lookups off the UI thread.
-        let files = Arc::new(files);
         *self.shared_files.write().unwrap() = files.clone();
         // Class names for terminal links: `Profit` in output links to Profit.kt.
         gpui_cn::terminal::add_known_names(files.iter().filter_map(|f| {

@@ -273,17 +273,18 @@ impl Workspace {
                 }
             })
         };
+        // Kept by the dialog and gone with it: detached, they would hold the inputs they listen to for good.
+        let listening: std::rc::Rc<std::cell::RefCell<Vec<Subscription>>> = Default::default();
         let watch = {
             let keep = keep.clone();
             std::rc::Rc::new(move |input: &Entity<InputState>, window: &mut Window, cx: &mut App| {
                 let keep = keep.clone();
-                window
-                    .subscribe(input, cx, move |_, event: &InputEvent, window, cx| {
-                        if matches!(event, InputEvent::Change) {
-                            keep(window, cx);
-                        }
-                    })
-                    .detach();
+                let heard = window.subscribe(input, cx, move |_, event: &InputEvent, window, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        keep(window, cx);
+                    }
+                });
+                listening.borrow_mut().push(heard);
             })
         };
         for (_, icon, name, _) in rows.borrow().iter() {

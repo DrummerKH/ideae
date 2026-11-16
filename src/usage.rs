@@ -97,42 +97,103 @@ pub fn transcript(root: &Path) -> Option<PathBuf> {
         .map(|(_, path)| path)
 }
 
-pub fn read(path: &Path) -> Option<Usage> {
-    let file = std::fs::File::open(path).ok()?;
-    // A message is written again as it grows: the last copy of each counts.
-    let mut answers: HashMap<String, (u64, u64, u64, u64)> = HashMap::new();
-    let mut usage = Usage::default();
-    let day_ago = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |now| now.as_secs().saturating_sub(86_400));
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
-        if !line.contains("\"usage\"") {
-            continue;
+/// What was read of a transcript so far: a session only grows, so the next
+/// read takes up where this one ended.
+#[derive(Default)]
+struct Tail {
+    /// Up to where whole lines were read.
+    offset: u64,
+    /// A message is written again as it grows: the last copy of each counts.
+    answers: HashMap<String, (u64, u64, u64, u64)>,
+    context: u64,
+    model: String,
+    used: u64,
+}
+
+/// The transcripts read lately, by path. A few bytes per answer; the ones
+/// not asked about for longest make room.
+static TAILS: std::sync::Mutex<Option<HashMap<PathBuf, Tail>>> = std::sync::Mutex::new(None);
+static READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const TAILS_KEPT: usize = 48;
+
+impl Tail {
+    fn take(&mut self, line: &[u8]) {
+        if memchr(line, b"\"usage\"").is_none() {
+            return;
         }
-        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+        let Ok(v) = serde_json::from_slice::<Value>(line) else { return };
         let message = &v["message"];
         let u = &message["usage"];
         if v["type"] != "assistant" || !u.is_object() {
-            continue;
+            return;
         }
         let n = |key: &str| u[key].as_u64().unwrap_or(0);
-        let (input, created, read, output) =
-            (n("input_tokens"), n("cache_creation_input_tokens"), n("cache_read_input_tokens"), n("output_tokens"));
+        let (input, created, read, output) = (n("input_tokens"), n("cache_creation_input_tokens"), n("cache_read_input_tokens"), n("output_tokens"));
         let id = message["id"].as_str().unwrap_or_default().to_string();
         let at = v["timestamp"].as_str().and_then(epoch).unwrap_or(0);
-        answers.insert(id, (input + created, read, output, at));
-        usage.context = input + created + read;
+        self.answers.insert(id, (input + created, read, output, at));
+        self.context = input + created + read;
         if let Some(model) = message["model"].as_str().filter(|m| !m.starts_with('<')) {
-            usage.model = model.to_string();
+            self.model = model.to_string();
         }
     }
-    for (input, read, output, at) in answers.values() {
-        usage.input += input;
-        usage.cache_read += read;
-        usage.output += output;
-        if *at >= day_ago {
-            usage.recent += input + output;
+
+    fn usage(&self) -> Usage {
+        let mut usage = Usage { model: self.model.clone(), context: self.context, answers: self.answers.len() as u32, ..Usage::default() };
+        let day_ago = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |now| now.as_secs().saturating_sub(86_400));
+        for (input, read, output, at) in self.answers.values() {
+            usage.input += input;
+            usage.cache_read += read;
+            usage.output += output;
+            if *at >= day_ago {
+                usage.recent += input + output;
+            }
+        }
+        usage
+    }
+}
+
+fn memchr(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|window| window == needle)
+}
+
+/// What a session has used. Slow for a long one the first time only: not
+/// for the UI thread.
+pub fn read(path: &Path) -> Option<Usage> {
+    use std::io::Seek as _;
+    let mut file = std::fs::File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    let mut tail = TAILS.lock().unwrap().get_or_insert_with(HashMap::new).remove(path).unwrap_or_default();
+    // Shorter than what was read: another file under the name.
+    if length < tail.offset {
+        tail = Tail::default();
+    }
+    file.seek(std::io::SeekFrom::Start(tail.offset)).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                tail.take(&line);
+                // A line still being written is read again when it is whole.
+                if line.last() != Some(&b'\n') {
+                    break;
+                }
+                tail.offset += n as u64;
+            }
         }
     }
-    usage.answers = answers.len() as u32;
+    let usage = tail.usage();
+    tail.used = READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut tails = TAILS.lock().unwrap();
+    let tails = tails.get_or_insert_with(HashMap::new);
+    tails.insert(path.to_path_buf(), tail);
+    while tails.len() > TAILS_KEPT {
+        let Some(oldest) = tails.iter().min_by_key(|(_, tail)| tail.used).map(|(path, _)| path.clone()) else { break };
+        tails.remove(&oldest);
+    }
     Some(usage)
 }
 
@@ -269,6 +330,21 @@ mod tests {
         let u = read(&path).unwrap();
         assert_eq!((u.answers, u.input, u.cache_read, u.output, u.context), (2, 30, 400, 12, 320));
         assert_eq!(u.model, "claude-x");
+        // More is written: only that is read, a line begun is not counted twice, and an answer written again replaces itself.
+        let mut more = lines.join("\n");
+        more.push('\n');
+        more.push_str(&answer("b", 20, 300, 9));
+        more.push('\n');
+        more.push_str(&answer("c", 5, 400, 2));
+        std::fs::write(&path, &more).unwrap();
+        let u = read(&path).unwrap();
+        assert_eq!((u.answers, u.input, u.cache_read, u.output, u.context), (3, 35, 800, 16, 405));
+        let read_to = super::TAILS.lock().unwrap().as_ref().unwrap()[&path].offset;
+        assert_eq!(read_to as usize, more.rfind('\n').unwrap() + 1, "up to the last whole line");
+        assert_eq!(read(&path).unwrap(), u, "nothing new: the same");
+        // Another file under the name is read from its start.
+        std::fs::write(&path, answer("z", 1, 2, 3)).unwrap();
+        assert_eq!(read(&path).unwrap().answers, 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -24,7 +24,7 @@ type Progress = Arc<Mutex<HashMap<String, String>>>;
 type Import = Arc<Mutex<ImportState>>;
 /// What the server last found wrong in each file, by uri, and a count of
 /// its reports: a file's view looks again when that moved.
-type Problems = Arc<Mutex<(u64, HashMap<String, Vec<lsp_types::Diagnostic>>)>>;
+type Problems = Arc<Mutex<(u64, HashMap<String, (u64, Vec<lsp_types::Diagnostic>)>)>>;
 
 /// The server's import of the build: its errors so far, and how it ended.
 #[derive(Default)]
@@ -126,7 +126,6 @@ pub struct LspClient {
     progress: Progress,
     import: Import,
     problems: Problems,
-    changes: AtomicI64,
     /// `capabilities` from the server's answer to `initialize`.
     capabilities: Mutex<Value>,
     child: Mutex<Option<Child>>,
@@ -418,6 +417,10 @@ impl LspClient {
     pub fn spawn(program: &str, executable: &Path, args: &[&str], root: &Path, init_options: Value) -> Result<Arc<Self>> {
         let mut command = crate::procs::command(executable);
         command.args(args).envs(server_env(program)).current_dir(root).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+        // A group of its own: what it starts (cargo check, a proc-macro
+        // server, tsserver) is ended with it, not left to notice.
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
         // Dies with the app even when it exits without running destructors.
         let mut child = crate::procs::spawn_tied(&mut command)
             .with_context(|| format!("starting {program}"))?;
@@ -448,7 +451,6 @@ impl LspClient {
             progress,
             import,
             problems,
-            changes: AtomicI64::new(1),
             capabilities: Mutex::new(Value::Null),
             child: Mutex::new(Some(child)),
         });
@@ -576,20 +578,18 @@ impl LspClient {
 
     /// Full-text sync: a change without a range replaces the whole document,
     /// which every server accepts whatever sync kind it prefers.
-    pub fn did_change(&self, path: &Path, version: i32, text: &str) -> Result<()> {
+    pub fn did_change(&self, path: &Path, _version: i32, text: &str) -> Result<()> {
         let uri = path_to_uri(path);
         // Before its file is opened there the server has nothing to change:
         // the text it is opened with is as new.
         if !self.opened.lock().unwrap().contains(&uri) {
             return Ok(());
         }
-        // Numbered here, past the caller's own count: the text also goes out
-        // ahead of a request about it, and a file's versions must only grow.
-        let version = version.max(0) + self.changes.fetch_add(1, Ordering::Relaxed) as i32;
+        // Its version is given where it is written, in the order written.
         let message = json!({
             "jsonrpc": "2.0",
             "method": "textDocument/didChange",
-            "params": { "textDocument": { "uri": uri, "version": version }, "contentChanges": [{ "text": text }] },
+            "params": { "textDocument": { "uri": uri, "version": 0 }, "contentChanges": [{ "text": text }] },
         });
         self.send(Out::Change { uri, message })
     }
@@ -689,7 +689,15 @@ impl LspClient {
     /// reports so far: unchanged, nothing is new.
     pub fn problems(&self, uri: &str) -> (u64, Vec<lsp_types::Diagnostic>) {
         let problems = self.problems.lock().unwrap();
-        (problems.0, problems.1.get(uri).cloned().unwrap_or_default())
+        problems.1.get(uri).cloned().unwrap_or_default()
+    }
+
+    /// The same, when it is another report than the one `seen`: asked twice
+    /// a second by every open file, most often there is none, and one about
+    /// another file is none.
+    pub fn problems_since(&self, uri: &str, seen: u64) -> Option<(u64, Vec<lsp_types::Diagnostic>)> {
+        let problems = self.problems.lock().unwrap();
+        problems.1.get(uri).filter(|(report, _)| *report != seen).cloned()
     }
 
     /// textDocument/codeAction: the fixes and refactorings for a range,
@@ -821,6 +829,11 @@ impl LspClient {
     /// Ends the server now, even while files still hold the client.
     pub fn shut_down(&self) {
         let Some(mut child) = self.child.lock().unwrap().take() else { return };
+        // SAFETY: a signal to the group the server was started as; not reaped yet, its id is still its own.
+        #[cfg(unix)]
+        unsafe {
+            libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+        }
         let _ = child.kill();
         // Reaping one that held gigabytes takes a while: not on this thread,
         // which is the UI's more often than not.
@@ -887,16 +900,26 @@ pub fn apply_edits(text: &str, edits: &[lsp_types::TextEdit]) -> String {
     let mut ranges: Vec<(usize, usize, &str)> = edits.iter().map(|e| (offset(&e.range.start), offset(&e.range.end), e.new_text.as_str())).collect();
     // From the end, so that what is before an edit keeps its place.
     ranges.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
-    let mut out = text.to_string();
     // What is still as it was: an edit that reaches into one already made
     // (a server's mistake) is left out, not put into text it was not for.
-    let mut untouched = out.len();
-    for (start, end, new) in ranges {
-        if start <= end && end <= untouched && out.is_char_boundary(start) && out.is_char_boundary(end) {
-            out.replace_range(start..end, new);
+    let mut untouched = text.len();
+    ranges.retain(|&(start, end, _)| {
+        let fits = start <= end && end <= untouched && text.is_char_boundary(start) && text.is_char_boundary(end);
+        if fits {
             untouched = start;
         }
+        fits
+    });
+    // Written out once, from the start: a formatter's thousands of small
+    // edits do not each move the rest of the file.
+    let mut out = String::with_capacity(text.len() + ranges.iter().map(|(_, _, new)| new.len()).sum::<usize>());
+    let mut at = 0;
+    for (start, end, new) in ranges.into_iter().rev() {
+        out.push_str(&text[at..start]);
+        out.push_str(new);
+        at = end;
     }
+    out.push_str(&text[at..]);
     out
 }
 
@@ -923,6 +946,8 @@ enum Out {
 fn write_loop(mut stdin: ChildStdin, outbox: mpsc::Receiver<Out>) {
     let mut ready = false;
     let mut held: Vec<Out> = Vec::new();
+    // A file is opened as its version 1.
+    let mut version = 1i64;
     while let Ok(first) = outbox.recv() {
         let mut queue = Vec::new();
         for out in std::iter::once(first).chain(outbox.try_iter()) {
@@ -937,20 +962,32 @@ fn write_loop(mut stdin: ChildStdin, outbox: mpsc::Receiver<Out>) {
             }
         }
         for waiting in [&mut queue, &mut held] {
-            let mut newest = HashMap::new();
-            for (ix, out) in waiting.iter().enumerate() {
-                if let Out::Change { uri, .. } = out {
-                    newest.insert(uri.clone(), ix);
+            // A text is left out only when a newer one of the file follows
+            // with nothing asked between them: what is asked is asked of
+            // the text that went before it.
+            let mut newer: HashSet<String> = HashSet::new();
+            let mut keep = vec![true; waiting.len()];
+            for (ix, out) in waiting.iter().enumerate().rev() {
+                match out {
+                    Out::Change { uri, .. } => keep[ix] = newer.insert(uri.clone()),
+                    Out::Later(_) => newer.clear(),
+                    _ => {}
                 }
             }
-            let mut ix = 0;
-            waiting.retain(|out| {
-                ix += 1;
-                !matches!(out, Out::Change { uri, .. } if newest.get(uri) != Some(&(ix - 1)))
-            });
+            let mut keep = keep.into_iter();
+            waiting.retain(|_| keep.next().unwrap_or(true));
         }
         for out in queue {
-            let (Out::Now(message) | Out::Later(message) | Out::Change { message, .. }) = out else { continue };
+            let message = match out {
+                Out::Now(message) | Out::Later(message) => message,
+                // Numbered as it is written: a file's versions only grow, whichever thread asked.
+                Out::Change { mut message, .. } => {
+                    version += 1;
+                    message["params"]["textDocument"]["version"] = version.into();
+                    message
+                }
+                Out::Ready => continue,
+            };
             if write_message(&mut stdin, &message).is_err() {
                 return;
             }
@@ -1025,7 +1062,8 @@ fn read_messages(stdout: impl Read, out: mpsc::Sender<Out>, pending: &Pending, p
                 };
                 let mut problems = problems.lock().unwrap();
                 problems.0 += 1;
-                problems.1.insert(uri.to_string(), found);
+                let report = problems.0;
+                problems.1.insert(uri.to_string(), (report, found));
             }
             (None, Some(method)) if method == "$/progress" => {
                 let params = &message["params"];
@@ -1354,6 +1392,33 @@ mod tests {
 mod write_tests {
     use super::*;
 
+    /// A server is ended with what it started.
+    #[test]
+    fn what_a_server_started_ends_with_it() {
+        let dir = std::env::temp_dir().join(format!("ideae-lsp-group-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (script, pid_file) = (dir.join("server.sh"), dir.join("child.pid"));
+        std::fs::write(&script, format!("#!/bin/sh\nsleep 300 &\necho $! > '{}'\ncat >/dev/null\n", pid_file.display())).unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let client = LspClient::spawn("test-server", &script, &[], &dir, Value::Null).unwrap();
+        let started = std::time::Instant::now();
+        let child = loop {
+            match std::fs::read_to_string(&pid_file).ok().and_then(|pid| pid.trim().parse::<u32>().ok()) {
+                Some(pid) => break pid,
+                None if started.elapsed() > Duration::from_secs(10) => panic!("the server did not start"),
+                None => thread::sleep(Duration::from_millis(20)),
+            }
+        };
+        assert!(crate::procs::alive(child));
+        client.shut_down();
+        let ended = std::time::Instant::now();
+        while crate::procs::alive(child) && ended.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!crate::procs::alive(child), "what the server started is left running");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// What the server is sent, read back from a `cat` in its place.
     #[test]
     fn the_server_is_written_to_in_order_and_only_the_newest_text() {
@@ -1387,8 +1452,9 @@ mod write_tests {
                 message["text"].as_str().or(message["method"].as_str()).unwrap().to_string()
             })
             .collect();
-        // The handshake at once; then what waited, in the order asked, a
-        // file's text once: the newest, where the last of them was asked.
-        assert_eq!(sent, ["initialize", "open", "other", "hover", "three"]);
+        // The handshake at once; then what waited, in the order asked. Of a
+        // file's texts with nothing asked between them the newest; what is
+        // asked comes after the text it was asked of.
+        assert_eq!(sent, ["initialize", "open", "two", "other", "hover", "three"]);
     }
 }
