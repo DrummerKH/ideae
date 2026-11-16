@@ -94,6 +94,11 @@ ignored; a folder, of what is in it. An ignored folder (`target/`,
 - History of any branch, narrowed by words, `@author` and `file:path`, with
   the whole commit message; a commit is cherry-picked, reverted, or made the
   start of a new task.
+- ⑂ Graph in History: every branch, local and on the remote, newest first,
+  with lanes for where each left and joined, as JetBrains and Zed draw it.
+  Branches can be hidden by pattern (`tenant/*`), and those of the remote
+  with no commits of their own (only merges into them) left out; both are
+  kept in the repository's git config.
 - Stash, and the stashes listed to look into, bring back or drop.
 
 ## Terminals and browser tabs

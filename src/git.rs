@@ -916,6 +916,8 @@ pub struct Commit {
     pub subject: String,
     /// The branches and tags that point at it: "main, origin/main, tag: v1".
     pub refs: String,
+    /// Joins branches: shown dimmer, as there is seldom anything to read in one.
+    pub merge: bool,
 }
 
 /// Whose history is read and which commits of it: all fields empty, the
@@ -955,7 +957,7 @@ impl HistoryQuery {
 pub fn history(root: &Path, limit: usize, query: &HistoryQuery) -> Vec<Commit> {
     let limit = format!("-n{limit}");
     let (text, author) = (format!("--grep={}", query.text), format!("--author={}", query.author));
-    let mut args = vec!["log", limit.as_str(), "--format=%H%x1f%h%x1f%an%x1f%ar%x1f%s%x1f%D%x1e"];
+    let mut args = vec!["log", limit.as_str(), "--format=%H%x1f%h%x1f%an%x1f%ar%x1f%s%x1f%D%x1f%P%x1e"];
     if !query.text.is_empty() {
         args.extend([text.as_str(), "-i", "--fixed-strings"]);
     }
@@ -981,7 +983,143 @@ pub fn history(root: &Path, limit: usize, query: &HistoryQuery) -> Vec<Commit> {
                 subject: fields.next().unwrap_or_default().to_string(),
                 // HEAD's own arrow says nothing the list does not.
                 refs: fields.next().unwrap_or_default().split(", ").map(|name| name.trim_start_matches("HEAD -> ")).filter(|name| !name.is_empty() && *name != "HEAD" && !name.ends_with("/HEAD")).collect::<Vec<_>>().join(", "),
+                merge: fields.next().is_some_and(|parents| parents.split_whitespace().count() > 1),
             })
+        })
+        .collect()
+}
+
+/// A commit of the graph of all branches, with its parents.
+#[derive(Clone, Debug)]
+pub struct GraphCommit {
+    pub commit: Commit,
+    pub parents: Vec<String>,
+}
+
+/// What the graph leaves out, kept in the repository's own config (so its
+/// worktrees share it): branches by name pattern (`tenant/*`), and with
+/// `own_only` those with no commit of their own but merges.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GraphFilter {
+    pub hide: Vec<String>,
+    pub own_only: bool,
+}
+
+pub fn graph_filter(root: &Path) -> GraphFilter {
+    let hide = git(root, &["config", "--get", "ideae.graphHide"]).unwrap_or_default();
+    GraphFilter {
+        hide: hide.split([',', ' ']).map(str::trim).filter(|g| !g.is_empty()).map(str::to_string).collect(),
+        own_only: git(root, &["config", "--get", "ideae.graphOwnOnly"]).is_some_and(|v| v.trim() == "true"),
+    }
+}
+
+pub fn set_graph_filter(root: &Path, filter: &GraphFilter) {
+    let _ = git(root, &["config", "--local", "ideae.graphHide", &filter.hide.join(", ")]);
+    let _ = git(root, &["config", "--local", "ideae.graphOwnOnly", if filter.own_only { "true" } else { "false" }]);
+}
+
+/// The branches and where they point, as one line each: what tells that the
+/// graph is to be read again.
+pub fn refs_stamp(root: &Path) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let out = git(root, &["for-each-ref", "--format=%(objectname) %(refname)", "refs/heads", "refs/remotes"]).unwrap_or_default();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    out.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Which branches of the remotes have commits of their own (not merges)
+/// that the base has not; `known` keeps the answers by branch and commit, so a reload asks
+/// only of the branches that moved.
+fn branches_with_work(root: &Path, known: &mut std::collections::HashMap<(String, String), bool>) -> Vec<(String, bool)> {
+    let base = git(root, &["rev-parse", "--abbrev-ref", "origin/HEAD"]).map(|s| s.trim().to_string()).filter(|s| !s.is_empty() && s != "origin/HEAD");
+    // The remotes' branches only: one's own are never noise.
+    let refs = git(root, &["for-each-ref", "--format=%(refname:short)%09%(objectname)%09%(refname)", "refs/remotes"]).unwrap_or_default();
+    let mut found = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for line in refs.lines() {
+        let mut parts = line.split('\t');
+        let (Some(name), Some(oid), Some(full)) = (parts.next(), parts.next(), parts.next()) else { continue };
+        if full.ends_with("/HEAD") || Some(name) == base.as_deref() {
+            continue;
+        }
+        let key = (name.to_string(), oid.to_string());
+        seen.insert(key.clone());
+        let has = *known.entry(key).or_insert_with(|| match &base {
+            Some(base) => git(root, &["rev-list", "--count", "--no-merges", &format!("{base}..{oid}")]).is_some_and(|n| n.trim() != "0"),
+            None => true,
+        });
+        found.push((full.to_string(), has));
+    }
+    known.retain(|key, _| seen.contains(key));
+    found
+}
+
+/// The branches, local and of the remotes, whose history holds `hash`.
+pub fn branches_containing(root: &Path, hash: &str) -> Vec<String> {
+    git(root, &["for-each-ref", "--contains", hash, "--format=%(refname:short)%09%(refname)", "refs/heads", "refs/remotes"])
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .filter(|(_, full)| !full.ends_with("/HEAD"))
+        .map(|(name, _)| name.to_string())
+        .collect()
+}
+
+/// Prefixes under which a remote has many branches (`tenant/`, with how
+/// many): families of branches the graph may be asked to leave out.
+pub fn branch_families(root: &Path, at_least: usize) -> Vec<(String, usize)> {
+    let refs = git(root, &["for-each-ref", "--format=%(refname:lstrip=3)", "refs/remotes"]).unwrap_or_default();
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for name in refs.lines() {
+        if let Some((prefix, _)) = name.split_once('/') {
+            *counts.entry(prefix).or_default() += 1;
+        }
+    }
+    let mut families: Vec<(String, usize)> = counts.into_iter().filter(|(_, n)| *n >= at_least).map(|(p, n)| (format!("{p}/*"), n)).collect();
+    families.sort_by(|a, b| b.1.cmp(&a.1));
+    families
+}
+
+/// The newest `limit` commits of every branch, local and of the remotes
+/// (tags only as names on them), newest first, with their parents.
+pub fn graph(root: &Path, limit: usize, filter: &GraphFilter, known: &mut std::collections::HashMap<(String, String), bool>) -> Vec<GraphCommit> {
+    let limit = format!("-n{limit}");
+    let mut args: Vec<String> = vec!["log".into(), limit, "--date-order".into(), "--format=%H%x1f%h%x1f%an%x1f%ar%x1f%s%x1f%D%x1f%P%x1e".into()];
+    // Branches without work of their own, left out one by one.
+    let idle: Vec<String> = if filter.own_only { branches_with_work(root, known).into_iter().filter(|(_, has)| !has).map(|(full, _)| full).collect() } else { Vec::new() };
+    // An exclusion holds for the next --branches or --remotes only.
+    for (kind, prefix) in [("--branches", "refs/heads/"), ("--remotes", "refs/remotes/")] {
+        for glob in &filter.hide {
+            args.push(format!("--exclude={}", if kind == "--remotes" { format!("*/{glob}") } else { glob.clone() }));
+        }
+        args.extend(idle.iter().filter_map(|full| full.strip_prefix(prefix)).map(|name| format!("--exclude={name}")));
+        args.push(kind.into());
+    }
+    // Nor their names on the commits that are listed for other branches.
+    for glob in &filter.hide {
+        args.push(format!("--decorate-refs-exclude=refs/heads/{glob}"));
+        args.push(format!("--decorate-refs-exclude=refs/remotes/*/{glob}"));
+    }
+    args.extend(idle.iter().map(|full| format!("--decorate-refs-exclude={full}")));
+    args.extend(["HEAD".into(), "--".into()]);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = git(root, &args).unwrap_or_default();
+    out.split('\x1e')
+        .filter_map(|record| {
+            let mut fields = record.trim_start_matches('\n').split('\x1f');
+            let commit = Commit {
+                hash: fields.next().filter(|h| !h.is_empty())?.to_string(),
+                short: fields.next()?.to_string(),
+                author: fields.next()?.to_string(),
+                date: fields.next()?.to_string(),
+                subject: fields.next().unwrap_or_default().to_string(),
+                refs: fields.next().unwrap_or_default().split(", ").map(|name| name.trim_start_matches("HEAD -> ")).filter(|name| !name.is_empty() && *name != "HEAD" && !name.ends_with("/HEAD")).collect::<Vec<_>>().join(", "),
+                merge: false,
+            };
+            let parents: Vec<String> = fields.next().unwrap_or_default().split_whitespace().map(str::to_string).collect();
+            let commit = Commit { merge: parents.len() > 1, ..commit };
+            Some(GraphCommit { commit, parents })
         })
         .collect()
 }
@@ -1230,7 +1368,7 @@ pub fn blame(root: &Path, file: &Path) -> Vec<Option<std::sync::Arc<BlameLine>>>
 
 /// One commit's list entry, for a commit outside the loaded history.
 pub fn commit_info(root: &Path, hash: &str) -> Option<Commit> {
-    let out = git(root, &["log", "-1", "--format=%H%x1f%h%x1f%an%x1f%ar%x1f%s", hash])?;
+    let out = git(root, &["log", "-1", "--format=%H%x1f%h%x1f%an%x1f%ar%x1f%s%x1f%P", hash])?;
     let mut fields = out.trim_end().split('\x1f');
     Some(Commit {
         hash: fields.next().filter(|h| !h.is_empty())?.to_string(),
@@ -1239,6 +1377,7 @@ pub fn commit_info(root: &Path, hash: &str) -> Option<Commit> {
         date: fields.next()?.to_string(),
         subject: fields.next().unwrap_or_default().to_string(),
         refs: String::new(),
+        merge: fields.next().is_some_and(|parents| parents.split_whitespace().count() > 1),
     })
 }
 
@@ -2001,10 +2140,21 @@ pub fn fetch_base(repo: &Path) -> Result<(), String> {
             .ok_or("no origin/main or origin/master")?
             .to_string(),
     };
+    fetch_quietly(repo, &["fetch", "--quiet", "--no-auto-maintenance", "origin", &branch])
+}
+
+/// Every branch of `origin`, those gone from it dropped: for the graph of
+/// all branches.
+pub fn fetch_all(repo: &Path) -> Result<(), String> {
+    fetch_quietly(repo, &["fetch", "--quiet", "--no-auto-maintenance", "--prune", "origin"])
+}
+
+/// A fetch that never asks for a password and gives up after a minute.
+fn fetch_quietly(repo: &Path, args: &[&str]) -> Result<(), String> {
     let mut child = crate::procs::command("git")
         .arg("-C")
         .arg(repo)
-        .args(["fetch", "--quiet", "--no-auto-maintenance", "origin", &branch])
+        .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("SSH_ASKPASS_REQUIRE", "never")
         .env("GCM_INTERACTIVE", "never")
