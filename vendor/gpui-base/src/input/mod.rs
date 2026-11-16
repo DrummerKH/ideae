@@ -28,6 +28,10 @@ mod display_map;
 mod editor;
 #[path = "base/element.rs"]
 mod element;
+// ideae patch: notes and bookmarks in the gutter.
+#[path = "base/gutter.rs"]
+mod gutter;
+pub use gutter::{GutterEvent, GutterNote, GutterNotes};
 #[path = "editor/highlighting.rs"]
 mod highlighting;
 #[path = "editor/indent.rs"]

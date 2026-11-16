@@ -47,6 +47,8 @@ mod change_tree;
 mod services;
 mod pr;
 mod replace;
+mod annotate;
+mod bookmarks;
 use git_ui::*;
 pub use helpers::*;
 // Named, to come before the one of the same name in gpui's own glob.
@@ -55,6 +57,8 @@ pub use term::*;
 pub use file::*;
 pub use changes::*;
 pub use session::*;
+pub use annotate::ToggleBlame;
+pub use bookmarks::{NextBookmark, PrevBookmark, ShowBookmarks, ToggleBookmark};
 use change_tree::*;
 use pr::*;
 
@@ -266,6 +270,8 @@ pub struct TaskView {
     /// Changed files you marked viewed, with their diff's hash then: a new
     /// change to one unmarks it.
     viewed: BTreeMap<String, u64>,
+    /// The bookmarks of files not open, by their path in the worktree.
+    bookmarks: BTreeMap<String, Vec<u32>>,
     /// Files you were in, the latest first, with where the cursor was.
     recent: Vec<(PathBuf, u32, u32)>,
     /// Its pull request, as last seen on GitHub.
@@ -563,6 +569,7 @@ impl TaskView {
             recent: Vec::new(),
             pr: None,
             viewed: BTreeMap::new(),
+            bookmarks: BTreeMap::new(),
             port_slot,
             services,
             services_error: None,
@@ -838,6 +845,7 @@ impl TaskView {
                 .track_focus(&self.focus)
                 .on_action(cx.listener(|this, _: &ToggleZoom, window, cx| this.toggle_zoom_focused(window, cx)))
                 .on_action(cx.listener(|this, _: &ShowOutline, window, cx| this.show_outline(window, cx)))
+                .on_action(cx.listener(|this, _: &ShowBookmarks, window, cx| this.show_bookmarks(window, cx)))
                 .on_action(cx.listener(|this, _: &ShowUsages, window, cx| this.show_usages_at_cursor(window, cx)))
                 .on_action(cx.listener(|this, _: &SendToAgent, window, cx| this.send_editor_selection(window, cx)))
                 .child(self.render_pane(right, cx))
@@ -1524,6 +1532,7 @@ impl TaskView {
         }
         // The server keeps every text it was given until told otherwise.
         if let TabKind::File(file) = &removed.kind {
+            self.keep_bookmarks(file, cx);
             let f = file.read(cx);
             if let Some(client) = f.lsp_client.clone() {
                 let path = f.path.clone();
@@ -1811,6 +1820,7 @@ impl Render for TaskView {
             }))
             .on_action(cx.listener(|this, _: &ToggleZoom, window, cx| this.toggle_zoom_focused(window, cx)))
             .on_action(cx.listener(|this, _: &ShowOutline, window, cx| this.show_outline(window, cx)))
+            .on_action(cx.listener(|this, _: &ShowBookmarks, window, cx| this.show_bookmarks(window, cx)))
             .on_action(cx.listener(|this, _: &ShowUsages, window, cx| this.show_usages_at_cursor(window, cx)))
             .on_action(cx.listener(|this, _: &SendToAgent, window, cx| this.send_editor_selection(window, cx)))
             .on_action(cx.listener(|this, _: &ShowBranches, window, cx| this.branches_dialog(window, cx)))

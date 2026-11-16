@@ -49,6 +49,11 @@ pub struct FileView {
     /// The cursor's column, for the navigation history to come back to.
     pub(super) cursor_col: u32,
     pub(super) _blame: Task<()>,
+    /// Blame shown by every line, in the gutter; made from `blame` once.
+    pub(super) annotate: bool,
+    pub(super) annotations: Option<Rc<gpui_kit::base::input::GutterNotes>>,
+    /// The line whose annotation the pointer is on, and where it is.
+    pub(super) blame_hover: Option<(usize, Point<Pixels>)>,
     /// Selections Ctrl+W grew from, for Ctrl+Shift+W to step back through.
     pub(super) expand_stack: Vec<std::ops::Range<usize>>,
     pub(super) last_expanded: Option<std::ops::Range<usize>>,
@@ -249,7 +254,10 @@ impl FileView {
         }
         // Told on every change, not only when it turns dirty: the Structure
         // panel follows the text.
-        self.dirty = !self.saved.is(self.editor.read(cx).text());
+        let was_dirty = std::mem::replace(&mut self.dirty, !self.saved.is(self.editor.read(cx).text()));
+        if self.annotate && was_dirty != self.dirty {
+            self.show_annotations(cx);
+        }
         cx.notify();
         // Tell the language server after typing pauses, so hover and
         // definitions see the edited text. The text is taken then, not on
@@ -369,7 +377,9 @@ impl FileView {
         let content_for_lsp = content.clone();
         self.editor.update(cx, |state, cx| {
             let cursor = state.cursor_position();
+            let bookmarks = state.bookmark_rows();
             state.set_value(content, window, cx);
+            state.set_bookmarks(&bookmarks, super::bookmarks::bookmark_color(), cx);
             // Not `set_cursor_position`, which takes the keyboard: the file may
             // be reloading in a task out of view, as its agent writes it.
             state.place_cursor(cursor, cx);
@@ -402,6 +412,8 @@ impl FileView {
                 cx.background_spawn(async move { (git::blame(&root, &path), git::committed_text(&root, &path, since_base)) }).await;
             let _ = this.update(cx, |this, cx| {
                 this.blame = Rc::new(blame);
+                this.annotations = None;
+                this.show_annotations(cx);
                 this.committed = committed.map(Arc::from);
                 this.mark_changes(false, cx);
                 cx.notify();
@@ -954,6 +966,10 @@ impl Render for FileView {
             .on_action(cx.listener(|this, _: &Unfold, _, cx| this.fold(false, false, cx)))
             .on_action(cx.listener(|this, _: &FoldAll, _, cx| this.fold(true, true, cx)))
             .on_action(cx.listener(|this, _: &UnfoldAll, _, cx| this.fold(false, true, cx)))
+            .on_action(cx.listener(|this, _: &ToggleBlame, _, cx| this.toggle_blame(cx)))
+            .on_action(cx.listener(|this, _: &ToggleBookmark, _, cx| this.toggle_bookmark(cx)))
+            .on_action(cx.listener(|this, _: &NextBookmark, window, cx| this.go_to_bookmark(false, window, cx)))
+            .on_action(cx.listener(|this, _: &PrevBookmark, window, cx| this.go_to_bookmark(true, window, cx)))
             .child(
                 h_flex()
                     .justify_between()
@@ -1087,10 +1103,29 @@ impl Render for FileView {
             })
             .when(self.preview && !veil, |this| this.child(self.render_preview(cx)))
             .when(!self.preview && !veil, |this| this.child(
-                div().relative().flex_1().min_h_0().children(self.render_signature(cx)).child(crate::zoom::wheel(crate::zoom::Kind::Editor)).child(
+                div()
+                    .id("file-editor")
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                        if !hovered && this.blame_hover.take().is_some() {
+                            cx.notify();
+                        }
+                    }))
+                    .children(self.render_signature(cx))
+                    .children(self.render_blame_hover(cx))
+                    .child(crate::zoom::wheel(crate::zoom::Kind::Editor)).child(
                     Editor::new(&self.editor)
                         // Replaces the built-in menu, so its items are listed again.
-                        .context_menu(|menu, _, _| {
+                        .context_menu({
+                            let (editor, annotating) = (self.editor.clone(), self.annotate);
+                            move |menu, _, cx| {
+                            // On the line numbers: what is about the lines.
+                            if editor.read(cx).gutter_press().is_some() {
+                                let blame = if annotating { "Close Annotations" } else { "Annotate with Git Blame" };
+                                return menu.menu(blame, Box::new(ToggleBlame)).menu("Toggle Bookmark", Box::new(ToggleBookmark));
+                            }
                             use gpui_kit::component::input::{Copy, Cut, GoToDefinition, Paste, SelectAll};
                             // Ctrl+B on a declaration lists its usages.
                             menu.menu("Go to Definition / Usages", Box::new(GoToDefinition))
@@ -1106,7 +1141,7 @@ impl Render for FileView {
                                 .menu("Compare with Branch, Tag or Commit…", Box::new(CompareFileWith))
                                 .separator()
                                 .menu("Send to Agent", Box::new(SendToAgent))
-                        })
+                        }})
                         .bordered(false)
                         .p_0()
                         .h_full()

@@ -108,6 +108,9 @@ impl TaskView {
             cursor_line: line,
             cursor_col: col,
             _blame: Task::ready(()),
+            annotate: false,
+            annotations: None,
+            blame_hover: None,
             lsp_status: SharedString::default(),
             lsp_ok: Some(false),
             lsp_client: None,
@@ -164,6 +167,13 @@ impl TaskView {
             }
         })
         .detach();
+        let weak = file.downgrade();
+        editor.update(cx, |state, _| {
+            state.on_gutter(move |event, window, cx| {
+                let _ = weak.update(cx, |f, cx| f.on_gutter(event, window, cx));
+            })
+        });
+        self.give_bookmarks(&path, &editor, cx);
         file.update(cx, |f, cx| f.load_blame(cx));
         self.attach_lsp(&path, content, &editor, &file, cx);
         self.use_search_definitions(&path, &editor, false, cx);

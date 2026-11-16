@@ -79,6 +79,8 @@ gpui-cn = { path = "vendor/gpui-cn" }
 # input/base/state.rs patched: hover/Ctrl+click hit-test ignored the scroll offset.
 # input/base/state.rs + element.rs + editor/lsp/definitions.rs patched: jump_to_position,
 # a jump lands a third down the viewport unless already in view.
+# input/base/gutter.rs (new) + state.rs + element.rs + layout.rs patched: notes left of the
+# line numbers (blame) with hover and click, and bookmarked lines that follow edits.
 gpui-base = { path = "vendor/gpui-base" }
 
 [dev-dependencies]

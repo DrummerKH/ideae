@@ -58,6 +58,7 @@ impl TaskView {
             expanded: self.expanded.iter().map(|e| e.to_string()).collect(),
             review: self.changes.read(cx).review.clone(),
             viewed: self.viewed.clone(),
+            bookmarks: self.all_bookmarks(cx),
             side_panel: match self.right {
                 RightPane::Changes => 0,
                 RightPane::Files => 1,
@@ -70,6 +71,8 @@ impl TaskView {
     /// Opens the tabs of a saved session next to the agent's.
     pub fn restore(&mut self, session: &crate::state::TaskSession, window: &mut Window, cx: &mut Context<Self>) {
         let mut ids: Vec<Option<usize>> = Vec::new();
+        // Before the files open: each takes its own.
+        self.bookmarks = session.bookmarks.clone();
         for saved in &session.tabs {
             let before: HashSet<usize> = self.tabs.iter().map(|t| t.id).collect();
             match saved.kind.as_str() {

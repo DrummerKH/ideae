@@ -22,6 +22,10 @@ pub(super) struct LastLayout {
     pub(super) wrap_width: Option<Pixels>,
     pub(super) wrapping_indent: WrappingIndent,
     pub(super) line_number_width: Pixels,
+    /// ideae patch: of `line_number_width`, the gutter's notes and the
+    /// room for bookmarks, left of the numbers.
+    pub(super) notes_width: Pixels,
+    pub(super) mark_width: Pixels,
     /// Width of one space in the editor font.
     ///
     /// Past the end of a line there are no glyphs to hit-test against, so this is the

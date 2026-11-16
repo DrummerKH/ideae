@@ -98,7 +98,11 @@ Windows build exists and is being tried out (see [Windows](#windows)).
   being written, and Ctrl+N goes to a class, function or type anywhere in
   the project (without a server, to what the grammars find declared).
   Blocks fold from the gutter and with Ctrl+− / Ctrl+=, all of them with
-  Shift. Markdown has a Preview
+  Shift. A right click on the line numbers annotates the file with git
+  blame, as JetBrains IDEs do: the day and author by every line, the commit
+  on hover, opened in History on a click. Lines are bookmarked (F11), go
+  with their text as you edit, and are listed for the whole task
+  (Shift+F11). Markdown has a Preview
   in its header.
 - **Git.** Changes with stage/unstage/discard, commit, push, PR (`gh`), the
   branch against its base, history, safe pull: Pull is marked when what
@@ -237,6 +241,7 @@ a release build needs a Windows host for `fxc.exe`.
 | Ctrl+Alt+B | Implementations, then usages |
 | Ctrl+F12 | File structure |
 | F2 / Shift+F2 | Next / previous problem in the file |
+| F11 / Shift+F11 | Bookmark the line / the task's bookmarks (Alt+PgDn / Alt+PgUp: next / previous in the file) |
 | Alt+1 / Alt+2 / Alt+3 | Changes / Files / Structure panel |
 | Ctrl+F4 / Ctrl+Shift+F4 | Close tab / reopen the last closed (more on a tab's right click) |
 | Shift+Esc | Focus mode |

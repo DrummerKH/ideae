@@ -270,6 +270,8 @@ pub struct TaskSession {
     pub review: Vec<ReviewNote>,
     /// Changed files marked viewed, with a hash of their diff then.
     pub viewed: std::collections::BTreeMap<String, u64>,
+    /// Bookmarked lines (0-based) by file, relative to the worktree.
+    pub bookmarks: std::collections::BTreeMap<String, Vec<u32>>,
 }
 
 /// A review comment on lines of the diff.

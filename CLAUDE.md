@@ -30,6 +30,8 @@ src/task/          one task, a module: what is private to it is seen by all of i
   session.rs       session save/restore, language servers asleep
   services.rs      the Run panel
   pr.rs            pull request feedback
+  annotate.rs      git blame by every line, in the gutter
+  bookmarks.rs     bookmarked lines: toggle, next/previous, the task's list
   change_tree.rs   the changed files as a tree
   helpers.rs       patches parsed for the panels, outline, symbol search, definition providers
 src/state.rs       state.json; APP_ID (ideae vs ideae-dev)

@@ -1189,18 +1189,19 @@ impl<M: InputModeKind> TextElement<M> {
         (visible_range, visible_buffer_lines, visible_top)
     }
 
-    /// Return (line_number_width, line_number_len)
+    /// Return (line_number_width, line_number_len, notes_width, mark_width)
     fn layout_line_numbers(
         state: &InputBaseState<M>,
         text: &Rope,
         font_size: Pixels,
         style: &TextStyle,
         window: &mut Window,
-    ) -> (Pixels, usize) {
+    ) -> (Pixels, usize, Pixels, Pixels) {
         let total_lines = text.lines_len();
         // Reserve three digits for small documents, then follow the actual
         // line count up to seven digits.
         let line_number_len = line_number_len(total_lines);
+        let (mut notes_width, mut mark_width) = (px(0.), px(0.));
 
         let mut line_number_width = if state.mode.line_number() {
             let empty_line_number = window.text_system().shape_line(
@@ -1217,7 +1218,15 @@ impl<M: InputModeKind> TextElement<M> {
                 None,
             );
 
-            empty_line_number.width + LINE_NUMBER_RIGHT_MARGIN
+            // ideae patch: room for the gutter's notes and bookmarks, left of the numbers.
+            let char_width = empty_line_number.width / line_number_len.max(1) as f32;
+            notes_width = state
+                .gutter
+                .notes
+                .as_ref()
+                .map_or(px(0.), |notes| char_width * notes.chars as f32 + super::gutter::NOTE_GAP);
+            mark_width = if state.gutter.bookmarks.is_some() { super::gutter::MARK_WIDTH } else { px(0.) };
+            empty_line_number.width + LINE_NUMBER_RIGHT_MARGIN + notes_width + mark_width
         } else if state.is_code_editor() {
             LINE_NUMBER_RIGHT_MARGIN
         } else {
@@ -1229,7 +1238,7 @@ impl<M: InputModeKind> TextElement<M> {
             line_number_width += FOLD_ICON_HITBOX_WIDTH
         }
 
-        (line_number_width, line_number_len)
+        (line_number_width, line_number_len, notes_width, mark_width)
     }
 
     /// Layout shaped lines for whitespace indicators (space and tab).
@@ -2452,6 +2461,9 @@ pub(super) struct PrepaintState {
     ///
     /// The child is the soft lines.
     line_numbers: Option<Vec<SmallVec<[ShapedLine; 1]>>>,
+    /// ideae patch: the gutter's notes of the visible lines, and where they are.
+    gutter_notes: Option<Vec<Option<(Option<ShapedLine>, Option<Hsla>)>>>,
+    notes_hitbox: Option<Hitbox>,
     /// Size of the scrollable area by entire lines.
     scroll_size: Size<Pixels>,
     /// Caret bounds for every selection, active flagged.
@@ -2744,7 +2756,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
         };
 
         // Calculate the width of the line numbers
-        let (line_number_width, line_number_len) =
+        let (line_number_width, line_number_len, notes_width, mark_width) =
             Self::layout_line_numbers(&state, &text, text_size, &text_style, window);
 
         let mut bounds = bounds;
@@ -2832,6 +2844,8 @@ impl<M: InputModeKind> Element for TextElement<M> {
             wrap_width,
             wrapping_indent,
             line_number_width,
+            notes_width,
+            mark_width,
             space_width,
             lines: Rc::new(vec![]),
             cursor_bounds: None,
@@ -3176,6 +3190,34 @@ impl<M: InputModeKind> Element for TextElement<M> {
         } else {
             None
         };
+        // ideae patch: the gutter's notes of the visible lines.
+        let gutter_notes = state.gutter.notes.as_ref().filter(|_| line_numbers.is_some()).map(|notes| {
+            last_layout
+                .visible_buffer_lines
+                .iter()
+                .map(|&row| {
+                    let note = notes.rows.get(row)?.as_ref()?;
+                    let shaped = (!note.text.is_empty()).then(|| {
+                        let run = TextRun {
+                            len: note.text.len(),
+                            font: style.font(),
+                            color: note.color,
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        };
+                        window.text_system().shape_line(note.text.clone(), text_size, &[run], None)
+                    });
+                    Some((shaped, note.tint))
+                })
+                .collect::<Vec<_>>()
+        });
+        let notes_hitbox = gutter_notes.is_some().then(|| {
+            window.insert_hitbox(
+                Bounds::new(input_bounds.origin, size(last_layout.notes_width, input_bounds.size.height)),
+                HitboxBehavior::Normal,
+            )
+        });
 
         let hover_definition_hitbox = M::hover_definition_hitbox(state, window, cx);
         let indent_guides_path =
@@ -3209,6 +3251,8 @@ impl<M: InputModeKind> Element for TextElement<M> {
             last_layout,
             scroll_size,
             line_numbers,
+            gutter_notes,
+            notes_hitbox,
             cursor_infos,
             cursor_scroll_offset,
             current_row,
@@ -3489,13 +3533,34 @@ impl<M: InputModeKind> Element for TextElement<M> {
             // ideae patch: marks of the rows, at the gutter's right edge.
             let line_marks = self.state.read(cx).line_marks.clone();
             let mark_x = gutter_bounds.right() - px(4.);
+            // ideae patch: the gutter's notes, then room for bookmarks, then the numbers.
+            let (notes_width, mark_width) = (prepaint.last_layout.notes_width, prepaint.last_layout.mark_width);
+            let bookmarked: SmallVec<[usize; 16]> = {
+                let state = self.state.read(cx);
+                let first = prepaint.last_layout.visible_buffer_lines.first().copied().unwrap_or(0);
+                let last = prepaint.last_layout.visible_buffer_lines.last().copied().unwrap_or(0);
+                match &state.gutter.bookmarks {
+                    Some(offsets) if !offsets.is_empty() => {
+                        let len = state.text.len();
+                        offsets
+                            .iter()
+                            .map(|&offset| state.text.offset_to_point(offset.min(len)).row)
+                            .filter(|row| (first..=last).contains(row))
+                            .collect()
+                    }
+                    _ => SmallVec::new(),
+                }
+            };
+            let bookmark_color = self.state.read(cx).gutter.bookmark_color;
 
             // Each item is the normal lines.
-            for (lines, &buffer_line) in line_numbers
+            for (ix, (lines, &buffer_line)) in line_numbers
                 .iter()
                 .zip(prepaint.last_layout.visible_buffer_lines.iter())
+                .enumerate()
             {
-                let p = point(input_bounds.origin.x, origin.y + offset_y);
+                let p = point(input_bounds.origin.x + notes_width + mark_width, origin.y + offset_y);
+                let note_p = point(input_bounds.origin.x, p.y);
                 let is_active = prepaint.current_row == Some(buffer_line);
 
                 let height = line_height * lines.len() as f32;
@@ -3512,6 +3577,21 @@ impl<M: InputModeKind> Element for TextElement<M> {
                     }
                 }
 
+                if let Some(Some((text, tint))) = prepaint.gutter_notes.as_ref().and_then(|notes| notes.get(ix)) {
+                    if let Some(tint) = tint {
+                        window.paint_quad(fill(Bounds::new(note_p, size(notes_width - px(4.), height)), *tint));
+                    }
+                    if let Some(text) = text {
+                        _ = text.paint(note_p + point(px(4.), px(0.)), line_height, TextAlign::Left, None, window, cx);
+                    }
+                }
+                if bookmarked.contains(&buffer_line) {
+                    let mark = Bounds::new(
+                        point(input_bounds.origin.x + notes_width + px(2.), p.y + line_height * 0.2),
+                        size(mark_width - px(5.), line_height * 0.6),
+                    );
+                    window.paint_quad(fill(mark, bookmark_color).corner_radii(px(2.)));
+                }
                 if let Some(&color) = line_marks.rows.get(&buffer_line) {
                     window.paint_quad(fill(Bounds::new(point(mark_x, p.y), size(px(3.), height)), color));
                 }
@@ -3567,6 +3647,10 @@ impl<M: InputModeKind> Element for TextElement<M> {
             }
         });
 
+        // ideae patch: a note of the gutter opens what it tells of.
+        if let Some(hitbox) = prepaint.notes_hitbox.as_ref() {
+            window.set_cursor_style(gpui::CursorStyle::PointingHand, hitbox);
+        }
         if let Some(hitbox) = prepaint.hover_definition_hitbox.as_ref()
             && !window.modifiers().alt
         {

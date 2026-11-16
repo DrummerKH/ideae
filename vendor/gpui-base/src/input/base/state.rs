@@ -542,6 +542,8 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(super) masked: bool,
     /// ideae patch: marks in the gutter, by buffer row (see [`LineMarks`]).
     pub(super) line_marks: std::rc::Rc<LineMarks>,
+    /// ideae patch: notes and bookmarks in the gutter (see `gutter.rs`).
+    pub(super) gutter: super::gutter::Gutter,
     pub(super) clean_on_escape: bool,
     pub(super) submit_on_enter: bool,
     /// Overrides for [`Self::text_input_configuration`].
@@ -1037,6 +1039,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             text_align: TextAlign::Left,
             masked: false,
             line_marks: Default::default(),
+            gutter: Default::default(),
             clean_on_escape: false,
             submit_on_enter: false,
             input_action: None,
@@ -2763,6 +2766,11 @@ impl<M: InputModeKind> InputBaseState<M> {
         if window.default_prevented() {
             return;
         }
+        // ideae patch: a click on a note of the gutter is the note's, and
+        // the editor does not take the keyboard for it.
+        if self.gutter_press_at(event.position, event.button == MouseButton::Right, window, cx) {
+            return;
+        }
         // A tap asks for the virtual keyboard. Focus alone does not when it
         // moves from another input, or stays here, after the user hid it.
         if event.button == MouseButton::Left
@@ -2899,6 +2907,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         // file is scrolled most of the view counted as outside: no hover and
         // no Ctrl+click definition there.
         let within_bounds = self.last_bounds.is_some() && self.input_bounds.contains(&event.position);
+        self.gutter_hover(event.position, window, cx);
         if !within_bounds {
             // Clear hover when mouse leaves the input
             M::clear_hover_state(self, cx);
@@ -4367,6 +4376,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             self.text.replace(range.clone(), new_text);
 
             M::adjust_annotations(self, range, new_text.len());
+            self.move_bookmarks(range, new_text.len()); // ideae patch
             recorded |= self.push_history(
                 &old_text,
                 range,
@@ -4748,6 +4758,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         } else {
             M::adjust_annotations(self, &range, new_text.len());
         }
+        self.move_bookmarks(&range, new_text.len()); // ideae patch
         if mask_changed {
             // A segment-based history entry no longer matches the masked
             // document, record a whole-document change instead, so that
@@ -4888,6 +4899,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         }
 
         M::adjust_annotations(self, &range, new_text.len());
+        self.move_bookmarks(&range, new_text.len()); // ideae patch
         if let Some(diagnostics) = self.mode.diagnostics_mut() {
             diagnostics.reset(&self.text)
         }

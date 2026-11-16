@@ -84,6 +84,12 @@ pub static SHORTCUTS: &[Shortcut] = &[
     shortcut!("unfold", "Unfold", "ctrl-=", Editor, task::Unfold),
     shortcut!("fold_all", "Fold all", "ctrl-shift--", Editor, task::FoldAll),
     shortcut!("unfold_all", "Unfold all", "ctrl-shift-=", Editor, task::UnfoldAll),
+    shortcut!("bookmark", "Toggle bookmark", "f11", Editor, task::ToggleBookmark),
+    shortcut!("bookmarks", "Bookmarks", "shift-f11", NotInTerminal, task::ShowBookmarks),
+    shortcut!("next_bookmark", "Next bookmark", "alt-pagedown", Editor, task::NextBookmark),
+    shortcut!("prev_bookmark", "Previous bookmark", "alt-pageup", Editor, task::PrevBookmark),
+    // No keys of its own, as in JetBrains IDEs: the gutter's menu has it.
+    shortcut!("annotate", "Annotate with Git Blame", "", Editor, task::ToggleBlame),
     shortcut!("parameter_info", "Parameter info", "ctrl-p", Editor, task::ParameterInfo),
     // Ctrl+Y is the line's: the editor's own Redo moves here.
     shortcut!("redo", "Redo", "ctrl-shift-z", Editor, gpui_kit::component::input::Redo),
