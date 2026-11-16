@@ -12,7 +12,16 @@ src/workspace.rs   projects and tasks: load, switch, create/close/delete, state,
 src/workspace/variants.rs  several tries at one task as a group: create, compare, keep one
 src/sidebar.rs     left sidebar (inbox, projects, tasks, drag and drop)
 src/task/          one task, a module: what is private to it is seen by all of its files (`use super::*`)
-  mod.rs           the task itself: tabs, panes, the refresh, git UI, navigation
+  mod.rs           the task itself: its state, the refresh loop, tabs and panes
+  agent_tab.rs     what is sent to the agent, its restart, queued prompts
+  open.rs          opening a file and giving it its language server
+  refresh.rs       what a refresh read, applied: diffs, files, the branch
+  git_ui.rs        the commit box, the changed files, stashes, single changes, git actions
+  branch_bar.rs    the branch line above the tabs
+  branches.rs      the branches of the repository: open, compare, delete
+  panels.rs        the tab bar and the side panels
+  nav.rs           back and forward
+  lookups.rs       outline, usages and places, installing a language server
   file.rs          an open file: editor, save and reload, blame, the language server's bridge
   changes.rs       the Changes tab: the diff, review notes, single changes
   term.rs          a terminal tab

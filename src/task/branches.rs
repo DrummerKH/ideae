@@ -1,0 +1,209 @@
+use super::*;
+
+impl TaskView {
+    /// Opens History on one commit (from a blame line).
+    /// The repository's branches, to choose one and say what to do with
+    /// it; and all the merged ones at once, to tidy up.
+    pub fn branches_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        const MERGED: &str = "\u{1}merged";
+        let (root, task, here) = (self.root.clone(), cx.weak_entity(), self.branch_info.head.clone());
+        cx.spawn_in(window, async move |_, cx| {
+            let from = root.clone();
+            let rows = cx.background_spawn(async move { git::branch_rows(&from) }).await;
+            let detail = crate::finder::DETAIL;
+            // Merged, here, in no task and not the one in hand: nothing is lost with these.
+            let spent: Vec<git::BranchRow> = rows.iter().filter(|r| r.merged && !r.remote && r.held.is_none() && r.name != here).cloned().collect();
+            let mut items = Vec::new();
+            if !spent.is_empty() {
+                let text = format!("Delete the {} merged local branch{}…{detail}all of what they hold is in the branch work starts from", spent.len(), if spent.len() == 1 { "" } else { "es" });
+                items.push(crate::finder::Hit { text, path: MERGED.into(), line: 0, col: 0, ranges: Vec::new() });
+            }
+            items.extend(rows.iter().map(|row| {
+                let mut what = vec![if row.remote { "remote" } else { "local" }.to_string()];
+                if row.name == here {
+                    what.push("this task".into());
+                } else if let Some(held) = &row.held {
+                    what.push(format!("in {}", held.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()));
+                }
+                if row.merged {
+                    what.push("merged".into());
+                }
+                what.extend([row.when.clone(), row.subject.clone()]);
+                crate::finder::Hit { text: format!("{}{detail}{}", row.name, what.join(" · ")), path: row.name.clone(), line: 0, col: 0, ranges: Vec::new() }
+            }));
+            let picked = task.clone();
+            let _ = cx.update(|window, cx| {
+                crate::finder::Finder::open_pick(
+                    "Branches…".into(),
+                    root,
+                    items,
+                    Rc::new(move |name, window, cx| {
+                        let _ = picked.update(cx, |task, cx| {
+                            if name == MERGED {
+                                return task.delete_branches_dialog(spent.clone(), window, cx);
+                            }
+                            if let Some(row) = rows.iter().find(|row| row.name == name) {
+                                task.branch_dialog(row.clone(), window, cx)
+                            }
+                        });
+                    }),
+                    task,
+                    window,
+                    cx,
+                )
+            });
+        })
+        .detach();
+    }
+
+    /// What can be done with one branch.
+    pub(super) fn branch_dialog(&mut self, branch: git::BranchRow, window: &mut Window, cx: &mut Context<Self>) {
+        let this = cx.weak_entity();
+        let here = branch.name == self.branch_info.head;
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let (this, branch) = (this.clone(), branch.clone());
+            let muted = cx.theme().muted_foreground;
+            dialog.title(format!("⎇ {}", branch.name)).w(px(520.)).content(move |content, _, _| {
+                let act = |id: &'static str, label: String, tip: &'static str, run: Rc<dyn Fn(&mut TaskView, git::BranchRow, &mut Window, &mut Context<TaskView>)>| {
+                    let (this, branch) = (this.clone(), branch.clone());
+                    Button::new(id).small().outline().label(label).tooltip(tip).on_click(move |_, window, cx| {
+                        window.close_dialog(cx);
+                        let (run, branch) = (run.clone(), branch.clone());
+                        let _ = this.update(cx, |task, cx| run(task, branch, window, cx));
+                    })
+                };
+                let held = branch.held.as_ref().map(|path| path.display().to_string());
+                content
+                    .child(div().text_sm().text_color(muted).child(format!("{} · {}", branch.when, branch.subject)))
+                    .children(held.clone().map(|path| div().text_xs().text_color(muted).child(format!("Checked out in {path}: a task has it."))))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .pt_3()
+                            .flex_wrap()
+                            .when(held.is_none(), |row| {
+                                row.child(act(
+                                    "branch-open",
+                                    "Open as task".into(),
+                                    "A worktree of its own for this branch: it shows up as a task",
+                                    Rc::new(|task, branch, window, cx| {
+                                        let copy_env = crate::state::settings().copy_env;
+                                        task.run_action("Open", move |root| git::branch_worktree(&root, &branch, copy_env).map(|dir| format!("Opened in {}", dir.display())), false, window, cx)
+                                    }),
+                                ))
+                            })
+                            .child(act(
+                                "branch-compare",
+                                "Compare with working tree".into(),
+                                "What is here that the branch does not have",
+                                Rc::new(|task, branch, window, cx| task.compare_with(branch.name, None, window, cx)),
+                            ))
+                            .when(held.is_none() && !here, |row| {
+                                row.child(act(
+                                    "branch-delete",
+                                    if branch.remote { "Delete on the remote…".into() } else { "Delete…".into() },
+                                    "Asked once more before it goes, unless nothing would be lost",
+                                    Rc::new(|task, branch, window, cx| task.delete_branches_dialog(vec![branch], window, cx)),
+                                ))
+                            }),
+                    )
+            })
+        });
+    }
+
+    /// Deletes branches: at once when they are local and merged, asked
+    /// first when something goes that is nowhere else, or goes for everyone.
+    pub(super) fn delete_branches_dialog(&mut self, branches: Vec<git::BranchRow>, window: &mut Window, cx: &mut Context<Self>) {
+        let delete = |task: &mut TaskView, branches: Vec<git::BranchRow>, window: &mut Window, cx: &mut Context<TaskView>| {
+            task.run_action(
+                "Delete",
+                move |root| {
+                    let mut gone = 0;
+                    for branch in &branches {
+                        // What was asked about is deleted as it is; what is merged needs no force.
+                        git::delete_branch(&root, branch, !branch.merged)?;
+                        gone += 1;
+                    }
+                    Ok(format!("Deleted {gone} branch{}", if gone == 1 { "" } else { "es" }))
+                },
+                false,
+                window,
+                cx,
+            )
+        };
+        let one_safe = branches.len() == 1 && branches[0].merged && !branches[0].remote;
+        if one_safe {
+            return delete(self, branches, window, cx);
+        }
+        let this = cx.weak_entity();
+        let names = branches.iter().map(|b| b.name.clone()).collect::<Vec<_>>().join(", ");
+        let why = match branches.as_slice() {
+            [one] if one.remote => "It is deleted on the remote, for everyone who uses it.",
+            [one] if !one.merged => "It is not merged: its commits are kept nowhere else.",
+            _ => "All of what they hold is in the branch work starts from.",
+        };
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            let (this, branches) = (this.clone(), branches.clone());
+            dialog
+                .confirm()
+                .title(if branches.len() == 1 { format!("Delete {names}?") } else { format!("Delete {} branches?", branches.len()) })
+                .description(if branches.len() == 1 { why.to_string() } else { format!("{names}\n\n{why}") })
+                .ok_text("Delete")
+                .on_ok(move |_, window, cx| {
+                    let branches = branches.clone();
+                    let _ = this.update(cx, |task, cx| delete(task, branches, window, cx));
+                    true
+                })
+        });
+    }
+
+    /// Asks what to compare the worktree with, or `file` of it alone: a
+    /// branch, a tag, one of the latest commits.
+    pub fn compare_with_dialog(&mut self, file: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let (root, task) = (self.root.clone(), cx.weak_entity());
+        cx.spawn_in(window, async move |_, cx| {
+            let from = root.clone();
+            let refs = cx.background_spawn(async move { git::refs(&from) }).await;
+            let items = refs
+                .into_iter()
+                .map(|(name, what)| crate::finder::Hit { text: format!("{name}{}{what}", crate::finder::DETAIL), path: name, line: 0, col: 0, ranges: Vec::new() })
+                .collect();
+            let title = match &file {
+                Some(file) => format!("Compare {file} with…"),
+                None => "Compare the working tree with…".to_string(),
+            };
+            let picked = task.clone();
+            let _ = cx.update(|window, cx| {
+                crate::finder::Finder::open_pick(
+                    title,
+                    root,
+                    items,
+                    Rc::new(move |rev, window, cx| {
+                        let file = file.clone();
+                        let _ = picked.update(cx, |task, cx| task.compare_with(rev, file, window, cx));
+                    }),
+                    task,
+                    window,
+                    cx,
+                )
+            });
+        })
+        .detach();
+    }
+
+    /// What the worktree has that `rev` has not, in a diff of its own.
+    pub fn compare_with(&mut self, rev: String, file: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let root = self.root.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            let title = match &file {
+                Some(file) => format!("{file}: {rev} on the left, as it is now on the right"),
+                None => format!("{rev} on the left, the working tree on the right"),
+            };
+            let files = cx
+                .background_spawn(async move { DiffFile::parse(&git::diff_against(&root, &rev, file.as_deref())).map(with_languages).unwrap_or_default() })
+                .await;
+            let _ = cx.update(|window, cx| show_diff_dialog(title, files, window, cx));
+        })
+        .detach();
+    }
+}
