@@ -29,17 +29,9 @@ impl TaskView {
             return;
         }
 
-        let content = match std::fs::read(&path).map(String::from_utf8) {
-            Ok(Ok(content)) => content,
-            failed => {
-                let reason = match failed {
-                    Ok(Err(_)) => {
-                        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                        format!("Binary file, {}: not shown as text", human_size(size))
-                    }
-                    Err(e) => format!("Cannot read: {e}"),
-                    Ok(Ok(_)) => unreachable!(),
-                };
+        let content = match read_text(&path) {
+            Ok(content) => content,
+            Err(reason) => {
                 let title = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 let view = cx.new(|_| BinaryView { path: path.clone(), reason });
                 self.place_tab(TabItem::new(title, TabKind::Binary(view)), how, window, cx);
@@ -368,5 +360,40 @@ impl TaskView {
                 }
             });
         }
+    }
+}
+
+/// The most a file can be to open in the editor: a build's binaries are a
+/// click away in the tree, and a file is read whole, on the UI thread.
+const MAX_TEXT: u64 = 16 << 20;
+
+/// A file's text, or why it is not opened as text.
+fn read_text(path: &std::path::Path) -> Result<String, String> {
+    let size = std::fs::metadata(path).map_err(|e| format!("Cannot read: {e}"))?.len();
+    if size > MAX_TEXT {
+        return Err(format!("{} file: too large to open here", human_size(size)));
+    }
+    match std::fs::read(path).map(String::from_utf8) {
+        Ok(Ok(content)) => Ok(content),
+        Ok(Err(_)) => Err(format!("Binary file, {}: not shown as text", human_size(size))),
+        Err(e) => Err(format!("Cannot read: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod read_tests {
+    #[test]
+    fn large_and_binary_files_are_not_opened_as_text() {
+        let dir = std::env::temp_dir().join(format!("ideae-read-text-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (text, binary, large) = (dir.join("a.txt"), dir.join("b.bin"), dir.join("c.log"));
+        std::fs::write(&text, "hi\n").unwrap();
+        std::fs::write(&binary, [0xff, 0xfe, 0]).unwrap();
+        std::fs::File::create(&large).unwrap().set_len(super::MAX_TEXT + 1).unwrap();
+        assert_eq!(super::read_text(&text).as_deref(), Ok("hi\n"));
+        assert!(super::read_text(&binary).unwrap_err().starts_with("Binary file"));
+        assert!(super::read_text(&large).unwrap_err().contains("too large"));
+        assert!(super::read_text(&dir.join("none")).unwrap_err().starts_with("Cannot read"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
