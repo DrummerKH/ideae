@@ -647,8 +647,9 @@ impl Render for SysMon {
         let mem_pct = if s.mem_total > 0 { 100. * s.mem_used as f32 / s.mem_total as f32 } else { 0. };
         // A dial each, as the tasks have for their agents' context: the numbers are in the tooltip.
         let dial = |id: &'static str, pct: f32, cx: &App| {
-            let color = if pct >= 85. { gpui_kit::red() } else if pct >= 60. { hsla(0.11, 0.9, 0.55, 1.) } else { cx.theme().primary };
-            crate::sidebar::dial(id, pct.clamp(0., 100.) / 100., color, muted)
+            use crate::sidebar::{DIAL_AMBER, DIAL_BLUE, DIAL_RED};
+            let color = if pct >= 85. { DIAL_RED } else if pct >= 60. { DIAL_AMBER } else { DIAL_BLUE };
+            crate::sidebar::dial(id, pct.clamp(0., 100.) / 100., color, cx.theme().foreground)
         };
         let tip = mon;
         h_flex()
