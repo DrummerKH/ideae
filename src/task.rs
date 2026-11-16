@@ -2519,7 +2519,11 @@ impl TaskView {
                     _ => false,
                 });
                 match ix {
-                    Some(ix) if this.tabs[ix].title != "agent" => this.remove_tab(ix, window, cx),
+                    Some(ix) if this.tabs[ix].title != "agent" => {
+                        // Its thread and what it kept of the screen go with the tab.
+                        state.update(cx, |state, cx| state.close(cx));
+                        this.remove_tab(ix, window, cx)
+                    }
                     Some(_) => this.agent_status = crate::agent::AgentStatus::Exited,
                     None => {}
                 }

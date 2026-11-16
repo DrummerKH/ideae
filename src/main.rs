@@ -24,6 +24,7 @@ mod pr;
 mod procs;
 mod search;
 mod services;
+mod stalls;
 mod settings_ui;
 mod sidebar;
 mod sysmon;
@@ -512,6 +513,7 @@ fn main() {
             visible_scrollbars(cx);
             cx.observe_global::<gpui_kit::base::Theme>(visible_scrollbars).detach();
             keymap::bind_all(cx);
+            stalls::watch(cx);
 
             // A saved window larger than the screen it opens on (another
             // monitor, another scale) shrinks to fit.

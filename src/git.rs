@@ -119,7 +119,7 @@ pub fn working_patch(root: &Path) -> String {
 fn tracked_patch(root: &Path, rev: &str, light: bool) -> String {
     let mut args = light_args(light, &["diff", rev]);
     args.extend_from_slice(DIFF_ARGS);
-    git(root, &args).unwrap_or_default()
+    without_huge_files(git(root, &args).unwrap_or_default())
 }
 
 /// The most untracked files a patch shows, the largest of them shown in
@@ -773,7 +773,7 @@ pub fn refresh(root: &Path, picked: Option<String>, light: bool, known: &mut Kno
 
     let untracked: Vec<&str> = untracked.iter().map(String::as_str).collect();
     let new_files = new_files_patch(root, &untracked);
-    let working = changed_patch(root, &changed, light) + &new_files;
+    let working = changed_patch(root, &oid, &changed, light) + &new_files;
     let branch = match &history.fork {
         // No commit of its own yet: the same patch, not asked for twice.
         Some(fork) if *fork == oid => working.clone(),
@@ -797,21 +797,56 @@ pub fn refresh(root: &Path, picked: Option<String>, light: bool, known: &mut Kno
 /// them costs more than it saves (and a command line has an end).
 const NAMED_PATHS: usize = 50;
 
+/// The tree of no files, which every repository has.
+const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
 /// The tracked files against HEAD, when the status has told which changed:
 /// none, and git is not asked; a few, and it looks at those and not at
 /// every file of the worktree.
-fn changed_patch(root: &Path, changed: &[String], light: bool) -> String {
+fn changed_patch(root: &Path, head: &str, changed: &[String], light: bool) -> String {
     if changed.is_empty() {
         return String::new();
     }
+    // Before the first commit there is no HEAD to compare with: what is
+    // added is new against a tree with nothing in it.
+    let head = if head == "(initial)" { EMPTY_TREE } else { "HEAD" };
     if changed.len() > NAMED_PATHS {
-        return tracked_patch(root, "HEAD", light);
+        return tracked_patch(root, head, light);
     }
-    let mut args = vec!["--literal-pathspecs", "diff", "HEAD"];
+    let mut args = vec!["--literal-pathspecs", "diff", head];
     args.extend_from_slice(DIFF_ARGS);
     args.push("--");
     args.extend(changed.iter().map(String::as_str));
-    git(root, &args).unwrap_or_default()
+    without_huge_files(git(root, &args).unwrap_or_default())
+}
+
+/// The most of one tracked file's changes a patch shows. A lock file or a
+/// bundle written anew is megabytes that would be parsed, laid out and kept
+/// for every task at every change: such a file is named, as a binary one is.
+const FILE_PATCH_BYTES: usize = 1024 * 1024;
+
+fn without_huge_files(patch: String) -> String {
+    const START: &str = "diff --git ";
+    let starts: Vec<usize> = patch.match_indices(START).map(|(at, _)| at).filter(|&at| at == 0 || patch.as_bytes()[at - 1] == b'\n').collect();
+    let ends = starts.iter().skip(1).copied().chain([patch.len()]);
+    if !starts.iter().zip(ends.clone()).any(|(start, end)| end - start > FILE_PATCH_BYTES) {
+        return patch;
+    }
+    let mut out = String::with_capacity(patch.len().min(4 * FILE_PATCH_BYTES));
+    for (&start, end) in starts.iter().zip(ends) {
+        let section = &patch[start..end];
+        // Named by the file as it is now, or as it was when it is gone.
+        let name = section.lines().take_while(|line| !line.starts_with("@@ ")).find_map(|line| line.strip_prefix("+++ b/").or(line.strip_prefix("--- a/")));
+        match name.filter(|_| section.len() > FILE_PATCH_BYTES) {
+            Some(name) => {
+                let name = name.trim_end_matches('\t');
+                out.push_str(section.lines().next().unwrap_or_default());
+                out.push_str(&format!("\nBinary files a/{name} and b/{name} differ\n"));
+            }
+            None => out.push_str(section),
+        }
+    }
+    out
 }
 
 #[derive(Clone, Debug)]
@@ -2338,7 +2373,7 @@ mod refresh_tests {
         // The patches of a task out of view, and those of the few files named to git, are the same.
         let light = refresh(&root, None, true, &mut Known::default()).patches.unwrap();
         assert!(light.working == working && light.branch == branch);
-        let named = changed_patch(&root, &["f.txt".to_string(), "src/staged.txt".to_string()], false);
+        let named = changed_patch(&root, "", &["f.txt".to_string(), "src/staged.txt".to_string()], false);
         assert_eq!(named, tracked_patch(&root, "HEAD", false));
         // A changed file changes again, the status the same: asked.
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -2505,6 +2540,25 @@ mod edge_tests {
         sh(&dir, "git checkout -q f.txt; echo more >> g.txt");
         assert!(rebase_onto(&dir, "base").is_ok());
         assert_eq!((out(&dir, "sed -n 2p f.txt").trim(), out(&dir, "tail -1 g.txt").trim()), ("TWO", "more"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Before the first commit what is added shows as new; and a file whose
+    /// changes are megabytes is named, not shown.
+    #[test]
+    fn a_repository_without_commits_and_a_file_too_large_to_show() {
+        let dir = repo("first");
+        sh(&dir, "echo one > a.txt; git add a.txt; echo two > b.txt");
+        let patches = refresh(&dir, None, false, &mut Known::default()).patches.unwrap();
+        assert!(patches.working.contains("+++ b/a.txt") && patches.working.contains("+one") && patches.working.contains("+++ b/b.txt"), "{}", patches.working);
+
+        sh(&dir, "git add .; git commit -qm base; seq 1 300000 > big.txt; echo three >> a.txt; git add big.txt; git commit -qm big; seq 300001 600000 > big.txt; echo more >> b.txt");
+        let working = refresh(&dir, None, false, &mut Known::default()).patches.unwrap().working;
+        assert!(working.len() < 10_000 && working.contains("Binary files a/big.txt and b/big.txt differ"), "{} bytes", working.len());
+        assert!(working.contains("+more"), "the file next to it is shown");
+        let files = gpui_kit::component::diff::DiffFile::parse(&working).unwrap();
+        assert_eq!(files.iter().map(|f| f.path().to_string()).collect::<Vec<_>>(), ["a.txt", "b.txt", "big.txt"]);
+        assert!(hunks(&working).iter().all(|hunk| hunk.path != "big.txt"), "no single change of it to take back");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

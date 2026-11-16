@@ -15,6 +15,7 @@ src/task.rs        one task: tabs, panes, editor, terminals, changes, git UI, se
 src/state.rs       state.json; APP_ID (ideae vs ideae-dev)
 src/agent.rs       Claude Code hooks bridge (unix socket, `ideae --hook`)
 src/crash.rs       what a panic leaves: crashes.log next to the state, told at the next start
+src/stalls.rs      debug aid: tells when the UI thread was held (debug builds, `IDEAE_DEBUG`): stderr and stalls.log
 src/git.rs         git CLI wrappers, worktrees
 src/lsp.rs         language server client
 src/lsp_install.rs language servers installed on request, ~/.local/share/ideae/lsp
