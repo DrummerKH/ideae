@@ -176,8 +176,14 @@ impl ServerDef {
     }
 }
 
+/// The extension a file is read by, past a template's `.dist` and the like.
+fn extension_of(path: &Path) -> String {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    template_of(name).rsplit_once('.').map(|(_, ext)| ext.to_string()).unwrap_or_default()
+}
+
 fn known(path: &Path) -> Option<(&'static str, &'static str, &'static [&'static str])> {
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
+    let ext = extension_of(path);
     SERVERS.iter().find_map(|def| {
         def.languages.iter().find(|(e, _)| *e == ext).map(|(_, language)| (*language, def.program, def.args))
     })
@@ -189,7 +195,7 @@ pub fn server_for(path: &Path) -> Result<Server, String> {
     if POWER_SAVING.load(Ordering::Relaxed) {
         return Err("language servers off (power saving)".into());
     }
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
+    let ext = extension_of(path);
     let (language_id, program, args) = known(path).ok_or_else(|| format!("no language server for .{ext}"))?;
     if crate::state::settings().lsp_off.iter().any(|p| p == program) {
         return Err(format!("{program} off in Settings"));
@@ -278,16 +284,37 @@ pub fn project_root(program: &str, file: &Path, limit: &Path) -> PathBuf {
     found.unwrap_or_else(|| limit.to_path_buf())
 }
 
+/// The name a copy to fill in or keep aside stands for: `phpunit.xml.dist`
+/// is read as `phpunit.xml`, `.env.example` as `.env`.
+pub fn template_of(name: &str) -> &str {
+    for suffix in [".dist", ".example", ".sample", ".template", ".orig", ".bak"] {
+        if name.len() > suffix.len() && name[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix) {
+            return &name[..name.len() - suffix.len()];
+        }
+    }
+    name
+}
+
 /// Highlighter language name for the editor, the same table gpui-kit's diff
 /// uses to detect a file's language (its own is crate-private).
 pub fn language_for(path: &Path) -> &'static str {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_lowercase();
+    let name = template_of(&name).to_string();
     match name.as_str() {
         "makefile" | "gnumakefile" => return "make",
         "cmakelists.txt" => return "cmake",
         "cargo.lock" => return "toml",
+        "composer.lock" => return "json",
         ".editorconfig" | ".gitconfig" | ".npmrc" => return "ini",
         "jenkinsfile" => return "groovy",
+        "gemfile" | "rakefile" | "podfile" | "vagrantfile" | "fastfile" | "brewfile" | "guardfile" | "appfile" => return "ruby",
+        ".bashrc" | ".bash_profile" | ".bash_aliases" | ".bash_logout" | ".zshrc" | ".zprofile" | ".zshenv" | ".zlogin"
+        | ".profile" | ".envrc" | "pkgbuild" | "apkbuild" => return "bash",
+        "build.bazel" | "workspace.bazel" | "tiltfile" | "sconstruct" | "sconscript" => return "python",
+        "pipfile" | "poetry.lock" | "uv.lock" | "gopkg.lock" => return "toml",
+        "flake.lock" | "package.resolved" | ".babelrc" | ".jshintrc" => return "json",
+        ".clang-format" | ".clang-tidy" | ".yamllint" => return "yaml",
+        ".gitmodules" | ".pylintrc" | ".flake8" | ".coveragerc" | ".pypirc" | ".hgrc" => return "ini",
         _ => {}
     }
     if name.starts_with("dockerfile") || name.starts_with("containerfile") || name.ends_with(".dockerfile") {
@@ -308,14 +335,14 @@ pub fn language_for(path: &Path) -> &'static str {
         "swift" => "swift",
         "scala" => "scala",
         "c" | "h" => "c",
-        "cpp" | "cc" | "cxx" | "hpp" | "hxx" => "cpp",
-        "cs" => "csharp",
+        "cpp" | "cc" | "cxx" | "c++" | "hpp" | "hxx" | "hh" | "h++" | "ipp" | "tpp" | "inl" | "ino" | "cu" | "cuh" | "mm" => "cpp",
+        "cs" | "csx" => "csharp",
         "ts" | "mts" | "cts" => "typescript",
         "tsx" => "tsx",
         "js" | "jsx" | "mjs" | "cjs" => "javascript",
         "php" | "phtml" => "php",
-        "py" | "pyi" => "python",
-        "rb" => "ruby",
+        "py" | "pyi" | "pyw" | "bzl" | "star" => "python",
+        "rb" | "rake" | "gemspec" | "ru" | "podspec" => "ruby",
         "lua" => "lua",
         "zig" => "zig",
         "ex" | "exs" => "elixir",
@@ -323,15 +350,15 @@ pub fn language_for(path: &Path) -> &'static str {
         "ejs" => "ejs",
         "svelte" => "svelte",
         "astro" => "astro",
-        "json" | "jsonc" => "json",
-        "md" | "mdx" => "markdown",
+        "json" | "jsonc" | "json5" | "jsonl" | "ndjson" | "geojson" | "webmanifest" | "ipynb" | "har" => "json",
+        "md" | "mdx" | "markdown" | "mkd" => "markdown",
         "toml" => "toml",
-        "yaml" | "yml" => "yaml",
-        "sql" => "sql",
-        "graphql" | "gql" => "graphql",
+        "yaml" | "yml" | "neon" => "yaml",
+        "sql" | "psql" | "pgsql" | "ddl" => "sql",
+        "graphql" | "gql" | "graphqls" => "graphql",
         "proto" => "proto",
-        "sh" | "bash" | "zsh" => "bash",
-        "css" => "css",
+        "sh" | "bash" | "zsh" | "ksh" | "bats" => "bash",
+        "css" | "pcss" | "postcss" => "css",
         // tree-sitter-scss passes MSVC a flag it rejects; CSS's grammar
         // reads most of SCSS.
         "scss" | "sass" => "css",
@@ -350,15 +377,19 @@ pub fn language_for(path: &Path) -> &'static str {
         "elm" => "elm",
         "gleam" => "gleam",
         "prisma" => "prisma",
-        "html" | "htm" | "vue" => "html",
+        "html" | "htm" | "xhtml" | "shtml" | "vue" => "html",
         "cmake" => "cmake",
         "diff" | "patch" => "diff",
-        "xml" | "svg" | "plist" | "xsd" | "xsl" | "xslt" => "xml",
+        "xml" | "svg" | "plist" | "xsd" | "xsl" | "xslt" | "csproj" | "fsproj" | "vbproj" | "props" | "targets" | "xaml"
+        | "axaml" | "resx" | "nuspec" | "iml" | "wsdl" | "fxml" | "storyboard" | "xib" | "rss" | "atom" | "xlf" | "xliff"
+        | "kml" | "gpx" | "pom" | "jelly" => "xml",
         "properties" => "properties",
-        "gradle" | "groovy" => "groovy",
+        "gradle" | "groovy" | "gvy" => "groovy",
         "bat" | "cmd" => "batch",
-        "ini" | "cfg" => "ini",
+        "ini" | "cfg" | "desktop" | "service" | "timer" | "socket" | "mount" | "target" | "path" | "inf" => "ini",
         "ps1" | "psm1" | "psd1" => "powershell",
+        "tf" | "tfvars" | "hcl" | "nomad" => "hcl",
+        "mk" | "mak" => "make",
         _ => "text",
     }
 }
@@ -1458,5 +1489,29 @@ mod write_tests {
         // file's texts with nothing asked between them the newest; what is
         // asked comes after the text it was asked of.
         assert_eq!(sent, ["initialize", "open", "two", "other", "hover", "three"]);
+    }
+}
+
+#[cfg(test)]
+mod language_tests {
+    use super::language_for;
+    use std::path::Path;
+
+    #[test]
+    fn a_template_is_read_as_what_it_stands_for() {
+        let of = |name: &str| language_for(Path::new(name));
+        assert_eq!(of("phpunit.xml.dist"), "xml");
+        assert_eq!(of("behat.yml.dist"), "yaml");
+        assert_eq!(of("phpstan.neon.dist"), "yaml");
+        assert_eq!(of("config.json.example"), "json");
+        assert_eq!(of(".env.example"), "properties");
+        assert_eq!(of("composer.lock"), "json");
+        assert_eq!(of("notes.dist"), "text");
+        assert_eq!(of("App.csproj"), "xml");
+        assert_eq!(of("Gemfile"), "ruby");
+        assert_eq!(of(".zshrc"), "bash");
+        assert_eq!(of("main.tf"), "hcl");
+        assert_eq!(super::extension_of(Path::new("/a/phpunit.xml.dist")), "xml");
+        assert_eq!(super::extension_of(Path::new("/a/Makefile")), "");
     }
 }

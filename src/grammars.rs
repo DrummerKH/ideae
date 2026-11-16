@@ -1,6 +1,6 @@
 //! Grammars gpui-kit does not bundle: XML (Android resources, manifests),
 //! Java properties (also `.env`), Groovy (Gradle scripts), Dockerfiles,
-//! Windows batch, INI, nginx, PowerShell, Twig, and a batch more from their
+//! Windows batch, INI, nginx, PowerShell, Twig, HCL (Terraform), and a batch more from their
 //! crates. Which file gets which grammar: `lsp::language_for`.
 
 use gpui_kit::component::highlighter::{LanguageConfig, LanguageRegistry};
@@ -22,6 +22,8 @@ fn twig() -> tree_sitter::Language {
 }
 /// From tree-sitter-nginx's repository; the crate does not export it.
 const NGINX_HIGHLIGHTS: &str = include_str!("../queries/nginx-highlights.scm");
+/// tree-sitter-hcl ships no highlights.
+const HCL_HIGHLIGHTS: &str = include_str!("../queries/hcl-highlights.scm");
 
 /// (name, grammar, highlights) for everything registered here.
 fn grammars() -> Vec<(&'static str, tree_sitter::Language, &'static str)> {
@@ -49,6 +51,7 @@ fn grammars() -> Vec<(&'static str, tree_sitter::Language, &'static str)> {
         ("elm", tree_sitter_elm::LANGUAGE.into(), tree_sitter_elm::HIGHLIGHTS_QUERY),
         ("gleam", tree_sitter_gleam::LANGUAGE.into(), tree_sitter_gleam::HIGHLIGHT_QUERY),
         ("prisma", tree_sitter_prisma::LANGUAGE.into(), tree_sitter_prisma::HIGHLIGHTS_QUERY),
+        ("hcl", tree_sitter_hcl::LANGUAGE.into(), HCL_HIGHLIGHTS),
     ]
 }
 
@@ -73,4 +76,39 @@ mod tests {
             }
         }
     }
+
+    /// Every language the editor names for a file gets colors, not plain text:
+    /// a grammar registered with an empty query parses and shows nothing.
+    #[test]
+    fn languages_are_colored() {
+        use gpui_kit::component::highlighter::{HighlightTheme, SyntaxHighlighter};
+        register();
+        let theme = HighlightTheme::default_dark();
+        let samples = [
+            ("a.yml", "a: 1\nb: \"x\" # c\n"),
+            ("phpunit.xml.dist", "<a b=\"c\"><d>t</d></a>\n"),
+            ("a.json", "{\"a\": 1}\n"),
+            ("a.swift", "import Foundation\nfunc run() -> Int { return 1 }\n"),
+            ("a.cs", "using System;\nclass A { int Run() { return 1; } }\n"),
+            ("a.graphql", "query Q($id: ID!) { user(id: $id) { name } }\n"),
+            ("a.proto", "syntax = \"proto3\";\nmessage A { string name = 1; }\n"),
+            ("CMakeLists.txt", "project(a)\nadd_executable(a main.c)\n"),
+            ("main.tf", "resource \"aws_s3_bucket\" \"b\" {\n  bucket = \"x\"\n  count  = 2\n}\n"),
+            ("a.scala", "object A { def f(x: Int) = if (x > 0) 1 else 2 }\n"),
+        ];
+        for (path, code) in samples {
+            let mut highlighter = SyntaxHighlighter::new(crate::lsp::language_for(std::path::Path::new(path)));
+            highlighter.update(None, &gpui_kit::component::Rope::from(code), None);
+            let styles = highlighter.styles(&(0..code.len()), &*theme);
+            assert!(styles.iter().any(|s| s.1.color.is_some()), "{path} is plain");
+        }
+        // `if` is a `@conditional` in Scala's query, a name themes lack.
+        let code = samples.last().unwrap().1;
+        let mut highlighter = SyntaxHighlighter::new("scala");
+        highlighter.update(None, &gpui_kit::component::Rope::from(code), None);
+        let at = code.find("if").unwrap();
+        assert!(highlighter.styles(&(0..code.len()), &*theme).iter().any(|(r, s)| r.start == at && s.color.is_some()));
+    }
 }
+
+

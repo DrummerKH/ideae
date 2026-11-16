@@ -37,12 +37,15 @@ pub fn folder(name: &str) -> &'static str {
 }
 
 pub fn file(name: &str) -> &'static str {
-    let lower = name.to_ascii_lowercase();
+    let lower = crate::lsp::template_of(&name.to_ascii_lowercase()).to_string();
     match lower.as_str() {
         "dockerfile" | "containerfile" | ".dockerignore" => return "docker",
         ".gitignore" | ".gitattributes" | ".gitmodules" | ".ignore" => return "gitignore",
         ".editorconfig" => return "editorConfig",
         "makefile" | "justfile" | ".env" => return "config",
+        ".bashrc" | ".bash_profile" | ".bash_aliases" | ".zshrc" | ".zprofile" | ".zshenv" | ".profile" | ".envrc" | "pkgbuild" => {
+            return "shell";
+        }
         "build.gradle" | "settings.gradle" | "build.gradle.kts" | "settings.gradle.kts" => return "gradle",
         _ => {}
     }
@@ -56,7 +59,7 @@ pub fn file(name: &str) -> &'static str {
     match ext {
         "rs" => "rust",
         "go" => "go",
-        "py" | "pyi" | "pyw" => "python",
+        "py" | "pyi" | "pyw" | "bzl" | "star" => "python",
         "js" | "mjs" | "cjs" | "jsx" => "javaScript",
         "ts" | "mts" | "cts" | "tsx" => "typeScript",
         "vue" => "vue",
@@ -66,28 +69,29 @@ pub fn file(name: &str) -> &'static str {
         "gradle" => "gradle",
         "swift" => "swiftLang",
         "c" => "c",
-        "h" | "hpp" | "hh" | "hxx" => "h",
-        "cc" | "cpp" | "cxx" | "c++" | "m" | "mm" => "cpp",
-        "cs" => "Csharp",
+        "h" | "hpp" | "hh" | "hxx" | "h++" | "cuh" => "h",
+        "cc" | "cpp" | "cxx" | "c++" | "m" | "mm" | "ino" | "cu" | "ipp" | "tpp" | "inl" => "cpp",
+        "cs" | "csx" => "Csharp",
         "php" | "phtml" => "php",
         "pl" | "pm" => "perl",
-        "json" | "jsonc" | "json5" => "json",
-        "yml" | "yaml" => "yaml",
+        "json" | "jsonc" | "json5" | "jsonl" | "ndjson" | "geojson" | "webmanifest" => "json",
+        "yml" | "yaml" | "neon" => "yaml",
         "toml" => "toml",
-        "xml" | "xsd" | "xsl" | "plist" | "twig" => "xml",
+        "xml" | "xsd" | "xsl" | "xslt" | "plist" | "twig" | "csproj" | "fsproj" | "vbproj" | "props" | "targets" | "xaml"
+        | "axaml" | "resx" | "nuspec" | "iml" | "wsdl" | "fxml" | "storyboard" | "xib" => "xml",
         "html" | "htm" | "xhtml" => "html",
         "css" | "scss" | "sass" | "less" => "css",
         "md" | "markdown" | "mdx" => "markdown",
         "rst" => "rst",
         "csv" | "tsv" => "csv",
         "sql" => "sql",
-        "graphql" | "gql" => "graphql",
-        "tf" | "tfvars" | "hcl" => "terraform",
+        "graphql" | "gql" | "graphqls" => "graphql",
+        "tf" | "tfvars" | "hcl" | "nomad" => "terraform",
         "ipynb" => "jupyter",
         "http" | "rest" => "http",
         "properties" => "properties",
         "ini" | "cfg" | "conf" | "env" | "lock" => "config",
-        "sh" | "bash" | "zsh" | "fish" | "nu" => "shell",
+        "sh" | "bash" | "zsh" | "ksh" | "bats" | "fish" | "nu" => "shell",
         "bat" | "cmd" | "ps1" | "psm1" => "shell",
         "patch" | "diff" => "patch",
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "icns" | "svg" | "tiff" | "avif" => "image",
@@ -139,6 +143,10 @@ mod tests {
         assert_eq!(file("Dockerfile"), "docker");
         assert_eq!(file("README.MD"), "markdown");
         assert_eq!(file("LICENSE"), "text");
+        assert_eq!(file("phpunit.xml.dist"), "xml");
+        assert_eq!(file("behat.yml.dist"), "yaml");
+        assert_eq!(file("App.csproj"), "xml");
+        assert_eq!(file(".zshrc"), "shell");
         assert_eq!(folder(".github"), "folderGithub");
         for name in ["rust", "php", "gitignore", "folder"] {
             for dark in [false, true] {

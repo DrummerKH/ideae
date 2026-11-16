@@ -33,6 +33,7 @@ tree-sitter-fish = "3.6.0"
 tree-sitter-gleam = "1.0.0"
 tree-sitter-glsl = "0.2.0"
 tree-sitter-groovy = "0.1"
+tree-sitter-hcl = "1.1"
 tree-sitter-haskell = "0.24.1"
 tree-sitter-ini = "1.4"
 tree-sitter-julia = "0.23.1"
@@ -72,6 +73,8 @@ opt-level = 2
 # diff/mod.rs patched: Diff::code_font_size, a per-view code size for zoom.
 # diff/mod.rs + state.rs patched: room past the last file; scroll_to_file puts a header a third down.
 # diff/mod.rs patched: the header of the file under the top edge sticks there.
+# highlighter/languages.rs + registry.rs patched: Swift, C#, CMake, Proto, GraphQL get highlights;
+# capture names of older queries (@conditional, @field…) take the colors themes define.
 [patch.crates-io]
 gpui-component = { path = "vendor/gpui-component" }
 # terminal/core.rs + engine.rs patched: report light/dark (CSI ? 996 n, mode 2031).

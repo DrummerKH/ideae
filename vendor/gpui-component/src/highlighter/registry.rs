@@ -240,6 +240,26 @@ impl From<ThemeStyle> for HighlightStyle {
     }
 }
 
+/// ideae patch: capture names of older queries (nvim-treesitter before its
+/// renames, TextMate scopes), which several grammar crates still ship, read
+/// as the names themes define.
+fn legacy_name(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "conditional" | "repeat" | "include" | "exception" | "storageclass" | "storage" => "keyword",
+        "field" => "property",
+        "parameter" => "variable",
+        "method" | "method.call" => "function",
+        "float" => "number",
+        "character" | "char" => "string",
+        "escape" | "character.escape" => "string.escape",
+        "delimiter" => "punctuation.delimiter",
+        "text.uri" => "link_uri",
+        "text.reference" => "link_text",
+        "union" => "type",
+        _ => return None,
+    })
+}
+
 impl SyntaxColors {
     pub fn style(&self, name: &str) -> Option<HighlightStyle> {
         if name.is_empty() {
@@ -294,6 +314,8 @@ impl SyntaxColors {
 
         if style.is_some() {
             style
+        } else if let Some(alias) = legacy_name(name) {
+            self.style(alias)
         } else {
             // Fallback `keyword.modifier` to `keyword`
             if name.contains(".") {
