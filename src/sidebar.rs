@@ -496,11 +496,10 @@ impl Workspace {
             let v = v.read(cx);
             (v.agent_status == AgentStatus::Working).then(|| v.agent_activity.clone()).flatten()
         });
-        // When it last moved has a place of its own, by the name: it is
-        // short and is never what gets cut off.
-        let when = if activity.is_some() { String::new() } else { ago(t.last_active) };
-        let working = activity.is_some();
-        details.extend(activity);
+        match activity {
+            Some(activity) => details.push(activity),
+            None => details.extend(Some(ago(t.last_active)).filter(|when| !when.is_empty())),
+        }
         // What stays whole at the end of the second line.
         let mut fixed: Vec<String> = Vec::new();
         if in_active {
@@ -540,9 +539,6 @@ impl Workspace {
         let needs = if in_active { None } else { needs };
         let pr = t.pr.clone().filter(|_| pr_status);
         let overlaps = self.overlaps(project, &path);
-        // A second line only where something goes on, or for the task in
-        // hand: a task at rest is its name, and the list is short.
-        let live = is_active || in_active || working || needs.is_some() || !details.is_empty() || pr.is_some() || !overlaps.is_empty();
         let whole_branch = t.branch.clone();
 
         let this = cx.weak_entity();
@@ -598,7 +594,7 @@ impl Workspace {
             .id(id)
             .pl(if listed { px(26.) } else { px(12.) })
             .pr_3()
-            .py_1()
+            .py_0p5()
             .cursor_pointer()
             .border_l_2()
             .border_color(transparent_black())
@@ -620,12 +616,12 @@ impl Workspace {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .text_sm()
+                            .text_size(px(13.))
+                            .line_height(px(18.))
                             .truncate()
                             .when(!running, |s| s.text_color(muted))
                             .child(label.clone()),
                     )
-                    .when(!when.is_empty(), |s| s.child(div().flex_none().text_xs().text_color(muted.opacity(0.8)).child(when.clone())))
                     // How full the agent's context is, as a dial.
                     .when(fill > 0., |s| s.child(context_dial(fill, cx)))
                     .when(unpushed > 0, |s| {
@@ -657,13 +653,16 @@ impl Workspace {
                         )
                     }),
             )
-            .when(live && (!details.is_empty() || !fixed.is_empty() || pr.is_some() || !overlaps.is_empty()), |s| {
+            // Always there, and of one height: the list does not jump as agents start and stop.
+            .map(|s| {
                 s.child(
                     h_flex()
                         .pl(px(18.))
                         .gap_1p5()
                         .min_w_0()
-                        .text_xs()
+                        .h(px(15.))
+                        .text_size(px(11.))
+                        .line_height(px(15.))
                         .when_some(pr, |row, pr| {
                             use crate::pr::{Checks, PrState};
                             let color = match (pr.state, pr.checks) {
