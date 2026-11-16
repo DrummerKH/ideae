@@ -558,8 +558,19 @@ impl FileView {
     /// undone there as one; those of others on disk, where their tabs pick
     /// them up. How many files changed.
     pub(super) fn apply_workspace_edit(&mut self, edit: &lsp_types::WorkspaceEdit, window: &mut Window, cx: &mut Context<Self>) -> usize {
+        // Another file of it open with edits not saved: the server placed its
+        // changes by what is on disk, and written there they would be at odds
+        // with the tab. Nothing is applied, rather than a part of it.
+        let by_file = lsp::edits_by_file(edit);
+        let this = cx.entity_id();
+        let unsaved = self.task.read_with(cx, |task, cx| task.unsaved_files(this, cx)).unwrap_or_default();
+        if let Some(open) = by_file.iter().map(|(path, _)| path).find(|path| unsaved.contains(path)) {
+            let name = open.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+            window.push_notification(Notification::info(format!("Not applied: {name} has edits that are not saved. Save it and ask again.")).title("Language server"), cx);
+            return 0;
+        }
         let mut files = 0;
-        for (path, edits) in lsp::edits_by_file(edit) {
+        for (path, edits) in by_file {
             if path == self.path {
                 let before = files;
                 self.edit(window, cx, |text, selection| {
@@ -593,6 +604,7 @@ impl FileView {
             let state = self.editor.read(cx);
             (self.path.clone(), state.value().to_string(), state.cursor_position())
         };
+        let asked_of = self.edit_version;
         cx.spawn_in(window, async move |this, cx| {
             let uri = lsp::path_to_uri(&path);
             let answer = cx
@@ -602,6 +614,11 @@ impl FileView {
                 }))
                 .await;
             let _ = this.update_in(cx, |this, window, cx| match answer {
+                // The answer is about the text as it was: put onto the one
+                // typed since, its changes would land in the wrong places.
+                Ok(_) if this.edit_version != asked_of => {
+                    window.push_notification(Notification::info("The text changed while the language server was asked: nothing was applied. Ask again.").title("Language server"), cx)
+                }
                 Ok(answer) => then(this, answer, window, cx),
                 Err(e) => window.push_notification(Notification::error(format!("{e:#}")).title("Language server"), cx),
             });

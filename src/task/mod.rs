@@ -1659,6 +1659,18 @@ impl TaskView {
         }
     }
 
+    /// The open files with edits not on disk, but for the one that asks
+    /// (which is being updated, and cannot be read).
+    fn unsaved_files(&self, but: EntityId, cx: &App) -> Vec<PathBuf> {
+        self.tabs
+            .iter()
+            .filter_map(|tab| match &tab.kind {
+                TabKind::File(file) if file.entity_id() != but => Some(file.read(cx)).filter(|file| file.dirty).map(|file| file.path.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn autosave_all(&mut self, cx: &mut Context<Self>) {
         for tab in &self.tabs {
             if let TabKind::File(file) = &tab.kind {

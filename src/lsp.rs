@@ -888,9 +888,13 @@ pub fn apply_edits(text: &str, edits: &[lsp_types::TextEdit]) -> String {
     // From the end, so that what is before an edit keeps its place.
     ranges.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
     let mut out = text.to_string();
+    // What is still as it was: an edit that reaches into one already made
+    // (a server's mistake) is left out, not put into text it was not for.
+    let mut untouched = out.len();
     for (start, end, new) in ranges {
-        if start <= end && end <= out.len() {
+        if start <= end && end <= untouched && out.is_char_boundary(start) && out.is_char_boundary(end) {
             out.replace_range(start..end, new);
+            untouched = start;
         }
     }
     out
@@ -1187,6 +1191,9 @@ mod tests {
         let renamed = apply_edits(text, &[at(0, 4, 6, "total"), at(0, 13, 15, "total"), at(1, 6, 8, "total")]);
         assert_eq!(renamed, "let total = foo(total);\nprint(total)\n", "columns are characters, and every range is of the text as it was");
         assert_eq!(apply_edits("a\n", &[at(5, 0, 0, "end")]), "a\nend", "past the end is the end");
+        // One reaching into another, and one inside a letter of two bytes: left out, the rest made.
+        assert_eq!(apply_edits("abcdef\n", &[at(0, 2, 5, "X"), at(0, 0, 3, "Y"), at(0, 5, 6, "Z")]), "abXZ\n");
+        assert_eq!(apply_edits("\u{e9}a\n", &[at(0, 1, 2, "b")]), "\u{e9}b\n");
     }
 
     #[test]
