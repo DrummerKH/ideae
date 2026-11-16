@@ -46,6 +46,7 @@ mod session;
 mod change_tree;
 mod services;
 mod pr;
+mod replace;
 use git_ui::*;
 pub use helpers::*;
 // Named, to come before the one of the same name in gpui's own glob.

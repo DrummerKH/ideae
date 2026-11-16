@@ -232,6 +232,7 @@ a release build needs a Windows host for `fxc.exe`.
 | Ctrl+Shift+T | New task |
 | Ctrl+1 / Ctrl+2 / Ctrl+3 / Ctrl+\` | Agent / Changes / History / shell |
 | Ctrl+Shift+N, Ctrl+Shift+F | Go to file, find in files |
+| Ctrl+Shift+R | Replace in files |
 | Ctrl+B / Ctrl+click | Go to definition; on a declaration, its usages |
 | Ctrl+Alt+B | Implementations, then usages |
 | Ctrl+F12 | File structure |

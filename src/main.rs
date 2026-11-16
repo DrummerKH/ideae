@@ -22,6 +22,7 @@ mod naming;
 mod palette;
 mod pr;
 mod procs;
+mod replace;
 mod search;
 mod services;
 mod stalls;
@@ -304,6 +305,7 @@ impl Render for Workspace {
                 }
             }))
             .on_action(cx.listener(|this, _: &FindInFiles, window, cx| this.finder(finder::FinderKind::Grep, window, cx)))
+            .on_action(cx.listener(|this, _: &ReplaceInFiles, window, cx| this.replace_in_files(window, cx)))
             .on_action(cx.listener(|this, _: &Quit, window, cx| this.request_quit(window, cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)))
             .on_action(cx.listener(|this, _: &palette::CommandPalette, window, cx| this.command_palette(window, cx)))
@@ -317,12 +319,18 @@ impl Render for Workspace {
     }
 }
 
-actions!(ideae, [GoToFile, GoToSymbol, FindInFiles, NewTask, Quit, OpenSettings, SwitchTheme]);
+actions!(ideae, [GoToFile, GoToSymbol, FindInFiles, ReplaceInFiles, NewTask, Quit, OpenSettings, SwitchTheme]);
 
 impl Workspace {
     fn finder(&mut self, kind: finder::FinderKind, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(task) = self.active_view() {
             task.update(cx, |t, cx| t.open_finder(kind, window, cx));
+        }
+    }
+
+    fn replace_in_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(task) = self.active_view() {
+            task.update(cx, |t, cx| t.open_replace(window, cx));
         }
     }
 
@@ -437,6 +445,7 @@ impl Workspace {
             menu = entry(menu, "Go to file…", Some("go_to_file"), |w, window, cx| w.finder(finder::FinderKind::Files, window, cx));
             menu = entry(menu, "Go to class or symbol…", Some("go_to_symbol"), |w, window, cx| w.finder(finder::FinderKind::Symbols, window, cx));
             menu = entry(menu, "Find in files…", Some("find_in_files"), |w, window, cx| w.finder(finder::FinderKind::Grep, window, cx));
+            menu = entry(menu, "Replace in files…", Some("replace_in_files"), |w, window, cx| w.replace_in_files(window, cx));
             menu = entry(menu, "Run a command…", Some("command_palette"), |w, window, cx| w.command_palette(window, cx)).separator();
             menu = entry(menu, if presenting { "End presentation" } else { "Enter presentation mode…" }, None, |w, window, cx| {
                 if w.is_presenting() { w.end_presentation(window, cx) } else { w.presentation_dialog(window, cx) }

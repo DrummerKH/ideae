@@ -3,7 +3,7 @@
 
 use gpui_kit::{Action, App, KeyBinding, NoAction};
 
-use crate::{FindInFiles, GoToFile, GoToSymbol, NewTask, SwitchTheme, OpenSettings, Quit, keys, palette, task};
+use crate::{FindInFiles, ReplaceInFiles, GoToFile, GoToSymbol, NewTask, SwitchTheme, OpenSettings, Quit, keys, palette, task};
 
 /// Where a shortcut works.
 #[derive(Clone, Copy, PartialEq)]
@@ -42,6 +42,7 @@ pub static SHORTCUTS: &[Shortcut] = &[
     shortcut!("branches", "Branches", "ctrl-shift-`", NotInTerminal, task::ShowBranches),
     shortcut!("go_to_symbol", "Go to class or symbol", "ctrl-n", NotInTerminal, GoToSymbol),
     shortcut!("find_in_files", "Find in files", "ctrl-shift-f", Everywhere, FindInFiles),
+    shortcut!("replace_in_files", "Replace in files", "ctrl-shift-r", Everywhere, ReplaceInFiles),
     shortcut!("find_in_terminal", "Find in terminal", "ctrl-f", Terminal, task::FindInTerminal),
     shortcut!("agent", "Agent", "ctrl-1", Everywhere, task::ShowView(0)),
     shortcut!("changes", "Changes", "ctrl-2", Everywhere, task::ShowView(1)),

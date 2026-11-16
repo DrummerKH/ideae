@@ -256,6 +256,7 @@ impl Workspace {
             keyed("Go to file…", "go_to_file", "go to"),
             keyed("Go to class or symbol…", "go_to_symbol", "go to: anywhere in the project"),
             keyed("Find in files…", "find_in_files", "go to"),
+            keyed("Replace in files…", "replace_in_files", "editor: across the project"),
             keyed("Find in terminal…", "find_in_terminal", "go to: the scrollback"),
             keyed("Go to line…", "go_to_line", "go to"),
             keyed("File structure", "outline", "go to: declarations of the open file"),
