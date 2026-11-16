@@ -53,7 +53,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release
-      # Against glibc 2.31, so it runs on older distributions too (see README).
+      # Against glibc 2.31, so it runs on older distributions too (see docs/building.md).
       - name: Build
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-Wl,--allow-shlib-undefined
@@ -138,6 +138,15 @@ jobs:
     permissions:
       contents: write
     steps:
+      # The install scripts of this commit go with its builds: the link to
+      # the latest release's install.sh is the one to give out.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SHA }}
+          sparse-checkout: |
+            scripts/install.sh
+            scripts/install.ps1
+          sparse-checkout-cone-mode: false
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
@@ -147,4 +156,4 @@ jobs:
           TAG: ${{ needs.version.outputs.tag }}
         run: |
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$SHA" \
-            --title "$TAG" --generate-notes ideae-*
+            --title "$TAG" --generate-notes ideae-* scripts/install.sh scripts/install.ps1

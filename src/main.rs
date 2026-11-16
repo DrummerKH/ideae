@@ -568,6 +568,17 @@ fn main() {
         agent::run_hook(argv.get(2).map(String::as_str).unwrap_or_default());
         return;
     }
+    if let Some(what) = argv.get(1).filter(|a| *a == "--install" || *a == "--uninstall") {
+        let done = if what == "--install" { desktop::install() } else { desktop::uninstall() };
+        match done {
+            Ok(told) => println!("{told}"),
+            Err(e) => {
+                eprintln!("ideae {what}: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     let mut repos = Vec::new();
     // None: as Settings say; Some(None): --no-agent.
     let mut agent: Option<Option<String>> = None;
@@ -587,7 +598,7 @@ fn main() {
                 return;
             }
             "--help" | "-h" => {
-                println!("usage: ideae [--agent CMD | --no-agent] [--theme auto|light|dark] [--task PATH] [--version] [REPO...]\nRepos join the project list, kept in {}.", state::data_dir().join("state.json").display());
+                println!("usage: ideae [--agent CMD | --no-agent] [--theme auto|light|dark] [--task PATH] [--version] [REPO...]\n       ideae --install | --uninstall   (list the app with the system's apps, or remove it)\nRepos join the project list, kept in {}.", state::data_dir().join("state.json").display());
                 return;
             }
             _ => repos.push(PathBuf::from(arg)),

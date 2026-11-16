@@ -199,6 +199,79 @@ fn refresh_icon_cache() {
     }
 }
 
+/// `ideae --install`, run by the install scripts: what makes the app one the
+/// system lists and lets you pin. On Linux a launcher entry and its icon;
+/// on Windows a Start menu shortcut; on macOS the .app in Applications is
+/// all it takes.
+pub fn install() -> Result<String, String> {
+    #[cfg(target_os = "linux")]
+    {
+        write_entry()?;
+        return Ok(format!("Listed with the applications: {}", desktop_file().map(|f| f.display().to_string()).unwrap_or_default()));
+    }
+    #[cfg(windows)]
+    {
+        let (exe, link) = (exe().map_err(|e| e.to_string())?, start_menu_link().ok_or("no Start menu folder")?);
+        let script = "$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:IDEAE_LINK); $s.TargetPath = $env:IDEAE_EXE; \
+                      $s.WorkingDirectory = Split-Path $env:IDEAE_EXE; $s.IconLocation = \"$env:IDEAE_EXE,0\"; $s.Save()";
+        let done = crate::procs::command("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .env("IDEAE_LINK", &link)
+            .env("IDEAE_EXE", &exe)
+            .status()
+            .map_err(|e| e.to_string())?;
+        return if done.success() { Ok(format!("In the Start menu: {}", link.display())) } else { Err("the shortcut was not made".into()) };
+    }
+    #[allow(unreachable_code)]
+    Ok("Nothing to do: the app is where the system looks for apps.".into())
+}
+
+/// `ideae --uninstall`: the entry or shortcut, and the program the install
+/// script put in place. Projects, tasks and settings stay where they are.
+pub fn uninstall() -> Result<String, String> {
+    let exe = exe().map_err(|e| e.to_string())?;
+    let kept = format!("Settings and tasks are kept in {}.", crate::state::data_dir().display());
+    #[cfg(target_os = "linux")]
+    {
+        unpin();
+        for file in [desktop_file(), icon_file()].into_iter().flatten() {
+            let _ = std::fs::remove_file(file);
+        }
+        refresh_icon_cache();
+        std::fs::remove_file(&exe).map_err(|e| e.to_string())?;
+        return Ok(format!("Removed {} and its launcher entry. {kept}", exe.display()));
+    }
+    #[cfg(windows)]
+    {
+        if let Some(link) = start_menu_link() {
+            let _ = std::fs::remove_file(link);
+        }
+        // A running program cannot be deleted: a moment after it is gone.
+        let script = "Start-Sleep 2; Remove-Item -Force $env:IDEAE_EXE; Remove-Item -Force ($env:IDEAE_EXE -replace '\\.exe$', '.old.exe') -ErrorAction SilentlyContinue; \
+                      $dir = Split-Path $env:IDEAE_EXE; if (-not (Get-ChildItem $dir)) { Remove-Item $dir }";
+        crate::procs::command("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", script])
+            .env("IDEAE_EXE", &exe)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        return Ok(format!("Removed {} and its shortcut. {kept}", exe.display()));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let app = exe.ancestors().find(|p| p.extension().is_some_and(|e| e == "app")).ok_or("not run from an .app")?.to_path_buf();
+        std::fs::remove_dir_all(&app).map_err(|e| e.to_string())?;
+        return Ok(format!("Removed {}. {kept}", app.display()));
+    }
+    #[allow(unreachable_code)]
+    Err(format!("nothing to remove for {}", exe.display()))
+}
+
+#[cfg(windows)]
+fn start_menu_link() -> Option<PathBuf> {
+    let name = if cfg!(debug_assertions) { "ideae (dev).lnk" } else { "ideae.lnk" };
+    Some(PathBuf::from(std::env::var_os("APPDATA")?).join("Microsoft/Windows/Start Menu/Programs").join(name))
+}
+
 /// An entry written earlier points at where the binary was then, and its
 /// icon is the one of that build: follow both.
 pub fn refresh_entry() {

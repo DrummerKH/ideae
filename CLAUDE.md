@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Context for AI coding agents working on ideae. Human docs: [README.md](README.md).
+Context for AI coding agents working on ideae. Human docs: [README.md](README.md) and [docs/](docs).
 
 ## Layout
 
@@ -47,7 +47,7 @@ src/lsp_install.rs language servers installed on request, ~/.local/share/ideae/l
 src/procs.rs       starting helper programs (no console on Windows), ending child sessions on quit
 src/daemon/        terminals in a daemon (`ideae --daemon`, unix): they outlive the window (×, Restart); Exit/Ctrl+Q ends them;
                    a window of another build makes the daemon hand its ptys to a new one (SCM_RIGHTS), agents keep running
-src/desktop.rs     launcher entry, dash pin, restart
+src/desktop.rs     launcher entry, dash pin, restart, `--install` / `--uninstall` (run by scripts/install.sh, install.ps1)
 src/naming.rs      branch names from task titles
 src/services.rs    `.ideae.toml` services (Run ▾): per-task port slots, IDEAE_PORT_<NAME>
 vendor/            patched gpui-component, gpui-base, gpui-cn; changes marked `ideae patch`
@@ -57,7 +57,7 @@ scripts/           Xvfb driver for UI checks, check.sh (the tests to run before 
 
 ## Build and test
 
-- Zig 0.17.x must be on PATH (libghostty-vt). System -dev libraries: see README.
+- Zig 0.17.x must be on PATH (libghostty-vt). System -dev libraries: see docs/building.md.
 - `cargo build`, `cargo test`. LSP tests are `#[ignore]` and need gopls / rust-analyzer.
 - Variants have an end-to-end test on a real repository with real terminals, `#[ignore]` too: `cargo test -- --ignored two_variants` after changing them.
 - Saving a file and following it on disk have one too: `cargo test -- --ignored an_open_file` after changing how an open file is written, reloaded or refreshed.
