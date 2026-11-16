@@ -7,7 +7,7 @@ actions!(ideae_file, [SaveFile, ExpandSelection, ShrinkSelection, ToggleComment,
 actions!(ideae_edit, [DeleteLine, DuplicateLine, MoveLineUp, MoveLineDown, JoinLines, ToggleCase, NextOccurrence, GoToLine, RenameSymbol, FormatFile, Fold, Unfold, FoldAll, UnfoldAll, ParameterInfo]);
 actions!(ideae_task, [ToggleZoom, SendDiffToAgent, CommentOnDiff, FindInTerminal]);
 
-actions!(ideae_task, [NextTab, PrevTab, NavigateBack, NavigateForward]);
+actions!(ideae_task, [NextTab, PrevTab, NavigateBack, NavigateForward, CloseTab, ReopenClosedTab]);
 
 /// Ctrl+1/2/3/`: the agent, Changes, History, a shell.
 #[derive(Clone, PartialEq, gpui_kit::Action)]

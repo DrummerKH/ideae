@@ -269,6 +269,16 @@ impl Render for Workspace {
                     task.update(cx, |t, cx| t.cycle_tab(false, window, cx));
                 }
             }))
+            .on_action(cx.listener(|this, _: &task::CloseTab, window, cx| {
+                if let Some(task) = this.active_view() {
+                    task.update(cx, |t, cx| t.close_active(window, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &task::ReopenClosedTab, window, cx| {
+                if let Some(task) = this.active_view() {
+                    task.update(cx, |t, cx| t.reopen_closed(window, cx));
+                }
+            }))
             .on_action(cx.listener(|this, _: &task::NavigateBack, window, cx| {
                 if let Some(task) = this.active_view() {
                     task.update(cx, |t, cx| t.navigate(true, window, cx));

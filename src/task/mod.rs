@@ -179,6 +179,9 @@ struct TabItem {
     /// way takes its place. Editing it, double-clicking it or moving it to
     /// the other pane keeps it.
     preview: bool,
+    /// Pinned: left alone by Close others and the like, by the preview tab
+    /// and by the limit of file tabs.
+    pinned: bool,
     /// When it was last brought to the front, for closing the file tabs
     /// left longest when there are more than the limit.
     used: u64,
@@ -201,9 +204,17 @@ impl TabItem {
             dirty: false,
             service: None,
             preview: false,
+            pinned: false,
             used: use_tick(),
         }
     }
+}
+
+struct ClosedTab {
+    path: PathBuf,
+    line: u32,
+    col: u32,
+    right: bool,
 }
 
 /// How a file is opened: to look at (a jump, a search result, a click in
@@ -282,6 +293,10 @@ pub struct TaskView {
     /// Focus mode: this pane (right or not) fills the window alone.
     zoomed: Option<bool>,
     last_tab_click: Option<(usize, std::time::Instant)>,
+    /// The tab a right click opened the menu of; none for the bar around them.
+    menu_tab: Rc<std::cell::Cell<Option<usize>>>,
+    /// Files whose tabs were closed, latest last, for Reopen closed tab.
+    closed: Vec<ClosedTab>,
     /// Held when the tab in view takes no focus of its own (Changes, History,
     /// a placeholder), so keys such as Shift+Esc still reach the task.
     focus: FocusHandle,
@@ -562,6 +577,8 @@ impl TaskView {
             focus_right: false,
             zoomed: None,
             last_tab_click: None,
+            menu_tab: Rc::default(),
+            closed: Vec::new(),
             focus: cx.focus_handle(),
             changes,
             history,
@@ -1373,6 +1390,7 @@ impl TaskView {
                                     TabKind::File(f) => f.entity_id() == file_id,
                                     _ => false,
                                 }) {
+                                    t.remember_closed(ix, cx);
                                     t.remove_tab(ix, window, cx);
                                 }
                             });
@@ -1381,6 +1399,7 @@ impl TaskView {
                 })
             }
             Some(TabKind::File(_) | TabKind::Browser(_) | TabKind::Binary(_) | TabKind::Changes | TabKind::History) => {
+                self.remember_closed(ix, cx);
                 self.remove_tab(ix, window, cx)
             }
             Some(TabKind::Terminal(_)) if self.tabs[ix].title == "agent" => {}
@@ -1424,6 +1443,71 @@ impl TaskView {
                 })
             }
             _ => {}
+        }
+    }
+
+    fn remember_closed(&mut self, ix: usize, cx: &App) {
+        let Some(tab) = self.tabs.get(ix) else { return };
+        let (path, line, col) = match &tab.kind {
+            TabKind::File(f) => {
+                let f = f.read(cx);
+                (f.path.clone(), f.cursor_line, f.cursor_col)
+            }
+            TabKind::Binary(b) => (b.read(cx).path.clone(), 0, 0),
+            _ => return,
+        };
+        self.closed.retain(|c| c.path != path);
+        self.closed.push(ClosedTab { path, line, col, right: tab.right });
+        if self.closed.len() > 30 {
+            self.closed.remove(0);
+        }
+    }
+
+    pub fn reopen_closed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        while let Some(closed) = self.closed.pop() {
+            if closed.path.is_file() {
+                self.focus_right = closed.right && self.is_split();
+                self.open_file_as(closed.path, closed.line, closed.col, OpenAs::Kept, window, cx);
+                return;
+            }
+        }
+    }
+
+    pub fn close_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix) = self.focused_ix() {
+            self.close_tab(ix, window, cx);
+        }
+    }
+
+    /// The tabs `which` picks in a pane, closed without asking: those of
+    /// files, pictures and pages. Pinned ones, files with unsaved edits,
+    /// terminals and the agent stay.
+    fn close_many(&mut self, right: bool, which: impl Fn(usize, &TabItem) -> bool, window: &mut Window, cx: &mut Context<Self>) {
+        let ids: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(ix, t)| t.right == right && !t.pinned && which(*ix, t))
+            .filter(|(_, t)| match &t.kind {
+                TabKind::File(f) => !f.read(cx).dirty && f.read(cx).saving.is_none(),
+                TabKind::Binary(_) | TabKind::Browser(_) => true,
+                _ => false,
+            })
+            .map(|(_, t)| t.id)
+            .collect();
+        for id in ids {
+            if let Some(ix) = self.ix_of(id) {
+                self.remember_closed(ix, cx);
+                self.remove_tab(ix, window, cx);
+            }
+        }
+    }
+
+    fn toggle_pin(&mut self, id: usize, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
+            tab.pinned = !tab.pinned;
+            tab.preview = false;
+            cx.notify();
         }
     }
 
@@ -1863,7 +1947,7 @@ mod open_file_scenario {
     use super::{FileView, TabKind, TaskView};
     use crate::state::{ProjectState, State};
     use crate::workspace::Workspace;
-    use gpui_kit::{AppContext as _, Bounds, Entity, Point, TestAppContext, WindowBounds, WindowOptions, px, size};
+    use gpui_kit::{App, AppContext as _, Bounds, Entity, Point, TestAppContext, WindowBounds, WindowOptions, px, size};
     use gpui_kit::test::TestWindowExt as _;
     use std::time::Duration;
 
@@ -2042,6 +2126,20 @@ mod open_file_scenario {
         open(cx, "c.txt", super::OpenAs::Kept);
         assert_eq!(open_files(cx), ["a.txt?", "c.txt"], "f.txt, then b.txt, were left longest");
         crate::state::set_settings(crate::state::Settings { notifications: false, pr_status: false, ..Default::default() });
+        // Pinned, a tab stays through Close others; a closed one comes back.
+        open(cx, "b.txt", super::OpenAs::Kept);
+        cx.update_window(handle.into(), |_, window, cx| {
+            task.update(cx, |t, cx| {
+                let id = |t: &TaskView, cx: &App, name: &str| t.tabs.iter().find(|tab| matches!(&tab.kind, TabKind::File(f) if f.read(cx).path.ends_with(name))).unwrap().id;
+                let (a, b) = (id(t, cx, "a.txt"), id(t, cx, "b.txt"));
+                t.toggle_pin(a, cx);
+                t.close_many(false, |_, tab| tab.id != b, window, cx);
+            })
+        })
+        .unwrap();
+        assert_eq!(open_files(cx), ["a.txt", "b.txt"], "a.txt pinned, so no longer the preview either");
+        cx.update_window(handle.into(), |_, window, cx| task.update(cx, |t, cx| t.reopen_closed(window, cx))).unwrap();
+        assert_eq!(open_files(cx), ["a.txt", "b.txt", "c.txt"]);
 
         task.update(cx, |t, cx| t.shut_down(cx));
         cx.update_window(handle.into(), |_, window, _| window.remove_window()).ok();

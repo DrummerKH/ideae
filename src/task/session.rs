@@ -17,7 +17,7 @@ impl TaskView {
             .tabs
             .iter()
             .map(|tab| {
-                let mut s = TabSession { right: tab.right, preview: tab.preview, ..Default::default() };
+                let mut s = TabSession { right: tab.right, preview: tab.preview, pinned: tab.pinned, ..Default::default() };
                 match &tab.kind {
                     // The task's first terminal: the agent, or the shell without one.
                     TabKind::Terminal(_) if tab.title == "agent" || tab.title == "shell" => s.kind = "agent".into(),
@@ -107,6 +107,7 @@ impl TaskView {
             ids.push(new.map(|tab| {
                 tab.right = saved.right;
                 tab.preview = saved.preview;
+                tab.pinned = saved.pinned;
                 tab.id
             }));
         }

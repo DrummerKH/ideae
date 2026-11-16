@@ -180,7 +180,7 @@ impl TaskView {
         tab.right = right;
         tab.preview = how == OpenAs::Preview && crate::state::settings().preview_tabs;
         let id = tab.id;
-        let replaced = tab.preview.then(|| self.tabs.iter().position(|t| t.preview && t.right == right)).flatten();
+        let replaced = tab.preview.then(|| self.tabs.iter().position(|t| t.preview && !t.pinned && t.right == right)).flatten();
         match replaced {
             Some(ix) => {
                 self.tabs.insert(ix + 1, tab);
@@ -213,13 +213,14 @@ impl TaskView {
                 _ => false,
             };
             let Some(oldest) = files
-                .filter(|t| !busy(t) && !shown.contains(&Some(t.id)))
+                .filter(|t| !t.pinned && !busy(t) && !shown.contains(&Some(t.id)))
                 .min_by_key(|t| t.used)
                 .map(|t| t.id)
             else {
                 return;
             };
             let Some(ix) = self.ix_of(oldest) else { return };
+            self.remember_closed(ix, cx);
             self.remove_tab(ix, window, cx);
         }
     }

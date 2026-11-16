@@ -300,6 +300,8 @@ pub struct TabSession {
     pub right: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub preview: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
 }
 
 /// Debug builds are a separate app: their own data, sockets, window class

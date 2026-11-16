@@ -1,4 +1,5 @@
 use super::*;
+use gpui_kit::component::menu::PopupMenuItem;
 
 impl TaskView {
     pub(super) fn render_tabs(&self, right: bool, cx: &mut Context<Self>) -> impl IntoElement {
@@ -7,7 +8,8 @@ impl TaskView {
         let selected = in_pane.iter().position(|&ix| Some(self.tabs[ix].id) == shown).unwrap_or(0);
         let can_split = !right && in_pane.len() > 1;
         let map = in_pane.clone();
-        TabBar::new(if right { "tabs-right" } else { "tabs-left" })
+        let menu_tab = self.menu_tab.clone();
+        let bar = TabBar::new(if right { "tabs-right" } else { "tabs-left" })
             .selected_index(selected)
             .on_click(cx.listener(move |this, pos: &usize, window, cx| {
                 let Some(&ix) = map.get(*pos) else { return };
@@ -68,7 +70,7 @@ impl TaskView {
                                 .ghost()
                                 .label("◫")
                                 .disabled(!can_split)
-                                .tooltip("Move this tab to the right pane (or right-click any tab)")
+                                .tooltip("Move this tab to the right pane (or from a tab's right-click menu)")
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     if let Some(ix) = this.ix_of(this.left_active) {
                                         this.move_to_other_pane(ix, window, cx)
@@ -105,6 +107,9 @@ impl TaskView {
                         label = format!("● {label}").into();
                     }
                 }
+                if tab.pinned {
+                    label = format!("⚑ {label}").into();
+                }
                 // Middle click closes what the user opened, never the agent, the
                 // first shell or the Changes/History views.
                 let middle_closes = match &tab.kind {
@@ -124,11 +129,10 @@ impl TaskView {
                 } else {
                     Tab::new().label(label).when(tab.preview, |tab| tab.italic())
                 };
+                let id = tab.id;
+                let menu_tab = self.menu_tab.clone();
                 let item = item
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, _, window, cx| this.move_to_other_pane(ix, window, cx)),
-                    )
+                    .on_mouse_down(MouseButton::Right, move |_, _, _| menu_tab.set(Some(id)))
                     .when(middle_closes, |tab| {
                         tab.on_mouse_down(
                             MouseButton::Middle,
@@ -161,7 +165,52 @@ impl TaskView {
                 } else {
                     item
                 }
-            }))
+            }));
+        let task = cx.weak_entity();
+        div().id(if right { "tab-bar-right" } else { "tab-bar-left" }).w_full().child(bar).context_menu(move |menu, _, cx| {
+            let Some(view) = task.upgrade() else { return menu };
+            let clicked = menu_tab.take();
+            let t = view.read(cx);
+            let tab = clicked.and_then(|id| t.tabs.iter().find(|t| t.id == id));
+            let reopen = !t.closed.is_empty();
+            let can_move = tab.is_some_and(|tab| tab.right || t.tabs.iter().filter(|t| !t.right).count() > 1);
+            let (pinned, id) = (tab.is_some_and(|t| t.pinned), tab.map(|t| t.id));
+            let act = |label: &'static str, f: fn(&mut TaskView, Option<usize>, bool, &mut Window, &mut Context<TaskView>)| {
+                let view = view.downgrade();
+                PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                    let _ = view.update(cx, |t, cx| f(t, id, right, window, cx));
+                })
+            };
+            let menu = match id {
+                Some(_) => menu
+                    .item(act("Close", |t, id, _, window, cx| {
+                        if let Some(ix) = id.and_then(|id| t.ix_of(id)) {
+                            t.close_tab(ix, window, cx)
+                        }
+                    }))
+                    .item(act("Close others", |t, id, right, window, cx| t.close_many(right, |_, tab| Some(tab.id) != id, window, cx)))
+                    .item(act("Close to the right", |t, id, right, window, cx| {
+                        let from = id.and_then(|id| t.ix_of(id)).unwrap_or(usize::MAX);
+                        t.close_many(right, |ix, _| ix > from, window, cx)
+                    }))
+                    .item(act("Close all", |t, _, right, window, cx| t.close_many(right, |_, _| true, window, cx)))
+                    .separator()
+                    .item(act(if pinned { "Unpin" } else { "Pin" }, |t, id, _, _, cx| {
+                        if let Some(id) = id {
+                            t.toggle_pin(id, cx)
+                        }
+                    }))
+                    .when(can_move, |menu| {
+                        menu.item(act(if right { "Move to the left pane" } else { "Move to the right pane" }, |t, id, _, window, cx| {
+                            if let Some(ix) = id.and_then(|id| t.ix_of(id)) {
+                                t.move_to_other_pane(ix, window, cx)
+                            }
+                        }))
+                    }),
+                None => menu.item(act("Close all", |t, _, right, window, cx| t.close_many(right, |_, _| true, window, cx))),
+            };
+            menu.when(reopen, |menu| menu.separator().item(act("Reopen closed tab", |t, _, _, window, cx| t.reopen_closed(window, cx))))
+        })
     }
 
     pub(super) fn render_files(&self, cx: &mut Context<Self>) -> impl IntoElement {
