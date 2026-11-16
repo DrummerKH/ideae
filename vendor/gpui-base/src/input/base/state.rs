@@ -544,6 +544,12 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(super) line_marks: std::rc::Rc<LineMarks>,
     /// ideae patch: notes and bookmarks in the gutter (see `gutter.rs`).
     pub(super) gutter: super::gutter::Gutter,
+    /// ideae patch: the declarations of the text as line ranges, by first
+    /// line: those the top of the view is inside of keep their first line
+    /// over it.
+    pub(super) sticky_scopes: std::rc::Rc<Vec<std::ops::Range<usize>>>,
+    /// Where the sticky lines were drawn last, and the line each stands for.
+    pub(super) sticky_hits: Vec<(Bounds<Pixels>, usize)>,
     pub(super) clean_on_escape: bool,
     pub(super) submit_on_enter: bool,
     /// Overrides for [`Self::text_input_configuration`].
@@ -1040,6 +1046,8 @@ impl<M: InputModeKind> InputBaseState<M> {
             masked: false,
             line_marks: Default::default(),
             gutter: Default::default(),
+            sticky_scopes: Default::default(),
+            sticky_hits: Vec::new(),
             clean_on_escape: false,
             submit_on_enter: false,
             input_action: None,
@@ -3609,6 +3617,13 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.active_selection_mut().reversed = false;
         self.selected_word_range = None;
         self.select_to(end, cx);
+    }
+
+    /// ideae patch: the declarations whose first lines stick to the top
+    /// while the view is inside them; `start..end` lines, sorted by start.
+    pub fn set_sticky_scopes(&mut self, scopes: std::rc::Rc<Vec<std::ops::Range<usize>>>, cx: &mut Context<Self>) {
+        self.sticky_scopes = scopes;
+        cx.notify();
     }
 
     /// ideae patch: replaces the gutter's marks.

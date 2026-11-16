@@ -83,6 +83,8 @@ pub struct FileView {
     /// written, the line it was asked on.
     pub(super) signature: Option<(String, Option<std::ops::Range<usize>>, u32)>,
     pub(super) _signature: Task<()>,
+    /// The declarations read for the sticky lines, after typing pauses.
+    pub(super) _scopes: Task<()>,
     pub(super) _poll: Task<()>,
 }
 
@@ -259,6 +261,7 @@ impl FileView {
             self.show_annotations(cx);
         }
         cx.notify();
+        self.read_scopes(Duration::from_millis(500), cx);
         // Tell the language server after typing pauses, so hover and
         // definitions see the edited text. The text is taken then, not on
         // every key: it is a copy of the whole file.
@@ -386,6 +389,7 @@ impl FileView {
         });
         self.dirty = false;
         self.load_blame(cx);
+        self.read_scopes(Duration::ZERO, cx);
         if let Some(client) = self.lsp_client.clone() {
             self.lsp_version += 1;
             let (path, version) = (self.path.clone(), self.lsp_version);
@@ -844,6 +848,20 @@ impl FileView {
     pub(super) fn go_to_line(&mut self, line: u32, col: u32, window: &mut Window, cx: &mut Context<Self>) {
         self.jump(line, col, window, cx);
         self.editor.read(cx).focus_handle(cx).focus(window, cx);
+    }
+
+    /// The declarations of the text, read off the UI thread once typing
+    /// has paused for `after`, for the editor's sticky lines.
+    pub(super) fn read_scopes(&mut self, after: Duration, cx: &mut Context<Self>) {
+        let path = self.path.clone();
+        self._scopes = cx.spawn(async move |this, cx| {
+            if !after.is_zero() {
+                cx.background_executor().timer(after).await;
+            }
+            let Ok(text) = this.update(cx, |f, cx| f.editor.read(cx).text().clone()) else { return };
+            let scopes = cx.background_spawn(async move { sticky_scopes(&path, &text.to_string()) }).await;
+            let _ = this.update(cx, |f, cx| f.editor.update(cx, |state, cx| state.set_sticky_scopes(Rc::new(scopes), cx)));
+        });
     }
 
     /// F2 / Shift+F2: the next or previous problem the language server
@@ -1319,5 +1337,21 @@ fn problem_rank(severity: gpui_kit::component::input::DiagnosticSeverity) -> u8 
         S::Error => 2,
         S::Warning => 1,
         _ => 0,
+    }
+}
+
+/// Line ranges of the declarations that span lines, by first line.
+fn sticky_scopes(path: &std::path::Path, text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut scopes: Vec<_> = super::outline(path, text).into_iter().filter(|i| i.end > i.line).map(|i| i.line as usize..i.end as usize).collect();
+    scopes.sort_by_key(|s| (s.start, std::cmp::Reverse(s.end)));
+    scopes
+}
+
+#[cfg(test)]
+mod sticky_tests {
+    #[test]
+    fn declarations_that_span_lines_are_the_sticky_scopes() {
+        let text = "impl A {\n    fn one() {\n        x();\n    }\n    fn two() {}\n}\nconst N: u8 = 1;\n";
+        assert_eq!(super::sticky_scopes(std::path::Path::new("a.rs"), text), [0..5, 1..3]);
     }
 }

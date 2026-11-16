@@ -124,6 +124,7 @@ impl TaskView {
             problems_seen: 0,
             signature: None,
             _signature: Task::ready(()),
+            _scopes: Task::ready(()),
             // Re-render while the server reports progress, so the header can
             // say "indexing" instead of a misleading "ready".
             _poll: cx.spawn_in(window, async move |this: WeakEntity<FileView>, cx| {
@@ -174,7 +175,10 @@ impl TaskView {
             })
         });
         self.give_bookmarks(&path, &editor, cx);
-        file.update(cx, |f, cx| f.load_blame(cx));
+        file.update(cx, |f, cx| {
+            f.load_blame(cx);
+            f.read_scopes(Duration::ZERO, cx);
+        });
         self.attach_lsp(&path, content, &editor, &file, cx);
         self.use_search_definitions(&path, &editor, false, cx);
 

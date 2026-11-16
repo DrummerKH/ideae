@@ -233,6 +233,8 @@ impl Render for Workspace {
                             .size_full()
                             .p(px(10.))
                             .bg(gpui_kit::black().opacity(0.35))
+                            // What is under it takes no hover and no click.
+                            .occlude()
                             .child(
                                 div()
                                     .size_full()

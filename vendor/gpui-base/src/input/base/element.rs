@@ -772,7 +772,9 @@ impl<M: InputModeKind> TextElement<M> {
                 if let Some(fraction) = state.reveal_at.filter(|_| bounds.size.height > line_height) {
                     let top = scroll_offset.y + cursor_pos.y;
                     let height = bounds.size.height;
-                    let comfortable = top >= top_bottom_margin && top + line_height <= height * 0.75;
+                    // Not under the sticky lines either, of which there may be three.
+                    let margin = if state.sticky_scopes.is_empty() { top_bottom_margin } else { top_bottom_margin.max(line_height * 3.) };
+                    let comfortable = top >= margin && top + line_height <= height * 0.75;
                     if !comfortable {
                         scroll_offset.y = -(cursor_pos.y - (height * fraction).round());
                     }
@@ -2161,6 +2163,88 @@ impl<M: InputModeKind> TextElement<M> {
         out
     }
 
+    /// ideae patch: the declarations the line at the top is inside of, as
+    /// many as there are rows for; each row covers a line, so the line under
+    /// the last row is the one asked about. Up to three, the innermost kept.
+    fn sticky_rows(scopes: &[Range<usize>], rows: &[usize]) -> Vec<usize> {
+        const MOST: usize = 3;
+        let enclosing = |line: usize| -> Vec<usize> {
+            let before = scopes.partition_point(|s| s.start < line);
+            let mut found: Vec<usize> = scopes[..before].iter().filter(|s| s.end >= line && s.end > s.start).map(|s| s.start).collect();
+            found.dedup();
+            let skip = found.len().saturating_sub(MOST);
+            found.drain(..skip);
+            found
+        };
+        let mut covered = 0;
+        loop {
+            let Some(&line) = rows.get(covered).or(rows.last()) else { return Vec::new() };
+            let found = enclosing(line);
+            if found.len() <= covered || covered >= MOST {
+                return found;
+            }
+            covered = found.len();
+        }
+    }
+
+    fn layout_sticky(
+        state: &InputBaseState<M>,
+        last_layout: &LastLayout,
+        style: &gpui::TextStyle,
+        text_size: Pixels,
+        line_number_len: usize,
+        window: &mut Window,
+    ) -> Vec<(usize, ShapedLine, Option<ShapedLine>)> {
+        if state.sticky_scopes.is_empty() || state.soft_wrap {
+            return Vec::new();
+        }
+        let LayoutMode::CodeEditor { highlighter, .. } = &state.mode else { return Vec::new() };
+        let rows = Self::sticky_rows(&state.sticky_scopes, &last_layout.visible_buffer_lines);
+        let text = &state.text;
+        let mut highlighter = highlighter.borrow_mut();
+        rows.into_iter()
+            .filter(|&line| line < text.lines_len())
+            .map(|line| {
+                let start = text.line_start_offset(line);
+                let mut shown = text.slice_line(line).to_string();
+                if shown.len() > MAX_HIGHLIGHT_LINE_LENGTH {
+                    let mut end = MAX_HIGHLIGHT_LINE_LENGTH;
+                    while !shown.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    shown.truncate(end);
+                }
+                let end = start + shown.len();
+                let styles = highlighter
+                    .as_mut()
+                    .map(|h| h.styles(&(start..end), state.editor_style.highlight_styles.as_ref()))
+                    .unwrap_or_default();
+                let mut runs = Vec::with_capacity(styles.len() + 1);
+                let mut at = start;
+                for (range, highlight) in styles {
+                    let range = range.start.max(at)..range.end.min(end);
+                    if range.start > at {
+                        runs.push(style.clone().to_run(range.start - at));
+                    }
+                    if !range.is_empty() {
+                        runs.push(style.clone().highlight(highlight).to_run(range.len()));
+                        at = range.end;
+                    }
+                }
+                if at < end {
+                    runs.push(style.clone().to_run(end - at));
+                }
+                let shaped = window.text_system().shape_line(shown.into(), text_size, &runs, None);
+                let number = state.mode.line_number().then(|| {
+                    let number: SharedString = format!("{:>width$}", displayed_line_number(line + 1), width = line_number_len).into();
+                    let run = TextRun { len: number.len(), font: style.font(), color: state.editor_style.muted_foreground, background_color: None, underline: None, strikethrough: None };
+                    window.text_system().shape_line(number, text_size, &[run], None)
+                });
+                (line, shaped, number)
+            })
+            .collect()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn layout_lines(
         state: &InputBaseState<M>,
@@ -2490,6 +2574,9 @@ pub(super) struct PrepaintState {
     /// First line of inline completion (painted after cursor on same line)
     ghost_first_line: Option<ShapedLine>,
     ghost_lines_height: Pixels,
+    /// ideae patch: the first lines of the declarations the top of the view
+    /// is inside of, outermost first, with their line numbers.
+    sticky: Vec<(usize, ShapedLine, Option<ShapedLine>)>,
 }
 
 impl PrepaintState {
@@ -3219,6 +3306,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
             )
         });
 
+        let sticky = Self::layout_sticky(state, &last_layout, &style, text_size, line_number_len, window);
         let hover_definition_hitbox = M::hover_definition_hitbox(state, window, cx);
         let indent_guides_path =
             self.layout_indent_guides(state, &bounds, &last_layout, &text_style, window);
@@ -3268,6 +3356,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
             ghost_first_line,
             ghost_lines,
             ghost_lines_height,
+            sticky,
         }
     }
 
@@ -3619,6 +3708,59 @@ impl<M: InputModeKind> Element for TextElement<M> {
             cx,
         );
 
+        // ideae patch: the sticky lines, over the text and the gutter; a
+        // click on one goes to its declaration.
+        let mut sticky_hits = Vec::with_capacity(prepaint.sticky.len());
+        if !prepaint.sticky.is_empty() {
+            let top = input_bounds.origin.y + editor_paddings.top;
+            let gutter = prepaint.last_layout.line_number_width;
+            // The padding above too: text scrolls under it.
+            window.paint_quad(fill(Bounds::new(input_bounds.origin, size(input_bounds.size.width, editor_paddings.top)), editor_background));
+            // The padding above too: text scrolls under it.
+            window.paint_quad(fill(Bounds::new(input_bounds.origin, size(input_bounds.size.width, editor_paddings.top)), editor_background));
+            for (row, (line, shaped, number)) in prepaint.sticky.iter().enumerate() {
+                let y = top + line_height * row as f32;
+                let row_bounds = Bounds::new(point(input_bounds.origin.x, y), size(input_bounds.size.width, line_height));
+                window.paint_quad(fill(row_bounds, editor_background));
+                _ = shaped.paint(point(origin.x + gutter + scroll_offset, y), line_height, TextAlign::Left, None, window, cx);
+                let gutter_bg = editor_style.editor_gutter_background.unwrap_or(editor_background);
+                window.paint_quad(fill(Bounds::new(point(input_bounds.origin.x, y), size(gutter, line_height)), gutter_bg));
+                if let Some(number) = number {
+                    let x = input_bounds.origin.x + prepaint.last_layout.notes_width + prepaint.last_layout.mark_width;
+                    _ = number.paint(point(x, y), line_height, TextAlign::Left, None, window, cx);
+                }
+                sticky_hits.push((row_bounds, *line));
+            }
+            let bottom = top + line_height * prepaint.sticky.len() as f32;
+            window.paint_quad(fill(Bounds::new(point(input_bounds.origin.x, bottom - px(1.)), size(input_bounds.size.width, px(1.))), editor_style.border.opacity(0.85)));
+            // The press is kept from the text below; the release jumps.
+            let hits = sticky_hits.clone();
+            window.on_mouse_event(move |event: &gpui::MouseDownEvent, phase, _, cx| {
+                if phase == gpui::DispatchPhase::Capture && hits.iter().any(|(b, _)| b.contains(&event.position)) {
+                    cx.stop_propagation();
+                }
+            });
+            let hits = sticky_hits.clone();
+            let state = self.state.clone();
+            window.on_mouse_event(move |event: &gpui::MouseUpEvent, phase, window, cx| {
+                if phase != gpui::DispatchPhase::Capture || event.button != gpui::MouseButton::Left {
+                    return;
+                }
+                let Some(row) = hits.iter().position(|(b, _)| b.contains(&event.position)) else { return };
+                let line = hits[row].1;
+                cx.stop_propagation();
+                // The declaration comes to where its sticky line was.
+                state.update(cx, |state, cx| {
+                    let display_row = state.display_map.buffer_line_to_display_row(line);
+                    let y = (line_height * display_row.saturating_sub(row) as f32 - state.editor_paddings.top).max(px(0.));
+                    let x = state.scroll_offset().x;
+                    state.place_cursor(lsp_types::Position::new(line as u32, 0), cx);
+                    state.set_scroll_offset(point(x, -y), cx);
+                    state.focus(window, cx);
+                });
+            });
+        }
+
         self.state.update(cx, |state, cx| {
             let geometry_changed = state.last_bounds != Some(bounds)
                 || state.input_bounds != input_bounds
@@ -3628,6 +3770,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
                         || layout.line_height != prepaint.last_layout.line_height
                 });
             state.last_layout = Some(prepaint.last_layout.clone());
+            state.sticky_hits = sticky_hits;
             state.last_bounds = Some(bounds);
             state.last_cursor = Some(state.cursor());
             state.set_input_bounds(input_bounds, cx);

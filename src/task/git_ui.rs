@@ -459,9 +459,11 @@ impl TaskView {
         h_flex()
             .id(("file", id))
             .test_support()
-            .when(keyboard, |row| row.border_l_2().border_color(cx.theme().primary))
+            // Always the room of the mark, so the row does not move when it shows.
+            .border_l_2()
+            .border_color(if keyboard { cx.theme().primary } else { gpui_kit::transparent_black() })
             .group("change-row")
-            .pl(px(12. + 14. * depth as f32))
+            .pl(px(10. + 14. * depth as f32))
             .pr_3()
             .py_0p5()
             .gap_2()
@@ -502,7 +504,10 @@ impl TaskView {
                             })),
                     ),
             )
-            .on_click(cx.listener(move |this, _, window, cx| this.show_changed_file(path.clone(), window, cx)))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.side_selected = ix;
+                this.show_changed_file(path.clone(), window, cx)
+            }))
             .context_menu(move |menu, _, _| {
                 use gpui_kit::component::menu::PopupMenuItem;
                 let (open_view, open_path) = (view.clone(), open_path.clone());

@@ -375,6 +375,7 @@ pub(super) fn collect_declarations(node: tree_sitter::Node, text: &str, depth: u
                     depth,
                     label: format!("{short} {name}"),
                     line: child.start_position().row as u32,
+                    end: child.end_position().row as u32,
                 });
                 collect_declarations(child, text, depth + 1, items);
             }

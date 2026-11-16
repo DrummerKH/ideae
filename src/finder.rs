@@ -40,6 +40,8 @@ pub struct OutlineItem {
     pub depth: usize,
     pub label: String,
     pub line: u32,
+    /// The declaration's last line.
+    pub end: u32,
 }
 
 #[derive(Clone)]
