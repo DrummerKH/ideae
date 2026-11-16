@@ -861,7 +861,7 @@ impl Workspace {
                 let stale = t.pr_checked.is_none_or(|at| at.elapsed() >= every || (now && active && at.elapsed() > Duration::from_secs(20)));
                 if stale && (!now || active) {
                     t.pr_checked = Some(std::time::Instant::now());
-                    due.push((t.path.clone(), t.branch.clone()));
+                    due.push((p.path.clone(), t.path.clone(), t.branch.clone()));
                 }
             }
         }
@@ -871,10 +871,27 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let found = cx
                 .background_spawn(crate::procs::on_thread(move || {
-                    due.into_iter().map(|(path, branch)| {
-                        let pr = crate::pr::lookup(&path, &branch);
-                        (path, pr)
-                    }).collect::<Vec<_>>()
+                    // One question to GitHub for a repository's branches, not
+                    // two for each; each on its own where that is not answered.
+                    let mut found = Vec::with_capacity(due.len());
+                    let mut by_repo: Vec<(PathBuf, Vec<(PathBuf, String)>)> = Vec::new();
+                    for (repo, path, branch) in due {
+                        match by_repo.iter_mut().find(|(known, _)| *known == repo) {
+                            Some((_, tasks)) => tasks.push((path, branch)),
+                            None => by_repo.push((repo, vec![(path, branch)])),
+                        }
+                    }
+                    for (repo, tasks) in by_repo {
+                        let branches: Vec<String> = tasks.iter().map(|(_, branch)| branch.clone()).collect();
+                        match crate::pr::lookup_all(&repo, &branches) {
+                            Some(prs) => found.extend(tasks.into_iter().map(|(path, _)| path).zip(prs)),
+                            None => found.extend(tasks.into_iter().map(|(path, branch)| {
+                                let pr = crate::pr::lookup(&path, &branch);
+                                (path, pr)
+                            })),
+                        }
+                    }
+                    found
                 }))
                 .await;
             let _ = this.update(cx, |this, cx| {

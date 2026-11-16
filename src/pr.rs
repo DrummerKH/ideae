@@ -67,6 +67,59 @@ pub fn lookup(root: &Path, branch: &str) -> Option<Pr> {
     Some(pr)
 }
 
+/// What `lookup` tells of a PR, asked for many branches at once.
+const PR_FIELDS: &str = "nodes{number url state isDraft \
+commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{__typename ... on CheckRun{status conclusion} ... on StatusContext{state}}}}}}} \
+reviewThreads(first:100){nodes{isResolved}} reviews(last:50){nodes{state body}}}";
+
+/// The most branches one query asks about.
+const BRANCHES_A_QUERY: usize = 20;
+
+/// The PR of each of `branches`, in their order, with one question to
+/// GitHub for all of them where `lookup` is two a branch. None when gh
+/// did not answer (no gh, no login, no GitHub remote): then nothing is known.
+pub fn lookup_all(root: &Path, branches: &[String]) -> Option<Vec<Option<Pr>>> {
+    let mut found = Vec::with_capacity(branches.len());
+    for chunk in branches.chunks(BRANCHES_A_QUERY) {
+        let asked: String = chunk
+            .iter()
+            .enumerate()
+            // A name no branch has asks about none, and keeps the place.
+            .map(|(i, branch)| {
+                let name = if branch.is_empty() || branch.starts_with('(') { "\"\"".to_string() } else { serde_json::to_string(branch).unwrap_or_default() };
+                format!("b{i}:pullRequests(headRefName:{name},first:1,orderBy:{{field:CREATED_AT,direction:DESC}}){{{PR_FIELDS}}} ")
+            })
+            .collect();
+        let query = format!("query($owner:String!,$name:String!){{repository(owner:$owner,name:$name){{{asked}}}}}");
+        let out = crate::procs::command("gh")
+            .current_dir(root)
+            .env("GH_PROMPT_DISABLED", "1")
+            // gh puts the repository of this directory in their place.
+            .args(["api", "graphql", "-F", "owner={owner}", "-F", "name={repo}", "-f", &format!("query={query}")])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let answer: Value = serde_json::from_slice(&out.stdout).ok()?;
+        let repository = answer["data"]["repository"].as_object()?;
+        found.extend((0..chunk.len()).map(|i| parse_listed(&repository.get(&format!("b{i}"))?["nodes"][0])));
+    }
+    Some(found)
+}
+
+/// A PR as `lookup_all` is told of it.
+fn parse_listed(v: &Value) -> Option<Pr> {
+    let mut pr = parse(v)?;
+    pr.checks = checks(&v["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"]);
+    if matches!(pr.state, PrState::Open | PrState::Draft) {
+        let open = |thread: &&Value| thread["isResolved"].as_bool() != Some(true);
+        let asks = |review: &&Value| !review["body"].as_str().unwrap_or_default().trim().is_empty() && matches!(review["state"].as_str(), Some("CHANGES_REQUESTED" | "COMMENTED"));
+        pr.open_feedback = v["reviewThreads"]["nodes"].as_array().into_iter().flatten().filter(open).count() + v["reviews"]["nodes"].as_array().into_iter().flatten().filter(asks).count();
+    }
+    Some(pr)
+}
+
 /// One review thread: where it is and what was said in it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Thread {
@@ -228,6 +281,39 @@ mod tests {
         let merged = r#"{"number":67,"url":"u","state":"MERGED","isDraft":false,"statusCheckRollup":[{"state":"SUCCESS"}]}"#;
         assert_eq!((pr(merged).state, pr(merged).checks), (PrState::Merged, Checks::Passed));
         assert_eq!(pr(merged).label(), "#67 merged");
+    }
+
+    #[test]
+    fn a_pr_asked_for_among_many() {
+        let v: serde_json::Value = serde_json::from_str(r#"{"number":7,"url":"https://github.com/o/r/pull/7","state":"OPEN","isDraft":false,
+            "commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[
+                {"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"},{"__typename":"StatusContext","state":"PENDING"}]}}}}]},
+            "reviewThreads":{"nodes":[{"isResolved":true},{"isResolved":false}]},
+            "reviews":{"nodes":[{"state":"APPROVED","body":"lgtm"},{"state":"COMMENTED","body":" "},{"state":"CHANGES_REQUESTED","body":"tests"}]}}"#).unwrap();
+        let pr = super::parse_listed(&v).unwrap();
+        assert_eq!((pr.number, pr.state, pr.checks, pr.open_feedback), (7, PrState::Open, Checks::Pending, 2));
+        // No checks at all, and no PR of the branch.
+        let bare: serde_json::Value = serde_json::from_str(r#"{"number":8,"url":"u","state":"MERGED","isDraft":false,"commits":{"nodes":[{"commit":{"statusCheckRollup":null}}]}}"#).unwrap();
+        assert_eq!(super::parse_listed(&bare).map(|pr| (pr.state, pr.checks)), Some((PrState::Merged, Checks::None)));
+        assert!(super::parse_listed(&serde_json::Value::Null).is_none());
+    }
+
+    /// Needs gh, a login and the network, in a clone of a GitHub repository
+    /// (`IDEAE_PR_ROOT`, of its branches `IDEAE_PR_BRANCHES`, comma-separated):
+    /// `cargo test live_lookup_all -- --ignored --nocapture`. Each PR it
+    /// finds is told as `lookup` tells it.
+    #[test]
+    #[ignore]
+    fn live_lookup_all() {
+        let root = std::env::var("IDEAE_PR_ROOT").unwrap_or_else(|_| ".".into());
+        let root = std::path::Path::new(&root);
+        let branches: Vec<String> = std::env::var("IDEAE_PR_BRANCHES").unwrap_or_else(|_| "main".into()).split(',').map(str::to_string).collect();
+        let all = super::lookup_all(root, &branches).expect("gh answered");
+        assert_eq!(all.len(), branches.len());
+        for (branch, pr) in branches.iter().zip(&all) {
+            println!("{branch}: {pr:?}");
+            assert_eq!(*pr, super::lookup(root, branch), "{branch}");
+        }
     }
 
     /// Needs gh and the network: `cargo test live_feedback -- --ignored --nocapture`.
