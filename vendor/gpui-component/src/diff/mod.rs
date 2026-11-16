@@ -532,6 +532,7 @@ fn render_diff(
         mode,
         content_width,
         column_width,
+        viewport_width: state.viewport().width,
         font_size,
         row_height,
         gutter_width,
@@ -802,6 +803,7 @@ struct CodePresentation {
     mode: DiffMode,
     content_width: Pixels,
     column_width: Pixels,
+    viewport_width: Pixels,
     font_size: Pixels,
     row_height: Pixels,
     gutter_width: Pixels,
@@ -1885,9 +1887,13 @@ fn annotation_elements(
             // ideae patch: the row of a change's own buttons is no note to
             // read: it takes the height of its buttons and no frame.
             let slim = matches!(&annotation.id, ElementId::NamedInteger(name, _) if name.as_ref() == "hunk");
+            // Nor is it as wide as the longest line, which would put its
+            // buttons out of view: as wide as the column's share of the view.
+            let in_view = code.viewport_width / if code.mode == DiffMode::Split { 2. } else { 1. };
             div()
                 .id(annotation.id.clone())
                 .w_full()
+                .when(slim && in_view > px(0.), |row| row.max_w(in_view))
                 .px_3()
                 .when(!slim, |row| {
                     row.py_3()
