@@ -428,16 +428,22 @@ impl TaskView {
 
         let (refresh_tx, refresh_rx) = async_channel::unbounded::<()>();
         let watch_tx = refresh_tx.clone();
+        let filter: Arc<std::sync::RwLock<WatchFilter>> = Arc::default();
+        let event_filter = filter.clone();
         let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
             if let Ok(event) = event {
-                if !matches!(event.kind, notify::EventKind::Access(_)) {
+                let wanted = !whole_trees() || event.paths.is_empty() || {
+                    let filter = event_filter.read().unwrap();
+                    event.paths.iter().any(|path| filter.lets_through(path))
+                };
+                if wanted && !matches!(event.kind, notify::EventKind::Access(_)) {
                     let _ = watch_tx.try_send(());
                 }
             }
         })
         .inspect_err(|e| eprintln!("file watcher off, polling only: {e}"))
         .ok();
-        let watching = Arc::new(std::sync::Mutex::new(Watching { watcher, watched: Default::default() }));
+        let watching = Arc::new(std::sync::Mutex::new(Watching::new(watcher, filter)));
         let poll_watching = watching.clone();
         // Fallback for anything the watcher misses (new directories, remotes).
         // Out of view a task is looked at once a minute: every open task pays
