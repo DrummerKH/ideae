@@ -41,7 +41,14 @@ pub struct HistoryView {
     /// A commit shown from elsewhere that the list does not reach: put back
     /// when the list is read again while it is the one looked at.
     brought: Option<git::Commit>,
+    /// The message of the commit shown past its first line, by its hash,
+    /// and whether all of it is shown.
+    body: Option<(String, Rc<Vec<SharedString>>)>,
+    body_open: bool,
 }
+
+/// Lines of a long message shown before "Show all".
+const BODY_LINES: usize = 4;
 
 /// The whole history: `git log` of 6k commits takes 30 ms and the list is
 /// virtualized. The cap only guards against giant monorepos.
@@ -71,6 +78,8 @@ impl HistoryView {
             _load: Task::ready(()),
             _show: Task::ready(()),
             brought: None,
+            body: None,
+            body_open: false,
         }
     }
 
@@ -147,14 +156,21 @@ impl HistoryView {
         let (root, hash) = (self.root.clone(), commit.hash.clone());
         self._show = cx.spawn(async move |this, cx| {
             let (files, lines) = cx
-                .background_spawn(async move {
-                    let patch = git::commit_patch(&root, &hash);
-                    (crate::task::with_languages(DiffFile::parse(&patch).unwrap_or_default()), git::first_changed_lines(&patch))
+                .background_spawn({
+                    let hash = hash.clone();
+                    async move {
+                        let patch = git::commit_patch(&root, &hash);
+                        let body: Vec<SharedString> = git::commit_body(&root, &hash).lines().map(|l| SharedString::from(l.to_string())).collect();
+                        (crate::task::with_languages(DiffFile::parse(&patch).unwrap_or_default()), (git::first_changed_lines(&patch), body))
+                    }
                 })
                 .await;
+            let (lines, body) = lines;
             let lines = Rc::new(lines);
             let _ = this.update(cx, |this, cx| {
                 this.first_lines = lines;
+                this.body = Some((hash, Rc::new(body)));
+                this.body_open = false;
                 this.diff.update(cx, |d, cx| d.set_files(files, cx));
             });
         });
@@ -344,6 +360,49 @@ impl HistoryView {
     }
 }
 
+impl HistoryView {
+    /// The message past its subject: the first lines, and all of them on
+    /// asking, scrolled within a part of the height.
+    fn render_body(&self, hash: &str, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (_, body) = self.body.as_ref().filter(|(h, _)| h == hash)?;
+        if body.iter().all(|l| l.trim().is_empty()) {
+            return None;
+        }
+        let long = body.len() > BODY_LINES;
+        let open = self.body_open;
+        let shown = if long && !open { &body[..BODY_LINES] } else { &body[..] };
+        let muted = cx.theme().muted_foreground;
+        Some(
+            v_flex()
+                .pt_1()
+                .child(
+                    div()
+                        .id("commit-body")
+                        .when(open, |d| d.max_h(window.viewport_size().height * 0.4).overflow_y_scroll())
+                        .text_sm()
+                        .text_color(cx.theme().foreground.opacity(0.85))
+                        .children(shown.iter().map(|line| if line.trim().is_empty() { div().h_2().into_any_element() } else { div().child(line.clone()).into_any_element() })),
+                )
+                .when(long, |this| {
+                    this.child(
+                        div()
+                            .id("commit-body-more")
+                            .text_xs()
+                            .text_color(muted)
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(cx.theme().foreground))
+                            .child(if open { "Show less".to_string() } else { format!("Show all · {} lines", body.len()) })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.body_open = !this.body_open;
+                                cx.notify();
+                            })),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+}
+
 impl Render for HistoryView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.stale {
@@ -370,6 +429,7 @@ impl Render for HistoryView {
                                 .border_b_1()
                                 .border_color(cx.theme().border)
                                 .child(div().font_semibold().child(c.subject.clone()))
+                                .children(self.render_body(&c.hash, window, cx))
                                 .child(
                                     h_flex()
                                         .gap_2()

@@ -963,6 +963,11 @@ pub fn history(root: &Path, limit: usize, query: &HistoryQuery) -> Vec<Commit> {
 }
 
 /// The patch a commit introduced, against its first parent.
+/// A commit's message past its subject, trailing blank lines left out.
+pub fn commit_body(root: &Path, hash: &str) -> String {
+    git(root, &["show", "-s", "--format=%b", hash, "--"]).map(|b| b.trim_end().to_string()).unwrap_or_default()
+}
+
 pub fn commit_patch(root: &Path, hash: &str) -> String {
     let mut args = vec!["show", "--format=", "--patch", "--first-parent", "-m"];
     args.extend_from_slice(DIFF_ARGS);
