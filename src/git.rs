@@ -1,7 +1,8 @@
 use std::{
     path::{Path, PathBuf},
-    process::Command,
 };
+#[cfg(test)]
+use std::process::Command;
 
 pub struct Worktree {
     pub path: PathBuf,
@@ -47,6 +48,9 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
     // file watcher would see our own refresh and refresh again forever.
     let output = crate::procs::command("git")
         .env("GIT_OPTIONAL_LOCKS", "0")
+        // Names as they are: quoted ("b/\303\251.rs") they are not the
+        // names the rest of the app knows the files by.
+        .args(["-c", "core.quotePath=false"])
         .arg("-C")
         .arg(root)
         .args(args)
@@ -56,7 +60,9 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
     if !output.status.success() && output.status.code() != Some(1) {
         return None;
     }
-    String::from_utf8(output.stdout).ok()
+    // One file in Latin-1 is no reason to show nothing of all the others:
+    // what is not UTF-8 shows as U+FFFD.
+    Some(String::from_utf8(output.stdout).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
 }
 
 /// Every worktree of the repository containing `path`, main one first.
@@ -96,6 +102,10 @@ const DIFF_ARGS: &[&str] = &[
     "--find-renames",
     "--src-prefix=a/",
     "--dst-prefix=b/",
+    // Whatever the user's own git is set to show: the patch is parsed, and
+    // its changes are applied back one at a time.
+    "--unified=3",
+    "--submodule=short",
 ];
 
 /// Uncommitted changes against HEAD, untracked files included, as one patch.
@@ -249,7 +259,8 @@ pub fn hunks(patch: &str) -> Vec<Hunk> {
     let mut open: Option<(u32, u32, Vec<&str>)> = None;
     let mut close = |open: &mut Option<(u32, u32, Vec<&str>)>, header: &str, path: &str, whole_file: bool| {
         let Some((old, new, lines)) = open.take() else { return };
-        if whole_file || path.is_empty() {
+        // Nor what was not UTF-8 and is shown with U+FFFD: it would not apply.
+        if whole_file || path.is_empty() || lines.iter().any(|line| line.contains('\u{FFFD}')) {
             return;
         }
         let changed = |line: &str| line.starts_with(['+', '-']);
@@ -306,13 +317,20 @@ pub fn hunks(patch: &str) -> Vec<Hunk> {
         } else if let Some((_, _, lines)) = open.as_mut() {
             lines.push(line);
         } else {
-            if line.starts_with("--- /dev/null") || line.starts_with("+++ /dev/null") || line.starts_with("Binary files") {
+            // A submodule's commit is no line to take back either.
+            let submodule = line.strip_prefix("index ").is_some_and(|index| index.trim_end().ends_with(" 160000"));
+            if line.starts_with("--- /dev/null") || line.starts_with("+++ /dev/null") || line.starts_with("Binary files") || submodule {
                 whole_file = true;
             }
             if let Some(name) = line.strip_prefix("+++ b/") {
                 path = name.trim_end().to_string();
+                // The header a change is applied with is of the file as it is
+                // named now, and of nothing else: with the one git gave, taking
+                // one line back would also take back a rename or a mode.
+                header = format!("diff --git a/{path} b/{path}\n--- a/{name}+++ b/{name}");
+            } else {
+                header.push_str(line);
             }
-            header.push_str(line);
         }
     }
     close(&mut open, &header, &path, whole_file);
@@ -323,8 +341,17 @@ pub fn hunks(patch: &str) -> Vec<Hunk> {
 /// change is looked up in what the index has now, so that others of its
 /// file staged before it are no obstacle.
 pub fn stage_change(root: &Path, change: &Hunk, stage: bool) -> Result<String, String> {
-    let against = if stage { git(root, &["diff", "--", &change.path]) } else { git(root, &["diff", "--cached", "--", &change.path]) };
-    let now = hunks(&against.unwrap_or_default()).into_iter().find(|hunk| hunk.changes == change.changes).ok_or("the change is no longer there")?;
+    // The whole of what is staged, not the file's alone: a renamed file
+    // would be a new one there, with no change to take out.
+    let mut args = if stage { vec!["diff"] } else { vec!["diff", "--cached"] };
+    args.extend_from_slice(DIFF_ARGS);
+    if stage {
+        args.extend(["--", change.path.as_str()]);
+    }
+    let now = hunks(&git(root, &args).unwrap_or_default())
+        .into_iter()
+        .find(|hunk| hunk.path == change.path && hunk.changes == change.changes)
+        .ok_or("the change is no longer there")?;
     if stage { apply_hunk(root, &now.stage(), false, true) } else { apply_hunk(root, &now.patch(), true, true) }
 }
 
@@ -364,7 +391,8 @@ pub fn first_changed_lines(patch: &str) -> std::collections::HashMap<String, u32
     let mut current: Option<String> = None;
     for line in patch.lines() {
         if let Some(path) = line.strip_prefix("+++ ") {
-            current = path.strip_prefix("b/").map(str::to_string);
+            // Git ends a name that has a space in it with a tab.
+            current = path.strip_prefix("b/").map(|path| path.trim_end_matches('\t').to_string());
         } else if line.starts_with("@@ ") {
             if let Some(path) = current.take() {
                 let start = line
@@ -456,6 +484,10 @@ fn parse_status(out: &str) -> Status {
                 }
             }
         } else if let Some(path) = entry.strip_prefix("? ") {
+            // A directory, when it holds a repository of its own: no file of this one.
+            if path.ends_with('/') {
+                continue;
+            }
             status.states.insert(path.to_string(), FileState { staged: false, unstaged: true });
             status.untracked.push(path.to_string());
         } else {
@@ -578,6 +610,9 @@ pub struct Refreshed {
     pub base: Option<String>,
     /// None when they are the ones of the refresh before.
     pub patches: Option<Patches>,
+    /// Git did not answer (no repository any more, no git): nothing here
+    /// is to be believed, and what was read before stays.
+    pub failed: bool,
     /// Work put away, the latest first.
     pub stashes: Vec<Stash>,
 }
@@ -654,6 +689,8 @@ pub fn refresh(root: &Path, picked: Option<String>, light: bool, known: &mut Kno
     use std::hash::{Hash as _, Hasher as _};
     known.fresh(root);
     let raw = git(root, &light_args(light, &["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"])).unwrap_or_default();
+    // A status has its branch lines at the least.
+    let failed = raw.is_empty();
     let Status { mut info, oid, states, untracked, changed } = parse_status(&raw);
 
     // Every file: the tracked ones and, from the status, those that are new.
@@ -726,7 +763,11 @@ pub fn refresh(root: &Path, picked: Option<String>, light: bool, known: &mut Kno
     }
     let stashes = known.stashes.1.clone();
     if known.patches == Some(made_of) {
-        return Refreshed { files, watch, info, states, base, patches: None, stashes };
+        // As found when the patches were made: nothing it depends on has moved.
+        if info.upstream.is_some() && info.behind > 0 {
+            info.pull_conflicts = known.pull.1.clone();
+        }
+        return Refreshed { files, watch, info, states, base, patches: None, stashes, failed };
     }
     known.patches = Some(made_of);
 
@@ -748,8 +789,8 @@ pub fn refresh(root: &Path, picked: Option<String>, light: bool, known: &mut Kno
         }
         info.pull_conflicts = known.pull.1.clone();
     }
-    let staged = if states.values().any(|state| state.staged) { git(root, &["diff", "--cached"]).unwrap_or_default() } else { String::new() };
-    Refreshed { files, watch, info, states, base, patches: Some(Patches { working, branch, staged }), stashes }
+    let staged = if states.values().any(|state| state.staged) { git(root, &[&["diff", "--cached"][..], DIFF_ARGS].concat()).unwrap_or_default() } else { String::new() };
+    Refreshed { files, watch, info, states, base, patches: Some(Patches { working, branch, staged }), stashes, failed }
 }
 
 /// The most changed files `git diff` is told by name. More, and naming
@@ -1257,13 +1298,10 @@ pub fn pull_conflicts(root: &Path) -> Option<Vec<String>> {
 /// The same for any commit taken into the worktree; `base` is what both
 /// sides are compared with when it is not their common ancestor.
 fn merge_conflicts(root: &Path, base: Option<&str>, theirs: &str) -> Option<Vec<String>> {
-    // A commit of the worktree as it is, kept nowhere; nothing when it is clean.
-    // Git refuses to make one of some states of the index: then it is not known.
-    let made = crate::procs::command("git").current_dir(root).args(["stash", "create"]).output().ok().filter(|made| made.status.success())?;
-    let written = String::from_utf8_lossy(&made.stdout).trim().to_string();
-    let mine = if written.is_empty() { "HEAD" } else { written.as_str() };
+    let written = worktree_commit(root)?;
+    let mine = written.as_str();
     let mut merge = crate::procs::command("git");
-    merge.current_dir(root).args(["merge-tree", "--write-tree", "--name-only", "--no-messages"]);
+    merge.current_dir(root).args(["-c", "core.quotePath=false", "merge-tree", "--write-tree", "--name-only", "--no-messages"]);
     if let Some(base) = base {
         merge.args(["--merge-base", base]);
     }
@@ -1276,6 +1314,39 @@ fn merge_conflicts(root: &Path, base: Option<&str>, theirs: &str) -> Option<Vec<
     }
 }
 
+/// A commit of the worktree as it is, kept nowhere: HEAD when it is clean.
+/// Made in an index of its own, a copy of the repository's: `git stash
+/// create` takes the index's lock and writes the index, which fails an
+/// agent's `git add` at that moment and has every watcher look again.
+fn worktree_commit(root: &Path) -> Option<String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let git_dir = PathBuf::from(git(root, &["rev-parse", "--absolute-git-dir"])?.trim());
+    let index = std::env::temp_dir().join(format!("ideae-index-{}-{}", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    std::fs::copy(git_dir.join("index"), &index).ok()?;
+    let run = |args: &[&str]| {
+        let done = crate::procs::command("git")
+            .current_dir(root)
+            .env("GIT_INDEX_FILE", &index)
+            // Whoever the user is to git, or nobody: the commit is shown to no one.
+            .envs([("GIT_AUTHOR_NAME", "ideae"), ("GIT_AUTHOR_EMAIL", "ideae@localhost"), ("GIT_COMMITTER_NAME", "ideae"), ("GIT_COMMITTER_EMAIL", "ideae@localhost")])
+            .args(args)
+            .output()
+            .ok()
+            .filter(|done| done.status.success())?;
+        Some(String::from_utf8_lossy(&done.stdout).trim().to_string())
+    };
+    let made = (|| {
+        run(&["add", "-u"])?;
+        let tree = run(&["write-tree"])?;
+        if run(&["rev-parse", "HEAD^{tree}"])? == tree {
+            return Some("HEAD".to_string());
+        }
+        run(&["commit-tree", &tree, "-p", "HEAD", "-m", "worktree"])
+    })();
+    let _ = std::fs::remove_file(&index);
+    made
+}
+
 /// The files of a patch that have a conflict left in them, as markers at
 /// the start of added lines, and the line of the first.
 pub fn conflict_marked(patch: &str) -> Vec<(String, u32)> {
@@ -1285,7 +1356,7 @@ pub fn conflict_marked(patch: &str) -> Vec<(String, u32)> {
         if text.starts_with("diff --git ") {
             (path, opened) = (String::new(), None);
         } else if let Some(name) = text.strip_prefix("+++ b/") {
-            path = name.to_string();
+            path = name.trim_end_matches('\t').to_string();
         } else if let Some(at) = text.strip_prefix("@@ -") {
             line = at.split(" +").nth(1).and_then(|new| new.split([',', ' ']).next()).and_then(|n| n.parse().ok()).unwrap_or(0);
         } else if text.starts_with('+') {
@@ -1766,7 +1837,7 @@ pub fn branches(root: &Path) -> Vec<String> {
 }
 
 fn git_status(root: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
+    let output = crate::procs::command("git")
         .env("GIT_TERMINAL_PROMPT", "0")
         .arg("-C")
         .arg(root)
@@ -2332,5 +2403,99 @@ mod blame_tests {
         assert!(std::sync::Arc::ptr_eq(lines[0].as_ref().unwrap(), lines[2].as_ref().unwrap()));
         assert!(lines[0].as_ref().unwrap().time > 0 && lines[1].as_ref().unwrap().hash.len() == 40);
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod edge_tests {
+    use super::*;
+
+    fn sh(dir: &Path, script: &str) {
+        let ok = Command::new("bash").arg("-ec").arg(script).current_dir(dir).status().unwrap().success();
+        assert!(ok, "{script}");
+    }
+
+    fn out(dir: &Path, script: &str) -> String {
+        String::from_utf8_lossy(&Command::new("bash").arg("-ec").arg(script).current_dir(dir).output().unwrap().stdout).into_owned()
+    }
+
+    fn repo(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ideae-edge-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        sh(&dir, "git init -q -b main .; git config user.email t@t; git config user.name t");
+        dir.canonicalize().unwrap()
+    }
+
+    /// One change of a file that is also renamed and made executable is
+    /// taken back, staged and unstaged alone: the name and the mode stay.
+    #[test]
+    fn a_change_of_a_renamed_file_alone() {
+        let dir = repo("rename");
+        sh(&dir, "seq 1 30 > old.txt; git add old.txt; git commit -qm base
+            git mv old.txt new.txt; chmod +x new.txt; sed -i.bak -e 's/^2$/two/' -e 's/^28$/twenty-eight/' new.txt; rm new.txt.bak");
+        let found = hunks(&working_patch(&dir));
+        assert_eq!(found.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(), ["new.txt", "new.txt"]);
+        apply_hunk(&dir, &found[0].patch(), true, false).unwrap();
+        assert!(!dir.join("old.txt").exists(), "the rename is not taken back with the line");
+        assert_eq!(out(&dir, "sed -n 2p new.txt; test -x new.txt && echo x").trim(), "2\nx", "the line is, the mode is not");
+        // The other one into the index and out again, the file there under its new name.
+        let left = hunks(&working_patch(&dir));
+        stage_change(&dir, &left[0], true).unwrap();
+        assert!(out(&dir, "git diff --cached").contains("+twenty-eight"));
+        stage_change(&dir, &left[0], false).unwrap();
+        assert!(!out(&dir, "git diff --cached").contains("+twenty-eight") && out(&dir, "git status --short").starts_with("R"), "unstaged, still renamed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Names git would quote, a file that is not UTF-8, a repository of its
+    /// own in a directory, and a user whose git shows diffs their own way.
+    #[test]
+    fn names_encodings_and_the_users_own_git_settings() {
+        let dir = repo("names");
+        sh(&dir, "seq 1 9 > 'é.rs'; seq 1 9 > 'sp ace.rs'; seq 1 9 > ok.txt; printf 'caf\\xe9\\nline\\n' > latin.txt; git add .; git commit -qm base
+            for f in 'é.rs' 'sp ace.rs' ok.txt; do sed -i.bak 's/^5$/five/' \"$f\"; rm \"$f.bak\"; done; printf 'caf\\xe9\\nmore\\n' > latin.txt
+            mkdir nested; git init -q nested; echo x > nested/x.txt
+            git config diff.noprefix true; git config diff.mnemonicPrefix true; git config color.ui always; git config diff.context 0");
+        let read = refresh(&dir, None, false, &mut Known::default());
+        assert!(!read.files.iter().any(|file| file.starts_with("nested")), "another repository's directory is no file of this one");
+        let patches = read.patches.unwrap();
+        // The Latin-1 file is shown, lossy, and the others with it.
+        for name in ["é.rs", "sp ace.rs", "ok.txt", "latin.txt"] {
+            assert!(patches.working.contains(&format!("+++ b/{name}")), "{name} in the patch");
+        }
+        let found = hunks(&patches.working);
+        let mut paths: Vec<&str> = found.iter().map(|h| h.path.as_str()).collect();
+        paths.sort();
+        assert_eq!(paths, ["ok.txt", "sp ace.rs", "é.rs"], "a change of each, none of the file that would not apply");
+        let lines = first_changed_lines(&patches.working);
+        assert!(lines.contains_key("é.rs") && lines.contains_key("sp ace.rs"), "{lines:?}");
+        for hunk in &found {
+            stage_change(&dir, hunk, true).unwrap_or_else(|e| panic!("staging {}: {e}", hunk.path));
+        }
+        let staged = hunks(&refresh(&dir, None, false, &mut Known::default()).patches.unwrap().staged);
+        assert_eq!(staged.len(), 3, "and found staged, whatever prefixes and colours the user's git has");
+        stage_change(&dir, &found[0], false).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The commit a pull is tried against leaves the repository's index
+    /// alone, and is made while something else holds its lock.
+    #[test]
+    fn the_worktree_is_committed_without_touching_the_index() {
+        let dir = repo("index");
+        sh(&dir, "echo one > f.txt; git add f.txt; git commit -qm base");
+        assert_eq!(worktree_commit(&dir).as_deref(), Some("HEAD"), "clean");
+        sh(&dir, "echo two >> f.txt; echo new > staged.txt; git add staged.txt; echo untracked > u.txt");
+        let index = dir.join(".git/index");
+        let before = (stamp(&index), std::fs::read(&index).unwrap());
+        std::fs::write(dir.join(".git/index.lock"), "").unwrap();
+        let made = worktree_commit(&dir).expect("made with the index locked");
+        std::fs::remove_file(dir.join(".git/index.lock")).unwrap();
+        assert!(before == (stamp(&index), std::fs::read(&index).unwrap()), "the index is as it was");
+        assert_eq!(out(&dir, &format!("git ls-tree -r --name-only {made}")).lines().collect::<Vec<_>>(), ["f.txt", "staged.txt"], "what is tracked, as on disk");
+        assert_eq!(out(&dir, &format!("git show {made}:f.txt")), "one\ntwo\n");
+        assert!(out(&dir, "git stash list").is_empty() && out(&dir, "git status --short").contains("A  staged.txt"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

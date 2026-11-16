@@ -983,10 +983,15 @@ impl FileView {
     }
 
     fn go_to_line(&mut self, line: u32, col: u32, window: &mut Window, cx: &mut Context<Self>) {
+        self.jump(line, col, window, cx);
+        self.editor.read(cx).focus_handle(cx).focus(window, cx);
+    }
+
+    /// As `go_to_line`, the keyboard left where it is.
+    fn jump(&mut self, line: u32, col: u32, window: &mut Window, cx: &mut Context<Self>) {
         self.editor.update(cx, |state, cx| {
             state.jump_to_position(Position::new(line, col), JUMP_AT, window, cx);
         });
-        self.editor.read(cx).focus_handle(cx).focus(window, cx);
     }
 }
 
@@ -1401,6 +1406,8 @@ pub struct ChangesView {
     /// The text of the last selection: a click in the context menu clears
     /// the selection before its action runs.
     selected_code: String,
+    /// Each shown file's part of the patch, hashed: what the selection was made in.
+    shown_keys: Rc<HashMap<String, u64>>,
 }
 
 /// Lists the repository's branches, newest first, into `known`.
@@ -1440,6 +1447,7 @@ impl ChangesView {
             task,
             review: Vec::new(),
             selected_code: String::new(),
+            shown_keys: Rc::default(),
             branches,
             hunks: Rc::default(),
             staged: Rc::default(),
@@ -1560,7 +1568,12 @@ impl ChangesView {
         }
         self.review.clear();
         cx.notify();
-        let _ = self.task.update(cx, |t, cx| t.paste_to_agent(message, window, cx));
+        // Once this view's own update is over: the task may show this view
+        // a newer diff on the way, which reads it.
+        let task = self.task.clone();
+        window.defer(cx, move |window, cx| {
+            let _ = task.update(cx, |t, cx| t.paste_to_agent(message, window, cx));
+        });
     }
 
     fn render_review(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -1628,7 +1641,10 @@ impl ChangesView {
     /// The lines selected by their numbers, to the agent with their location.
     fn send_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((location, code, language)) = self.selected(cx) else { return };
-        let _ = self.task.update(cx, |t, cx| t.send_to_agent(location, code, language, window, cx));
+        let task = self.task.clone();
+        window.defer(cx, move |window, cx| {
+            let _ = task.update(cx, |t, cx| t.send_to_agent(location, code, language, window, cx));
+        });
     }
 
     fn set_scope(&mut self, scope: DiffScope, cx: &mut Context<Self>) {
@@ -1654,7 +1670,10 @@ impl ChangesView {
         let Some(range) = self.selection.clone() else { return };
         let path = self.root.join(range.path().as_ref());
         let line = range.start().saturating_sub(1) as u32;
-        let _ = self.task.update(cx, |task, cx| task.open_file(path, line, window, cx));
+        let task = self.task.clone();
+        window.defer(cx, move |window, cx| {
+            let _ = task.update(cx, |task, cx| task.open_file(path, line, window, cx));
+        });
     }
 }
 
@@ -1871,19 +1890,19 @@ impl Render for ChangesView {
                                 }
                             })
                             .on_line_click({
-                                let view = cx.weak_entity();
+                                let (root, task) = (self.root.clone(), self.task.clone());
                                 move |position, event, window, cx| {
                                     // Ctrl+click opens; a plain click stays in the review.
                                     if !event.modifiers().secondary(cx) {
                                         return;
                                     }
-                                    let path = position.path().clone();
+                                    let path = root.join(position.path().as_ref());
                                     let line = position.line().saturating_sub(1) as u32;
-                                    let _ = view.update(cx, |this, cx| {
-                                        let path = this.root.join(path.as_ref());
-                                        let _ = this.task.update(cx, |task, cx| {
-                                            task.open_file(path, line, window, cx)
-                                        });
+                                    let task = task.clone();
+                                    // After the click is done with the diff, which
+                                    // opening the file may give other files.
+                                    window.defer(cx, move |window, cx| {
+                                        let _ = task.update(cx, |task, cx| task.open_file(path, line, window, cx));
                                     });
                                 }
                             })
@@ -2278,7 +2297,7 @@ impl TaskView {
                         (read, patch, branch, shared, staged, changed_on_disk(open_known), seen, known)
                     })
                     .await;
-                let git::Refreshed { files, info, states, base, stashes, .. } = read;
+                let git::Refreshed { files, info, states, base, stashes, failed, .. } = read;
                 known = now_known;
                 seen = now_seen;
                 let applied = this.update_in(cx, |this, window, cx| {
@@ -2286,6 +2305,11 @@ impl TaskView {
                         if let Some(change) = change {
                             let _ = file.update(cx, |f, cx| f.apply_disk(change, window, cx));
                         }
+                    }
+                    // Git did not answer: what was read before stays, rather
+                    // than an empty tree and no changes in its place.
+                    if failed {
+                        return;
                     }
                     if this.file_states != states {
                         this.file_states = states;
@@ -2584,6 +2608,7 @@ impl TaskView {
         self.focus_right = right;
         self.normalize();
         self.sync_visibility(cx);
+        self.show_diff_if_seen(cx);
         self.focus_active(window, cx);
         cx.notify();
     }
@@ -2595,6 +2620,7 @@ impl TaskView {
         }
         self.normalize();
         self.sync_visibility(cx);
+        self.show_diff_if_seen(cx);
         self.focus_active(window, cx);
         cx.notify();
     }
@@ -3633,6 +3659,13 @@ impl TaskView {
     }
 
     fn focus_active(&self, window: &mut Window, cx: &mut Context<Self>) {
+        // A task out of view has nothing the keyboard can go to: asked for
+        // there (a tab restored at the start, a prompt sent as its agent's turn
+        // ends), the focus would leave the task that is typed in for nothing
+        // that is drawn. It takes the focus when it comes into view.
+        if !self.visible {
+            return;
+        }
         match self.focused_ix().and_then(|ix| self.tabs.get(ix)).map(|t| &t.kind) {
             Some(TabKind::Terminal(view)) => {
                 view.read(cx).state.read(cx).focus_handle().clone().focus(window, cx)
@@ -3829,6 +3862,8 @@ impl TaskView {
         }
         self.normalize();
         self.sync_visibility(cx);
+        // The tab that comes to the front may be Changes, with an older diff.
+        self.show_diff_if_seen(cx);
         self.focus_active(window, cx);
         cx.notify();
     }
@@ -3947,6 +3982,13 @@ impl TaskView {
             state.update_files(keyed, cx)
         });
         self.changes.update(cx, |c, cx| {
+            // Lines picked in a file that is another patch now are not those lines any more.
+            let key_of = |keys: &HashMap<String, u64>, range: &DiffLineRange| keys.get(range.path().as_ref()).copied();
+            if c.selection.as_ref().is_some_and(|range| key_of(&c.shown_keys, range) != key_of(&keys, range)) {
+                c.selection = None;
+                c.selected_code.clear();
+            }
+            c.shown_keys = keys;
             c.counts = counts;
             c.first_lines = lines;
             c.hunks = hunks;
@@ -4490,7 +4532,8 @@ impl TaskView {
         }) {
             self.activate(ix, window, cx);
             if let TabKind::File(file) = &self.tabs[ix].kind {
-                file.update(cx, |f, cx| f.go_to_line(line, col, window, cx));
+                let visible = self.visible;
+                file.update(cx, |f, cx| if visible { f.go_to_line(line, col, window, cx) } else { f.jump(line, col, window, cx) });
             }
             return;
         }
@@ -5570,6 +5613,7 @@ impl TaskView {
         if self.busy.is_some() {
             return;
         }
+        self.save_all_now(cx);
         self.busy = Some("Writing the message");
         self.action = None;
         cx.notify();
@@ -5639,6 +5683,9 @@ impl TaskView {
         if self.busy.is_some() {
             return;
         }
+        // On disk before git reads the files: a save still on its way would
+        // be left out of a commit, or come back after a discard.
+        self.save_all_now(cx);
         self.busy = Some(label);
         self.action = None;
         cx.notify();
@@ -5672,6 +5719,7 @@ impl TaskView {
         if self.busy.is_some() {
             return;
         }
+        self.save_all_now(cx);
         self.busy = Some("Rebase");
         self.action = None;
         cx.notify();
@@ -5714,6 +5762,9 @@ impl TaskView {
         if self.busy.is_some() {
             return;
         }
+        // On disk before git reads the files: a save still on its way would
+        // be left out of a commit, or come back after a discard.
+        self.save_all_now(cx);
         self.busy = Some(label);
         self.action = None;
         self.discard_undo = None;
@@ -6877,6 +6928,7 @@ impl TaskView {
         };
         self.structure_file = self.focused_ix().filter(|&ix| matches!(self.tabs[ix].kind, TabKind::File(_))).map(|ix| self.tabs[ix].id);
         self.sync_visibility(cx);
+        self.show_diff_if_seen(cx);
         cx.notify();
     }
 

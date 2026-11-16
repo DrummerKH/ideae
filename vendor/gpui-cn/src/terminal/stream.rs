@@ -141,7 +141,8 @@ impl StreamPeer {
     /// closing; true at once before it has started.
     pub fn wait_for_room(&self) -> bool {
         let sink = self.shared.lock().sink.clone();
-        sink.is_none_or(|sink| sink.wait_for_room())
+        // Not for ever: one terminal that takes nothing must not stop the others.
+        sink.is_none_or(|sink| sink.wait_for_room_at_most(std::time::Duration::from_secs(5)))
     }
 
     /// Reports that the program ended. The terminal shows the status and

@@ -33,13 +33,17 @@ pub struct Daemon {
     pid: std::sync::atomic::AtomicI32,
     writer: Mutex<UnixStream>,
     peers: Mutex<HashMap<String, Peer>>,
+    /// The app told it to end: it is not looked for again, nor started anew.
+    quitting: std::sync::atomic::AtomicBool,
+    /// It went away and did not come back: terminals run in the window.
+    lost: std::sync::atomic::AtomicBool,
 }
 
 static DAEMON: OnceLock<Option<Arc<Daemon>>> = OnceLock::new();
 
 /// The connected daemon, when terminals run there.
 pub fn get() -> Option<Arc<Daemon>> {
-    DAEMON.get().cloned().flatten()
+    DAEMON.get().cloned().flatten().filter(|daemon| !daemon.lost.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Connects, starting the daemon when none runs, and moving its sessions
@@ -47,7 +51,7 @@ pub fn get() -> Option<Arc<Daemon>> {
 /// latest ones the daemon kept go to `on_hook`.
 pub fn connect(on_hook: impl Fn(Hook) + Send + Sync + 'static) -> Option<(Arc<Daemon>, Vec<Hook>)> {
     let (writer, reader, hooks) = dial(true)?;
-    let daemon = Arc::new(Daemon { pid: peer_pid(&writer).into(), writer: Mutex::new(writer), peers: Mutex::default() });
+    let daemon = Arc::new(Daemon { pid: peer_pid(&writer).into(), writer: Mutex::new(writer), peers: Mutex::default(), quitting: Default::default(), lost: Default::default() });
     let reading = daemon.clone();
     std::thread::Builder::new()
         .name("daemon-reader".into())
@@ -57,18 +61,29 @@ pub fn connect(on_hook: impl Fn(Hook) + Send + Sync + 'static) -> Option<(Arc<Da
                 while let Ok(frame) = proto::read_frame(&mut reader) {
                     reading.on_frame(frame, &on_hook);
                 }
+                // Told to end by this window: looking for it again would start
+                // another, and the agents just ended with it.
+                if reading.quitting.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
                 // The daemon went away: handed over to a newer one, or died.
                 // Attach again where it serves now.
                 match dial(false) {
-                    Some((writer, next, _)) => {
+                    Some((writer, next, kept)) => {
                         reading.pid.store(peer_pid(&writer), std::sync::atomic::Ordering::Relaxed);
                         *reading.writer.lock().unwrap() = writer;
                         reader = next;
                         reading.reopen();
+                        // What was reported while nobody listened: a turn's
+                        // end among them, or the task stays "working".
+                        for hook in kept {
+                            on_hook(hook);
+                        }
                     }
                     None => break,
                 }
             }
+            reading.lost.store(true, std::sync::atomic::Ordering::Relaxed);
             for (_, p) in reading.peers.lock().unwrap().drain() {
                 p.peer.output(b"\r\n[ideae: lost the daemon]\r\n");
                 p.peer.exit(ExitStatus::new(None, Some("daemon gone")));
@@ -116,6 +131,10 @@ fn dial(upgrade: bool) -> Option<(UnixStream, UnixStream, Vec<Hook>)> {
                     return Some((writer, reader, hooks));
                 }
                 upgraded = true;
+                // A window that only attaches again ends nobody's daemon.
+                if !upgrade {
+                    return None;
+                }
                 if protocol == proto::PROTOCOL {
                     // Another build: it hands its sessions to one of ours.
                     let exe = crate::desktop::exe().ok()?;
@@ -313,6 +332,7 @@ impl Daemon {
 
     /// Ends every session and the daemon: the app quits for good.
     pub fn shutdown(&self) {
+        self.quitting.store(true, std::sync::atomic::Ordering::Relaxed);
         self.send(proto::encode_msg(&Msg::Shutdown));
     }
 }

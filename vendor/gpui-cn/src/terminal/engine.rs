@@ -367,6 +367,25 @@ impl ByteSink {
         !self.shared.closing.load(Ordering::Acquire)
     }
 
+    /// ideae patch: as `wait_for_room`, but for no longer than `most`:
+    /// true then too. For a source that feeds many terminals from one
+    /// thread, which a terminal that has stopped taking output must not
+    /// hold up for good.
+    pub fn wait_for_room_at_most(&self, most: Duration) -> bool {
+        let until = Instant::now() + most;
+        let mut mail = self.shared.lock();
+        while mail.read_bytes >= READ_QUEUE_BYTES && !self.shared.closing.load(Ordering::Acquire) {
+            let Some(left) = until.checked_duration_since(Instant::now()).filter(|left| !left.is_zero()) else { break };
+            mail = self
+                .shared
+                .room
+                .wait_timeout(mail, left)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+        !self.shared.closing.load(Ordering::Acquire)
+    }
+
     /// The program can take input again after a short
     /// [`ByteHandle::write`]; wakes the engine to write the rest.
     pub fn writable(&self) {

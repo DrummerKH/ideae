@@ -127,6 +127,15 @@ fn chrome() -> Result<Arc<Chrome>> {
     Ok(chrome)
 }
 
+/// Ends Chrome as the app quits: nothing else does where a child is not
+/// told of its parent's end (macOS), and its idle time is a minute.
+pub fn quit() {
+    if let Some(chrome) = CHROME.get().and_then(|slot| slot.lock().ok()?.take()) {
+        PORT.store(0, std::sync::atomic::Ordering::Relaxed);
+        drop(chrome);
+    }
+}
+
 /// The DevTools endpoint for Playwright MCP (`--cdp-endpoint`), once Chrome runs.
 pub fn endpoint() -> Option<String> {
     // Not through `CHROME`: it is locked for as long as Chrome takes to

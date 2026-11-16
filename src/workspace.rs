@@ -307,6 +307,7 @@ impl Workspace {
                     }
                 }
                 crate::procs::end_child_sessions();
+                crate::browser::quit();
                 async {}
             }),
         ];
