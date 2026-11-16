@@ -50,14 +50,29 @@ fn section_header(label: &'static str, cx: &App) -> Div {
 
 /// A ring filled clockwise from the top as far as the context is full:
 /// yellow when it will soon be squeezed, red when that is about to happen.
-fn context_dial(fill: f32, muted: Hsla, cx: &App) -> impl IntoElement {
-    let color = if fill >= 0.9 { gpui_kit::red() } else if fill >= 0.75 { gpui_kit::yellow() } else { cx.theme().primary };
-    dial("context-dial", fill, color, muted)
+fn context_dial(fill: f32, cx: &App) -> impl IntoElement {
+    let color = if fill >= 0.9 { DIAL_RED } else if fill >= 0.75 { DIAL_AMBER } else { DIAL_BLUE };
+    dial("context-dial", fill, color, cx.theme().foreground)
+}
+
+/// Colors that show on a light ground as on a dark one: the theme's
+/// yellow is all but white on white.
+pub(crate) const DIAL_BLUE: Hsla = Hsla { h: 0.58, s: 0.8, l: 0.5, a: 1. };
+pub(crate) const DIAL_AMBER: Hsla = Hsla { h: 0.09, s: 0.95, l: 0.5, a: 1. };
+pub(crate) const DIAL_RED: Hsla = Hsla { h: 0.0, s: 0.8, l: 0.52, a: 1. };
+
+/// Whether a branch is named after the task: its title's words, in
+/// order, begin the branch's (`fix-login-x7k2` for "Fix login").
+fn branch_follows(title: &str, branch: &str) -> bool {
+    let words = |text: &str| text.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect::<Vec<_>>().join("-");
+    let (title, branch) = (words(title), words(branch));
+    !title.is_empty() && branch.starts_with(&title)
 }
 
 /// A ring of 12 px, filled clockwise from the top by `fill` of a turn in
-/// `color`, on a faint whole ring: a share of something, at a glance.
-pub(crate) fn dial(id: &'static str, fill: f32, color: Hsla, muted: Hsla) -> impl IntoElement {
+/// `color`, on a faint whole ring of `ink`: a share of something, at a
+/// glance.
+pub(crate) fn dial(id: &'static str, fill: f32, color: Hsla, ink: Hsla) -> impl IntoElement {
     let dial = canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
@@ -77,8 +92,8 @@ pub(crate) fn dial(id: &'static str, fill: f32, color: Hsla, muted: Hsla) -> imp
                     window.paint_path(path, color);
                 }
             };
-            arc(0., 1., px(1.5), muted.opacity(0.25));
-            arc(0., fill.clamp(0.03, 1.), px(2.), color);
+            arc(0., 1., px(2.), ink.opacity(0.14));
+            arc(0., fill.clamp(0.03, 1.), px(2.5), color);
         },
     );
     div().id(id).test_support().flex_none().size(px(12.)).child(dial.size_full())
@@ -481,18 +496,19 @@ impl Workspace {
             let v = v.read(cx);
             (v.agent_status == AgentStatus::Working).then(|| v.agent_activity.clone()).flatten()
         });
-        let when = ago(t.last_active);
         match activity {
             Some(activity) => details.push(activity),
-            None if !when.is_empty() => details.push(when),
-            None => {}
+            None => details.extend(Some(ago(t.last_active)).filter(|when| !when.is_empty())),
         }
+        // What stays whole at the end of the second line.
+        let mut fixed: Vec<String> = Vec::new();
         if in_active {
             details.push(project.name.clone());
         } else if t.main {
-            details.push(format!("⌂ {}", t.branch));
-        } else if label.as_ref() != t.branch && !listed {
-            details.push(t.branch.clone());
+            fixed.push(format!("⌂ {}", t.branch));
+        } else if !listed && !branch_follows(label.as_ref(), &t.branch) {
+            // A branch named after the task says nothing its title does not.
+            fixed.push(t.branch.clone());
         }
         if let Some(info) = self.variant_info.get(&path).filter(|i| listed && i.files > 0) {
             details.push(format!("+{} −{}", info.additions, info.deletions));
@@ -512,7 +528,7 @@ impl Workspace {
         // How full its agent's context is, once that is worth knowing.
         let fill = self.usage.get(&path).map_or(0., |(_, usage)| usage.fill());
         if t.starred {
-            details.push("★".into());
+            fixed.push("★".into());
         }
         if t.locked.is_some() {
             details.push("locked".into());
@@ -523,6 +539,7 @@ impl Workspace {
         let needs = if in_active { None } else { needs };
         let pr = t.pr.clone().filter(|_| pr_status);
         let overlaps = self.overlaps(project, &path);
+        let whole_branch = t.branch.clone();
 
         let this = cx.weak_entity();
         let (starred, main) = (t.starred, t.main);
@@ -577,7 +594,7 @@ impl Workspace {
             .id(id)
             .pl(if listed { px(26.) } else { px(12.) })
             .pr_3()
-            .py_1()
+            .py_0p5()
             .cursor_pointer()
             .border_l_2()
             .border_color(transparent_black())
@@ -599,13 +616,14 @@ impl Workspace {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .text_sm()
+                            .text_size(px(13.))
+                            .line_height(px(18.))
                             .truncate()
                             .when(!running, |s| s.text_color(muted))
                             .child(label.clone()),
                     )
                     // How full the agent's context is, as a dial.
-                    .when(fill > 0., |s| s.child(context_dial(fill, muted, cx)))
+                    .when(fill > 0., |s| s.child(context_dial(fill, cx)))
                     .when(unpushed > 0, |s| {
                         s.child(
                             div()
@@ -635,13 +653,16 @@ impl Workspace {
                         )
                     }),
             )
-            .when(!details.is_empty() || pr.is_some() || !overlaps.is_empty(), |s| {
+            // Always there, and of one height: the list does not jump as agents start and stop.
+            .map(|s| {
                 s.child(
                     h_flex()
                         .pl(px(18.))
                         .gap_1p5()
                         .min_w_0()
-                        .text_xs()
+                        .h(px(15.))
+                        .text_size(px(11.))
+                        .line_height(px(15.))
                         .when_some(pr, |row, pr| {
                             use crate::pr::{Checks, PrState};
                             let color = match (pr.state, pr.checks) {
@@ -691,9 +712,9 @@ impl Workspace {
                                     }),
                             )
                         })
-                        .when(!details.is_empty(), |row| {
-                            row.child(div().min_w_0().truncate().text_color(muted).child(details.join(" · ")))
-                        }),
+                        // What may be cut off, then what may not.
+                        .child(div().flex_1().min_w_0().truncate().text_color(muted).child(details.join(" · ")))
+                        .when(!fixed.is_empty(), |row| row.child(div().flex_none().max_w(relative(0.6)).truncate().text_color(muted).child(fixed.join(" · ")))),
                 )
             })
             .when_some(needs, |s, message| {
@@ -726,18 +747,34 @@ impl Workspace {
         }
         // Under the row, how full the agent's context is: yellow when it
         // will soon be squeezed, red when that is about to happen.
-        // What the agent has used, in words, when the pointer rests on the task.
+        // What the row leaves out, when the pointer rests on the task: its
+        // branch, and what its agent has used.
+        let mut told = format!("⎇ {whole_branch}");
         if let Some((_, usage)) = self.usage.get(&path).filter(|(_, usage)| usage.context > 0) {
             let window = if usage.context > 200_000 || usage.model.contains("[1m]") { "1M" } else { "200k" };
-            let told = format!(
-                "Context {:.0}% full: {} of {window} tokens\nThis session: {} tokens · last 24 hours: {}",
+            told.push_str(&format!(
+                "\nContext {:.0}% full: {} of {window} tokens\nThis session: {} tokens · last 24 hours: {}",
                 fill * 100.,
                 crate::usage::tokens(usage.context),
                 crate::usage::tokens(usage.spent()),
                 crate::usage::tokens(usage.recent)
-            );
-            row = row.tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(told.clone()).build(window, cx));
+            ));
         }
+        row = row.tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(told.clone()).build(window, cx));
         row.context_menu(menu).into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::branch_follows;
+
+    #[core::prelude::v1::test]
+    fn a_branch_named_after_its_task_is_not_shown() {
+        assert!(branch_follows("performance check", "performance-check-h3crnhm3"));
+        assert!(branch_follows("Fix login!", "fix-login"));
+        assert!(!branch_follows("Fix login", "DEV-123_fixLogin"), "named by hand, or from an issue");
+        assert!(!branch_follows("Сборка приложения", "main"));
+        assert!(!branch_follows("", "anything"));
     }
 }
