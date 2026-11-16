@@ -48,9 +48,9 @@ Windows build exists and is being tried out (see [Windows](#windows)).
   fires when a task out of view wants you. The Changes and Files panels
   mark the file the agent is writing to and those it wrote to since your
   last prompt.
-- **Tokens.** Under a task in the sidebar, how full its agent's context
-  is once it is half full (yellow from three quarters, red from nine
-  tenths); in the title
+- **Tokens.** By a task in the sidebar, a small dial of how full its
+  agent's context is (yellow from three quarters, red from nine tenths;
+  the numbers when the pointer rests on the task); in the title
   bar, what all the agents took in the last 24 hours. A session that
   has used more than a limit you set is told of once (Settings, Agent).
 - **State.** Projects, tasks, open tabs, cursor lines and open folders

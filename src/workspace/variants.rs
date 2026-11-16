@@ -2244,7 +2244,7 @@ pub(crate) mod tests {
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             assert!(window.find("group-judge").visible());
-            assert!(window.find("tokens-day").visible() && window.find("context-bar").visible());
+            assert!(window.find("tokens-day").visible() && window.find("context-dial").visible());
             assert!(window.find("compare-A-B").visible(), "the pair, by the files changed");
         })
         .unwrap();

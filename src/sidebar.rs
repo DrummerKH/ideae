@@ -48,6 +48,36 @@ fn section_header(label: &'static str, cx: &App) -> Div {
         .child(label)
 }
 
+/// A ring filled clockwise from the top as far as the context is full:
+/// yellow when it will soon be squeezed, red when that is about to happen.
+fn context_dial(fill: f32, muted: Hsla, cx: &App) -> impl IntoElement {
+    let color = if fill >= 0.9 { gpui_kit::red() } else if fill >= 0.75 { gpui_kit::yellow() } else { cx.theme().primary };
+    let dial = canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let (center, radius) = (bounds.center(), bounds.size.width.min(bounds.size.height) / 2. - px(1.));
+            let at = |turn: f32| {
+                let angle = turn * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
+                point(center.x + radius * angle.cos(), center.y + radius * angle.sin())
+            };
+            // An arc of a whole turn has no direction: every arc is drawn as halves.
+            let mut arc = |from: f32, to: f32, width: Pixels, color: Hsla| {
+                let mut ring = PathBuilder::stroke(width);
+                ring.move_to(at(from));
+                let middle = from + (to - from) / 2.;
+                ring.arc_to(point(radius, radius), px(0.), false, true, at(middle));
+                ring.arc_to(point(radius, radius), px(0.), false, true, at(to));
+                if let Ok(path) = ring.build() {
+                    window.paint_path(path, color);
+                }
+            };
+            arc(0., 1., px(1.5), muted.opacity(0.25));
+            arc(0., fill.clamp(0.03, 1.), px(2.), color);
+        },
+    );
+    div().id("context-dial").test_support().flex_none().size(px(12.)).child(dial.size_full())
+}
+
 /// "now", "5m", "3h", "2d", "2w", "4mo".
 pub(crate) fn ago(secs: u64) -> String {
     if secs == 0 {
@@ -475,10 +505,6 @@ impl Workspace {
         }
         // How full its agent's context is, once that is worth knowing.
         let fill = self.usage.get(&path).map_or(0., |(_, usage)| usage.fill());
-        // First, and short: the end of the line is what is cut off.
-        if fill >= 0.5 {
-            details.insert(0, format!("ctx {:.0}%", fill * 100.));
-        }
         if t.starred {
             details.push("★".into());
         }
@@ -572,6 +598,8 @@ impl Workspace {
                             .when(!running, |s| s.text_color(muted))
                             .child(label.clone()),
                     )
+                    // How full the agent's context is, as a dial.
+                    .when(fill > 0., |s| s.child(context_dial(fill, muted, cx)))
                     .when(unpushed > 0, |s| {
                         s.child(
                             div()
@@ -703,13 +731,6 @@ impl Workspace {
                 crate::usage::tokens(usage.recent)
             );
             row = row.tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(told.clone()).build(window, cx));
-        }
-        // Not before it is half full: an all but empty bar under every task says nothing.
-        if fill >= 0.5 {
-            let color = if fill >= 0.9 { gpui_kit::red() } else if fill >= 0.75 { gpui_kit::yellow() } else { cx.theme().primary };
-            row = row.child(
-                div().id("context-bar").test_support().mt_0p5().ml(px(18.)).h(px(2.)).rounded_full().bg(muted.opacity(0.12)).child(div().h_full().w(relative(fill)).rounded_full().bg(color)),
-            );
         }
         row.context_menu(menu).into_any_element()
     }
