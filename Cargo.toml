@@ -89,4 +89,5 @@ cc = "1"
 embed-resource = "3.0.12"
 
 [profile.release]
-strip = true
+# The names of functions stay: a crash is told with them (crash.rs).
+strip = "debuginfo"

@@ -3,6 +3,7 @@
 
 mod agent;
 mod browser;
+mod crash;
 mod build_watch;
 #[cfg(unix)]
 mod daemon;
@@ -462,6 +463,7 @@ fn main() {
     let _ = build_watch::build_id();
     #[cfg(unix)]
     if argv.get(1).map(String::as_str) == Some("--daemon") {
+        crash::install("daemon");
         daemon::server::run(argv.get(2).map(String::as_str) == Some("--adopt"));
         return;
     }
@@ -494,6 +496,7 @@ fn main() {
             _ => repos.push(PathBuf::from(arg)),
         }
     }
+    crash::install("ideae");
     procs::adopt_shell_env();
     std::thread::spawn(desktop::refresh_entry);
     procs::catch_quit_signals();

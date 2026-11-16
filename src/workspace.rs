@@ -514,6 +514,14 @@ impl Workspace {
             })
             .detach();
         }
+        // A panic of the run before, said once.
+        cx.spawn_in(window, async move |_, cx| {
+            let Some((said, log)) = cx.background_spawn(async { crate::crash::take_last() }).await else { return };
+            let _ = cx.update(|window, cx| {
+                window.push_notification(Notification::error(format!("{said}\n{}", log.display())).title("ideae ended unexpectedly last time"), cx);
+            });
+        })
+        .detach();
         // The other tasks of the last run come back one at a time, the
         // window drawn in between: it is there with the task in view.
         cx.spawn_in(window, async move |this, cx| {

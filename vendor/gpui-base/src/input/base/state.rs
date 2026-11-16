@@ -1709,8 +1709,19 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.focus(window, cx);
     }
 
-    /// ideae patch: [`Self::set_cursor_position`] for a jump (go to
-    /// definition, a search hit): unless the line is already well in view,
+    /// ideae patch: [`Self::set_cursor_position`] with the keyboard left
+    /// where it is. A text reloaded from disk, or opened in a view that is
+    /// not shown, must not take the focus from what is being typed in.
+    pub fn place_cursor(&mut self, position: impl Into<Position>, cx: &mut Context<Self>) {
+        let position: Position = position.into();
+        let offset = self.text.position_to_offset(&position);
+        self.move_to(offset, None, cx);
+        self.update_preferred_column();
+    }
+
+    /// ideae patch: the cursor placed for a jump (go to definition, a
+    /// search hit), the keyboard left where it is (`focus` is the caller's
+    /// to ask for): unless the line is already well in view,
     /// it lands `fraction` of the way down the viewport rather than at an edge.
     pub fn jump_to_position(
         &mut self,
@@ -1719,8 +1730,9 @@ impl<M: InputModeKind> InputBaseState<M> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let _ = window;
         self.reveal_at = Some(fraction.clamp(0., 1.));
-        self.set_cursor_position(position, window, cx);
+        self.place_cursor(position, cx);
         cx.notify();
     }
 

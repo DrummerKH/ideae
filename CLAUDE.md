@@ -14,6 +14,7 @@ src/sidebar.rs     left sidebar (inbox, projects, tasks, drag and drop)
 src/task.rs        one task: tabs, panes, editor, terminals, changes, git UI, session save/restore
 src/state.rs       state.json; APP_ID (ideae vs ideae-dev)
 src/agent.rs       Claude Code hooks bridge (unix socket, `ideae --hook`)
+src/crash.rs       what a panic leaves: crashes.log next to the state, told at the next start
 src/git.rs         git CLI wrappers, worktrees
 src/lsp.rs         language server client
 src/lsp_install.rs language servers installed on request, ~/.local/share/ideae/lsp
@@ -25,7 +26,7 @@ src/naming.rs      branch names from task titles
 src/services.rs    `.ideae.toml` services (Run ▾): per-task port slots, IDEAE_PORT_<NAME>
 vendor/            patched gpui-component, gpui-base, gpui-cn; changes marked `ideae patch`
 assets/icon/       the app icon: ideae.svg, and the .icns and .ico made from it by scripts/icons.py
-scripts/           Xvfb driver for UI checks, icons.py, macos-app.sh (a .app around a binary)
+scripts/           Xvfb driver for UI checks, check.sh (the tests to run before a push), icons.py, macos-app.sh (a .app around a binary)
 ```
 
 ## Build and test
@@ -36,6 +37,7 @@ scripts/           Xvfb driver for UI checks, icons.py, macos-app.sh (a .app aro
 - Saving a file and following it on disk have one too: `cargo test -- --ignored an_open_file` after changing how an open file is written, reloaded or refreshed.
 - So has the start: `cargo test -- --ignored the_tasks_of_the_last_run` after changing how the tasks of the last run are restored.
 - And the daemon's terminals: `cargo test -- --ignored a_window_that_does_not_read` after changing how output goes from a session to a window (it floods one that reads nothing).
+- `scripts/check.sh` runs all of these and the Windows check: before every push, and again after merging main. A new end-to-end test goes into it; none of them waits on real time except for a timeout it is about, and together they stay under a minute.
 - UI can be tested without a display: `#[gpui_kit::test]` with `gpui_kit::test` (find, click, scroll by element id; mark elements with `.test_support()`), as `settings_ui.rs` does.
 - A debug build is the separate app `ideae-dev`: own state, sockets, window class, launcher. Keep that split for anything new that has an identity on the system.
 

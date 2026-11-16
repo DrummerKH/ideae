@@ -245,6 +245,11 @@ pub fn data_dir() -> PathBuf {
     data_home().join(APP_ID)
 }
 
+/// Where the state is, and what is kept next to it.
+pub fn state_dir() -> PathBuf {
+    state_path().parent().map(PathBuf::from).unwrap_or_else(data_dir)
+}
+
 fn state_path() -> PathBuf {
     // A separate state for experiments, such as headless test runs.
     match std::env::var_os("IDEAE_STATE") {

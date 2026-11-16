@@ -2360,7 +2360,22 @@ pub(crate) mod tests {
             std::env::set_var("IDEAE_NO_DAEMON", "1");
         }
         let tasks = vec![
-            TaskState { path: repo.clone(), branch: "main".into(), main: true, open: true, ..Default::default() },
+            // With a file open, which asks for the keyboard as it is restored.
+            TaskState {
+                path: repo.clone(),
+                branch: "main".into(),
+                main: true,
+                open: true,
+                session: crate::state::TaskSession {
+                    tabs: vec![
+                        crate::state::TabSession { kind: "agent".into(), ..Default::default() },
+                        crate::state::TabSession { kind: "file".into(), path: Some("f.txt".into()), ..Default::default() },
+                    ],
+                    left_active: Some(1),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
             TaskState { path: other.clone(), branch: "other".into(), title: "Other".into(), open: true, ..Default::default() },
         ];
         let saved = State { projects: vec![ProjectState { path: repo.clone(), tasks, ..Default::default() }], active_task: Some(other.clone()), ..Default::default() };
@@ -2389,6 +2404,13 @@ pub(crate) mod tests {
             assert!(w.restoring.is_empty() && w.projects[0].tasks.iter().all(|t| t.view.is_some()), "both back");
             assert_eq!(w.active.as_deref(), Some(other.as_path()));
         });
+        // The keyboard is still with the task in view, not with the file of the one that came after.
+        cx.update_window(handle.into(), |_, window, cx| {
+            let views: Vec<_> = workspace.read(cx).projects[0].tasks.iter().map(|t| t.view.clone().unwrap()).collect();
+            let focused: Vec<bool> = views.iter().map(|view| view.read(cx).front_tab_has_focus(window, cx)).collect();
+            assert_eq!(focused, [false, true], "the main checkout restored later, the task in view");
+        })
+        .unwrap();
         workspace.update(cx, |w, cx| {
             for view in w.views() {
                 view.update(cx, |t, cx| t.shut_down(cx));

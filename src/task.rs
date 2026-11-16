@@ -606,7 +606,9 @@ impl FileView {
         self.editor.update(cx, |state, cx| {
             let cursor = state.cursor_position();
             state.set_value(content, window, cx);
-            state.set_cursor_position(cursor, window, cx);
+            // Not `set_cursor_position`, which takes the keyboard: the file may
+            // be reloading in a task out of view, as its agent writes it.
+            state.place_cursor(cursor, cx);
         });
         self.dirty = false;
         self.load_blame(cx);
@@ -3656,6 +3658,17 @@ impl TaskView {
     fn focused_ix(&self) -> Option<usize> {
         let id = if self.focus_right { self.right_active } else { Some(self.left_active) };
         id.and_then(|id| self.ix_of(id))
+    }
+
+    /// Whether the keyboard is with the tab in front, for tests.
+    #[cfg(test)]
+    pub fn front_tab_has_focus(&self, window: &Window, cx: &App) -> bool {
+        match self.focused_ix().and_then(|ix| self.tabs.get(ix)).map(|t| &t.kind) {
+            Some(TabKind::Terminal(view)) => view.read(cx).state.read(cx).focus_handle().is_focused(window),
+            Some(TabKind::File(file)) => file.read(cx).editor.read(cx).focus_handle(cx).is_focused(window),
+            Some(TabKind::Browser(view)) => view.focus_handle(cx).is_focused(window),
+            _ => self.focus.is_focused(window),
+        }
     }
 
     fn focus_active(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -7863,6 +7876,30 @@ mod open_file_scenario {
         cx.run_until_parked();
         assert_eq!(on_disk(), last, "the earlier write does not come after");
         file.update(cx, |f, _| assert!(!f.dirty && f.saving.is_none()));
+
+        // The Changes tab in front has the diff as it is; behind the file's
+        // tab it is left as it was, and given the new one when it comes to
+        // the front again, however it does: here by the file's tab closing.
+        let shown = |cx: &mut TestAppContext| task.update(cx, |t, cx| t.changes.read(cx).diff.read(cx).files().len());
+        cx.update_window(handle.into(), |_, window, cx| task.update(cx, |t, cx| t.show_tab(|k| matches!(k, TabKind::Changes), window, cx))).unwrap();
+        refreshed(cx);
+        task.update(cx, |t, _| assert!(!t.diff_stale));
+        assert_eq!(shown(cx), 1, "the one changed file");
+        // Another file's tab, opened after it and so to its right, comes in front.
+        std::fs::write(repo.join("new.txt"), "new\n").unwrap();
+        cx.update_window(handle.into(), |_, window, cx| task.update(cx, |t, cx| t.open_file(repo.join("new.txt"), 0, window, cx))).unwrap();
+        refreshed(cx);
+        task.update(cx, |t, _| assert!(t.diff_stale && t.files.len() == 2, "read, and not laid out behind the file's tab"));
+        assert_eq!(shown(cx), 1);
+        cx.update_window(handle.into(), |_, window, cx| {
+            task.update(cx, |t, cx| {
+                let ix = t.tabs.iter().rposition(|tab| matches!(tab.kind, TabKind::File(_))).unwrap();
+                t.remove_tab(ix, window, cx);
+            })
+        })
+        .unwrap();
+        task.update(cx, |t, _| assert!(!t.diff_stale, "in front again, with the diff of now"));
+        assert_eq!(shown(cx), 2);
 
         task.update(cx, |t, cx| t.shut_down(cx));
         cx.update_window(handle.into(), |_, window, _| window.remove_window()).ok();

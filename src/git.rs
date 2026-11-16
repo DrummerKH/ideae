@@ -1241,6 +1241,14 @@ pub fn rebase_onto(root: &Path, base: &str) -> Result<String, RebaseError> {
     if let Some((remote, branch)) = base.split_once('/') {
         let _ = run(root, "git", &["fetch", remote, branch]);
     }
+    // What is not committed is set aside and put back after: where it
+    // would not fit back, git leaves its conflict in the files, under an
+    // agent that may be writing them. Tried on trees first, and not begun.
+    if worktree_commit(root).is_some_and(|commit| commit != "HEAD") {
+        if let Some(files) = merge_conflicts(root, None, base).filter(|files| !files.is_empty()) {
+            return Err(RebaseError::Conflicts(files));
+        }
+    }
     match run(root, "git", &["rebase", "--autostash", base]) {
         Ok(_) => Ok(format!("Rebased onto {base}")),
         Err(e) => {
@@ -2476,6 +2484,27 @@ mod edge_tests {
         let staged = hunks(&refresh(&dir, None, false, &mut Known::default()).patches.unwrap().staged);
         assert_eq!(staged.len(), 3, "and found staged, whatever prefixes and colours the user's git has");
         stage_change(&dir, &found[0], false).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Work that is not committed and would not fit back on the new base:
+    /// the rebase is not begun, and the files are as the agent left them.
+    #[test]
+    fn a_rebase_that_would_break_uncommitted_work_is_not_begun() {
+        let dir = repo("rebase");
+        sh(&dir, "printf 'one\\ntwo\\nthree\\n' > f.txt; echo x > g.txt; git add .; git commit -qm base; git branch base
+            git checkout -qb task; echo mine > mine.txt; git add mine.txt; git commit -qm mine
+            git checkout -q base; printf 'one\\nTWO\\nthree\\n' > f.txt; git commit -qam theirs; git checkout -q task");
+        // The same line as the base changed, not committed.
+        sh(&dir, "printf 'one\\n2\\nthree\\n' > f.txt");
+        let head = out(&dir, "git rev-parse HEAD");
+        assert!(matches!(rebase_onto(&dir, "base"), Err(RebaseError::Conflicts(files)) if files == ["f.txt"]));
+        assert_eq!(out(&dir, "cat f.txt"), "one\n2\nthree\n", "no conflict markers in it");
+        assert_eq!((out(&dir, "git rev-parse HEAD"), out(&dir, "git stash list")), (head, String::new()), "nothing moved, nothing set aside");
+        // Work that does fit goes along.
+        sh(&dir, "git checkout -q f.txt; echo more >> g.txt");
+        assert!(rebase_onto(&dir, "base").is_ok());
+        assert_eq!((out(&dir, "sed -n 2p f.txt").trim(), out(&dir, "tail -1 g.txt").trim()), ("TWO", "more"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
