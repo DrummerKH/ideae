@@ -79,6 +79,25 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
         })
         .default_value(SharedString::from(default.token_warn_k.to_string()))
     };
+    let restore_with = {
+        let (read, write) = (draft.clone(), draft.clone());
+        let options = vec![(SharedString::from("full"), SharedString::from("The full conversation")), (SharedString::from("summary"), SharedString::from("A summary only"))];
+        SettingField::dropdown(options, move |_| SharedString::from(if read.borrow().restore_summary { "summary" } else { "full" }), move |value, _| {
+            write.borrow_mut().restore_summary = value.as_ref() == "summary"
+        })
+        .default_value(SharedString::from("full"))
+    };
+    let archive_keep = {
+        let (read, write) = (draft.clone(), draft.clone());
+        let options = [(30, "A month"), (90, "3 months"), (180, "6 months"), (365, "A year"), (0, "Never")]
+            .into_iter()
+            .map(|(d, label)| (SharedString::from(d.to_string()), SharedString::from(label)))
+            .collect();
+        SettingField::dropdown(options, move |_| read.borrow().archive_keep_days.to_string().into(), move |value, _| {
+            write.borrow_mut().archive_keep_days = value.parse().unwrap_or(0)
+        })
+        .default_value(SharedString::from(default.archive_keep_days.to_string()))
+    };
     let present_zoom = {
         let (read, write) = (draft.clone(), draft.clone());
         let options = [100, 110, 125, 150, 175, 200].into_iter().map(|p| (SharedString::from(p.to_string()), SharedString::from(format!("{p}%")))).collect();
@@ -267,6 +286,14 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
                     "New worktrees get the main checkout's ignored .env* files, unless the project's settings name the files to copy.",
                     |s| s.copy_env,
                     |s, v| s.copy_env = v,
+                )),
+        ).group(
+            SettingGroup::new().title("Archived tasks")
+                .item(SettingItem::new("Restore with", restore_with).description(
+                    "A restored task's agent goes on with its whole conversation, told what changed since; or starts a new session told only the task, what was said last and what changed: a short context.",
+                ))
+                .item(SettingItem::new("Delete archived tasks after", archive_keep).description(
+                    "Archives older than this are deleted, with their agent's conversation and any commits or changes in them that were never pushed.",
                 )),
         ).group(
             SettingGroup::new().title("Git in the background")

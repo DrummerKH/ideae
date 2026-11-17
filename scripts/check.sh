@@ -11,7 +11,8 @@ cargo test -- --ignored \
   two_agents \
   the_tasks_of_the_last_run \
   a_window_that_does_not_read \
-  a_task_is_set_up_checked_and_torn_down
+  a_task_is_set_up_checked_and_torn_down \
+  an_archived_task
 
 if rustup target list --installed 2>/dev/null | grep -q x86_64-pc-windows-gnu; then
   cargo check --target x86_64-pc-windows-gnu --target-dir target/win

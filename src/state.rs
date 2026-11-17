@@ -139,6 +139,11 @@ pub struct Settings {
     /// Shortcuts set by hand, by id (keymap.rs): keystrokes such as
     /// "ctrl-e", empty for none.
     pub keys: std::collections::BTreeMap<String, String>,
+    /// A restored task's agent starts a new session told a summary, not
+    /// its whole conversation again.
+    pub restore_summary: bool,
+    /// Days an archived task is kept; 0 for always.
+    pub archive_keep_days: u32,
 }
 
 impl Default for Settings {
@@ -179,6 +184,8 @@ impl Default for Settings {
             present_veil: true,
             present_hide_readouts: true,
             keys: std::collections::BTreeMap::new(),
+            restore_summary: false,
+            archive_keep_days: 90,
         }
     }
 }
@@ -342,6 +349,12 @@ pub struct TaskState {
     /// Its agents' sessions, the one it runs last.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sessions: Vec<AgentSession>,
+    /// The archive it was restored from, by key: archived again, it takes
+    /// its place, unless that one keeps work the task did not get back.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub archive: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub archive_keep: bool,
 }
 
 /// A session of an agent in a task.

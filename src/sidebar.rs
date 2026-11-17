@@ -456,7 +456,7 @@ impl Workspace {
         let this = cx.weak_entity();
         let spaces: Vec<(String, String)> = self.spaces.iter().map(|s| (s.name.clone(), s.mark())).collect();
         let in_space = p.space.clone();
-        let merged = p.tasks.iter().filter(|t| !t.main && t.pr.as_ref().is_some_and(|pr| pr.state == crate::pr::PrState::Merged)).count();
+        let merged = p.tasks.iter().filter(|t| !t.main && t.side.is_none() && t.busy.is_none() && t.pr.as_ref().is_some_and(|pr| pr.state == crate::pr::PrState::Merged)).count();
         // Which agent its new tasks run, when there is a choice.
         let profiles: Vec<(String, String)> = crate::state::with_settings(|s| if s.several_agents() { s.agents.iter().map(|a| (a.id.clone(), a.name.clone())).collect() } else { Vec::new() });
         let project_agent = p.agent.clone();
@@ -464,17 +464,21 @@ impl Workspace {
             let (spaces, in_space) = (spaces.clone(), in_space.clone());
             let (profiles, project_agent, agent_w) = (profiles.clone(), project_agent.clone(), this.clone());
             let settings = this.clone();
-            let (a, b, c, d) = (this.clone(), this.clone(), this.clone(), this);
+            let (a, b, c, d) = (this.clone(), this.clone(), this.clone(), this.clone());
+            let archived = this;
             menu.item(PopupMenuItem::new("Open main thread").on_click(move |_, window, cx| {
                 let _ = a.update(cx, |w, cx| w.open_main(pi, window, cx));
             }))
             .item(PopupMenuItem::new("New task…").on_click(move |_, window, cx| {
                 let _ = b.update(cx, |w, cx| w.new_task_dialog(pi, window, cx));
             }))
+            .item(PopupMenuItem::new("From an archived task…").on_click(move |_, window, cx| {
+                let _ = archived.update(cx, |w, cx| w.archived_dialog(Some(pi), window, cx));
+            }))
             // Only when there is something to clean up, and how much.
             .when(merged > 0, |menu| {
-                menu.item(PopupMenuItem::new(format!("Delete {merged} merged task{}…", if merged == 1 { "" } else { "s" })).on_click(move |_, window, cx| {
-                    let _ = d.update(cx, |w, cx| w.clean_up_merged(pi, window, cx));
+                menu.item(PopupMenuItem::new(format!("Archive {merged} merged task{}…", if merged == 1 { "" } else { "s" })).on_click(move |_, window, cx| {
+                    let _ = d.update(cx, |w, cx| w.archive_merged(pi, window, cx));
                 }))
             })
             .item(PopupMenuItem::new("Project settings…").on_click(move |_, window, cx| {
@@ -790,7 +794,7 @@ impl Workspace {
 
         let this = cx.weak_entity();
         let (starred, main) = (t.starred, t.main);
-        let (grouped, ready) = (!t.group.is_empty(), t.busy.is_none());
+        let (grouped, ready, side) = (!t.group.is_empty(), t.busy.is_none(), t.side.is_some());
         let can_continue = several && t.side.is_none() && ready;
         let menu_path = path.clone();
         let branch = t.branch.clone();
@@ -812,7 +816,7 @@ impl Workspace {
             .item(PopupMenuItem::new("Copy branch name").on_click(move |_, _, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(branch.clone()));
             }))
-            .when(!main && ready, |m| {
+            .when(!main && !side && ready, |m| {
                 m.separator()
                     .item(PopupMenuItem::new("Another variant…").on_click(move |_, window, cx| {
                         let _ = e.update(cx, |w, cx| w.another_variant_dialog(&pe, window, cx));
@@ -828,17 +832,17 @@ impl Workspace {
                     let _ = g.update(cx, |w, cx| w.continue_with_dialog(&pg, window, cx));
                 }))
             })
-            .when(running || !main, |m| m.separator())
+            .when(running || (!main && ready), |m| m.separator())
+            // Pause stops what runs and keeps the task; Archive is the end
+            // of one, which a restore takes up again.
             .when(running, |m| {
-                m.item(PopupMenuItem::new(if main { "Close main thread" } else { "Close" }).on_click(
-                    move |_, window, cx| {
-                        let _ = b.update(cx, |w, cx| w.close_task(&pb, window, cx));
-                    },
-                ))
+                m.item(PopupMenuItem::new("Pause").on_click(move |_, window, cx| {
+                    let _ = b.update(cx, |w, cx| w.close_task(&pb, window, cx));
+                }))
             })
-            .when(!main, |m| {
-                m.item(PopupMenuItem::new("Delete…").on_click(move |_, window, cx| {
-                    let _ = c.update(cx, |w, cx| w.delete_task(&pc, window, cx));
+            .when(!main && ready, |m| {
+                m.item(PopupMenuItem::new(if side { "Remove" } else { "Archive" }).on_click(move |_, window, cx| {
+                    let _ = c.update(cx, |w, cx| if side { w.remove_side(&pc, window, cx) } else { w.archive_task(&pc, window, cx) });
                 }))
             })
         };

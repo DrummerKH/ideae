@@ -1,5 +1,5 @@
 //! What runs for a project's tasks besides their agents: the setup of a
-//! new worktree, the teardown when a task is closed or deleted, the check
+//! new worktree, the teardown when a task is paused or archived, the check
 //! when its agent finishes a turn. The commands of a repository's
 //! `.ideae.toml` may be anyone's: they run once you allowed that version
 //! of them. Also the hints that tell of all this when it would have helped,
@@ -31,7 +31,7 @@ use crate::{
     task::{AutoAsk, TaskEvent, TaskView},
 };
 
-/// How long a teardown may run on Close and Delete; at quit, all of them
+/// How long a teardown may run on Pause and Archive; at quit, all of them
 /// together, the window gone already.
 const TEARDOWN: Duration = Duration::from_secs(60);
 const TEARDOWN_AT_QUIT: Duration = Duration::from_secs(10);
@@ -228,7 +228,7 @@ impl Workspace {
         }
     }
 
-    /// The task was closed or is being deleted: its teardown runs in its
+    /// The task was paused or is being archived: its teardown runs in its
     /// worktree, bounded, the worktree kept until it is done.
     pub(super) fn teardown(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
         let Some((pi, ti)) = self.find(path) else { return };
@@ -602,7 +602,7 @@ impl Workspace {
                             .when_some(file_error.clone(), |form, e| form.child(div().text_xs().text_color(gpui_kit::red()).child(e)))
                             .children(trust_row)
                             .child(field("Setup", "Runs in each new task's worktree, next to the agent", Textarea::new(&setup).into_any_element()))
-                            .child(field("Teardown", "Runs when a task is closed or deleted", Textarea::new(&teardown).into_any_element()))
+                            .child(field("Teardown", "Runs when a task is paused or archived", Textarea::new(&teardown).into_any_element()))
                             .child(field("Check", "Runs when the agent finishes a turn; ✓ or ✗ on the task", Input::new(&check).into_any_element()))
                             .child(field("Files to copy", "Ignored files a new worktree gets from the main checkout", Input::new(&copy).into_any_element()))
                             .child(field("Services", "Started from Run: name, command, port", services.into_any_element()))
@@ -731,7 +731,7 @@ fn commands_list(project: &str, task: &TaskSetup, cx: &App) -> AnyElement {
         "Anyone who can commit to {project} can change these. They run with your rights, in each task's worktree; asked again when they change."
     )));
     let check = [task.check.trim().to_string()].into_iter().filter(|c| !c.is_empty()).collect::<Vec<_>>();
-    for (what, commands) in [("Setup, in each new task", &task.setup), ("Teardown, when a task is closed or deleted", &task.teardown), ("Check, when an agent finishes a turn", &check)] {
+    for (what, commands) in [("Setup, in each new task", &task.setup), ("Teardown, when a task is paused or archived", &task.teardown), ("Check, when an agent finishes a turn", &check)] {
         if commands.is_empty() {
             continue;
         }
@@ -867,7 +867,7 @@ mod tests {
         turn(cx);
         until(cx, "the check to pass", &mut |cx| mark(cx) == "✓ check");
 
-        step(cx, &mut |w, window, cx| w.remove_task(&path, window, cx));
+        step(cx, &mut |w, window, cx| w.archive_task(&path, window, cx));
         until(cx, "the task to go", &mut |cx| workspace.update(cx, |w, _| w.projects[0].tasks.iter().all(|t| t.main)));
         assert!(!path.exists(), "the worktree is gone");
         if let Some(pid) = stray_pid {

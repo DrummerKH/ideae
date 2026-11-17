@@ -2148,10 +2148,10 @@ mod pull_tests {
         let task = super::create_task_worktree(&repo, "DEV-1_x", false).unwrap();
         let head = |at: &std::path::Path, rev: &str| super::git(at, &["rev-parse", rev]).unwrap();
         assert_eq!(head(&task, "HEAD"), head(&repo, "origin/main"), "from the remote's main, not the local one ahead of it");
-        assert_eq!(super::unsaved_work(&task), (0, 0), "nothing of its own to lose");
+        assert!(crate::archive::unpushed(&task).is_empty(), "nothing of its own to lose: main's commits not pushed are main's");
         std::fs::write(task.join("b"), "b").unwrap();
         assert!(std::process::Command::new("sh").arg("-ec").arg("git add b; git -c user.email=t@t -c user.name=t commit -qm own").current_dir(&task).status().unwrap().success());
-        assert_eq!(super::unsaved_work(&task), (0, 1), "its own commit");
+        assert_eq!(crate::archive::unpushed(&task).len(), 1, "its own commit");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -2588,23 +2588,6 @@ fn copy_env_files(from: &Path, to: &Path) {
         }
         let _ = std::fs::copy(from.join(rel), &target);
     }
-}
-
-/// What deleting a task's worktree would lose: uncommitted files, commits on
-/// no remote.
-/// What deleting the task at `root` would lose: changed files, and commits
-/// on no remote and on no other local branch (those of main not pushed yet
-/// are main's, not the task's).
-pub fn unsaved_work(root: &Path) -> (usize, usize) {
-    let dirty = git(root, &["status", "--porcelain"]).map_or(0, |s| s.lines().count());
-    let own = git(root, &["symbolic-ref", "--short", "-q", "HEAD"]).map(|b| format!("--exclude={}", b.trim()));
-    let mut args = vec!["rev-list", "--count", "HEAD", "--not", "--remotes"];
-    if let Some(own) = own.as_deref() {
-        args.push(own);
-    }
-    args.push("--branches");
-    let unpushed = git(root, &args).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
-    (dirty, unpushed)
 }
 
 /// The file as the last commit has it, or with `since_fork` as the commit

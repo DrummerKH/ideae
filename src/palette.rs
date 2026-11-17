@@ -248,9 +248,15 @@ impl Workspace {
                 if e.is_empty() { e } else { format!("{e} {e}") }
             }),
             own("Add project…", "task", |w, window, cx| w.add_project_dialog(window, cx)),
-            own("Clean up merged tasks…", "task", |w, window, cx| {
+            own("Archive merged tasks…", "task: of the project in view", |w, window, cx| {
                 if let Some(project) = w.active_project() {
-                    w.clean_up_merged(project, window, cx);
+                    w.archive_merged(project, window, cx);
+                }
+            }),
+            own("Archived tasks…", "task: search, restore, delete", |w, window, cx| w.archived_dialog(None, window, cx)),
+            own("Archive task", "task: the one in view", |w, window, cx| {
+                if let Some(path) = w.active.clone() {
+                    w.archive_task(&path, window, cx);
                 }
             }),
             keyed("Go to file…", "go_to_file", "go to"),

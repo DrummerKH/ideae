@@ -73,9 +73,14 @@ pub struct TaskEntry {
     /// Made this run and not started yet, or its latest session recorded
     /// and not run: its agent starts a new session.
     pub fresh: bool,
+    /// The archive it was restored from, and whether that one keeps work
+    /// it did not get back (archive.rs).
+    pub archive: String,
+    pub archive_keep: bool,
 }
 
 pub mod agents_ui;
+pub mod archive_ui;
 pub mod automation;
 pub mod present;
 pub mod side;
@@ -244,6 +249,8 @@ pub struct Workspace {
     pub group_message: Entity<InputState>,
     /// Setups, teardowns, checks and what they wait for.
     auto: automation::AutoState,
+    /// Where tasks are archived (archive.rs).
+    pub archive_dir: PathBuf,
 }
 
 impl Workspace {
@@ -470,6 +477,10 @@ impl Workspace {
                     if n % 5 == 2 {
                         this.fetch_bases(cx);
                     }
+                    // Once a day, the first soon after start.
+                    if n % 28_800 == 5 {
+                        this.clean_up_archives(cx);
+                    }
                 });
                 if alive.is_err() {
                     break;
@@ -567,6 +578,7 @@ impl Workspace {
             fetched: Default::default(),
             build: crate::build_watch::BuildWatch::new(),
             auto: Default::default(),
+            archive_dir: crate::archive::root(),
         };
         this.restore(&saved, window, cx);
         this.tell_what_is_hidden();
@@ -740,6 +752,8 @@ impl Workspace {
                     agent: t.agent.clone(),
                     sessions: t.sessions.clone(),
                     fresh: false,
+                    archive: t.archive.clone(),
+                    archive_keep: t.archive_keep,
                 })
                 .collect();
             self.projects.push(project);
@@ -826,7 +840,8 @@ impl Workspace {
                     tasks: p
                         .tasks
                         .iter()
-                        .filter(|t| t.busy.is_none() || t.view.is_some() || !t.group.is_empty())
+                        // One being archived is kept till it is: the app may quit before.
+                        .filter(|t| t.busy.is_none() || t.view.is_some() || !t.group.is_empty() || t.busy.as_deref() == Some(archive_ui::ARCHIVING))
                         .map(|t| TaskState {
                             path: t.path.clone(),
                             branch: t.branch.clone(),
@@ -850,6 +865,8 @@ impl Workspace {
                             check: self.checks.get(&t.path).filter(|run| run.is_over()).cloned(),
                             agent: t.agent.clone(),
                             sessions: t.sessions.clone(),
+                            archive: t.archive.clone(),
+                            archive_keep: t.archive_keep,
                         })
                         .collect(),
                 })
@@ -1154,41 +1171,6 @@ impl Workspace {
         self.shared = shared;
     }
 
-    /// Deletes every task of the project whose PR was merged, after a list.
-    pub fn clean_up_merged(&mut self, project: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(p) = self.projects.get(project) else { return };
-        let merged: Vec<(PathBuf, String)> = p
-            .tasks
-            .iter()
-            .filter(|t| !t.main && t.pr.as_ref().is_some_and(|pr| pr.state == crate::pr::PrState::Merged))
-            .map(|t| (t.path.clone(), t.label()))
-            .collect();
-        if merged.is_empty() {
-            window.push_notification(Notification::info("No task of this project has a merged PR."), cx);
-            return;
-        }
-        let names = merged.iter().map(|(_, l)| format!("• {l}")).collect::<Vec<_>>().join("\n");
-        let description = format!("Removes their worktrees and branches:\n{names}");
-        let this = cx.weak_entity();
-        let paths: Vec<PathBuf> = merged.into_iter().map(|(p, _)| p).collect();
-        window.open_alert_dialog(cx, move |dialog, _, _| {
-            let (this, paths) = (this.clone(), paths.clone());
-            dialog
-                .confirm()
-                .title(format!("Delete {} merged task{}?", paths.len(), if paths.len() == 1 { "" } else { "s" }))
-                .description(description.clone())
-                .ok_text("Delete")
-                .on_ok(move |_, window, cx| {
-                    let _ = this.update(cx, |w, cx| {
-                        for path in &paths {
-                            w.remove_task(path, window, cx);
-                        }
-                    });
-                    true
-                })
-        });
-    }
-
     /// Language servers of tasks out of view this long go to sleep;
     /// IDEAE_LSP_IDLE_SECS shortens it for tests.
     fn lsp_idle() -> std::time::Duration {
@@ -1215,7 +1197,8 @@ impl Workspace {
         }
     }
 
-    /// Stops a task; its worktree and tabs stay for the next start.
+    /// Pauses a task: its agent, terminals and servers stop, its teardown
+    /// runs; its worktree and tabs stay for the next start, a click away.
     pub fn close_task(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
         let Some(view) = self.find(path).and_then(|(pi, ti)| self.projects[pi].tasks[ti].view.clone()) else {
             return;
@@ -1276,98 +1259,6 @@ impl Workspace {
             }
         }
         cx.notify();
-    }
-
-    /// Removes the task's worktree and branch, after a look at what would be lost.
-    pub fn delete_task(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((pi, ti)) = self.find(path) else { return };
-        let entry = &self.projects[pi].tasks[ti];
-        if entry.main || entry.busy.is_some() {
-            return;
-        }
-        let this = cx.weak_entity();
-        let path = path.to_path_buf();
-        cx.spawn_in(window, async move |_, cx| {
-            let job_path = path.clone();
-            let lost = cx.background_spawn(async move { git::unsaved_work(&job_path) }).await;
-            let _ = this.update_in(cx, |this, window, cx| this.delete_task_dialog(&path, lost, window, cx));
-        })
-        .detach();
-    }
-
-    fn delete_task_dialog(&mut self, path: &Path, (dirty, unpushed): (usize, usize), window: &mut Window, cx: &mut Context<Self>) {
-        let Some((pi, ti)) = self.find(path) else { return };
-        let entry = &self.projects[pi].tasks[ti];
-        if entry.main || entry.busy.is_some() {
-            return;
-        }
-        // Under the home folder, as ~/…: the whole path wraps over lines.
-        let shown = std::env::var_os("HOME").and_then(|home| path.strip_prefix(home).ok().map(|rest| format!("~/{}", rest.display()))).unwrap_or_else(|| path.display().to_string());
-        let mut description = format!("Removes the worktree {shown} and the branch {}.", entry.branch);
-        if dirty > 0 {
-            description.push_str(&format!("\n{dirty} uncommitted file(s) will be lost."));
-        }
-        if unpushed > 0 {
-            description.push_str(&format!("\n{unpushed} commit(s) are on no remote and will be lost."));
-        }
-        if let Some(reason) = entry.locked.as_ref() {
-            let reason = if reason.is_empty() { String::new() } else { format!(" ({reason})") };
-            description.push_str(&format!("\nThe worktree is locked{reason}, by nothing running now; the lock is overridden."));
-        }
-        let title = format!("Delete \"{}\"?", entry.label());
-        let this = cx.weak_entity();
-        let path = path.to_path_buf();
-        window.open_alert_dialog(cx, move |dialog, _, _| {
-            let (this, path) = (this.clone(), path.clone());
-            dialog
-                .confirm()
-                .title(title.clone())
-                .description(description.clone())
-                .ok_text("Delete")
-                .ok_variant(gpui_kit::component::button::ButtonVariant::Danger)
-                .on_ok(move |_, window, cx| {
-                    let _ = this.update(cx, |this, cx| this.remove_task(&path, window, cx));
-                    true
-                })
-        });
-    }
-
-    fn remove_task(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
-        self.stop(path, window, cx);
-        let Some((pi, ti)) = self.find(path) else { return };
-        let repo = self.projects[pi].path.clone();
-        let entry = &mut self.projects[pi].tasks[ti];
-        entry.busy = Some("deleting…".into());
-        let (path, branch, unlock) = (path.to_path_buf(), entry.branch.clone(), entry.locked.is_some());
-        cx.notify();
-        let torn_down = self.torn_down(&path);
-        cx.spawn_in(window, async move |this, cx| {
-            torn_down.await;
-            let task_path = path.clone();
-            let result = cx
-                .background_spawn(async move { git::remove_task_worktree(&repo, &task_path, &branch, unlock) })
-                .await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                match result {
-                    Ok(()) => {
-                        if let Some((pi, ti)) = this.find(&path) {
-                            this.projects[pi].tasks.remove(ti);
-                        }
-                        if let Some(left) = this.dissolve_lonely_groups() {
-                            this.switch(&left, window, cx);
-                        }
-                    }
-                    Err(e) => {
-                        if let Some(entry) = this.entry_mut(&path) {
-                            entry.busy = None;
-                        }
-                        window.push_notification(Notification::error(e).title("Delete failed"), cx);
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
     }
 
     /// A new title for a task; its branch and worktree stay as they are.
