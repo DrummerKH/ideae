@@ -113,6 +113,7 @@ impl TaskView {
             lsp_program: String::new(),
             lsp_missing: None,
             preview: false,
+            preview_text: None,
             veiled,
             occurrence: None,
             committed: None,

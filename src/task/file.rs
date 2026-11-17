@@ -69,6 +69,9 @@ pub struct FileView {
     pub(super) lsp_missing: Option<&'static str>,
     /// Markdown shown as it reads instead of its source.
     pub(super) preview: bool,
+    /// The text the preview was drawn from, by edit version: the same
+    /// string each frame, which the preview knows without comparing it.
+    pub(super) preview_text: Option<(u64, SharedString)>,
     /// Git ignores it: while presenting it is not shown until asked for.
     pub(super) veiled: bool,
     /// The text whose next occurrence was added to the selection last,
@@ -989,11 +992,19 @@ impl FileView {
 
     /// The text as it is in the editor, unsaved edits too, drawn as
     /// Markdown. A link to another file of the worktree opens it here.
-    pub(super) fn render_preview(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_preview(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         use gpui_kit::component::text::TextView;
+        let text = match &self.preview_text {
+            Some((version, text)) if *version == self.edit_version => text.clone(),
+            _ => {
+                let text = self.editor.read(cx).value();
+                self.preview_text = Some((self.edit_version, text.clone()));
+                text
+            }
+        };
         let (task, dir) = (self.task.clone(), self.path.parent().map(PathBuf::from).unwrap_or_default());
         div().id("markdown-preview").flex_1().min_h_0().bg(cx.theme().background).child(
-            TextView::markdown("markdown", self.editor.read(cx).value())
+            TextView::markdown("markdown", text)
                 .scrollable(true)
                 .selectable(true)
                 .on_link_click(move |link, _, window, cx| {
@@ -1098,6 +1109,7 @@ impl Render for FileView {
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.preview = !this.preview;
                                     if !this.preview {
+                                        this.preview_text = None;
                                         this.editor.read(cx).focus_handle(cx).focus(window, cx);
                                     }
                                     cx.notify();
