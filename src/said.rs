@@ -236,6 +236,8 @@ impl Said {
 /// A desktop notification's text: what the agent asks, or what it did.
 pub fn notice(status: &crate::agent::AgentStatus, said: Option<&str>) -> String {
     match (status, said) {
+        // The question its tool call asked is the message already.
+        (crate::agent::AgentStatus::NeedsInput(message), Some(said)) if said.starts_with(message.trim_end_matches('…')) => lead(said, 160),
         (crate::agent::AgentStatus::NeedsInput(message), Some(said)) => format!("{message}\n{}", lead(said, 140)),
         (crate::agent::AgentStatus::NeedsInput(message), None) => message.clone(),
         (_, said) => said.map(|said| lead(said, 160)).filter(|s| !s.is_empty()).unwrap_or_else(|| "Finished".into()),
@@ -262,6 +264,15 @@ mod tests {
 
     fn line(v: Value) -> String {
         v.to_string()
+    }
+
+    #[test]
+    fn notices() {
+        use crate::agent::AgentStatus::{Done, NeedsInput};
+        let asks = NeedsInput("Which database?".into());
+        assert_eq!(notice(&asks, Some("Which database? (+1 more)")), "Which database? (+1 more)");
+        assert_eq!(notice(&NeedsInput("Needs permission".into()), Some("$ rm x")), "Needs permission\n$ rm x");
+        assert_eq!(notice(&Done, Some("All done.")), "All done.");
     }
 
     fn assistant(id: &str, content: Value) -> String {

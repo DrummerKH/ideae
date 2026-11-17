@@ -22,11 +22,18 @@ pub const TASK_ENV: &str = "IDEAE_TASK";
 /// Set to `agent` in the agent tab's terminal, for the process monitor.
 pub const ROLE_ENV: &str = "IDEAE_ROLE";
 
+/// The `kind` of a PreToolUse whose tool waits for the user's answer.
+pub const ASKS_USER: &str = "asks_user";
+/// Tools that wait for the user: a question, a plan to approve. Some
+/// versions of Claude Code send no Notification for them.
+const ASKING_TOOLS: &str = "AskUserQuestion|ExitPlanMode";
+
 /// Hook events we listen to.
 const EVENTS: &[&str] = &[
     "SessionStart",
     "UserPromptSubmit",
     "PreToolUse",
+    "PostToolUse",
     "Notification",
     "Stop",
     "SessionEnd",
@@ -87,7 +94,10 @@ impl HookEvent {
     pub fn status(&self) -> Option<AgentStatus> {
         Some(match self.event.as_str() {
             "SessionStart" => AgentStatus::Idle,
-            "UserPromptSubmit" | "PreToolUse" => AgentStatus::Working,
+            "PreToolUse" if self.kind.as_deref() == Some(ASKS_USER) => AgentStatus::NeedsInput(
+                self.message.clone().unwrap_or_else(|| "Asks you a question".into()),
+            ),
+            "UserPromptSubmit" | "PreToolUse" | "PostToolUse" => AgentStatus::Working,
             // A minute after a turn ends Claude reminds that it waits; that is
             // no question, the turn is just done.
             "Notification" if self.is_idle_reminder() => AgentStatus::Done,
@@ -100,6 +110,12 @@ impl HookEvent {
             _ => return None,
         })
     }
+}
+
+/// A Notification about what already waits for the user: the question
+/// its tool call (AskUserQuestion) told of before.
+pub fn asked_again(was: &AgentStatus, event: &HookEvent) -> bool {
+    event.event == "Notification" && matches!(was, AgentStatus::NeedsInput(_)) && matches!(event.status(), Some(AgentStatus::NeedsInput(_)))
 }
 
 /// The socket and the hooks file of this app instance.
@@ -291,8 +307,11 @@ fn hooks_settings(exe: &Path) -> Value {
     for event in EVENTS {
         let command = hook_command(exe, event);
         let mut matcher = json!({ "hooks": [{ "type": "command", "command": command, "timeout": 5 }] });
-        if *event == "PreToolUse" {
-            matcher["matcher"] = json!("*");
+        match *event {
+            "PreToolUse" => matcher["matcher"] = json!("*"),
+            // Only to hear that a question was answered.
+            "PostToolUse" => matcher["matcher"] = json!(ASKING_TOOLS),
+            _ => {}
         }
         hooks.insert(event.to_string(), json!([matcher]));
     }
@@ -347,6 +366,23 @@ pub fn activity(payload: &Value) -> Option<String> {
     })
 }
 
+/// Whether a tool call waits for the user to answer.
+fn asks_user(payload: &Value) -> bool {
+    payload["tool_name"].as_str().is_some_and(|tool| ASKING_TOOLS.split('|').any(|t| t == tool))
+}
+
+/// What a tool that waits for the user asks: its question, or that a plan
+/// waits for approval.
+fn asking(payload: &Value) -> Option<String> {
+    Some(match payload["tool_name"].as_str()? {
+        "ExitPlanMode" => "Waits for you to approve its plan".into(),
+        _ => {
+            let question = payload["tool_input"]["questions"][0]["question"].as_str().map(str::trim).filter(|q| !q.is_empty());
+            crate::said::cap(question.unwrap_or("Asks you a question"), 200)
+        }
+    })
+}
+
 /// The file a tool call writes to, as the agent names it.
 pub fn edited_file(payload: &Value) -> Option<String> {
     let input = &payload["tool_input"];
@@ -379,8 +415,10 @@ pub fn run_hook(args: &[String]) {
     let (Some(socket), Some(task)) = (given("sock").or_else(|| std::env::var(SOCK_ENV).ok()), given("task").or_else(|| std::env::var(TASK_ENV).ok())) else {
         return;
     };
+    let asks_user = event == "PreToolUse" && asks_user(&payload);
     // Before a tool runs the message says what the agent is doing.
     let message = match event {
+        "PreToolUse" if asks_user => asking(&payload),
         "PreToolUse" => activity(&payload),
         _ => payload["message"].as_str().map(str::to_string),
     };
@@ -393,7 +431,7 @@ pub fn run_hook(args: &[String]) {
         "task": task,
         "event": event,
         "message": message,
-        "kind": payload["notification_type"].as_str(),
+        "kind": if asks_user { Some(ASKS_USER) } else { payload["notification_type"].as_str() },
         "file": if event == "PreToolUse" { edited_file(&payload) } else { None },
         "said": said,
         "session": payload["session_id"].as_str(),
@@ -451,6 +489,36 @@ mod tests {
         assert_eq!(a(json!({"tool_name":"Bash","tool_input":{"command":"x","description":"Build the app"}})).as_deref(), Some("Build the app"));
         assert_eq!(a(json!({"tool_name":"Grep","tool_input":{"pattern":"fn main"}})).as_deref(), Some("Searching \"fn main\""));
         assert_eq!(a(json!({"tool_name":"mcp__github__get_issue","tool_input":{}})).as_deref(), Some("Using github get_issue"));
+    }
+
+    #[test]
+    fn a_question_tool_needs_the_user_until_answered() {
+        let ask = json!({"tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"Which database?","header":"DB","options":[{"label":"Postgres"}],"multiSelect":false}]}});
+        let plan = json!({"tool_name":"ExitPlanMode","tool_input":{"plan":"1. Do it"}});
+        assert!(asks_user(&ask) && asks_user(&plan) && !asks_user(&json!({"tool_name":"Bash"})));
+        assert_eq!(asking(&ask).as_deref(), Some("Which database?"));
+        assert_eq!(asking(&plan).as_deref(), Some("Waits for you to approve its plan"));
+        let event = |name: &str, kind: Option<&str>, message: Option<&str>| HookEvent {
+            task: PathBuf::new(),
+            event: name.into(),
+            message: message.map(Into::into),
+            kind: kind.map(Into::into),
+            file: None,
+            said: None,
+            replayed: false,
+            session: None,
+            guessed: false,
+        };
+        let asked = event("PreToolUse", Some(ASKS_USER), Some("Which database?")).status().unwrap();
+        assert_eq!(asked, AgentStatus::NeedsInput("Which database?".into()));
+        assert_eq!(event("PreToolUse", None, Some("Running ls")).status(), Some(AgentStatus::Working));
+        assert_eq!(event("PostToolUse", None, None).status(), Some(AgentStatus::Working));
+        // Versions that do send a Notification for it: no second notice.
+        assert!(asked_again(&asked, &event("Notification", None, Some("Claude needs your input"))));
+        assert!(!asked_again(&AgentStatus::Working, &event("Notification", None, Some("Claude needs your input"))));
+        assert!(!asked_again(&asked, &event("Stop", None, None)));
+        let hooks = hooks_settings(Path::new("/x/ideae"));
+        assert_eq!(hooks["hooks"]["PostToolUse"][0]["matcher"], json!("AskUserQuestion|ExitPlanMode"));
     }
 
     #[test]

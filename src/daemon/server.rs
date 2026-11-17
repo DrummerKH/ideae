@@ -269,7 +269,8 @@ fn serve(shared: Shared, stream: UnixStream) {
                 if hook.said.is_none() {
                     hook.said = s.hooks.get(&hook.task).filter(|before| carries(before, &hook)).and_then(|before| before.said.clone());
                 }
-                if s.clients.is_empty() {
+                let asked = s.hooks.get(&hook.task).and_then(|before| event_of(before).status()).is_some_and(|was| crate::agent::asked_again(&was, &event_of(&hook)));
+                if s.clients.is_empty() && !asked {
                     notify(&hook);
                 }
                 s.broadcast(&proto::encode_msg(&Msg::Hook(hook.clone())));

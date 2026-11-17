@@ -1887,6 +1887,8 @@ impl Workspace {
         let in_view = self.active.as_deref() == Some(event.task.as_path()) || (group.is_some() && self.active_group == group);
         let seen = in_view && window.is_window_active();
         let was = view.read(cx).agent_status.clone();
+        // The Notification about a question its PreToolUse told already: no second notice, the question kept.
+        let status = if agent::asked_again(&was, &event) { was.clone() } else { status };
         // A turn's end, not the reminder a minute later or a session's start.
         let turn_over = status == agent::AgentStatus::Done && matches!(was, agent::AgentStatus::Working | agent::AgentStatus::NeedsInput(_));
         // A message that waited for this goes out now: the agent is not done yet.
@@ -1899,7 +1901,7 @@ impl Workspace {
             let before = t.agent_shown();
             t.follow_agent(&event.event, event.file.as_deref());
             match event.event.as_str() {
-                "PreToolUse" => t.agent_activity = event.message.clone(),
+                "PreToolUse" if status == agent::AgentStatus::Working => t.agent_activity = event.message.clone(),
                 "UserPromptSubmit" => t.agent_activity = Some("Thinking".into()),
                 _ => {}
             }

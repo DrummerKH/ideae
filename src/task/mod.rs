@@ -1320,6 +1320,12 @@ impl TaskView {
                 self.agent_asks = None;
                 self.agent_pending = None;
             }
+            // A question or a plan, which waits for the user.
+            ("PreToolUse", crate::agent::AgentStatus::NeedsInput(_)) => {
+                self.agent_asks = event.said.as_deref().and_then(Said::new);
+                self.agent_pending = None;
+            }
+            ("PostToolUse", _) => self.agent_asks = None,
             ("PreToolUse", _) => {
                 self.agent_asks = None;
                 self.agent_pending = event.said.clone().or_else(|| event.message.clone());
@@ -1331,8 +1337,10 @@ impl TaskView {
                 }
             }
             ("Notification", crate::agent::AgentStatus::NeedsInput(_)) => {
-                let asks = event.said.clone().or_else(|| self.agent_pending.take());
-                self.agent_asks = asks.as_deref().and_then(Said::new);
+                // After a question's own PreToolUse, its words are kept.
+                if let Some(asks) = event.said.clone().or_else(|| self.agent_pending.take()) {
+                    self.agent_asks = Said::new(&asks);
+                }
             }
             ("Notification", crate::agent::AgentStatus::Done) if self.agent_said.is_none() => {
                 self.agent_said = event.said.as_deref().and_then(Said::new);
