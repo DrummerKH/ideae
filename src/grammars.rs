@@ -24,6 +24,10 @@ fn twig() -> tree_sitter::Language {
 const NGINX_HIGHLIGHTS: &str = include_str!("../queries/nginx-highlights.scm");
 /// tree-sitter-hcl ships no highlights.
 const HCL_HIGHLIGHTS: &str = include_str!("../queries/hcl-highlights.scm");
+/// C++'s own query names only what C++ adds to C (gpui-kit uses it alone):
+/// with C's after it, keywords, types and strings are colored too.
+static CPP_HIGHLIGHTS: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!("{}\n{}", tree_sitter_cpp::HIGHLIGHT_QUERY, tree_sitter_c::HIGHLIGHT_QUERY));
 
 /// (name, grammar, highlights) for everything registered here.
 fn grammars() -> Vec<(&'static str, tree_sitter::Language, &'static str)> {
@@ -52,6 +56,7 @@ fn grammars() -> Vec<(&'static str, tree_sitter::Language, &'static str)> {
         ("gleam", tree_sitter_gleam::LANGUAGE.into(), tree_sitter_gleam::HIGHLIGHT_QUERY),
         ("prisma", tree_sitter_prisma::LANGUAGE.into(), tree_sitter_prisma::HIGHLIGHTS_QUERY),
         ("hcl", tree_sitter_hcl::LANGUAGE.into(), HCL_HIGHLIGHTS),
+        ("cpp", tree_sitter_cpp::LANGUAGE.into(), CPP_HIGHLIGHTS.as_str()),
     ]
 }
 
@@ -102,6 +107,11 @@ mod tests {
             let styles = highlighter.styles(&(0..code.len()), &*theme);
             assert!(styles.iter().any(|s| s.1.color.is_some()), "{path} is plain");
         }
+        let code = "int main() { return 0; }\n";
+        let mut highlighter = SyntaxHighlighter::new(crate::lsp::language_for(std::path::Path::new("a.cpp")));
+        highlighter.update(None, &gpui_kit::component::Rope::from(code), None);
+        let at = code.find("return").unwrap();
+        assert!(highlighter.styles(&(0..code.len()), &*theme).iter().any(|(r, s)| r.start == at && s.color.is_some()), "C++ keywords are plain");
         // `if` is a `@conditional` in Scala's query, a name themes lack.
         let code = samples.last().unwrap().1;
         let mut highlighter = SyntaxHighlighter::new("scala");
