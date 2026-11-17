@@ -494,6 +494,10 @@ fn declaration_name(node: tree_sitter::Node, text: &str) -> Option<(String, Stri
         // Kotlin names a class by a type identifier, after which its constructor's parameters come.
         let mut cursor = node.walk();
         let type_name = node.named_children(&mut cursor).find(|c| c.kind() == "type_identifier");
+        if kind == "companion_object" && type_name.is_none() {
+            // Kotlin's unnamed companion is called Companion; a name deeper down is one of its members'.
+            return Some(("companion object".into(), "Companion".into()));
+        }
         node.child_by_field_name("name").or(by_type).or(type_name).or_else(|| first_identifier(node, 3))?
     } else {
         return None;
@@ -619,6 +623,15 @@ mod outline_tests {
         assert_eq!(lines("a.ts", ts).into_iter().map(|(l, _, _)| l).collect::<Vec<_>>(), ["function run", "class A"]);
         let kt = "class A(val p: Int) : B() {\n    fun run() {}\n}\n";
         assert_eq!(lines("a.kt", kt).into_iter().map(|(l, _, _)| l).collect::<Vec<_>>(), ["class A", "  function run"]);
+    }
+
+    #[test]
+    fn kotlin_objects_are_declarations() {
+        let kt = "object Registry {\n    fun get() {}\n}\nclass A {\n    companion object {\n        const val X = 1\n    }\n    companion object Factory\n}\n";
+        assert_eq!(
+            lines("a.kt", kt).into_iter().map(|(l, _, _)| l).collect::<Vec<_>>(),
+            ["object Registry", "  function get", "class A", "  companion object Companion", "    property X", "  companion object Factory"]
+        );
     }
 
     #[test]
