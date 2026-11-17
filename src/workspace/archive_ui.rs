@@ -9,7 +9,7 @@ use std::{
 };
 
 use gpui_kit::component::{
-    ActiveTheme as _, Selectable as _, Sizable as _, WindowExt as _,
+    ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     h_flex,
@@ -52,6 +52,9 @@ struct Choice {
     commits: bool,
     changes: bool,
     summary: bool,
+    /// The new branch's name, when it starts from origin; empty for one
+    /// named from the title.
+    branch: String,
 }
 
 impl Workspace {
@@ -406,7 +409,18 @@ impl Workspace {
         let repo = self.projects[pi].path.clone();
         let m = item.meta.clone();
         let summary = state::with_settings(|s| s.restore_summary);
-        let choice = Rc::new(RefCell::new(Choice { pr: if m.pr.is_some() { None } else { Some(None) }, on_branch: false, commits: true, changes: true, summary }));
+        let choice = Rc::new(RefCell::new(Choice { pr: if m.pr.is_some() { None } else { Some(None) }, on_branch: false, commits: true, changes: true, summary, branch: String::new() }));
+        let branch_input = cx.new(|cx| {
+            let mut input = InputState::new(window, cx);
+            input.set_value(naming::branch_name(&m.title), window, cx);
+            input
+        });
+        let typed = cx.subscribe_in(&branch_input, window, |_, _, event: &InputEvent, window, _| {
+            if matches!(event, InputEvent::Change) {
+                window.refresh();
+            }
+        });
+        let typed = Rc::new(typed);
         if let Some(number) = m.pr.as_ref().map(|p| p.number) {
             let choice = choice.clone();
             cx.spawn_in(window, async move |_, cx| {
@@ -424,7 +438,7 @@ impl Workspace {
         let fallback = self.project_profile(pi);
         let this = cx.weak_entity();
         window.open_dialog(cx, move |dialog, _, cx| {
-            let (choice, m, this, item) = (choice.clone(), m.clone(), this.clone(), item.clone());
+            let (choice, m, this, item, branch_input, _typed) = (choice.clone(), m.clone(), this.clone(), item.clone(), branch_input.clone(), typed.clone());
             let muted = cx.theme().muted_foreground;
             let c = choice.borrow().clone();
             let pr_now = c.pr.clone().flatten();
@@ -453,10 +467,16 @@ impl Workspace {
                 Conversation::Summary { profile: None, .. } => "No agent is set up: the task opens with a shell.".to_string(),
             };
             let on_branch = c.on_branch && pr_branch.is_some();
+            let new_branch = branch_input.read(cx).value().trim().to_string();
+            let problem = if on_branch { None } else { naming::branch_problem(&new_branch) };
             let restore = {
-                let (choice, item) = (choice.clone(), item.clone());
+                let (choice, item, new_branch) = (choice.clone(), item.clone(), new_branch.clone());
                 move |window: &mut Window, cx: &mut App| {
-                    let c = choice.borrow().clone();
+                    if problem.is_some() {
+                        return;
+                    }
+                    let mut c = choice.borrow().clone();
+                    c.branch = new_branch.clone();
                     window.close_dialog(cx);
                     let _ = this.update(cx, |w, cx| w.restore_archived(item.clone(), c, window, cx));
                 }
@@ -464,7 +484,7 @@ impl Workspace {
             dialog
                 .title(format!("Restore \"{}\"", m.title))
                 .w(px(620.))
-                .content(move |content, _, _| {
+                .content(move |content, _, cx| {
                     let mut form = v_flex()
                         .gap_3()
                         .child(div().text_sm().child(format!("Archived {} from the branch {}. {pr_line}", archive::date(m.archived), m.branch)))
@@ -487,9 +507,22 @@ impl Workspace {
                                 .child(div().text_xs().text_color(muted).child(if on_branch {
                                     "Its PR is still open: its work is not in main yet, so the PR's branch is fetched and checked out."
                                 } else {
-                                    "As a new task is made: the current origin, with a branch named from the title."
+                                    "As a new task is made: the current origin, on a new branch."
                                 })),
                         );
+                    if !on_branch {
+                        let danger = cx.theme().danger;
+                        form = form.child(
+                            v_flex()
+                                .gap_1()
+                                .child(div().text_sm().child("Branch"))
+                                .child(Input::new(&branch_input).small())
+                                .child(match problem {
+                                    Some(problem) => div().text_xs().text_color(danger).child(problem),
+                                    None => div().text_xs().text_color(muted).child("Named from the title, as a new task's; a name that is taken gets a number."),
+                                }),
+                        );
+                    }
                     if offer.commits > 0 || offer.changes > 0 {
                         let mut work = v_flex().gap_1().child(div().text_sm().child("Work that was on no remote"));
                         if offer.commits > 0 {
@@ -522,7 +555,7 @@ impl Workspace {
                 })
                 .footer({
                     let restore = restore.clone();
-                    h_flex().justify_end().child(Button::new("restore-start").primary().label("Restore").on_click(move |_, window, cx| restore(window, cx)))
+                    h_flex().justify_end().child(Button::new("restore-start").primary().label("Restore").disabled(problem.is_some()).on_click(move |_, window, cx| restore(window, cx)))
                 })
         });
     }
@@ -552,7 +585,8 @@ impl Workspace {
         // Its sessions' files go to profiles of the same kind only.
         let profiles: Vec<Option<agents::Profile>> = m.sessions.iter().map(|s| settings.profile(&s.profile).filter(|p| p.kind == s.kind).cloned()).collect();
         let wanted = match &start {
-            Start::Origin => naming::branch_name(&m.title),
+            Start::Origin if choice.branch.trim().is_empty() => naming::branch_name(&m.title),
+            Start::Origin => choice.branch.trim().to_string(),
             Start::PrBranch(head) => head.clone(),
         };
         // Where it shows till its worktree is there: no task's path.
@@ -820,7 +854,7 @@ exec cat > "$OUT/$name.told"
         assert_eq!((meta.unpushed.len(), meta.uncommitted.clone()), (1, vec!["new.txt".to_string()]));
 
         let item = listed[0].clone();
-        step(cx, &mut |w, window, cx| w.restore_archived(item.clone(), Choice { pr: Some(None), on_branch: false, commits: true, changes: true, summary: false }, window, cx));
+        step(cx, &mut |w, window, cx| w.restore_archived(item.clone(), Choice { pr: Some(None), on_branch: false, commits: true, changes: true, summary: false, branch: String::new() }, window, cx));
         let mut back = None;
         wait(cx, "the restored task", &mut |cx| {
             back = task(cx).filter(|t| !t.2 && t.3);

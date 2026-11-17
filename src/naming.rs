@@ -34,6 +34,30 @@ fn build(title: &str, suffix: &str) -> String {
     if slug.is_empty() { format!("task-{suffix}") } else { format!("{slug}-{suffix}") }
 }
 
+/// Why git would not take `name` as a branch (its check-ref-format rules),
+/// or None when it would.
+pub fn branch_problem(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return Some("A branch needs a name.");
+    }
+    if name.chars().any(|c| c.is_whitespace() || c.is_control() || "~^:?*[\\".contains(c)) {
+        return Some("No spaces, nor any of ~ ^ : ? * [ \\");
+    }
+    if name.contains("..") || name.contains("@{") || name == "@" {
+        return Some("No \"..\" or \"@{\" in it, and not \"@\" alone.");
+    }
+    if name.starts_with('-') {
+        return Some("It cannot start with \"-\".");
+    }
+    if name.split('/').any(|part| part.is_empty() || part.starts_with('.') || part.ends_with(".lock")) {
+        return Some("No empty part between slashes, none starting with \".\" or ending in \".lock\".");
+    }
+    if name.ends_with('.') {
+        return Some("It cannot end with \".\".");
+    }
+    None
+}
+
 /// `DEV-123 summary`, `dev-123: summary`, `[DEV-123] summary`.
 fn split_key(title: &str) -> Option<(String, &str)> {
     let t = title.trim_start_matches('[');
@@ -139,6 +163,16 @@ fn random_suffix() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn branch_names_git_takes() {
+        for good in ["DEV-1_fix", "feature/a-b", "fix-ab12cd34", &branch_name("Some title")] {
+            assert_eq!(branch_problem(good), None, "{good}");
+        }
+        for bad in ["", "a b", "a..b", "-x", "a/", "/a", "a//b", "a/.b", "x.lock", "a.", "a~1", "@", "a@{1}", "a:b"] {
+            assert!(branch_problem(bad).is_some(), "{bad}");
+        }
+    }
 
     #[test]
     fn keyed_titles() {

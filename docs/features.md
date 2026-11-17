@@ -58,7 +58,8 @@ background with `gh` every half hour, and when a task's PR is merged.
 **From an archived task…** (a project's + and menu; "Archived tasks…" in the
 command palette for all projects in the window) lists them, newest first,
 searched by title, prompt, branch, PR and date. Restore takes the goal up
-again: a new worktree from origin, as a new task is made, or, when its PR is
+again: a new worktree from origin, as a new task is made, on a branch named
+from the title that you can change, or, when its PR is
 still open, its branch fetched from origin. The commits on no remote are
 cherry-picked onto it and the changes not committed applied, if you like;
 what does not apply is kept in the worktree's git folder, and you and the
