@@ -1222,7 +1222,10 @@ impl TaskView {
         // An agent at work reports every tool it uses: drawn again only for
         // what shows another way than before.
         let before = (self.unseen, self.agent_activity.is_some(), self.agent_editing.is_some());
-        self.unseen = status.is_attention() && !seen;
+        // The same again (a recap, the reminder a minute later) tells nothing new:
+        // a task already looked at stays out of Needs you.
+        let again = status == self.agent_status && !self.unseen;
+        self.unseen = status.is_attention() && !seen && !again;
         if status != crate::agent::AgentStatus::Working {
             self.agent_activity = None;
             self.agent_editing = None;
