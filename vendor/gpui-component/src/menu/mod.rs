@@ -6,7 +6,7 @@ mod dropdown_menu;
 mod menu_item;
 mod popup_menu;
 
-pub use app_menu_bar::AppMenuBar;
+pub use app_menu_bar::{AppMenuBar, MenuSource};
 pub use context_menu::{ContextMenu, ContextMenuExt, ContextMenuState};
 pub use dropdown_menu::DropdownMenu;
 pub(crate) use menu_item::MenuItemElement;

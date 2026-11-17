@@ -13,6 +13,12 @@ use gpui::{
     Render, Role, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription,
     Window, anchored, deferred, div, prelude::FluentBuilder, px,
 };
+use gpui_base::TestSupportExt as _;
+use std::rc::Rc;
+
+/// ideae patch: the menus, made again as one opens, so what is grey, checked
+/// or named follows the app's state at that moment.
+pub type MenuSource = Rc<dyn Fn(&mut Window, &mut App) -> Vec<OwnedMenu>>;
 
 const CONTEXT: &str = "AppMenuBar";
 pub fn init(cx: &mut App) {
@@ -29,21 +35,93 @@ pub struct AppMenuBar {
     selected_index: Option<usize>,
     action_context: Option<FocusHandle>,
     scroll_handle: ScrollHandle,
+    // ideae patch: menus from a source, behind a ☰ while collapsed.
+    source: Option<MenuSource>,
+    owned: Vec<OwnedMenu>,
+    generation: usize,
+    collapsed: bool,
 }
 
 impl AppMenuBar {
     /// Create a new app menu bar.
     pub fn new(cx: &mut App) -> Entity<Self> {
         cx.new(|cx| {
-            let mut this = Self {
-                selected_index: None,
-                action_context: None,
-                menus: Vec::new(),
-                scroll_handle: ScrollHandle::new(),
-            };
+            let mut this = Self::empty(None);
             this.reload(cx);
             this
         })
+    }
+
+    fn empty(source: Option<MenuSource>) -> Self {
+        Self {
+            selected_index: None,
+            action_context: None,
+            menus: Vec::new(),
+            scroll_handle: ScrollHandle::new(),
+            source,
+            owned: Vec::new(),
+            generation: 0,
+            collapsed: false,
+        }
+    }
+
+    /// ideae patch: a menu bar whose menus are asked of `source` each time
+    /// one opens, so their items are never stale.
+    pub fn with_source(source: MenuSource, window: &mut Window, cx: &mut App) -> Entity<Self> {
+        cx.new(|cx| {
+            let mut this = Self::empty(Some(source));
+            this.fetch(window, cx);
+            this
+        })
+    }
+
+    /// ideae patch: collapsed, the bar is one ☰ until a menu opens.
+    pub fn set_collapsed(&mut self, collapsed: bool, cx: &mut Context<Self>) {
+        if self.collapsed != collapsed {
+            self.collapsed = collapsed;
+            cx.notify();
+        }
+    }
+
+    pub fn collapsed(&self) -> bool {
+        self.collapsed
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.selected_index.is_some()
+    }
+
+    /// ideae patch: opens the first menu, or closes the one open.
+    pub fn toggle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ix = if self.selected_index.is_some() { None } else { Some(0) };
+        self.set_selected_index(ix, window, cx);
+    }
+
+    fn fetch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(source) = self.source.clone() else {
+            return;
+        };
+        // What is available is told by where actions go, not by the menu
+        // open before, which has the keyboard; the next one takes it again.
+        match self.action_context.as_ref() {
+            Some(context) if !context.is_focused(window) => context.focus(window, cx),
+            Some(_) => {}
+            None => window.blur(cx),
+        }
+        let owned = source(window, cx);
+        self.generation += 1;
+        let same = owned.len() == self.owned.len()
+            && owned.iter().zip(&self.owned).all(|(a, b)| a.name == b.name);
+        self.owned = owned;
+        if !same {
+            let menu_bar = cx.entity();
+            self.menus = self
+                .owned
+                .iter()
+                .enumerate()
+                .map(|(ix, menu)| AppMenu::new(ix, menu, menu_bar.clone(), cx))
+                .collect();
+        }
     }
 
     /// Reload the menus from the app.
@@ -102,13 +180,22 @@ impl AppMenuBar {
     ) {
         if self.selected_index.is_none() && ix.is_some() {
             self.action_context = window.focused(cx);
-        } else if ix.is_none() {
-            if let Some(action_context) = self.action_context.as_ref() {
+        } else if ix.is_none() && self.selected_index.is_some() {
+            // ideae patch: not away from a dialog the item opened.
+            if let Some(action_context) = self
+                .action_context
+                .as_ref()
+                .filter(|_| !crate::WindowExt::has_active_dialog(window, cx))
+            {
                 action_context.focus(window, cx);
             }
             self.action_context = None;
         }
 
+        // ideae patch: each menu opened, as it is now.
+        if ix.is_some() && ix != self.selected_index {
+            self.fetch(window, cx);
+        }
         self.selected_index = ix;
         cx.notify();
     }
@@ -121,9 +208,30 @@ impl AppMenuBar {
 
 impl Render for AppMenuBar {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // ideae patch: collapsed and closed, a ☰ that opens the first menu.
+        if self.collapsed && self.selected_index.is_none() {
+            return div()
+                .child(
+                    Button::new("app-menu")
+                        .xsmall()
+                        .ghost()
+                        .label("☰")
+                        .tooltip("Menu  Alt")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                window.prevent_default();
+                                cx.stop_propagation();
+                                this.set_selected_index(Some(0), window, cx);
+                            }),
+                        ),
+                )
+                .into_any_element();
+        }
         div()
             .relative()
-            .size_full()
+            .h_full()
+            .min_w_0()
             .child(
                 h_flex()
                     .id("app-menu-bar")
@@ -132,14 +240,17 @@ impl Render for AppMenuBar {
                     .on_action(cx.listener(Self::on_move_left))
                     .on_action(cx.listener(Self::on_move_right))
                     .on_action(cx.listener(Self::on_cancel))
-                    .size_full()
+                    .h_full()
+                    .min_w_0()
                     .gap_x_1()
                     .overflow_x_scroll()
                     .lock_scroll_axis()
                     .track_scroll(&self.scroll_handle)
-                    .children(self.menus.clone()),
+                    .children(self.menus.clone())
+                    .test_support(),
             )
             .child(ScrollableMask::vertical_wheel(&self.scroll_handle))
+            .into_any_element()
     }
 }
 
@@ -150,6 +261,8 @@ pub(super) struct AppMenu {
     name: SharedString,
     menu: OwnedMenu,
     popup_menu: Option<Entity<PopupMenu>>,
+    // ideae patch: the bar's menus this popup was made from.
+    generation: usize,
 
     _subscription: Option<Subscription>,
 }
@@ -168,6 +281,7 @@ impl AppMenu {
             name,
             menu: menu.clone(),
             popup_menu: None,
+            generation: 0,
             _subscription: None,
         })
     }
@@ -183,6 +297,16 @@ impl AppMenu {
         cx: &mut Context<Self>,
     ) -> Entity<PopupMenu> {
         let action_context = self.menu_bar.read(cx).action_context.clone();
+        // ideae patch: made again from what the bar was told as it opened.
+        let bar = self.menu_bar.read(cx);
+        if bar.source.is_some() && bar.generation != self.generation {
+            self.generation = bar.generation;
+            if let Some(menu) = bar.owned.get(self.ix) {
+                self.menu = menu.clone();
+            }
+            self.popup_menu = None;
+            self._subscription = None;
+        }
         let popup_menu = match self.popup_menu.as_ref() {
             None => {
                 let items = self.menu.items.clone();
@@ -272,10 +396,11 @@ impl Render for AppMenu {
         div()
             .id(self.ix)
             .relative()
+            .flex_none()
             .child(
-                Button::new("menu")
-                    .small()
-                    .py_0p5()
+                // ideae patch: the size of the title bar's other buttons, found by its name in tests.
+                Button::new(SharedString::from(format!("menu-{}", self.name)))
+                    .xsmall()
                     .compact()
                     .ghost()
                     .label(self.name.clone())
@@ -338,12 +463,7 @@ mod tests {
             first_focus.focus(window, cx);
 
             TestRoot {
-                menu_bar: cx.new(|_| AppMenuBar {
-                    menus: Vec::new(),
-                    selected_index: None,
-                    action_context: None,
-                    scroll_handle: ScrollHandle::new(),
-                }),
+                menu_bar: cx.new(|_| AppMenuBar::empty(None)),
                 first_focus,
                 second_focus,
             }

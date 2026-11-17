@@ -380,6 +380,8 @@ impl RenderOnce for TitleBar {
                         .justify_between()
                         .flex_shrink_0()
                         .flex_1()
+                        // ideae patch: in a narrow window what it holds shrinks, not the window's buttons go.
+                        .min_w_0()
                         .when(!is_web, |this| {
                             this.window_control_area(WindowControlArea::Drag)
                                 .when(window.is_fullscreen(), |this| this.pl_3())
