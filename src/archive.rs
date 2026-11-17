@@ -100,8 +100,13 @@ pub struct CommitLine {
 
 impl CommitLine {
     pub fn short(&self) -> &str {
-        &self.sha[..self.sha.len().min(8)]
+        prefix(&self.sha, 8)
     }
+}
+
+/// The first `n` characters, whatever an archive holds.
+pub fn prefix(text: &str, n: usize) -> &str {
+    text.char_indices().nth(n).map_or(text, |(at, _)| &text[..at])
 }
 
 /// Where archives are: `IDEAE_ARCHIVE_DIR`, else next to the state (so a
@@ -741,6 +746,13 @@ mod tests {
 
     fn profile(id: &str, kind: Kind) -> Profile {
         Profile { id: id.into(), name: id.into(), kind, command: kind.program().into(), env: Default::default() }
+    }
+
+    #[test]
+    fn short_ids_of_whatever_an_archive_says() {
+        assert_eq!(CommitLine { sha: "0123456789ab".into(), subject: String::new() }.short(), "01234567");
+        assert_eq!(prefix("ééééééééé", 8), "éééééééé");
+        assert_eq!(prefix("abc", 8), "abc");
     }
 
     fn meta_with(sessions: &[(&str, Option<&str>)]) -> Meta {

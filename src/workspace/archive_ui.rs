@@ -462,7 +462,7 @@ impl Workspace {
             let (full, short) = (set(|c, _| c.summary = false), set(|c, _| c.summary = true));
             let (commits, changes) = (set(|c, on| c.commits = on), set(|c, on| c.changes = on));
             let conversation = match &offer.conversation {
-                Conversation::Resume { profile, id, .. } => format!("{} resumes session {}: the whole conversation, then a short note of what changed since.", profile.name, &id[..id.len().min(8)]),
+                Conversation::Resume { profile, id, .. } => format!("{} resumes session {}: the whole conversation, then a short note of what changed since.", profile.name, archive::prefix(id, 8)),
                 Conversation::Summary { profile: Some(p), why } => format!("{} starts a new session, told the task, what was said last and what changed since ({why}).", p.name),
                 Conversation::Summary { profile: None, .. } => "No agent is set up: the task opens with a shell.".to_string(),
             };
