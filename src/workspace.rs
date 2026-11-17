@@ -133,6 +133,14 @@ pub struct Project {
     pub merged_checked: Option<std::time::Instant>,
 }
 
+#[cfg(test)]
+impl Project {
+    /// Its tasks but the main thread, which every project has.
+    pub fn work(&self) -> Vec<&TaskEntry> {
+        self.tasks.iter().filter(|t| !t.main).collect()
+    }
+}
+
 impl Project {
     fn new(path: PathBuf) -> Self {
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
