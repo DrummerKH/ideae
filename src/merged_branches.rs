@@ -2,7 +2,10 @@
 //! ones can go without losing anything, and deleting them. GitHub keeps
 //! the merged PR and its commits; only the branch goes.
 
-use std::{collections::HashSet, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
 use serde_json::Value;
 
@@ -93,11 +96,19 @@ fn of_origin(pr: &ListedPr, origin: Option<&str>) -> bool {
 /// PR still open.
 pub fn select(merged: &[ListedPr], open: &[ListedPr], branches: &[RemoteBranch], default: &str, in_use: &HashSet<String>, origin: Option<&str>) -> Vec<MergedBranch> {
     let open: HashSet<&str> = open.iter().filter(|pr| of_origin(pr, origin)).map(|pr| pr.head.as_str()).collect();
+    // Each branch's latest merged PR, found once: not every PR for every branch.
+    let mut latest: HashMap<&str, &ListedPr> = HashMap::new();
+    for pr in merged.iter().filter(|pr| !pr.merged_at.is_empty() && of_origin(pr, origin)) {
+        let at = latest.entry(pr.head.as_str()).or_insert(pr);
+        if pr.merged_at > at.merged_at {
+            *at = pr;
+        }
+    }
     let mut out: Vec<MergedBranch> = branches
         .iter()
         .filter(|b| b.name != default && b.name != "HEAD" && !in_use.contains(&b.name) && !open.contains(b.name.as_str()))
         .filter_map(|b| {
-            let pr = merged.iter().filter(|pr| pr.head == b.name && !pr.merged_at.is_empty() && of_origin(pr, origin)).max_by(|x, y| x.merged_at.cmp(&y.merged_at))?;
+            let pr = *latest.get(b.name.as_str())?;
             let as_merged = !pr.head_oid.is_empty() && pr.head_oid == b.tip;
             // Seconds of the two, as text: "2026-11-17T10:00:00".
             let tip_time = crate::usage::stamp(b.time);
@@ -133,6 +144,11 @@ pub fn find(repo: &Path, in_use: &HashSet<String>) -> Vec<MergedBranch> {
     let Some(merged) = gh(repo, &["pr", "list", "--state", "merged", "--limit", "300", "--json", FIELDS]) else { return Vec::new() };
     let merged = parse_prs(&merged);
     if merged.is_empty() {
+        return Vec::new();
+    }
+    // No remote branch is the head of a merged PR: GitHub need not be asked more.
+    let heads: HashSet<&str> = merged.iter().map(|pr| pr.head.as_str()).collect();
+    if !refs.lines().any(|line| line.split('\0').next().is_some_and(|name| heads.contains(name))) {
         return Vec::new();
     }
     let Some(open) = gh(repo, &["pr", "list", "--state", "open", "--limit", "300", "--json", FIELDS]) else { return Vec::new() };
