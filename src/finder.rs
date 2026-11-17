@@ -7,7 +7,7 @@ use gpui_kit::component::{
     ActiveTheme as _, IndexPath, Selectable as _, Sizable as _, WindowExt as _,
     button::ButtonVariants as _,
     command::{Command, CommandGroup, CommandItem, CommandState},
-    h_flex,
+    h_flex, v_flex,
 };
 use gpui_kit::*;
 
@@ -489,11 +489,19 @@ fn item(hit: &Hit, kind: FinderKind) -> CommandItem {
             }
             FinderKind::Pick => {
                 let (name, detail) = hit.text.split_once(DETAIL).unwrap_or((&hit.text, ""));
-                h_flex()
-                    .gap_3()
+                // A second line of detail when it has one: more than fits beside the name.
+                let (detail, more) = detail.split_once('\n').unwrap_or((detail, ""));
+                let muted = cx.theme().muted_foreground;
+                v_flex()
                     .min_w_0()
-                    .child(div().flex_none().font_family(cx.theme().mono_font_family.clone()).text_sm().child(name.to_string()))
-                    .child(div().truncate().text_xs().text_color(cx.theme().muted_foreground).child(detail.to_string()))
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .min_w_0()
+                            .child(div().flex_none().font_family(cx.theme().mono_font_family.clone()).text_sm().child(name.to_string()))
+                            .child(div().truncate().text_xs().text_color(muted).child(detail.to_string())),
+                    )
+                    .children((!more.is_empty()).then(|| div().truncate().text_xs().text_color(muted).child(more.to_string())))
                     .into_any_element()
             }
             FinderKind::Files => h_flex()

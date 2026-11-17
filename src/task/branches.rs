@@ -215,8 +215,9 @@ impl TaskView {
 }
 
 /// What a branch is and holds, in the words of the list: whose it is, what
-/// is done in it, when. A branch with no commits of its own is "merged" to
-/// git even while an agent works in it: then what it changes is told.
+/// is done in it, when; on a second line what it changes or its last commit.
+/// A branch with no commits of its own is "merged" to git even while an
+/// agent works in it: then what it changes is told.
 fn branch_detail(row: &git::BranchRow, here: &str) -> String {
     let mut what = Vec::new();
     if row.agent {
@@ -229,20 +230,28 @@ fn branch_detail(row: &git::BranchRow, here: &str) -> String {
         what.push(if row.remote { "remote" } else { "local" }.into());
     }
     let ahead = row.ahead.unwrap_or(0);
-    if !row.changed.is_empty() {
-        let names: Vec<&str> = row.changed.iter().take(3).map(|p| p.rsplit('/').next().unwrap_or(p)).collect();
-        let more = row.changed.len().saturating_sub(3);
-        let files = format!("{} file{} changed: {}{}", row.changed.len(), if row.changed.len() == 1 { "" } else { "s" }, names.join(", "), if more > 0 { format!(" +{more}") } else { String::new() });
-        what.push(if ahead == 0 { format!("nothing committed yet, {files}") } else { files });
-    }
     if ahead > 0 {
         what.push(format!("{ahead} commit{} ahead", if ahead == 1 { "" } else { "s" }));
-    } else if row.merged && row.changed.is_empty() {
+    }
+    if !row.changed.is_empty() {
+        let n = row.changed.len();
+        what.push(format!("{}{n} file{} changed", if ahead == 0 { "nothing committed yet, " } else { "" }, if n == 1 { "" } else { "s" }));
+    } else if ahead == 0 && row.merged {
         what.push(if row.held.is_some() { "nothing done yet".into() } else { "merged".into() });
     }
     // Its own last commit says what it did, and when; one it has not made is the base's.
-    if ahead > 0 || row.ahead.is_none() || row.held.is_none() {
-        what.extend([row.when.clone(), row.subject.clone()]);
+    let own = ahead > 0 || row.ahead.is_none() || row.held.is_none();
+    if own {
+        what.push(row.when.clone());
     }
-    what.join(" · ")
+    let second = if !row.changed.is_empty() {
+        const SHOWN: usize = 8;
+        let more = row.changed.len().saturating_sub(SHOWN);
+        format!("{}{}", row.changed.iter().take(SHOWN).cloned().collect::<Vec<_>>().join("  "), if more > 0 { format!("  +{more}") } else { String::new() })
+    } else if own {
+        row.subject.clone()
+    } else {
+        String::new()
+    };
+    if second.is_empty() { what.join(" · ") } else { format!("{}\n{second}", what.join(" · ")) }
 }
