@@ -754,8 +754,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("repo")).unwrap();
         let torn = dir.join("torn.txt");
+        // The setup also leaves a process in a session of its own: no terminal
+        // ends it, the task's end has to find it.
+        let stray = if cfg!(target_os = "linux") { r#", "setsid sh -c 'echo $$ > stray.pid; exec sleep 300' </dev/null >/dev/null 2>&1 &""# } else { "" };
         let toml = format!(
-            "[task]\nsetup = [\"echo made > setup.txt\"]\nteardown = [\"pwd > '{}'\"]\ncheck = \"test -f ok.txt || (echo no ok.txt; exit 1)\"\ncopy = [\".env\"]\n",
+            "[task]\nsetup = [\"echo made > setup.txt\"{stray}]\nteardown = [\"pwd > '{}'\"]\ncheck = \"test -f ok.txt || (echo no ok.txt; exit 1)\"\ncopy = [\".env\"]\n",
             torn.display()
         );
         std::fs::write(dir.join("repo/.ideae.toml"), &toml).unwrap();
@@ -817,6 +820,15 @@ mod tests {
         let path = path.unwrap();
         assert_eq!(std::fs::read_to_string(path.join(".env")).unwrap(), "A=1\n", "the ignored file it names is copied");
         until(cx, "the setup", &mut |cx| path.join("setup.txt").exists() && mark(cx).is_empty());
+        let stray_pid = cfg!(target_os = "linux").then(|| {
+            let file = path.join("stray.pid");
+            let mut pid = None;
+            until(cx, "the stray to start", &mut |_| {
+                pid = std::fs::read_to_string(&file).ok().and_then(|p| p.trim().parse::<i32>().ok());
+                pid.is_some()
+            });
+            pid.unwrap()
+        });
 
         let hook = |event: &str| HookEvent { task: path.clone(), event: event.into(), message: None, kind: None, file: None, said: None, replayed: false };
         let turn = |cx: &mut TestAppContext| {
@@ -832,6 +844,11 @@ mod tests {
         step(cx, &mut |w, window, cx| w.remove_task(&path, window, cx));
         until(cx, "the task to go", &mut |cx| workspace.update(cx, |w, _| w.projects[0].tasks.iter().all(|t| t.main)));
         assert!(!path.exists(), "the worktree is gone");
+        if let Some(pid) = stray_pid {
+            // SAFETY: kill with signal 0 only asks whether it is there.
+            let alive = || unsafe { libc::kill(pid, 0) } == 0 && std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| !s.contains(") Z "));
+            until(cx, "what the task left behind to end", &mut |_| !alive());
+        }
         let torn_in = std::fs::read_to_string(&torn).expect("the teardown ran");
         assert_eq!(std::path::Path::new(torn_in.trim()), path, "in the worktree, before it went");
         let _ = std::fs::remove_dir_all(&dir);

@@ -176,16 +176,27 @@ impl TaskView {
         self.auto.stop();
         let task = self.root.display().to_string();
         let socket = self.hook_socket.clone().filter(|_| strays);
-        // Before the terminals go: what they started is told by them.
-        let seen = socket.as_ref().map(|socket| crate::procs::task_processes(Some(&task), socket)).unwrap_or_default();
-        for tab in &self.tabs {
-            if let TabKind::Terminal(view) = &tab.kind {
-                TermView::end(&view, cx);
+        let terminals: Vec<Entity<TermView>> = self.tabs.iter().filter_map(|tab| if let TabKind::Terminal(view) = &tab.kind { Some(view.clone()) } else { None }).collect();
+        let Some(socket) = socket else {
+            for view in &terminals {
+                TermView::end(view, cx);
             }
-        }
-        if let Some(socket) = socket {
+            return;
+        };
+        // What the terminals started is told by them, so it is looked for
+        // before they go; all of /proc is read for it, off the UI thread.
+        // The terminals are held here: the task may be dropped meanwhile.
+        cx.spawn(async move |_, cx| {
+            let (look_task, look_socket) = (task.clone(), socket.clone());
+            let seen = cx.background_spawn(async move { crate::procs::task_processes(Some(&look_task), &look_socket) }).await;
+            let _ = cx.update(|cx| {
+                for view in &terminals {
+                    TermView::end(view, cx);
+                }
+            });
             std::thread::spawn(move || crate::procs::end_task_strays(Some(&task), &socket, seen));
-        }
+        })
+        .detach();
     }
 }
 
