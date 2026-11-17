@@ -33,6 +33,9 @@ Claude Code and git should be installed.
 - **Tasks.** A title becomes a branch and a worktree, with the agent started
   in it. The sidebar shows which agents work, wait for you or are done, and
   tells you when one out of view wants you.
+- **Archive.** A task that is done is archived with its agent's
+  conversation and any work on no remote; restored weeks later, the agent
+  goes on with the same conversation in a fresh worktree.
 - **Variants.** One prompt to up to four agents at once, compared side by
   side, with a judge to say which to keep.
 - **[Agents](docs/agents.md)**: Claude Code by default; Codex, OpenCode or any

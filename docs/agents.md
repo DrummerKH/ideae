@@ -45,6 +45,11 @@ session. It is first told the task, what the agent before it said last, and
 that `git log` and `git diff` show what was done. The earlier session stays
 recorded with the task.
 
+An archived task keeps its sessions' files (Claude Code's transcript and its
+subagents', Codex's rollout); a restore puts them back for the new worktree
+and resumes the latest session by its id, else starts a new one told a
+summary (see [features](features.md#pause-archive-restore)).
+
 ## Quick questions
 
 Commit messages ("✦ Write") and the variants' judge ask one question and
@@ -62,12 +67,15 @@ or `opencode run`. Any other program cannot be asked that way.
 | Variants run unasked | `--permission-mode auto` | `--sandbox workspace-write --ask-for-approval never` | `--auto` | as typed |
 | Tokens and context | transcript | rollout file (`$CODEX_HOME/sessions`) | not read (SQLite) | — |
 | One question | `claude -p` | `codex exec -` | `opencode run` | — |
+| Archived sessions | transcript and subagents | rollout file | its database, left as it is | — |
 
 Nothing of an agent's own configuration is written. Claude Code gets its
 hooks from a `--settings` file the app writes in its runtime folder; Codex
 its `notify` through `-c` for the session; OpenCode a plugin file in the
 same folder, added with `OPENCODE_CONFIG_CONTENT` (a profile that sets that
-variable itself keeps it, and then reports nothing).
+variable itself keeps it, and then reports nothing). The one thing put in
+an agent's own folder is a restored task's session files, where it keeps
+its sessions (a new file next to the others, none replaced).
 
 **Codex and OpenCode have not been tried live**: their adapters follow their
 source code (openai/codex `codex-rs/`, anomalyco/opencode `packages/`), and

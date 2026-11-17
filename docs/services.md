@@ -7,7 +7,7 @@ the Run panel, Alt+4) and kept in `.ideae.toml` at the repository root:
 ```toml
 [task]
 setup = ["npm ci"]                   # in a new task's worktree, next to the agent
-teardown = ["docker compose down"]   # when the task is closed or deleted
+teardown = ["docker compose down"]   # when the task is paused or archived
 check = "npm test"                   # when the agent finishes a turn
 copy = [".env", "config/*.local"]    # ignored files a new worktree gets
 
@@ -45,8 +45,8 @@ Run panel runs it again. A setup that went well closes its terminal.
 
 ## Teardown
 
-Runs when a task is closed or deleted, in its worktree, for a minute at
-most; Delete removes the worktree after it. Quitting the app (Exit, Ctrl+Q)
+Runs when a task is paused or archived, in its worktree, for a minute at
+most; Archive removes the worktree after it. Quitting the app (Exit, Ctrl+Q)
 runs the teardown of every running task at once, for ten seconds at most.
 Closing the window with × leaves the tasks running, and runs none.
 

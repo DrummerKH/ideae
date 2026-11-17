@@ -16,7 +16,57 @@ folder) are folded under the task they came from, with the commits and
 changes they hold, and open with a shell, not an agent.
 
 Projects, tasks, open tabs, cursor lines and open folders survive a restart
-(`~/.local/share/ideae/state.json`).
+(`~/.local/share/ideae/state.json`). A task that is done is archived, not
+deleted: see below.
+
+## Pause, archive, restore
+
+A task's menu ends with **Pause** and **Archive**. Pause stops its agent,
+terminals and servers and runs the project's teardown; the task stays in
+the list, and a click starts it again (the main checkout's Pause takes it
+out of the list, as before).
+
+Archive is how a task ends when it is done, merged or not: one click, since
+nothing is lost. The task is paused, then one file is written for it,
+`archive/<project>/<branch>-<time>.tar.gz` next to the state
+(`~/.local/share/ideae/archive`; `IDEAE_ARCHIVE_DIR` puts it elsewhere):
+
+- `task.json`: title, prompt, project, branch, base and last commit, the
+  PR, review comments not sent, what the agent said last, the agent's
+  sessions with their profiles, the branch's commits, dates, the version;
+- the agent's session files (Claude Code's transcript and its subagents',
+  Codex's rollout; OpenCode keeps its own in its database);
+- work that exists nowhere else: commits on no remote and no other branch
+  (a git bundle) and changes not committed, new files too (a binary patch).
+
+The file is read back before anything goes; only then the worktree and the
+local branch are removed. Remote branches are never touched. If the archive
+cannot be written, nothing is removed and you are told. A project's menu
+archives all of its tasks whose PR was merged at once.
+
+**From an archived task…** (a project's + and menu; "Archived tasks…" in the
+command palette for all projects in the window) lists them, newest first,
+searched by title, prompt, branch, PR and date. Restore takes the goal up
+again: a new worktree from origin, as a new task is made, or, when its PR is
+still open, its branch fetched from origin. The commits on no remote are
+cherry-picked onto it and the changes not committed applied, if you like;
+what does not apply is kept in the worktree's git folder, and you and the
+agent are told where. The agent's session files go back where it looks for
+them for the new worktree, and it resumes that same session, first told
+when the task was archived, what became of its PR, that main has moved on,
+its commits then, and what came back. With Settings → Tasks → "Restore
+with: A summary only", or when its agent can no longer resume it, a new
+session starts, told the task, what was said last and the same news.
+
+The archive stays after a restore: archived again, the task replaces it,
+unless it holds work the restored task did not get back. Delete one for
+good from the list. Settings → Tasks deletes archives after a while (3
+months by default; never, if you like), with their conversation and any
+work in them that was never pushed.
+
+A worktree an agent made for itself has **Remove** instead: its branch goes
+too when everything on it is on a remote or another branch, else it stays
+and you are told.
 
 ## Agent status
 

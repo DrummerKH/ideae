@@ -14,6 +14,7 @@ src/workspace/spaces.rs    spaces: projects sorted into sets, one in the window 
 src/workspace/side.rs      worktrees an agent made for itself: told apart, folded under their task, no agent of their own
 src/workspace/automation.rs  a project's setup, teardown and check, the trust its .ideae.toml needs, hints, Project settings…
 src/workspace/agents_ui.rs choosing agents: the picker, a project's agent, Continue with another agent
+src/workspace/archive_ui.rs Archive (a task's everyday end), the archived list, Restore, an agent's worktree removed
 src/workspace/present.rs   presenting: only the tasks chosen stay in the window, the rest out of the list and the notifications
 src/sidebar.rs     left sidebar (inbox, projects, tasks, drag and drop)
 src/task/          one task, a module: what is private to it is seen by all of its files (`use super::*`)
@@ -43,6 +44,7 @@ src/task/          one task, a module: what is private to it is seen by all of i
   helpers.rs       patches parsed for the panels, outline, symbol search, definition providers
 src/file_icons.rs  file and folder icons (assets/file-icons, JetBrains' new UI), by name
 src/state.rs       state.json; APP_ID (ideae vs ideae-dev)
+src/archive.rs     an archived task's .tar.gz (task.json, sessions, unpushed bundle, patch): write, list, restore, clean up
 src/agent.rs       agents' reports bridge: Claude Code hooks, Codex notify, OpenCode plugin (unix socket, `ideae --hook`)
 src/agents/        agent profiles and adapters (docs/agents.md): how each kind starts, resumes, reports, is asked once
   mod.rs           profiles, resolution (task > project > default), the Adapter trait, Launch
@@ -73,6 +75,7 @@ scripts/           Xvfb driver for UI checks, check.sh (the tests to run before 
 - So do agent profiles (two agents, session ids, guessed status, carrying a task on): `cargo test -- --ignored two_agents` after changing agents/ or how an agent is started.
 - Saving a file and following it on disk have one too: `cargo test -- --ignored an_open_file` after changing how an open file is written, reloaded or refreshed.
 - So has the start: `cargo test -- --ignored the_tasks_of_the_last_run` after changing how the tasks of the last run are restored.
+- So has archiving and restoring: `cargo test -- --ignored an_archived_task` after changing either.
 - And the daemon's terminals: `cargo test -- --ignored a_window_that_does_not_read` after changing how output goes from a session to a window (it floods one that reads nothing).
 - And a project's setup, check and teardown: `cargo test -- --ignored a_task_is_set_up_checked_and_torn_down` after changing them.
 - `scripts/check.sh` runs all of these and the Windows check: before every push, and again after merging main. A new end-to-end test goes into it; none of them waits on real time except for a timeout it is about, and together they stay under a minute.
@@ -110,7 +113,7 @@ IDEAE_STATE=/tmp/x/state.json scripts/drive.sh /tmp/x/run.log 7 \
   `scripts/macos-sign.sh` after `cargo build --release` on a Mac where the
   app has them, or they are gone at the next restart.
 - The repository is public: no personal paths, hostnames, emails or private project names in code, tests or commits.
-- Agents and terminals belong to tasks; whatever a task starts must end on Close, Delete and quit.
+- Agents and terminals belong to tasks; whatever a task starts must end on Pause, Archive and quit.
 - No comments unless the why is non-obvious.
 
 ## Speed and memory
