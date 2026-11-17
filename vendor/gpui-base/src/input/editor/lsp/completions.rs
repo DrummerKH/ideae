@@ -9,7 +9,7 @@ use lsp_types::{
 use ropey::Rope;
 use std::{cell::RefCell, ops::Range, rc::Rc, time::Duration};
 
-use crate::input::{InputBaseState, ShowCompletions};
+use crate::input::{InputBaseState, RopeExt as _, ShowCompletions};
 
 /// Default debounce duration for inline completions.
 const DEFAULT_INLINE_COMPLETION_DEBOUNCE: Duration = Duration::from_millis(300);
@@ -472,6 +472,8 @@ impl InputBaseState<EditorMode> {
 
         let offset = self.cursor();
         let text = self.text.clone();
+        // ideae patch: an answer about a text that changed since is dropped, not only one for another cursor.
+        let revision = self.document_revision;
         let debounce = provider.inline_completion_debounce();
         let background_executor = cx.background_executor().clone();
 
@@ -482,7 +484,11 @@ impl InputBaseState<EditorMode> {
             // Now fetch the inline completion after the debounce period
             let task = editor.update_in(cx, |editor, window, cx| {
                 // Check if cursor has moved during debounce
-                if editor.cursor() != offset {
+                // ideae patch: and only for the editor typed in.
+                if editor.cursor() != offset
+                    || editor.document_revision != revision
+                    || !editor.focus_handle.is_focused(window)
+                {
                     return None;
                 }
 
@@ -507,7 +513,7 @@ impl InputBaseState<EditorMode> {
 
             editor.update_in(cx, |editor, _window, cx| {
                 // Only apply if cursor still hasn't moved
-                if editor.cursor() != offset {
+                if editor.cursor() != offset || editor.document_revision != revision {
                     return;
                 }
 
@@ -553,7 +559,12 @@ impl InputBaseState<EditorMode> {
         };
 
         let cursor = self.cursor();
-        let range_utf16 = self.range_to_utf16(&(cursor..cursor));
+        // ideae patch: a suggestion with a range replaces the text from the cursor to its end.
+        let end = completion_item
+            .range
+            .map(|range| self.text.position_to_offset(&range.end).clamp(cursor, self.text.len()))
+            .unwrap_or(cursor);
+        let range_utf16 = self.range_to_utf16(&(cursor..end));
         let completion_text = completion_item.insert_text;
         self.replace_text_in_range_silent(Some(range_utf16), &completion_text, window, cx);
         true

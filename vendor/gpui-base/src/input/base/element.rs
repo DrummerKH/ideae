@@ -4059,7 +4059,19 @@ impl<M: InputModeKind> Element for TextElement<M> {
                     let p = point(first_line_x, cursor_row_y);
 
                     // Paint background to cover any existing text
-                    let bg_bounds = Bounds::new(p, size(first_line.width + px(4.), line_height));
+                    // ideae patch: a suggestion that replaces the rest of the line hides all of it.
+                    let replaces = self
+                        .state
+                        .read(cx)
+                        .extras
+                        .inline_completion_item()
+                        .is_some_and(|item| item.range.is_some());
+                    let width = if replaces {
+                        (first_line.width + px(4.)).max(bounds.right() - p.x)
+                    } else {
+                        first_line.width + px(4.)
+                    };
+                    let bg_bounds = Bounds::new(p, size(width, line_height));
                     window.paint_quad(fill(bg_bounds, editor_background));
 
                     // Paint first line completion text
