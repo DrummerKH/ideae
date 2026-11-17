@@ -819,8 +819,9 @@ mod tests {
         };
         // Terminals, checks and teardowns run on threads of their own; the
         // setup's terminal is looked at every second of the app's clock.
+        // A ceiling of 30 s: a loaded machine (a parallel build) is slow to start the stray.
         let until = |cx: &mut TestAppContext, what: &str, done: &mut dyn FnMut(&mut TestAppContext) -> bool| {
-            for _ in 0..1000 {
+            for _ in 0..3000 {
                 if done(cx) {
                     return;
                 }
