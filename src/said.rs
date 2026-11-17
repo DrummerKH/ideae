@@ -124,7 +124,11 @@ pub fn plain(markdown: &str) -> String {
         let heading = line.starts_with('#');
         line = line.trim_start_matches('#').trim();
         let bullet = ["- ", "* ", "+ "].iter().find_map(|b| line.strip_prefix(b));
-        let mut text = inline(bullet.unwrap_or(line));
+        // What is shown is a few hundred characters: a longer line is cut
+        // before its marks are looked for, each from every `[`.
+        let line = bullet.unwrap_or(line);
+        let line = line.char_indices().nth(2000).map_or(line, |(at, _)| &line[..at]);
+        let mut text = inline(line);
         if text.is_empty() {
             if out.last().is_some_and(|l| !l.is_empty()) {
                 out.push(String::new());
