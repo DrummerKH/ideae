@@ -87,6 +87,10 @@ to `~/.claude` or the repository. Other agents (Codex, OpenCode, any program)
 report what they can, and the rest is guessed from their terminal: see
 [agents](agents.md) for profiles, sessions and what each kind of agent can
 do. The sidebar shows working / needs input / done, and a desktop notification fires when a task out of view wants you.
+A question Claude Code asks (AskUserQuestion) or a plan it waits to have
+approved counts as needing you. Notifications carry the agent's last answer
+or its question; Settings → General → "Show what the agent said in
+notifications" off, they say only Finished or Needs your answer.
 The Changes and Files panels mark the file the agent is writing to and those
 it wrote to since your last prompt.
 
