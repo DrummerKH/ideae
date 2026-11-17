@@ -99,6 +99,25 @@ impl Adapter for Claude {
         crate::usage::last_answer(transcript)
     }
 
+    fn resumes(&self) -> bool {
+        true
+    }
+
+    /// Its projects folder for the working directory: the transcript is
+    /// `<id>.jsonl` there, its subagents' and tools' files in `<id>/`.
+    fn session_base(&self, profile: &Profile, root: &Path) -> Option<PathBuf> {
+        Some(config_dir(profile)?.join("projects").join(project_dir(root)))
+    }
+
+    fn session_files(&self, profile: &Profile, root: &Path, session: Option<&str>) -> Option<SessionFiles> {
+        let base = self.session_base(profile, root)?;
+        let transcript = self.transcript(profile, root, session)?;
+        let id = transcript.file_stem()?.to_string_lossy().into_owned();
+        let mut files = vec![PathBuf::from(format!("{id}.jsonl"))];
+        files.extend(files_under(&base, &base.join(&id)));
+        Some(SessionFiles { base, id: Some(id), files })
+    }
+
     fn one_shot(&self, profile: &Profile, ask: &Ask) -> Option<OneShot> {
         let program = program(&profile.command);
         let program = if program.is_empty() { "claude" } else { program }.to_string();

@@ -94,6 +94,22 @@ impl Adapter for Codex {
         rollout_usage(&std::fs::read_to_string(transcript).ok()?)
     }
 
+    fn resumes(&self) -> bool {
+        true
+    }
+
+    /// Its sessions folder, wherever the session ran: rollouts are by day.
+    fn session_base(&self, profile: &Profile, _root: &Path) -> Option<PathBuf> {
+        Some(home(profile)?.join("sessions"))
+    }
+
+    fn session_files(&self, profile: &Profile, root: &Path, session: Option<&str>) -> Option<SessionFiles> {
+        let base = self.session_base(profile, root)?;
+        let rollout = self.transcript(profile, root, session)?;
+        let rel = rollout.strip_prefix(&base).ok()?.to_path_buf();
+        Some(SessionFiles { base, id: session.map(str::to_string), files: vec![rel] })
+    }
+
     fn one_shot(&self, profile: &Profile, ask: &Ask) -> Option<OneShot> {
         let program = program(&profile.command);
         let program = if program.is_empty() { "codex" } else { program }.to_string();

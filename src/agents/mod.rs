@@ -323,10 +323,57 @@ pub trait Adapter: Sync {
         None
     }
 
+    /// It goes on with a session of before, by its id.
+    fn resumes(&self) -> bool {
+        false
+    }
+
+    /// Where the files of its sessions in `root` are kept: what
+    /// `session_files` are relative to. An archived session is put back
+    /// under this for the worktree it is restored in.
+    fn session_base(&self, _profile: &Profile, _root: &Path) -> Option<PathBuf> {
+        None
+    }
+
+    /// The files of a session, for an archive: with its id when the agent
+    /// did not report it (a task of before ids were kept). Not for the UI thread.
+    fn session_files(&self, _profile: &Profile, _root: &Path, _session: Option<&str>) -> Option<SessionFiles> {
+        None
+    }
+
     /// A question answered once and the program gone.
     fn one_shot(&self, _profile: &Profile, _ask: &Ask) -> Option<OneShot> {
         None
     }
+}
+
+/// The files a session is kept in, relative to `base`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionFiles {
+    pub base: PathBuf,
+    pub id: Option<String>,
+    pub files: Vec<PathBuf>,
+}
+
+/// Every file under `dir`, relative to `base`.
+pub fn files_under(base: &Path, dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(at) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&at) else { continue };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_dir() {
+                dirs.push(entry.path());
+            } else if kind.is_file() {
+                if let Ok(rel) = entry.path().strip_prefix(base) {
+                    found.push(rel.to_path_buf());
+                }
+            }
+        }
+    }
+    found.sort();
+    found
 }
 
 /// The program of a command, its first word.

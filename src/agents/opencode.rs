@@ -64,6 +64,11 @@ impl Adapter for OpenCode {
         false
     }
 
+    /// Its sessions stay in its own database, which an archive leaves be.
+    fn resumes(&self) -> bool {
+        true
+    }
+
     fn command(&self, profile: &Profile, start: &Start, unasked: bool, _: Option<&Hooks>) -> String {
         let cmd = profile.command.trim();
         let mut line = if cmd.is_empty() { "opencode" } else { cmd }.to_string();
