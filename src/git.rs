@@ -1749,6 +1749,12 @@ fn merge_conflicts(root: &Path, base: Option<&str>, theirs: &str) -> Option<Vec<
 /// create` takes the index's lock and writes the index, which fails an
 /// agent's `git add` at that moment and has every watcher look again.
 fn worktree_commit(root: &Path) -> Option<String> {
+    worktree_snapshot(root, false)
+}
+
+/// `worktree_commit`, with files git does not follow yet when `new` (not
+/// those it ignores).
+fn worktree_snapshot(root: &Path, new: bool) -> Option<String> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let git_dir = PathBuf::from(git(root, &["rev-parse", "--absolute-git-dir"])?.trim());
     let index = std::env::temp_dir().join(format!("ideae-index-{}-{}", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
@@ -1766,7 +1772,7 @@ fn worktree_commit(root: &Path) -> Option<String> {
         Some(String::from_utf8_lossy(&done.stdout).trim().to_string())
     };
     let made = (|| {
-        run(&["add", "-u"])?;
+        run(&["add", if new { "-A" } else { "-u" }])?;
         let tree = run(&["write-tree"])?;
         if run(&["rev-parse", "HEAD^{tree}"])? == tree {
             return Some("HEAD".to_string());
@@ -2323,6 +2329,18 @@ pub fn refs(root: &Path) -> Vec<(String, String)> {
 
 /// The worktree against `rev`, all of it or the one file: what is here
 /// that the commit, tag or branch does not have.
+/// What to compare with for `rev`: a branch checked out in another worktree
+/// is that worktree as it is, with what is not committed yet (an agent's
+/// work in progress); anything else is itself.
+pub fn as_worked_on(root: &Path, rev: &str) -> String {
+    let here = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let there = worktrees(root).into_iter().find(|w| w.branch == rev && w.path.canonicalize().unwrap_or_else(|_| w.path.clone()) != here);
+    match there.and_then(|w| worktree_snapshot(&w.path, true)) {
+        Some(commit) if commit != "HEAD" => commit,
+        _ => rev.to_string(),
+    }
+}
+
 pub fn diff_against(root: &Path, rev: &str, file: Option<&str>) -> String {
     let mut args = vec!["diff", rev];
     args.extend_from_slice(DIFF_ARGS);
@@ -3076,6 +3094,25 @@ mod edge_tests {
         let files = gpui_kit::component::diff::DiffFile::parse(&working).unwrap();
         assert_eq!(files.iter().map(|f| f.path().to_string()).collect::<Vec<_>>(), ["a.txt", "b.txt", "big.txt"]);
         assert!(hunks(&working).iter().all(|hunk| hunk.path != "big.txt"), "no single change of it to take back");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A branch an agent works on in its own worktree is compared as it is
+    /// there, new files too, and that worktree's index is left alone.
+    #[test]
+    fn a_branch_in_another_worktree_is_compared_as_it_is_there() {
+        let dir = repo("worked-on");
+        sh(&dir, "echo one > f.txt; git add f.txt; git commit -qm base; git worktree add -q -b agent \"../$(basename \"$PWD\")-agent\"");
+        let there = dir.with_file_name(format!("{}-agent", dir.file_name().unwrap().to_string_lossy()));
+        sh(&there, "echo two >> f.txt; echo new > n.txt; echo ignored > i.log; echo '*.log' > .gitignore");
+        let index = there.join(out(&there, "git rev-parse --git-path index").trim());
+        let before = std::fs::read(&index).unwrap();
+        let diff = diff_against(&dir, &as_worked_on(&dir, "agent"), None);
+        assert!(diff.contains("-two") && diff.contains("-new"), "{diff}");
+        assert!(!diff.contains("ignored"), "{diff}");
+        assert_eq!(std::fs::read(&index).unwrap(), before);
+        assert_eq!(as_worked_on(&dir, "main-or-none"), "main-or-none");
+        let _ = std::fs::remove_dir_all(&there);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

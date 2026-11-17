@@ -193,7 +193,10 @@ impl TaskView {
                 None => format!("{shown} on the left, the working tree on the right"),
             };
             let files = cx
-                .background_spawn(async move { DiffFile::parse(&git::diff_against(&root, &rev, file.as_deref())).map(with_languages).unwrap_or_default() })
+                .background_spawn(async move {
+                    let rev = git::as_worked_on(&root, &rev);
+                    DiffFile::parse(&git::diff_against(&root, &rev, file.as_deref())).map(with_languages).unwrap_or_default()
+                })
                 .await;
             let _ = this.update_in(cx, |task, window, cx| task.show_diff_tab(format!("⇄ {shown}"), title, files, window, cx));
         })
