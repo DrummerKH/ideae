@@ -128,14 +128,22 @@ impl TaskView {
             // say "indexing" instead of a misleading "ready".
             _poll: cx.spawn_in(window, async move |this: WeakEntity<FileView>, cx| {
                 let mut last = None;
+                let mut ticks = 0u32;
                 loop {
                     cx.background_executor().timer(Duration::from_millis(500)).await;
+                    ticks += 1;
+                    // Out of view, every few seconds is enough: nobody looks.
                     let Ok(busy) = this.update(cx, |f, cx| {
+                        let hidden = f.task.upgrade().is_some_and(|t| !t.read(cx).visible);
+                        if hidden && ticks % 8 != 0 {
+                            return None;
+                        }
                         f.show_problems(cx);
-                        f.lsp_client.as_ref().map(|c| (c.busy(), c.problem()))
+                        Some(f.lsp_client.as_ref().map(|c| (c.busy(), c.problem())))
                     }) else {
                         break;
                     };
+                    let Some(busy) = busy else { continue };
                     if busy != last {
                         // Done with some work, indexing most of all: the server
                         // now knows names it could not tell a moment ago.
