@@ -15,24 +15,13 @@ impl TaskView {
             let detail = crate::finder::DETAIL;
             // Merged, here, in no task and not the one in hand: nothing is lost with these.
             let spent: Vec<git::BranchRow> = rows.iter().filter(|r| r.merged && !r.remote && r.held.is_none() && r.name != here).cloned().collect();
+            let detail_of = |row: &git::BranchRow| branch_detail(row, &here);
             let mut items = Vec::new();
             if !spent.is_empty() {
                 let text = format!("Delete the {} merged local branch{}…{detail}all of what they hold is in the branch work starts from", spent.len(), if spent.len() == 1 { "" } else { "es" });
                 items.push(crate::finder::Hit { text, path: MERGED.into(), line: 0, col: 0, ranges: Vec::new() });
             }
-            items.extend(rows.iter().map(|row| {
-                let mut what = vec![if row.remote { "remote" } else { "local" }.to_string()];
-                if row.name == here {
-                    what.push("this task".into());
-                } else if let Some(held) = &row.held {
-                    what.push(format!("in {}", held.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()));
-                }
-                if row.merged {
-                    what.push("merged".into());
-                }
-                what.extend([row.when.clone(), row.subject.clone()]);
-                crate::finder::Hit { text: format!("{}{detail}{}", row.name, what.join(" · ")), path: row.name.clone(), line: 0, col: 0, ranges: Vec::new() }
-            }));
+            items.extend(rows.iter().map(|row| crate::finder::Hit { text: format!("{}{detail}{}", row.name, detail_of(row)), path: row.name.clone(), line: 0, col: 0, ranges: Vec::new() }));
             let picked = task.clone();
             let _ = cx.update(|window, cx| {
                 crate::finder::Finder::open_pick(
@@ -223,4 +212,37 @@ impl TaskView {
         }
         self.place_tab(TabItem::new(label, TabKind::Diff(view)), OpenAs::Kept, window, cx);
     }
+}
+
+/// What a branch is and holds, in the words of the list: whose it is, what
+/// is done in it, when. A branch with no commits of its own is "merged" to
+/// git even while an agent works in it: then what it changes is told.
+fn branch_detail(row: &git::BranchRow, here: &str) -> String {
+    let mut what = Vec::new();
+    if row.agent {
+        what.push("subagent".to_string());
+    } else if row.name == here {
+        what.push("this task".into());
+    } else if let Some(held) = &row.held {
+        what.push(format!("in {}", held.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()));
+    } else {
+        what.push(if row.remote { "remote" } else { "local" }.into());
+    }
+    let ahead = row.ahead.unwrap_or(0);
+    if !row.changed.is_empty() {
+        let names: Vec<&str> = row.changed.iter().take(3).map(|p| p.rsplit('/').next().unwrap_or(p)).collect();
+        let more = row.changed.len().saturating_sub(3);
+        let files = format!("{} file{} changed: {}{}", row.changed.len(), if row.changed.len() == 1 { "" } else { "s" }, names.join(", "), if more > 0 { format!(" +{more}") } else { String::new() });
+        what.push(if ahead == 0 { format!("nothing committed yet, {files}") } else { files });
+    }
+    if ahead > 0 {
+        what.push(format!("{ahead} commit{} ahead", if ahead == 1 { "" } else { "s" }));
+    } else if row.merged && row.changed.is_empty() {
+        what.push(if row.held.is_some() { "nothing done yet".into() } else { "merged".into() });
+    }
+    // Its own last commit says what it did, and when; one it has not made is the base's.
+    if ahead > 0 || row.ahead.is_none() || row.held.is_none() {
+        what.extend([row.when.clone(), row.subject.clone()]);
+    }
+    what.join(" · ")
 }

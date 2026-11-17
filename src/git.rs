@@ -2013,6 +2013,13 @@ pub struct BranchRow {
     pub subject: String,
     /// The worktree it is checked out in: a task has it.
     pub held: Option<PathBuf>,
+    /// Commits it has that the branch work starts from has not; none when
+    /// git is too old to tell.
+    pub ahead: Option<u32>,
+    /// What is changed and not committed in the worktree that holds it.
+    pub changed: Vec<String>,
+    /// That worktree is one an agent made for itself (a Claude Code subagent's).
+    pub agent: bool,
 }
 
 pub fn branch_rows(root: &Path) -> Vec<BranchRow> {
@@ -2026,7 +2033,21 @@ pub fn branch_rows(root: &Path) -> Vec<BranchRow> {
         git(root, &args).unwrap_or_default()
     };
     let merged: std::collections::HashSet<String> = listed(true).lines().filter_map(|line| line.split('\x1f').next().map(str::to_string)).collect();
-    let held: std::collections::HashMap<String, PathBuf> = worktrees(root).into_iter().map(|w| (w.branch, w.path)).collect();
+    let all = worktrees(root);
+    let paths: Vec<PathBuf> = all.iter().map(|w| w.path.clone()).collect();
+    let held: std::collections::HashMap<String, PathBuf> = all.into_iter().map(|w| (w.branch, w.path)).collect();
+    // One call for all of them; git before 2.41 has no ahead-behind and tells nothing.
+    let ahead: std::collections::HashMap<String, u32> = git(root, &["for-each-ref", &format!("--format=%(refname)%1f%(ahead-behind:{base})"), "refs/heads", "refs/remotes"])
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let (name, counts) = line.split_once('\x1f')?;
+            Some((name.to_string(), counts.split_whitespace().next()?.parse().ok()?))
+        })
+        .collect();
+    let changed = |path: &Path| -> Vec<String> {
+        git(path, &["status", "--porcelain"]).unwrap_or_default().lines().filter_map(|l| l.get(3..)).map(|p| p.rsplit(" -> ").next().unwrap_or(p).to_string()).collect()
+    };
     listed(false)
         .lines()
         .filter_map(|line| {
@@ -2037,9 +2058,13 @@ pub fn branch_rows(root: &Path) -> Vec<BranchRow> {
             if name.ends_with("/HEAD") || name == "origin" || name == base || base.strip_prefix("origin/") == Some(name.as_str()) {
                 return None;
             }
+            let held = (!remote).then(|| held.get(&name).cloned()).flatten();
             Some(BranchRow {
                 merged: merged.contains(full),
-                held: (!remote).then(|| held.get(&name).cloned()).flatten(),
+                ahead: ahead.get(full).copied(),
+                changed: held.as_deref().map(changed).unwrap_or_default(),
+                agent: held.as_deref().is_some_and(|path| crate::workspace::side::made_by_agent(path, &paths).is_some()),
+                held,
                 when: parts.next()?.to_string(),
                 subject: parts.next().unwrap_or_default().to_string(),
                 name,
