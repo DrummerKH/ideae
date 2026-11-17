@@ -3,6 +3,7 @@
 
 mod agent;
 mod agents;
+mod archive;
 mod browser;
 mod crash;
 mod build_watch;

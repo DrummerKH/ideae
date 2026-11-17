@@ -67,6 +67,37 @@ pub fn lookup(root: &Path, branch: &str) -> Option<Pr> {
     Some(pr)
 }
 
+/// A PR by its number as it is now, with the branch it is of: an archived
+/// task's, which has no branch here any more. Off the UI thread.
+pub fn by_number(root: &Path, number: u64) -> Option<(Pr, String)> {
+    let out = crate::procs::command("gh")
+        .current_dir(root)
+        .env("GH_PROMPT_DISABLED", "1")
+        .args(["pr", "view", &number.to_string(), "--json", "number,url,state,isDraft,headRefName"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v: Value = serde_json::from_slice(&out.stdout).ok()?;
+    Some((parse(&v)?, v["headRefName"].as_str().unwrap_or_default().to_string()))
+}
+
+impl PrState {
+    pub fn word(self) -> &'static str {
+        match self {
+            PrState::Open => "open",
+            PrState::Draft => "draft",
+            PrState::Merged => "merged",
+            PrState::Closed => "closed",
+        }
+    }
+
+    pub fn from_word(word: &str) -> Option<Self> {
+        [PrState::Open, PrState::Draft, PrState::Merged, PrState::Closed].into_iter().find(|s| s.word() == word)
+    }
+}
+
 /// What `lookup` tells of a PR, asked for many branches at once.
 const PR_FIELDS: &str = "nodes{number url state isDraft \
 commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{__typename ... on CheckRun{status conclusion} ... on StatusContext{state}}}}}}} \

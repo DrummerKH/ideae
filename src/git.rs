@@ -2326,7 +2326,7 @@ pub fn branches(root: &Path) -> Vec<String> {
         .collect()
 }
 
-fn git_status(root: &Path, args: &[&str]) -> Result<String, String> {
+pub(crate) fn git_status(root: &Path, args: &[&str]) -> Result<String, String> {
     let output = crate::procs::command("git")
         .env("GIT_TERMINAL_PROMPT", "0")
         .arg("-C")
@@ -2640,6 +2640,48 @@ pub fn has_upstream(root: &Path) -> bool {
     }
     git(root, &["rev-parse", "--abbrev-ref", "HEAD"])
         .is_some_and(|branch| git_status(root, &["rev-parse", "--verify", "-q", &format!("refs/remotes/origin/{}", branch.trim())]).is_ok())
+}
+
+/// A branch name like `name` that neither this repository nor its origin
+/// has: `name`, else `name-2`, `name-3`…
+pub fn free_branch_name(repo: &Path, name: &str) -> String {
+    let taken = |b: &str| {
+        branch_exists(repo, b)
+            || git_status(repo, &["rev-parse", "--verify", "-q", &format!("refs/remotes/origin/{b}")]).is_ok()
+            || task_worktree_dir(repo, b).exists()
+    };
+    std::iter::once(name.to_string()).chain((2..100).map(|n| format!("{name}-{n}"))).find(|b| !taken(b)).unwrap_or_else(|| format!("{name}-{}", crate::state::now()))
+}
+
+/// A task's worktree on a branch of origin, fetched first: the branch of a
+/// pull request that is still open. The local branch follows origin's.
+pub fn remote_branch_worktree(repo: &Path, branch: &str, copy_env: bool) -> Result<PathBuf, String> {
+    fetch_quietly(repo, &["fetch", "--quiet", "--no-auto-maintenance", "origin", &format!("+refs/heads/{branch}:refs/remotes/origin/{branch}")])?;
+    let dir = worktree_at(repo, branch, &format!("origin/{branch}"), copy_env)?;
+    let _ = git_status(&dir, &["branch", "--set-upstream-to", &format!("origin/{branch}")]);
+    Ok(dir)
+}
+
+/// Removes a worktree an agent made for itself. Its branch goes too when
+/// everything on it is on a remote or another branch; else it stays, and
+/// the reason is returned.
+pub fn remove_side_worktree(repo: &Path, path: &Path, branch: &str) -> Result<Option<String>, String> {
+    let named = !branch.is_empty() && !branch.starts_with('(');
+    let own = if named { Some(format!("--exclude={branch}")) } else { None };
+    let mut args = vec!["rev-list", "--count", "HEAD", "--not", "--remotes"];
+    if let Some(own) = own.as_deref() {
+        args.push(own);
+    }
+    args.push("--branches");
+    let only_here: u32 = if path.exists() { git(path, &args).and_then(|n| n.trim().parse().ok()).unwrap_or(0) } else { 0 };
+    remove_task_worktree(repo, path, "", false)?;
+    if !named {
+        return Ok(None);
+    }
+    if only_here > 0 {
+        return Ok(Some(format!("The branch {branch} stays: {only_here} commit{} on it {} on no remote and no other branch.", if only_here == 1 { "" } else { "s" }, if only_here == 1 { "is" } else { "are" })));
+    }
+    git_status(repo, &["branch", "-D", branch]).map(|_| None)
 }
 
 /// Removes a task's worktree and its branch; a lock is overridden only

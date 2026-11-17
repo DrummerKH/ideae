@@ -88,7 +88,6 @@ pub fn epoch(time: &str) -> Option<u64> {
 }
 
 /// A time as transcripts write it, of seconds since 1970.
-#[cfg(test)]
 pub fn stamp(secs: u64) -> String {
     let (days, rest) = (secs / 86_400, secs % 86_400);
     // Civil from days (Howard Hinnant's algorithm).
