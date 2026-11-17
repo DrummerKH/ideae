@@ -4023,6 +4023,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
             if bounds.size.height > px(0.) {
                 state.reveal_at = None;
             }
+            M::after_layout(state, window, cx);
 
             // Layout consumers need changed geometry, not another notification
             // for every paint of an unchanged input.

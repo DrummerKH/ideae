@@ -122,6 +122,7 @@ pub use lsp::{
     CodeActionItem, CodeActionMenuState, CodeActionProvider, CompletionHighlighter,
     CompletionMenuOptions, CompletionMenuState, CompletionProvider, DefinitionProvider,
     DocumentColorProvider, DocumentRangeSemanticTokensProvider, HoverPopoverState, HoverProvider,
+    INLAY_HINTS_KEY, InlayHintsProvider,
     InputOverlayKind, Lsp, ShowDocumentHandler, highlight_characters, highlight_contains,
     highlight_prefix,
 };

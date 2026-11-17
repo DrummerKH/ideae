@@ -567,4 +567,103 @@ mod tests {
         assert_near(x_after, w * 11.);
         assert_eq!(row, visible.iter().position(|&r| r == 3).unwrap());
     }
+
+    type Asked = Rc<
+        RefCell<
+            Vec<(
+                Range<usize>,
+                futures::channel::oneshot::Sender<Vec<lsp_types::InlayHint>>,
+            )>,
+        >,
+    >;
+
+    /// A server that answers when the test says so.
+    struct Server(Asked);
+
+    impl crate::input::InlayHintsProvider for Server {
+        fn inlay_hints(
+            &self,
+            _: &crate::input::Rope,
+            range: Range<usize>,
+            _: &mut Window,
+            cx: &mut gpui::App,
+        ) -> gpui::Task<anyhow::Result<Vec<lsp_types::InlayHint>>> {
+            let (tx, rx) = futures::channel::oneshot::channel();
+            self.0.borrow_mut().push((range, tx));
+            cx.background_executor()
+                .spawn(async move { Ok(rx.await.unwrap_or_default()) })
+        }
+    }
+
+    fn type_hint(line: u32, character: u32, label: &str) -> lsp_types::InlayHint {
+        lsp_types::InlayHint {
+            position: lsp_types::Position::new(line, character),
+            label: lsp_types::InlayHintLabel::String(label.into()),
+            kind: Some(lsp_types::InlayHintKind::TYPE),
+            text_edits: None,
+            tooltip: None,
+            padding_left: None,
+            padding_right: None,
+            data: None,
+        }
+    }
+
+    #[gpui::test]
+    fn hints_are_asked_for_the_view_and_a_stale_answer_is_dropped(cx: &mut TestAppContext) {
+        let (input, mut cx) = editor(cx, 800., "let x = 5;\nlet y = 6;");
+        let asked: Asked = Rc::default();
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                state.lsp_mut().inlay_hints_provider = Some(Rc::new(Server(asked.clone())));
+                cx.notify();
+            })
+        });
+        draw(&mut cx);
+        cx.run_until_parked();
+        let texts = |cx: &mut VisualTestContext| {
+            input.read_with(cx, |s, _| {
+                s.inlays()
+                    .map(|i| (i.offset, i.text.to_string()))
+                    .collect::<Vec<_>>()
+            })
+        };
+        // The first paint asks at once, for every line.
+        let (range, answer) = asked.borrow_mut().remove(0);
+        assert_eq!(range, 0..21);
+        answer.send(vec![type_hint(0, 5, ": i32")]).unwrap();
+        cx.run_until_parked();
+        assert_eq!(texts(&mut cx), vec![(5, ": i32".to_string())]);
+
+        // Typing asks again after a pause; what answers meanwhile for the
+        // old text is not shown.
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.focus(window, cx);
+                state.move_to(0, None, cx);
+            })
+        });
+        cx.simulate_input("x");
+        draw(&mut cx);
+        cx.run_until_parked();
+        assert!(asked.borrow().is_empty());
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(700));
+        cx.run_until_parked();
+        let (_, answer) = asked.borrow_mut().remove(0);
+        cx.simulate_input("y");
+        // Typing again dropped the request: its answer finds no one.
+        let _ = answer.send(vec![type_hint(1, 0, "stale")]);
+        cx.run_until_parked();
+        assert_eq!(texts(&mut cx), vec![(7, ": i32".to_string())]);
+
+        // The fresh answer replaces the hints.
+        draw(&mut cx);
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(700));
+        cx.run_until_parked();
+        let (_, answer) = asked.borrow_mut().remove(0);
+        answer.send(vec![type_hint(1, 5, ": u8")]).unwrap();
+        cx.run_until_parked();
+        assert_eq!(texts(&mut cx), vec![(18, ": u8".to_string())]);
+    }
 }
