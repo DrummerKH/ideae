@@ -3153,18 +3153,17 @@ mod push_tests {
         std::fs::create_dir_all(&top).unwrap();
         let (here, there) = (top.join("here"), top.join("there"));
         git(&top, &["init", "-q", "--bare", "-b", "main", "remote.git"]);
-        git(&top, &["clone", "-q", "remote.git", "here"]);
+        // As the clone is made: set after it, Windows' CRLF checkout looks changed.
+        git(&top, &["clone", "-q", "-c", "core.autocrlf=false", "remote.git", "here"]);
         git(&here, &["config", "user.email", "me@example.com"]);
         git(&here, &["config", "user.name", "me"]);
-        git(&here, &["config", "core.autocrlf", "false"]);
         git(&here, &["checkout", "-qb", "main"]);
         commit(&here, "a.txt", "one\n", "me");
         git(&here, &["push", "-q", "-u", "origin", "main"]);
         git(&here, &["checkout", "-qb", "feature"]);
         commit(&here, "b.txt", "mine\n", "me");
         git(&here, &["push", "-q", "-u", "origin", "feature"]);
-        git(&top, &["clone", "-q", "-b", "feature", "remote.git", "there"]);
-        git(&there, &["config", "core.autocrlf", "false"]);
+        git(&top, &["clone", "-q", "-c", "core.autocrlf=false", "-b", "feature", "remote.git", "there"]);
         (top, here, there)
     }
 
