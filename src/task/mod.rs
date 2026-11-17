@@ -369,6 +369,9 @@ pub struct TaskView {
     structure: std::cell::RefCell<Option<(usize, u64, Rc<Vec<crate::finder::OutlineItem>>)>>,
     /// The outline being made, by what it is of.
     structure_job: std::cell::RefCell<(Option<(usize, u64)>, Task<()>)>,
+    /// The panel opened before its file's outline was made: the cursor's
+    /// declaration is selected when it comes.
+    structure_select: bool,
     tree: Entity<TreeState>,
     /// The file list the tree was built from, and the folders open in it.
     tree_files: Arc<Vec<String>>,
@@ -673,6 +676,7 @@ impl TaskView {
             side_has_focus: Default::default(),
             structure: Default::default(),
             structure_job: std::cell::RefCell::new((None, Task::ready(()))),
+            structure_select: false,
             tree,
             tree_files: Arc::default(),
             tree_stale: false,
@@ -1728,6 +1732,7 @@ impl TaskView {
             RightPane::Structure => self.structure_items(cx).iter().rposition(|i| i.line <= self.structure_cursor(cx)).unwrap_or(0),
             _ => 0,
         };
+        self.structure_select = self.right == RightPane::Structure && !self.structure_ready();
         match self.right {
             RightPane::Files => self.tree.update(cx, |t, cx| t.focus(window, cx)),
             _ => self.side_focus.focus(window, cx),
@@ -1782,22 +1787,19 @@ impl TaskView {
         self.structure_target().map_or(0, |(_, f)| f.read(cx).cursor_line)
     }
 
-    /// The outline of the Structure file, parsed again only after edits.
-    fn structure_items(&self, cx: &App) -> Rc<Vec<crate::finder::OutlineItem>> {
-        let Some((id, file)) = self.structure_target() else { return Rc::default() };
-        let (path, version) = {
-            let f = file.read(cx);
-            (f.path.clone(), f.edit_version)
-        };
+    /// The outline of the Structure file, parsed again only after edits;
+    /// none until `refresh_structure` has made it (a long file takes tens of
+    /// milliseconds).
+    fn structure_items(&self, _: &App) -> Rc<Vec<crate::finder::OutlineItem>> {
+        let Some(id) = self.structure_file else { return Rc::default() };
         // While you type, the outline of a moment ago: `refresh_structure`
         // brings the new one once the typing pauses.
-        if let Some((_, _, items)) = self.structure.borrow().as_ref().filter(|(i, _, _)| *i == id) {
-            return items.clone();
-        }
-        let text = file.read(cx).editor.read(cx).text().to_string();
-        let items = Rc::new(outline(&path, &text));
-        *self.structure.borrow_mut() = Some((id, version, items.clone()));
-        items
+        self.structure.borrow().as_ref().filter(|(i, _, _)| *i == id).map(|(_, _, items)| items.clone()).unwrap_or_default()
+    }
+
+    /// Whether the outline is that of the Structure file, if of an older text.
+    fn structure_ready(&self) -> bool {
+        self.structure_file.is_some_and(|id| self.structure.borrow().as_ref().is_some_and(|(i, _, _)| *i == id))
     }
 
     /// Parses the Structure panel's file again, off the UI thread, when its
@@ -1812,11 +1814,19 @@ impl TaskView {
         if self.structure.borrow().as_ref().map(|(i, v, _)| (*i, *v)) == current || self.structure_job.borrow().0 == current {
             return;
         }
+        // Another file's is made at once; the same file's once typing pauses.
+        let typing = self.structure_ready();
         let job = cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_millis(200)).await;
+            if typing {
+                cx.background_executor().timer(Duration::from_millis(200)).await;
+            }
             let (version, text) = file.read_with(cx, |f, cx| (f.edit_version, f.editor.read(cx).text().to_string()));
             let items = cx.background_spawn(async move { outline(&path, &text) }).await;
             let _ = this.update(cx, |this, cx| {
+                if this.structure_file == Some(id) && std::mem::take(&mut this.structure_select) && this.right == RightPane::Structure {
+                    let cursor = this.structure_cursor(cx);
+                    this.side_selected = items.iter().rposition(|i| i.line <= cursor).unwrap_or(0);
+                }
                 *this.structure.borrow_mut() = Some((id, version, Rc::new(items)));
                 cx.notify();
             });
