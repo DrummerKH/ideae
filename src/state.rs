@@ -144,6 +144,14 @@ pub struct Settings {
     pub restore_summary: bool,
     /// Days an archived task is kept; 0 for always.
     pub archive_keep_days: u32,
+    /// The first start's word on which agents are installed was answered.
+    /// A state from before it had its agents set up already.
+    #[serde(default = "yes")]
+    pub agents_welcomed: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -186,6 +194,7 @@ impl Default for Settings {
             keys: std::collections::BTreeMap::new(),
             restore_summary: false,
             archive_keep_days: 90,
+            agents_welcomed: false,
         }
     }
 }

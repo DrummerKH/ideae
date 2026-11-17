@@ -87,6 +87,7 @@ pub mod present;
 pub mod side;
 pub mod spaces;
 pub mod variants;
+pub mod welcome;
 
 impl TaskEntry {
     /// The agent's latest session, to find its file by.
@@ -455,6 +456,9 @@ impl Workspace {
                     // While an agent of the group in view works; a turn's end reads it too.
                     if this.active_group.clone().is_some_and(|group| !this.group_settled(&group, cx)) {
                         this.refresh_variant_info(window, cx);
+                    }
+                    if n == 1 {
+                        this.welcome_agents(window, cx);
                     }
                     // Every six hours, the first time soon after start.
                     if n % 7200 == 3 {

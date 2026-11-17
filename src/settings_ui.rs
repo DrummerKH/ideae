@@ -388,7 +388,6 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
 
 /// Where the shortcuts are among the pages.
 pub const KEYS_PAGE: usize = 5;
-#[cfg(test)]
 pub const AGENTS_PAGE: usize = 1;
 
 /// The Agents page: the profiles, the default, the one for quick questions.
@@ -430,12 +429,19 @@ fn agents_page(draft: &Draft, lsp_switch: SettingItem, token_warn: SettingField<
                         window.refresh();
                     }))
             });
-            let add = draft.clone();
+            let (add, find) = (draft.clone(), draft.clone());
             gpui_kit::component::v_flex()
                 .gap_1()
                 .children(rows)
                 .when(d.agents.is_empty(), |s| s.child(div().text_xs().text_color(muted).child("No agent: tasks open with a plain shell.")))
-                .child(h_flex().pt_1().child(Button::new("agent-add").small().outline().label("Add agent…").on_click(move |_, window, cx| profile_dialog(add.clone(), None, window, cx))))
+                .child(
+                    h_flex()
+                        .pt_1()
+                        .gap_2()
+                        .child(Button::new("agent-add").small().outline().label("Add agent…").on_click(move |_, window, cx| profile_dialog(add.clone(), None, window, cx)))
+                        .child(Button::new("agent-find").small().outline().label("Find installed agents").on_click(move |_, window, cx| crate::workspace::welcome::find_into(find.clone(), window, cx))),
+                )
+                .when_some(crate::workspace::welcome::find_said(), |s, said| s.child(div().text_xs().text_color(muted).child(said)))
         })
     };
     let choices = |with_default: bool| -> Vec<(SharedString, SharedString)> {
@@ -612,6 +618,7 @@ impl Workspace {
 fn open(current: state::Settings, first: usize, window: &mut Window, cx: &mut App, save: impl Fn(state::Settings, &mut App) + 'static) {
     let draft: Draft = Rc::new(RefCell::new(current));
     INSTALLED.with(|known| known.borrow_mut().clear());
+    crate::workspace::welcome::forget_find();
     // The shortcut waiting for keys, and what catches them before any
     // binding does.
     let recording: Rc<Cell<Option<&'static str>>> = Rc::default();

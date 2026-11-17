@@ -6,6 +6,21 @@ an agent **profile** (Settings → Agents). A fresh install has one, Claude
 Code (`claude`); with one profile nothing below shows and everything works
 as it always did.
 
+## Installed agents
+
+On the first start the app looks for Claude Code (`claude`), Codex
+(`codex`), OpenCode (`opencode`) and Gemini CLI (`gemini`, as any other
+program) on PATH (the login shell's) and where their installers put them:
+`~/.local/bin`, `~/.claude/local`, `~/.npm-global/bin`, `~/.bun/bin`,
+`~/.opencode/bin`, `~/.volta/bin`, nvm's and pnpm's folders, `/usr/local/bin`,
+`/opt/homebrew/bin`; on Windows `%APPDATA%\npm`, `%USERPROFILE%\.local\bin`,
+pnpm, Scoop, WinGet, Volta. Claude Code alone, and the default: nothing is
+said. Others found: a card offers to add them as profiles (the default stays
+unless you tick it). None: a card says where to get one, and that tasks open
+with a shell until then. "Don't show again", or Add, ends it; it never shows
+while presenting. Settings → Agents → **Find installed agents** looks again
+and adds what it finds to the list.
+
 ## Profiles
 
 A profile has a name, a kind (Claude Code, Codex, OpenCode, or any other

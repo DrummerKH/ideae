@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod claude;
 pub mod codex;
+pub mod find;
 pub mod generic;
 pub mod opencode;
 
