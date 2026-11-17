@@ -29,6 +29,7 @@ mod menu;
 mod naming;
 mod palette;
 mod pr;
+mod predict;
 mod procs;
 mod project_config;
 mod replace;

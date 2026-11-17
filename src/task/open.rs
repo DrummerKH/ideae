@@ -53,6 +53,8 @@ impl TaskView {
             state.set_value(content.clone(), window, cx);
             state.jump_to_position(Position::new(line, col), JUMP_AT, window, cx);
         });
+        let predict = crate::predict::provider(None, &path, &self.root, editor.read(cx).text().clone(), cx);
+        editor.update(cx, |state, _| state.lsp_mut().completion_provider = Some(predict));
 
         let saved = super::file::Print::of(&content);
         let root = self.root.clone();
@@ -346,10 +348,11 @@ impl TaskView {
         let bridge = Rc::new(LspBridge { client, uri: lsp::path_to_uri(path), path: path.clone(), file: file.downgrade() });
         let task = cx.weak_entity();
         let this_path = path.clone();
+        let completions = crate::predict::provider(Some(bridge.clone()), path, &self.root, editor.read(cx).text().clone(), cx);
         editor.update(cx, |state, cx| {
             let lsp = state.lsp_mut();
             lsp.hover_provider = Some(bridge.clone());
-            lsp.completion_provider = Some(bridge.clone());
+            lsp.completion_provider = Some(completions);
             lsp.code_action_providers = vec![bridge.clone()];
             lsp.semantic_tokens_provider = Some(bridge.clone());
             lsp.inlay_hints_provider = Some(bridge.clone());

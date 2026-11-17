@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Before a push: the tests, the end-to-end ones (real repositories, real
 # terminals, a real daemon; under a minute together), and the Windows side.
+# Edit prediction's runs a real model only when IDEAE_PREDICT_SERVER and
+# IDEAE_PREDICT_MODEL name one.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -12,7 +14,8 @@ cargo test -- --ignored \
   the_tasks_of_the_last_run \
   a_window_that_does_not_read \
   a_task_is_set_up_checked_and_torn_down \
-  an_archived_task
+  an_archived_task \
+  a_local_model_predicts_at_the_cursor
 
 if rustup target list --installed 2>/dev/null | grep -q x86_64-pc-windows-gnu; then
   cargo check --target x86_64-pc-windows-gnu --target-dir target/win

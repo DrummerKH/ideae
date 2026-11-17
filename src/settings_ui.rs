@@ -255,7 +255,7 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
                     |s| s.format_on_save,
                     |s, v| s.format_on_save = v,
                 )),
-        ).group(
+        ).group(crate::predict::settings_group(draft)).group(
             SettingGroup::new().title("Tabs")
                 .item(switch(
                     draft,

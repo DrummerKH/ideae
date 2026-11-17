@@ -408,6 +408,7 @@ impl Workspace {
                 }
                 crate::procs::end_child_sessions();
                 crate::browser::quit();
+                crate::predict::quit();
                 async {}
             }),
         ];
@@ -2247,6 +2248,7 @@ impl Workspace {
                 });
             }
         }
+        crate::predict::settings_changed(&old, &new, cx);
         self.save(cx);
         cx.notify();
     }

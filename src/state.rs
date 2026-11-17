@@ -159,6 +159,11 @@ pub struct Settings {
     /// A state from before it had its agents set up already.
     #[serde(default = "yes")]
     pub agents_welcomed: bool,
+    /// Edit prediction by a local model (predict/): None until the offer
+    /// to turn it on is answered.
+    pub edit_prediction: Option<bool>,
+    /// "auto", or the id of a model (predict::assets::Model).
+    pub prediction_model: String,
 }
 
 fn yes() -> bool {
@@ -210,6 +215,8 @@ impl Default for Settings {
             restore_summary: false,
             archive_keep_days: 90,
             agents_welcomed: false,
+            edit_prediction: None,
+            prediction_model: "auto".into(),
         }
     }
 }

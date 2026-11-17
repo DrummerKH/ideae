@@ -212,6 +212,7 @@ impl TaskView {
         );
         let task_weak = cx.weak_entity();
         let this_path = path.clone();
+        let predict = replace.then(|| crate::predict::provider(None, path, &self.root, editor.read(cx).text().clone(), cx));
         editor.update(cx, |state, cx| {
             let lsp = state.lsp_mut();
             if replace {
@@ -219,7 +220,7 @@ impl TaskView {
                 // and ask it on every key.
                 lsp.hover_provider = None;
                 lsp.definition_provider = None;
-                lsp.completion_provider = None;
+                lsp.completion_provider = predict;
                 lsp.code_action_providers.clear();
                 lsp.semantic_tokens_provider = None;
                 lsp.inlay_hints_provider = None;

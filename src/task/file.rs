@@ -1140,6 +1140,7 @@ impl Render for FileView {
                                 }),
                         )
                     })
+                    .children(crate::predict::badge(cx))
                     .child(
                         div()
                             .id("lsp-status")

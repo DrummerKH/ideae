@@ -61,6 +61,8 @@ src/procs.rs       starting helper programs (no console on Windows), ending chil
 src/daemon/        terminals in a daemon (`ideae --daemon`, unix): they outlive the window (×, Restart); Exit/Ctrl+Q ends them;
                    a window of another build makes the daemon hand its ptys to a new one (SCM_RIGHTS), agents keep running
 src/desktop.rs     launcher entry, dash pin, restart, `--install` / `--uninstall` (run by scripts/install.sh, install.ps1)
+src/predict/       edit prediction: llama-server and a model downloaded on consent, run for the app, ghost text at the cursor;
+                   tests and UI checks use local files: IDEAE_PREDICT_SERVER, IDEAE_PREDICT_MODEL (IDEAE_DEBUG_PREDICT logs misses)
 src/naming.rs      branch names from task titles
 src/services.rs    `.ideae.toml` services (Run ▾): per-task port slots, IDEAE_PORT_<NAME>
 src/project_config.rs  `.ideae.toml` [task] (setup, teardown, check, copy), your own over the file, suggestions, runs
