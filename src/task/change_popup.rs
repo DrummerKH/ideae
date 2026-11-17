@@ -57,7 +57,7 @@ impl FileView {
                 && h.changes.lines().filter(|l| l.starts_with('+')).count() == run.new.len()
                 && h.changes.lines().filter_map(|l| l.strip_prefix('-')).eq(old.lines())
         })?;
-        let staged = task.changes.read(cx).staged.contains(&(hunk.path.clone(), hunk.changes.clone()));
+        let staged = task.changes.read(cx).staged.contains(&super::changes::staged_key(&hunk.path, &hunk.changes));
         Some((hunk.clone(), staged))
     }
 

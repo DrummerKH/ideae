@@ -538,7 +538,7 @@ impl TaskView {
                                     }
                                     _ => (parse_patch(branch, &mut seen.1), false),
                                 };
-                                let staged: HashSet<(String, String)> = git::hunks(&staged).into_iter().map(|hunk| (hunk.path, hunk.changes)).collect();
+                                let staged: HashSet<u64> = git::hunks(&staged).iter().map(|hunk| changes::staged_key(&hunk.path, &hunk.changes)).collect();
                                 (patch, branch, shared, Some(staged))
                             }
                             None => (None, None, false, None),
@@ -1651,7 +1651,10 @@ impl TaskView {
         if matches!(removed.kind, TabKind::Changes) {
             let diff = self.changes.read(cx).diff.clone();
             diff.update(cx, |state, cx| state.set_files([], cx));
-            self.changes.update(cx, |changes, _| (changes.hunks, changes.first_lines) = Default::default());
+            self.changes.update(cx, |changes, _| {
+                changes.set_hunks(Rc::default());
+                changes.first_lines = Rc::default();
+            });
             self.diff_stale = true;
         }
         // The server keeps every text it was given until told otherwise.

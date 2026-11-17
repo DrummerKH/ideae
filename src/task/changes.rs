@@ -22,8 +22,10 @@ pub struct ChangesView {
     /// The single changes of the diff shown: each can be taken back or
     /// staged without the rest of its file.
     pub(super) hunks: Rc<Vec<git::Hunk>>,
-    /// Those of them that are staged, by file and lines.
-    pub(super) staged: Rc<HashSet<(String, String)>>,
+    /// Where each file's are in `hunks`: looked up for every hunk drawn.
+    hunks_of: Rc<HashMap<String, Vec<usize>>>,
+    /// Those of them that are staged, by `staged_key`.
+    pub(super) staged: Rc<HashSet<u64>>,
     pub(super) selection: Option<DiffLineRange>,
     pub(super) task: WeakEntity<TaskView>,
     /// The branches to compare with, for the menu: listed off the UI thread.
@@ -84,6 +86,7 @@ impl ChangesView {
             shown_keys: Rc::default(),
             branches,
             hunks: Rc::default(),
+            hunks_of: Rc::default(),
             staged: Rc::default(),
             review_file: None,
             review_change: None,
@@ -283,6 +286,19 @@ impl ChangesView {
         });
     }
 
+    pub(super) fn set_hunks(&mut self, hunks: Rc<Vec<git::Hunk>>) {
+        let mut of: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, hunk) in hunks.iter().enumerate() {
+            of.entry(hunk.path.clone()).or_default().push(i);
+        }
+        self.hunks_of = Rc::new(of);
+        self.hunks = hunks;
+    }
+
+    fn hunks_in(&self, path: &str) -> &[usize] {
+        self.hunks_of.get(path).map_or(&[], Vec::as_slice)
+    }
+
     pub(super) fn set_scope(&mut self, scope: DiffScope, cx: &mut Context<Self>) {
         if self.scope == scope {
             return;
@@ -297,7 +313,7 @@ impl ChangesView {
             return;
         };
         self.first_lines = lines;
-        self.hunks = hunks;
+        self.set_hunks(hunks);
         self.diff.update(cx, |d, cx| d.set_files(files, cx));
         // The other scope's files: those viewed fold there too.
         let diff = self.diff.clone();
@@ -346,7 +362,7 @@ impl ChangesView {
                 if open_only && diff.is_file_collapsed(file.path()) {
                     continue;
                 }
-                order.extend(self.hunks.iter().enumerate().filter(|(_, h)| h.path == file.path().as_ref()).map(|(i, _)| i));
+                order.extend(self.hunks_in(file.path()).iter().copied());
             }
             order
         };
@@ -358,7 +374,7 @@ impl ChangesView {
     fn review_hunk(&self, cx: &App) -> Option<git::Hunk> {
         let (line, modified) = self.review_change?;
         let file = self.review_file(cx)?;
-        self.hunks.iter().find(|h| h.path == file.as_ref() && h.line == line && h.modified == modified).cloned()
+        self.hunks_in(&file).iter().map(|&i| &self.hunks[i]).find(|h| h.line == line && h.modified == modified).cloned()
     }
 
     fn step_change(&mut self, forward: bool, cx: &mut Context<Self>) {
@@ -426,7 +442,7 @@ impl ChangesView {
         self.review_file = Some(path.clone());
         self.review_change = None;
         self.selection = None;
-        match self.hunks.iter().find(|h| h.path == path.as_ref()).cloned() {
+        match self.hunks_in(&path).first().map(|&i| self.hunks[i].clone()) {
             Some(hunk) if !self.diff.read(cx).is_file_collapsed(&path) => self.select_change(&hunk, false, cx),
             _ => self.diff.update(cx, |d, cx| d.set_selected_lines(None, cx)),
         }
@@ -458,7 +474,7 @@ impl ChangesView {
         if !revert && self.scope != DiffScope::Uncommitted {
             return;
         }
-        let staged = self.staged.contains(&(hunk.path.clone(), hunk.changes.clone()));
+        let staged = self.staged.contains(&staged_key(&hunk.path, &hunk.changes));
         let task = self.task.clone();
         window.defer(cx, move |window, cx| {
             let _ = task.update(cx, |t, cx| match revert {
@@ -704,8 +720,8 @@ impl Render for ChangesView {
                             })
                             // What can be done with each change alone, on the row of its hunk.
                             .render_hunk_suffix({
-                                let (hunks, task, in_index) = (self.hunks.clone(), self.task.clone(), self.staged.clone());
-                                move |file, original, modified, _, _| hunk_actions(file, original, modified, &hunks, &task, &in_index, staging)
+                                let (hunks, hunks_of, task, in_index) = (self.hunks.clone(), self.hunks_of.clone(), self.task.clone(), self.staged.clone());
+                                move |file, original, modified, _, _| hunk_actions(file, original, modified, &hunks, &hunks_of, &task, &in_index, staging)
                             })
                             .on_line_click({
                                 let (root, task) = (self.root.clone(), self.task.clone());
@@ -733,6 +749,15 @@ impl Render for ChangesView {
     }
 }
 
+/// What a staged change is known by: its file and its lines, hashed. The
+/// staged patch is not kept a second time for it.
+pub(super) fn staged_key(path: &str, changes: &str) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (path, changes).hash(&mut hasher);
+    hasher.finish()
+}
+
 /// The first and last line a change covers on the side `line` is on.
 pub(super) fn change_lines(hunk: &git::Hunk) -> (u32, u32) {
     let sign = if hunk.modified { '+' } else { '-' };
@@ -747,20 +772,23 @@ fn hunk_actions(
     original: std::ops::Range<usize>,
     modified: std::ops::Range<usize>,
     hunks: &Rc<Vec<git::Hunk>>,
+    hunks_of: &HashMap<String, Vec<usize>>,
     task: &WeakEntity<TaskView>,
-    in_index: &Rc<HashSet<(String, String)>>,
+    in_index: &Rc<HashSet<u64>>,
     staging: bool,
 ) -> Option<AnyElement> {
     use gpui_kit::component::menu::PopupMenuItem;
-    let path = file.path().as_ref();
-    let inside: Vec<usize> = hunks
+    let inside: Vec<usize> = hunks_of
+        .get(file.path().as_ref())?
         .iter()
-        .enumerate()
-        .filter(|(_, h)| h.path == path && (if h.modified { &modified } else { &original }).contains(&(h.line as usize)))
-        .map(|(i, _)| i)
+        .copied()
+        .filter(|&i| {
+            let h = &hunks[i];
+            (if h.modified { &modified } else { &original }).contains(&(h.line as usize))
+        })
         .collect();
     let &first = inside.first()?;
-    let is_staged = |h: &git::Hunk| in_index.contains(&(h.path.clone(), h.changes.clone()));
+    let is_staged = |h: &git::Hunk| in_index.contains(&staged_key(&h.path, &h.changes));
     const REVERT_TIP: &str = "Take this change back; the rest of the file stays (Undo follows)";
     let mut row = h_flex().flex_none().gap_0p5();
     if inside.len() == 1 {
@@ -800,7 +828,7 @@ fn hunk_actions(
         row = row.child(Button::new(("hunk-stage", first)).xsmall().ghost().label("Stage ▾").tooltip("Stage or unstage one of the changes here alone").dropdown_menu(move |mut menu, _, _| {
             for &i in &inside {
                 let (hunk, task) = (stage_hunks[i].clone(), stage_task.clone());
-                let staged = in_index.contains(&(hunk.path.clone(), hunk.changes.clone()));
+                let staged = in_index.contains(&staged_key(&hunk.path, &hunk.changes));
                 let label = format!("{} {}", if staged { "Unstage" } else { "Stage" }, named(&hunk).to_lowercase());
                 menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
                     let _ = task.update(cx, |t, cx| t.stage_hunk(hunk.clone(), !staged, window, cx));
