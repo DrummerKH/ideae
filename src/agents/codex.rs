@@ -91,8 +91,7 @@ impl Adapter for Codex {
     }
 
     fn usage(&self, transcript: &Path) -> Option<crate::usage::Usage> {
-        let file = std::fs::File::open(transcript).ok()?;
-        rollout_usage(std::io::BufReader::new(file))
+        read_rollout(transcript)
     }
 
     fn resumes(&self) -> bool {
@@ -133,8 +132,14 @@ impl Adapter for Codex {
 fn find_rollout(sessions: &Path, id: &str) -> Option<PathBuf> {
     use std::{collections::HashMap, sync::Mutex};
     static FOUND: Mutex<Option<HashMap<String, PathBuf>>> = Mutex::new(None);
+    static MISSED: Mutex<Option<HashMap<String, std::time::Instant>>> = Mutex::new(None);
     if let Some(path) = FOUND.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|found| found.get(id)).filter(|p| p.is_file()) {
         return Some(path.clone());
+    }
+    // Not there a moment ago: the whole tree is not walked again for a while.
+    const AGAIN: std::time::Duration = std::time::Duration::from_secs(120);
+    if MISSED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|missed| missed.get(id)).is_some_and(|at| at.elapsed() < AGAIN) {
+        return None;
     }
     let suffix = format!("{id}.jsonl");
     let mut dirs = vec![sessions.to_path_buf()];
@@ -154,7 +159,15 @@ fn find_rollout(sessions: &Path, id: &str) -> Option<PathBuf> {
             break;
         }
     }
-    let found = found?;
+    let Some(found) = found else {
+        let mut missed = MISSED.lock().unwrap_or_else(|e| e.into_inner());
+        let missed = missed.get_or_insert_with(HashMap::new);
+        if missed.len() > 256 {
+            missed.clear();
+        }
+        missed.insert(id.to_string(), std::time::Instant::now());
+        return None;
+    };
     let mut known = FOUND.lock().unwrap_or_else(|e| e.into_inner());
     let known = known.get_or_insert_with(HashMap::new);
     if known.len() > 256 {
@@ -165,31 +178,38 @@ fn find_rollout(sessions: &Path, id: &str) -> Option<PathBuf> {
 }
 
 /// What a session used, from its `token_count` events: the totals of the
-/// last, the context of the latest turn, and what the last day took.
-/// Read a line at a time: a long session's rollout is many megabytes,
-/// read again whenever it grows.
-pub fn rollout_usage(reader: impl std::io::BufRead) -> Option<crate::usage::Usage> {
-    let has = |line: &[u8], word: &[u8]| line.windows(word.len()).any(|w| w == word);
-    let mut usage = crate::usage::Usage::default();
-    let day_ago = crate::state::now().saturating_sub(86_400);
-    let mut before = 0u64;
-    let mut seen = false;
-    for line in reader.split(b'\n').map_while(Result::ok) {
-        if !has(&line, b"token_count") && !has(&line, b"turn_context") {
-            continue;
+/// last, the context of the latest turn, and what the last day took. Kept
+/// for each rollout with where it was read to: a long session's rollout is
+/// many megabytes, and only what was written since is read.
+#[derive(Default, Clone)]
+struct Rollout {
+    offset: u64,
+    usage: crate::usage::Usage,
+    seen: bool,
+    /// What each count added, and when: for the last day's share.
+    spent: Vec<(u64, u64)>,
+    before: u64,
+}
+
+impl Rollout {
+    fn take(&mut self, line: &[u8]) {
+        let has = |word: &[u8]| line.windows(word.len()).any(|w| w == word);
+        if !has(b"token_count") && !has(b"turn_context") {
+            return;
         }
-        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&line) else { continue };
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else { return };
         let payload = &v["payload"];
+        let usage = &mut self.usage;
         if v["type"] == "turn_context" {
             if let Some(model) = payload["model"].as_str() {
                 usage.model = model.to_string();
             }
-            continue;
+            return;
         }
         if v["type"] != "event_msg" || payload["type"] != "token_count" || !payload["info"].is_object() {
-            continue;
+            return;
         }
-        seen = true;
+        self.seen = true;
         let info = &payload["info"];
         let n = |u: &serde_json::Value, key: &str| u[key].as_u64().unwrap_or(0);
         let total = &info["total_token_usage"];
@@ -199,17 +219,71 @@ pub fn rollout_usage(reader: impl std::io::BufRead) -> Option<crate::usage::Usag
         usage.output = n(total, "output_tokens");
         let spent = usage.input + usage.output;
         let at = v["timestamp"].as_str().and_then(crate::usage::epoch).unwrap_or(0);
-        if at >= day_ago {
-            usage.recent += spent.saturating_sub(before);
-        }
-        before = spent;
+        self.spent.push((at, spent.saturating_sub(self.before)));
+        self.before = spent;
         usage.answers += 1;
         usage.context = n(&info["last_token_usage"], "input_tokens");
         if let Some(window) = info["model_context_window"].as_u64() {
             usage.window = window;
         }
     }
-    seen.then_some(usage)
+
+    fn now(&mut self) -> Option<crate::usage::Usage> {
+        let day_ago = crate::state::now().saturating_sub(86_400);
+        // What is older than a day counts no more, and is not kept.
+        self.spent.retain(|(at, _)| *at >= day_ago);
+        let mut usage = self.usage.clone();
+        usage.recent = self.spent.iter().map(|(_, n)| n).sum();
+        self.seen.then_some(usage)
+    }
+}
+
+/// A whole rollout read at once: for tests.
+#[cfg(test)]
+pub fn rollout_usage(reader: impl std::io::BufRead) -> Option<crate::usage::Usage> {
+    let mut rollout = Rollout::default();
+    for line in reader.split(b'\n').map_while(Result::ok) {
+        rollout.take(&line);
+    }
+    rollout.now()
+}
+
+/// The rollouts read lately, by path; the oldest make room.
+static ROLLOUTS: std::sync::Mutex<Option<std::collections::HashMap<PathBuf, Rollout>>> = std::sync::Mutex::new(None);
+const ROLLOUTS_KEPT: usize = 48;
+
+fn read_rollout(path: &Path) -> Option<crate::usage::Usage> {
+    use std::io::{BufRead as _, Seek as _};
+    let mut file = std::fs::File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    let mut rollout = ROLLOUTS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).remove(path).unwrap_or_default();
+    // Shorter than what was read: another file under the name.
+    if length < rollout.offset {
+        rollout = Rollout::default();
+    }
+    file.seek(std::io::SeekFrom::Start(rollout.offset)).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => break,
+            // A line still being written is read again when it is whole.
+            Ok(_) if line.last() != Some(&b'\n') => break,
+            Ok(n) => {
+                rollout.take(&line);
+                rollout.offset += n as u64;
+            }
+        }
+    }
+    let usage = rollout.now();
+    let mut kept = ROLLOUTS.lock().unwrap_or_else(|e| e.into_inner());
+    let kept = kept.get_or_insert_with(Default::default);
+    if kept.len() >= ROLLOUTS_KEPT {
+        kept.clear();
+    }
+    kept.insert(path.to_path_buf(), rollout);
+    usage
 }
 
 /// What `ideae --hook Codex <json>` hands on: a turn's end, as Claude
@@ -285,6 +359,19 @@ mod tests {
         assert_eq!(u.model, "gpt-5-codex");
         assert!((u.fill() - 4000. / 272_000.).abs() < 1e-6);
         assert!(rollout_usage(&b"{}"[..]).is_none());
+
+        // Read as it grows: only what was written since, the same sums.
+        let file = std::env::temp_dir().join(format!("ideae-rollout-{}.jsonl", std::process::id()));
+        let lines: Vec<&str> = text.lines().collect();
+        std::fs::write(&file, format!("{}\n", lines[..3].join("\n"))).unwrap();
+        assert_eq!(read_rollout(&file).map(|u| u.answers), Some(1));
+        let half = format!("{}\n{}", lines[..4].join("\n"), &lines[4][..20]);
+        std::fs::write(&file, &half).unwrap();
+        assert_eq!(read_rollout(&file).map(|u| u.answers), Some(1), "a line half written waits");
+        std::fs::write(&file, format!("{}\n", text)).unwrap();
+        let grown = read_rollout(&file).unwrap();
+        assert_eq!((grown.input, grown.output, grown.answers, grown.recent), (u.input, u.output, u.answers, u.recent));
+        let _ = std::fs::remove_file(file);
     }
 
     #[test]
