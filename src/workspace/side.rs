@@ -42,6 +42,24 @@ pub fn made_by_agent(path: &Path, all: &[PathBuf]) -> Option<Option<PathBuf>> {
 /// next to the subagent's transcript, under the projects folder of the
 /// session that started it (`from`, the worktree that session ran in).
 pub fn about(path: &Path, from: &Path) -> Option<String> {
+    use std::{collections::HashMap, sync::Mutex};
+    // Asked every time the worktrees are read again; it never changes.
+    static KNOWN: Mutex<Option<HashMap<PathBuf, String>>> = Mutex::new(None);
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    let known = known.get_or_insert_with(HashMap::new);
+    if let Some(about) = known.get(path) {
+        return Some(about.clone());
+    }
+    // Not found is not kept: Claude Code may write it a moment after the worktree.
+    let about = read_about(path, from)?;
+    if known.len() >= 256 {
+        known.clear();
+    }
+    known.insert(path.to_path_buf(), about.clone());
+    Some(about)
+}
+
+fn read_about(path: &Path, from: &Path) -> Option<String> {
     let id = path.file_name()?.to_str()?.strip_prefix("agent-")?;
     let config = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude")))?;
     let project = config.join("projects").join(project_dir(from));
