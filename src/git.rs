@@ -1166,12 +1166,21 @@ pub enum Change {
 /// Runs a command in `root` for a user action: stdout on success, stderr (or
 /// stdout) as the error.
 pub fn run(root: &Path, program: &str, args: &[&str]) -> Result<String, String> {
-    let output = crate::procs::command(program)
-        .current_dir(root)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| format!("{program}: {e}"))?;
+    let mut command = crate::procs::command(program);
+    command.current_dir(root).args(args).stdin(std::process::Stdio::null());
+    if program == "git" {
+        // Started from a terminal, git or ssh would ask for a password there and
+        // wait for ever: git asks no one, and ssh, with no terminal of its own,
+        // asks through SSH_ASKPASS when there is one or fails and says so.
+        command.env("GIT_TERMINAL_PROMPT", "0");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            // SAFETY: setsid is async-signal-safe and touches nothing of the parent.
+            unsafe { command.pre_exec(|| { libc::setsid(); Ok(()) }) };
+        }
+    }
+    let output = command.output().map_err(|e| format!("{program}: {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if output.status.success() {
