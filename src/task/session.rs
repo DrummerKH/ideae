@@ -41,6 +41,8 @@ impl TaskView {
                         s.kind = "file".into();
                         s.path = Some(rel(&view.read(cx).path));
                     }
+                    // Asked for once: the restart opens without it.
+                    TabKind::Diff(_) => s.kind = "diff".into(),
                     TabKind::Browser(view) => {
                         s.kind = "browser".into();
                         s.url = Some(view.read(cx).url());

@@ -298,14 +298,14 @@ impl TaskView {
         }
     }
 
-    /// What a stash holds, as a diff in a dialog.
+    /// What a stash holds, as a diff in a tab.
     pub(super) fn show_stash(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
         let root = self.root.clone();
         let what = self.stashes.iter().find(|s| s.name == name).map(|s| s.what.clone()).unwrap_or_default();
-        cx.spawn_in(window, async move |_, cx| {
-            let title = format!("{name} · {what}");
+        cx.spawn_in(window, async move |this, cx| {
+            let (label, title) = (name.clone(), format!("{name} · {what}"));
             let files = cx.background_spawn(async move { DiffFile::parse(&git::stash_patch(&root, &name)).map(with_languages).unwrap_or_default() }).await;
-            let _ = cx.update(|window, cx| show_diff_dialog(title, files, window, cx));
+            let _ = this.update_in(cx, |task, window, cx| task.show_diff_tab(label, title, files, window, cx));
         })
         .detach();
     }

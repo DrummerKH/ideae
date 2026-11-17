@@ -184,7 +184,7 @@ impl TaskView {
     /// A new file tab goes in the place of the pane's preview tab when it is
     /// one too, and the file tabs over the limit that were left longest
     /// close.
-    fn place_tab(&mut self, mut tab: TabItem, how: OpenAs, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn place_tab(&mut self, mut tab: TabItem, how: OpenAs, window: &mut Window, cx: &mut Context<Self>) {
         let right = self.focus_right && self.is_split();
         tab.right = right;
         tab.preview = how == OpenAs::Preview && crate::state::settings().preview_tabs;

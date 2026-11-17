@@ -113,7 +113,7 @@ impl TaskView {
                 // Middle click closes what the user opened, never the agent, the
                 // first shell or the Changes/History views.
                 let middle_closes = match &tab.kind {
-                    TabKind::File(_) | TabKind::Browser(_) | TabKind::Binary(_) => true,
+                    TabKind::File(_) | TabKind::Browser(_) | TabKind::Binary(_) | TabKind::Diff(_) => true,
                     TabKind::Terminal(_) => tab.title != "agent" && tab.title != "shell",
                     _ => false,
                 };
@@ -148,7 +148,7 @@ impl TaskView {
                     });
                 let closable = match &tab.kind {
                     TabKind::Terminal(_) => tab.title != "agent",
-                    TabKind::File(_) | TabKind::Browser(_) | TabKind::Binary(_) => true,
+                    TabKind::File(_) | TabKind::Browser(_) | TabKind::Binary(_) | TabKind::Diff(_) => true,
                     TabKind::Changes | TabKind::History => true,
                 };
                 if closable {

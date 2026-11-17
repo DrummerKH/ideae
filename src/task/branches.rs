@@ -196,9 +196,9 @@ impl TaskView {
     /// What the worktree has that `rev` has not, in a diff of its own.
     pub fn compare_with(&mut self, rev: String, file: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         let root = self.root.clone();
-        cx.spawn_in(window, async move |_, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             // A commit's whole hash says no more than its first ten characters.
-            let shown = if rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_hexdigit()) { &rev[..10] } else { rev.as_str() };
+            let shown = if rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_hexdigit()) { rev[..10].to_string() } else { rev.clone() };
             let title = match &file {
                 Some(file) => format!("{file}: {shown} on the left, as it is now on the right"),
                 None => format!("{shown} on the left, the working tree on the right"),
@@ -206,8 +206,21 @@ impl TaskView {
             let files = cx
                 .background_spawn(async move { DiffFile::parse(&git::diff_against(&root, &rev, file.as_deref())).map(with_languages).unwrap_or_default() })
                 .await;
-            let _ = cx.update(|window, cx| show_diff_dialog(title, files, window, cx));
+            let _ = this.update_in(cx, |task, window, cx| task.show_diff_tab(format!("⇄ {shown}"), title, files, window, cx));
         })
         .detach();
+    }
+
+    /// A diff in a tab of its own; one of the same name gives it its place.
+    pub(super) fn show_diff_tab(&mut self, label: String, what: String, files: Vec<DiffFile>, window: &mut Window, cx: &mut Context<Self>) {
+        if files.is_empty() {
+            return window.push_notification(Notification::info(format!("{what}: nothing differs.")), cx);
+        }
+        let view = cx.new(|cx| DiffTab::new(what, files, cx));
+        if let Some(ix) = self.tabs.iter().position(|t| matches!(t.kind, TabKind::Diff(_)) && t.title.as_ref() == label) {
+            self.tabs[ix].kind = TabKind::Diff(view);
+            return self.activate(ix, window, cx);
+        }
+        self.place_tab(TabItem::new(label, TabKind::Diff(view)), OpenAs::Kept, window, cx);
     }
 }

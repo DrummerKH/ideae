@@ -88,7 +88,50 @@ pub fn status_glyph(status: &crate::agent::AgentStatus) -> Option<(&'static str,
 
 /// Highlights diffs with the editor's language table, which knows more
 /// (Kotlin aliases, XML, Gradle, properties) than the diff's own detection.
-/// A diff of its own in a dialog: a stash, two variants against each other.
+/// A diff of its own in a tab: the worktree against a commit or a branch, a stash.
+pub struct DiffTab {
+    what: SharedString,
+    diff: Entity<DiffState>,
+}
+
+impl DiffTab {
+    pub fn new(what: String, files: Vec<DiffFile>, cx: &mut Context<Self>) -> Self {
+        // As the Changes tab shows diffs: in the mode chosen there.
+        let mode = if crate::state::with_settings(|s| s.diff_unified) { DiffMode::Unified } else { DiffMode::Split };
+        Self { what: what.into(), diff: cx.new(|cx| DiffState::new(files, cx).with_mode(mode)) }
+    }
+}
+
+impl Render for DiffTab {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let mode = self.diff.read(cx).mode();
+        v_flex()
+            .size_full()
+            .child(
+                h_flex()
+                    .gap_1()
+                    .px_2()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .children([("diff-split", "Split", DiffMode::Split), ("diff-unified", "Unified", DiffMode::Unified)].map(|(id, label, to)| {
+                        let diff = self.diff.clone();
+                        Button::new(id).small().ghost().label(label).selected(mode == to).on_click(move |_, _, cx| {
+                            // The one choice of mode, as the Changes tab's buttons make it.
+                            let mut settings = crate::state::settings();
+                            settings.diff_unified = to == DiffMode::Unified;
+                            crate::state::set_settings(settings);
+                            diff.update(cx, |d, cx| d.set_mode(to, cx));
+                        })
+                    }))
+                    .child(div().pl_2().min_w_0().truncate().text_sm().text_color(cx.theme().muted_foreground).child(self.what.clone())),
+            )
+            // Wrapped: unwrapped, the two sides share the longest line's width.
+            .child(div().flex_1().min_h_0().child(Diff::new(&self.diff).line_number(true).soft_wrap(true).code_font_size(crate::zoom::size(crate::zoom::Kind::Changes, cx))))
+    }
+}
+
+/// A diff of its own in a dialog: two variants against each other.
 pub fn show_diff_dialog(title: String, files: Vec<DiffFile>, window: &mut Window, cx: &mut App) {
     if files.is_empty() {
         return window.push_notification(Notification::info(format!("{title}: nothing differs.")), cx);

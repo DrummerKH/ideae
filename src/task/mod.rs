@@ -74,6 +74,8 @@ enum TabKind {
     Browser(Entity<crate::browser::BrowserView>),
     /// A file that cannot be shown as text: binary, or unreadable.
     Binary(Entity<BinaryView>),
+    /// The worktree against a commit, a branch or a stash: not kept over a restart.
+    Diff(Entity<DiffTab>),
 }
 
 pub struct BinaryView {
@@ -928,6 +930,7 @@ impl TaskView {
             Some(TabKind::File(file)) => file.clone().into_any_element(),
             Some(TabKind::Browser(view)) => view.clone().into_any_element(),
             Some(TabKind::Binary(view)) => view.clone().into_any_element(),
+            Some(TabKind::Diff(view)) => view.clone().into_any_element(),
             None => div().into_any_element(),
         }
     }
@@ -1450,7 +1453,7 @@ impl TaskView {
                         })
                 })
             }
-            Some(TabKind::File(_) | TabKind::Browser(_) | TabKind::Binary(_) | TabKind::Changes | TabKind::History) => {
+            Some(TabKind::File(_) | TabKind::Browser(_) | TabKind::Binary(_) | TabKind::Diff(_) | TabKind::Changes | TabKind::History) => {
                 self.remember_closed(ix, cx);
                 self.remove_tab(ix, window, cx)
             }
@@ -1542,7 +1545,7 @@ impl TaskView {
             .filter(|(ix, t)| t.right == right && !t.pinned && which(*ix, t))
             .filter(|(_, t)| match &t.kind {
                 TabKind::File(f) => !f.read(cx).dirty && f.read(cx).saving.is_none(),
-                TabKind::Binary(_) | TabKind::Browser(_) => true,
+                TabKind::Binary(_) | TabKind::Browser(_) | TabKind::Diff(_) => true,
                 _ => false,
             })
             .map(|(_, t)| t.id)
