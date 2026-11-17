@@ -10,6 +10,20 @@ pub(super) enum ChangeNode {
     File { ix: usize, depth: usize },
 }
 
+/// The changed files as the setting has them shown: a tree of folders, or
+/// the files alone, each to be drawn with its folder after its name.
+pub(super) fn changes_shown(paths: &[(usize, &str)]) -> Vec<ChangeNode> {
+    if crate::state::with_settings(|s| s.changes_flat) {
+        return paths.iter().map(|&(ix, _)| ChangeNode::File { ix, depth: 0 }).collect();
+    }
+    change_tree(paths)
+}
+
+/// The folder of a path, to follow a file's name where no tree shows it.
+pub(super) fn folder_shown(path: &str) -> Option<String> {
+    crate::state::with_settings(|s| s.changes_flat).then(|| path.rsplit_once('/').map(|(folder, _)| folder.to_string())).flatten()
+}
+
 /// Sorted paths as rows of a folder tree, folders first.
 pub(super) fn change_tree(paths: &[(usize, &str)]) -> Vec<ChangeNode> {
     #[derive(Default)]
@@ -53,6 +67,18 @@ pub(super) fn change_tree(paths: &[(usize, &str)]) -> Vec<ChangeNode> {
 #[cfg(test)]
 mod change_tree_tests {
     use super::{ChangeNode, change_tree};
+
+    #[test]
+    fn a_list_has_each_file_once_and_its_folder_told() {
+        let _one = crate::workspace::variants::tests::ONE_WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+        let paths = [(0, "README.md"), (1, "src/task/mod.rs")];
+        let before = crate::state::settings();
+        crate::state::set_settings(crate::state::Settings { changes_flat: true, ..before.clone() });
+        assert_eq!(super::changes_shown(&paths), vec![ChangeNode::File { ix: 0, depth: 0 }, ChangeNode::File { ix: 1, depth: 0 }]);
+        assert_eq!((super::folder_shown("src/task/mod.rs").as_deref(), super::folder_shown("README.md")), (Some("src/task"), None));
+        crate::state::set_settings(crate::state::Settings { changes_flat: false, ..before });
+        assert!(matches!(super::changes_shown(&paths)[0], ChangeNode::Dir { .. }) && super::folder_shown("src/task/mod.rs").is_none());
+    }
 
     #[test]
     fn folders_compact_and_nest() {

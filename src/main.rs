@@ -173,7 +173,7 @@ impl Render for Workspace {
                                         })),
                                 ))
                                 .child(self.render_space_switch(cx))
-                                .child(self.render_appearance(cx)),
+                                // The theme is in the menu and the command list: not a thing to have before the eyes all day.
                         ),
                 ),
             )
@@ -434,34 +434,15 @@ impl Workspace {
             .xsmall()
             .ghost()
             .icon(gpui_kit::component::IconName::Battery)
+            // Always there, dim until it is on: the one switch of the app that is wanted in a hurry.
             .when(saving, |b| b.text_color(hsla(0.11, 0.9, 0.55, 1.)))
-            .when(!saving, |b| b.text_color(cx.theme().muted_foreground))
+            .when(!saving, |b| b.text_color(cx.theme().muted_foreground.opacity(0.6)))
             .tooltip(if saving {
                 "Power saving is on: no language servers, no background fetch, no pull request status, no load readout. Click to turn it off."
             } else {
                 "Power saving: click to stop the language servers, the background fetch, the pull request status and the load readout."
             })
             .on_click(cx.listener(|this, _, _, cx| this.toggle_power_saving(cx)))
-    }
-
-    /// One button: a click always changes what is seen, light to dark or
-    /// back; a right click follows the system again.
-    fn render_appearance(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let current = self.appearance;
-        let dark = cx.theme().mode.is_dark();
-        let other = if dark { Appearance::Light } else { Appearance::Dark };
-        let shown = if dark { "☾" } else { "☀" };
-        let tip = match current {
-            Appearance::Auto => format!("{}, as the system is. Click: {}.", if dark { "Dark" } else { "Light" }, other.label().to_lowercase()),
-            _ => format!("{}. Click: {}; right click: as the system is.", current.label(), other.label().to_lowercase()),
-        };
-        Button::new("appearance")
-            .xsmall()
-            .ghost()
-            .label(shown)
-            .tooltip(tip)
-            .on_click(cx.listener(move |this, _, window, cx| this.set_appearance(other, window, cx)))
-            .on_mouse_down(MouseButton::Right, cx.listener(|this, _, window, cx| this.set_appearance(Appearance::Auto, window, cx)))
     }
 
     /// The project and task in view.
@@ -597,7 +578,7 @@ fn main() {
 
     menu::before_launch();
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(task::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
             gpui_cn::init(cx);

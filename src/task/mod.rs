@@ -53,6 +53,7 @@ mod annotate;
 mod bookmarks;
 mod change_popup;
 mod file_tree;
+mod strip;
 use file_tree::*;
 use git_ui::*;
 pub use helpers::*;
@@ -91,8 +92,9 @@ pub struct TabsState {
     pub forward: bool,
     pub reopen: bool,
     pub front: Option<FrontTab>,
-    /// None while no side panel is in view: in focus mode, or a narrow window's hidden one.
-    pub panel: Option<RightPane>,
+    /// The side panels in view, by their place in the order of their keys:
+    /// none in focus mode, or of a narrow window's hidden side.
+    pub panels: [bool; 4],
 }
 
 /// The tabs the menu bar names, when one is in front.
@@ -384,7 +386,14 @@ pub struct TaskView {
     /// The Changes tab shows an older diff than the one read last.
     diff_stale: bool,
     branch_info: git::BranchInfo,
-    right: RightPane,
+    /// The side: a panel in its upper half and one in its lower, either or
+    /// neither; the one the arrows go to; and one come over the task from
+    /// its mark in the strip, with what waits to bring or take it.
+    side: [Option<RightPane>; 2],
+    keyed: RightPane,
+    side_peek: Option<RightPane>,
+    side_peek_wait: Task<()>,
+    peek_focus: FocusHandle,
     /// The file the Structure panel shows (tab id), and its outline cached by
     /// (tab id, edit version).
     structure_file: Option<usize>,
@@ -394,9 +403,15 @@ pub struct TaskView {
     /// Where the Changes and Structure panels are scrolled to.
     changes_scroll: UniformListScrollHandle,
     structure_scroll: UniformListScrollHandle,
+    run_scroll: ScrollHandle,
     /// Whether the side panel holds the keyboard, set each render.
     side_has_focus: std::cell::Cell<bool>,
     structure: std::cell::RefCell<Option<(usize, u64, Rc<Vec<crate::finder::OutlineItem>>)>>,
+    /// The file the Files panel last went to by itself.
+    tree_followed: Option<usize>,
+    /// The outline as the Structure panel shows it, some of it left out or
+    /// in another order, by what it was made of.
+    structure_shown: std::cell::RefCell<Option<((usize, bool, bool, bool), Rc<Vec<crate::finder::OutlineItem>>)>>,
     /// The outline being made, by what it is of.
     structure_job: std::cell::RefCell<(Option<(usize, u64)>, Task<()>)>,
     /// The panel opened before its file's outline was made: the cursor's
@@ -708,14 +723,21 @@ impl TaskView {
             branch_hunks: Rc::default(),
             diff_stale: false,
             branch_info: git::BranchInfo::default(),
-            right: RightPane::Changes,
+            side: [Some(RightPane::Changes), None],
+            keyed: RightPane::Changes,
+            side_peek: None,
+            side_peek_wait: Task::ready(()),
+            peek_focus: cx.focus_handle(),
             structure_file: None,
             side_focus: cx.focus_handle(),
             side_selected: 0,
             changes_scroll: UniformListScrollHandle::new(),
             structure_scroll: UniformListScrollHandle::new(),
+            run_scroll: ScrollHandle::new(),
             side_has_focus: Default::default(),
             structure: Default::default(),
+            structure_shown: Default::default(),
+            tree_followed: None,
             structure_job: std::cell::RefCell::new((None, Task::ready(()))),
             structure_select: false,
             tree,
@@ -994,7 +1016,7 @@ impl TaskView {
                 TabKind::Terminal(_) if focused == shell => Some(FrontTab::Shell),
                 _ => None,
             }),
-            panel: (self.zoomed.is_none() && (!self.narrow || self.side_over)).then_some(self.right),
+            panels: strip::PANES.map(|pane| self.zoomed.is_none() && self.panel_shown(pane)),
         }
     }
 
@@ -1488,7 +1510,7 @@ impl TaskView {
             self.show_diff_if_seen(cx);
             self.fill_tree(cx);
             self.focus_active(window, cx);
-            if self.right == RightPane::Run && self._listening_poll.is_none() {
+            if self.panel_shown(RightPane::Run) && self._listening_poll.is_none() {
                 self.refresh_services(cx);
                 self.watch_listening(cx);
             }
@@ -1831,7 +1853,7 @@ impl TaskView {
     pub fn show_side_panel(&mut self, which: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.leave_focus_mode(window, cx);
         self.reveal_side_panel(which, cx);
-        match self.right {
+        match self.keyed {
             RightPane::Files => self.tree.update(cx, |t, cx| t.focus(window, cx)),
             _ => self.side_focus.focus(window, cx),
         }
@@ -1840,28 +1862,19 @@ impl TaskView {
     /// The panel comes up and the keyboard stays where it is.
     pub fn reveal_side_panel(&mut self, which: usize, cx: &mut Context<Self>) {
         self.side_over = true;
-        self.right = match which {
-            0 => RightPane::Changes,
-            1 => RightPane::Files,
-            2 => RightPane::Structure,
-            _ => RightPane::Run,
-        };
-        self.fill_tree(cx);
-        if self.right == RightPane::Run {
-            self.refresh_services(cx);
-            self.watch_listening(cx);
-        }
-        self.side_selected = match self.right {
+        self.keyed = strip::PANES[which.min(3)];
+        self.open_panel(self.keyed, cx);
+        self.side_selected = match self.keyed {
             // Start on the declaration the cursor is in.
-            RightPane::Structure => self.structure_items(cx).iter().rposition(|i| i.line <= self.structure_cursor(cx)).unwrap_or(0),
+            RightPane::Structure => at_cursor(&self.structure_items(cx), self.structure_cursor(cx)).unwrap_or(0),
             _ => 0,
         };
-        self.structure_select = self.right == RightPane::Structure && !self.structure_ready();
+        self.structure_select = self.keyed == RightPane::Structure && !self.structure_ready();
         cx.notify();
     }
 
     fn side_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let len = match self.right {
+        let len = match self.keyed {
             RightPane::Changes => self.files.len(),
             RightPane::Structure => self.structure_items(cx).len(),
             RightPane::Files | RightPane::Run => return,
@@ -1871,7 +1884,7 @@ impl TaskView {
             "up" => self.side_selected = self.side_selected.saturating_sub(1),
             "enter" if len > 0 => {
                 let ix = self.side_selected.min(len - 1);
-                match self.right {
+                match self.keyed {
                     RightPane::Changes => {
                         let path = self.files[ix].path.clone();
                         self.show_changed_file(path, window, cx);
@@ -1914,7 +1927,50 @@ impl TaskView {
         let Some(id) = self.structure_file else { return Rc::default() };
         // While you type, the outline of a moment ago: `refresh_structure`
         // brings the new one once the typing pauses.
-        self.structure.borrow().as_ref().filter(|(i, _, _)| *i == id).map(|(_, _, items)| items.clone()).unwrap_or_default()
+        let all: Rc<Vec<crate::finder::OutlineItem>> = self.structure.borrow().as_ref().filter(|(i, _, _)| *i == id).map(|(_, _, items)| items.clone()).unwrap_or_default();
+        let (public, fields, sorted) = crate::state::with_settings(|s| (s.structure_public, !s.structure_no_fields, s.structure_sorted));
+        if !public && fields && !sorted {
+            return all;
+        }
+        // What the panel's buttons leave out, with all that is declared in it, and the order asked: made once for an outline, not with every frame.
+        let made_of = (Rc::as_ptr(&all) as usize, public, fields, sorted);
+        if let Some((_, shown)) = self.structure_shown.borrow().as_ref().filter(|(of, _)| *of == made_of) {
+            return shown.clone();
+        }
+        let mut shown = Vec::new();
+        let mut under: Option<usize> = None;
+        for item in all.iter() {
+            if under.is_some_and(|depth| item.depth > depth) {
+                continue;
+            }
+            let kind = item.label.rsplit_once(' ').map_or("", |(kind, _)| kind);
+            let field = crate::finder::kind_mark(kind).0 == "v";
+            under = ((public && item.private) || (!fields && field)).then_some(item.depth);
+            if under.is_none() {
+                shown.push(item.clone());
+            }
+        }
+        if sorted {
+            shown = sorted_by_name(shown);
+        }
+        let shown = Rc::new(shown);
+        *self.structure_shown.borrow_mut() = Some((made_of, shown.clone()));
+        shown
+    }
+
+    /// The file whose structure is to show: the one in front where the
+    /// keyboard is, or the one beside a terminal that has it.
+    fn file_in_view(&self) -> Option<usize> {
+        let file = |id: usize| self.tabs.iter().any(|t| t.id == id && matches!(t.kind, TabKind::File(_))).then_some(id);
+        let focused = self.focused_ix().map(|ix| self.tabs[ix].id);
+        let beside = if !self.is_split() {
+            None
+        } else if self.focus_right {
+            Some(self.left_active)
+        } else {
+            self.right_active
+        };
+        focused.and_then(file).or(beside.and_then(file))
     }
 
     /// Whether the outline is that of the Structure file, if of an older text.
@@ -1943,11 +1999,11 @@ impl TaskView {
             let (version, text) = file.read_with(cx, |f, cx| (f.edit_version, f.editor.read(cx).text().to_string()));
             let items = cx.background_spawn(async move { outline(&path, &text) }).await;
             let _ = this.update(cx, |this, cx| {
-                if this.structure_file == Some(id) && std::mem::take(&mut this.structure_select) && this.right == RightPane::Structure {
-                    let cursor = this.structure_cursor(cx);
-                    this.side_selected = items.iter().rposition(|i| i.line <= cursor).unwrap_or(0);
-                }
                 *this.structure.borrow_mut() = Some((id, version, Rc::new(items)));
+                if this.structure_file == Some(id) && std::mem::take(&mut this.structure_select) && this.keyed == RightPane::Structure {
+                    // In the outline as it is shown: some of it may be left out, or in another order.
+                    this.side_selected = at_cursor(&this.structure_items(cx), this.structure_cursor(cx)).unwrap_or(0);
+                }
                 cx.notify();
             });
         });
@@ -1987,9 +2043,52 @@ impl TaskView {
 
 }
 
+/// The declaration the cursor is in: the last to begin at or above its
+/// line, whatever order the outline is shown in.
+pub(super) fn at_cursor(items: &[crate::finder::OutlineItem], cursor: u32) -> Option<usize> {
+    items.iter().enumerate().filter(|(_, item)| item.line <= cursor).max_by_key(|(_, item)| item.line).map(|(ix, _)| ix)
+}
+
+/// An outline with what is declared side by side in the order of the
+/// names, each still followed by what is declared in it.
+fn sorted_by_name(items: Vec<crate::finder::OutlineItem>) -> Vec<crate::finder::OutlineItem> {
+    fn sort(items: &[crate::finder::OutlineItem], out: &mut Vec<crate::finder::OutlineItem>) {
+        let Some(depth) = items.iter().map(|item| item.depth).min() else { return };
+        // Each of this depth with all that follows it deeper.
+        let starts: Vec<usize> = (0..items.len()).filter(|&ix| items[ix].depth == depth).collect();
+        let mut groups: Vec<&[crate::finder::OutlineItem]> = starts.iter().enumerate().map(|(n, &at)| &items[at..starts.get(n + 1).copied().unwrap_or(items.len())]).collect();
+        let name = |item: &crate::finder::OutlineItem| item.label.rsplit(' ').next().unwrap_or_default().to_lowercase();
+        groups.sort_by_cached_key(|group| name(&group[0]));
+        // What comes before the first of this depth is deeper and has no one above it: it stays first.
+        sort_rest(&items[..starts.first().copied().unwrap_or(0)], out);
+        for group in groups {
+            out.push(group[0].clone());
+            sort(&group[1..], out);
+        }
+    }
+    fn sort_rest(items: &[crate::finder::OutlineItem], out: &mut Vec<crate::finder::OutlineItem>) {
+        out.extend(items.iter().cloned());
+    }
+    let mut out = Vec::with_capacity(items.len());
+    sort(&items, &mut out);
+    out
+}
+
 impl Render for TaskView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.side_has_focus.set(self.side_focus.is_focused(window));
+        self.side_has_focus.set(self.side_focus.is_focused(window) || self.peek_focus.is_focused(window));
+        self.settle_side(cx);
+        // Structure is of the file in view: with none there it shows none, not the one that was.
+        let in_view = self.file_in_view();
+        self.structure_file = in_view;
+        // Told apart from the Structure file, which a tab coming to the front has set already.
+        if std::mem::replace(&mut self.tree_followed, in_view) != in_view && in_view.is_some() && self.panel_shown(RightPane::Files) && crate::state::with_settings(|s| s.tree_follows) {
+            // Not while drawing: the tree is another view.
+            cx.spawn(async move |this, cx| {
+                let _ = this.update(cx, |this, cx| this.locate_in_tree(cx));
+            })
+            .detach();
+        }
         // Narrow, the side panel would leave the task too little: it goes over it.
         let narrow = window.viewport_size().width < NARROW_WINDOW;
         if narrow != self.narrow {
@@ -1998,7 +2097,7 @@ impl Render for TaskView {
         }
         if self.action != self.told_action {
             self.told_action = self.action.clone();
-            let seen = self.right == RightPane::Changes && self.zoomed.is_none();
+            let seen = self.panel_shown(RightPane::Changes) && self.zoomed.is_none();
             if let Some((ok, message)) = self.action.clone().filter(|_| !seen && self.visible) {
                 let note = if ok { Notification::info(message) } else { Notification::error(message) };
                 window.push_notification(note.title("Git"), cx);
@@ -2036,56 +2135,67 @@ impl Render for TaskView {
             .on_action(cx.listener(|this, _: &SendToAgent, window, cx| this.send_editor_selection(window, cx)))
             .on_action(cx.listener(|this, _: &ShowBranches, window, cx| this.branches_dialog(window, cx)))
             .on_action(cx.listener(|this, _: &CompareFileWith, window, cx| this.compare_open_file(window, cx)))
-            .map(|view| if narrow {
+            .map(|view| {
                 let main = v_flex().size_full().min_w_0().child(self.render_branch(cx)).child(div().flex_1().min_h_0().child(content));
-                view.child(div().relative().size_full().child(main).when(self.side_over, |over| {
-                    over.child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .right_0()
-                            .h_full()
-                            .w(px(320.))
-                            .bg(cx.theme().background)
-                            .border_l_1()
-                            .border_color(cx.theme().border)
-                            .shadow_lg()
-                            .child(self.render_files(cx))
-                            .child(
-                                div().absolute().top_1().right_1().child(
-                                    Button::new("side-close").xsmall().ghost().label("×").tooltip("Close the panel").on_click(cx.listener(|this, _, _, cx| {
-                                        this.side_over = false;
-                                        cx.notify();
-                                    })),
-                                ),
-                            ),
-                    )
-                }))
-            } else {
+                let held = self.side != [None, None];
+                // Narrow, the side would leave the task too little: it is over it, on asking.
+                let body: AnyElement = if narrow || !held {
+                    main.into_any_element()
+                } else {
+                    h_resizable("task")
+                        .on_resize(|state, _, cx| {
+                            if let Some(width) = state.read(cx).sizes().get(1).copied() {
+                                cx.set_global(SidePanelWidth(width));
+                            }
+                        })
+                        .child(resizable_panel().child(main))
+                        .child(
+                            resizable_panel()
+                                .size(cx.try_global::<SidePanelWidth>().map_or(px(300.), |w| w.0))
+                                .size_range(px(200.)..px(640.))
+                                .fixed()
+                                .child(self.render_side(cx)),
+                        )
+                        .into_any_element()
+                };
+                let over = (narrow && held && self.side_over).then(|| {
+                    div()
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .h_full()
+                        .w(px(320.))
+                        .bg(cx.theme().background)
+                        .shadow_lg()
+                        .occlude()
+                        .child(self.render_side(cx))
+                });
                 view.child(
-                h_resizable("task")
-                    .on_resize(|state, _, cx| {
-                        if let Some(width) = state.read(cx).sizes().get(1).copied() {
-                            cx.set_global(SidePanelWidth(width));
-                        }
-                    })
-                    .child(resizable_panel().child(
-                        v_flex()
-                            .size_full()
-                            .min_w_0()
-                            .child(self.render_branch(cx))
-                            .child(div().flex_1().min_h_0().child(content)),
-                    ))
-                    .child(
-                        resizable_panel()
-                            .size(cx.try_global::<SidePanelWidth>().map_or(px(300.), |w| w.0))
-                            .size_range(px(200.)..px(640.))
-                            .fixed()
-                            .child(self.render_files(cx)),
-                    ),
+                    h_flex()
+                        .size_full()
+                        .child(div().relative().flex_1().min_w_0().h_full().child(body).children(over).children(self.render_peek(cx)))
+                        .child(self.render_strip(cx)),
                 )
             })
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod structure_tests {
+    use super::{at_cursor, sorted_by_name};
+    use crate::finder::OutlineItem;
+
+    #[test]
+    fn an_outline_by_name_keeps_what_is_declared_in_each() {
+        let item = |depth: usize, name: &str, line: u32| OutlineItem { depth, label: format!("fn {name}"), line, end: line, private: false };
+        let file = vec![item(0, "Zeta", 0), item(1, "run", 1), item(1, "Add", 2), item(0, "alpha", 3), item(0, "Beta", 4), item(1, "x", 5)];
+        let shown = sorted_by_name(file);
+        let names: Vec<(usize, &str)> = shown.iter().map(|i| (i.depth, i.label.rsplit(' ').next().unwrap())).collect();
+        assert_eq!(names, [(0, "alpha"), (0, "Beta"), (1, "x"), (0, "Zeta"), (1, "Add"), (1, "run")]);
+        // The cursor on line 2 is in Add, wherever that is in the list.
+        assert_eq!(at_cursor(&shown, 2).map(|ix| shown[ix].line), Some(2));
+        assert_eq!(at_cursor(&shown, 0).map(|ix| shown[ix].line), Some(0));
     }
 }
 
@@ -2239,14 +2349,93 @@ mod open_file_scenario {
         // The Changes panel draws it: a list of rows of which those in view are laid out.
         cx.update_window(handle.into(), |_, window, cx| {
             task.update(cx, |t, cx| {
-                t.right = super::RightPane::Changes;
-                cx.notify();
+                t.open_panel(super::RightPane::Changes, cx);
             });
             window.render_frame(cx);
             let row = window.find(("file", 0usize));
             assert!(row.visible() && row.bounds().size.height <= px(super::git_ui::CHANGE_ROW), "the changed file's row, whole in the room every row has: {:?}", row.bounds());
         })
         .unwrap();
+        // The side: a strip of marks, a panel in each half, and one that comes over the task from its mark.
+        use super::RightPane::{Changes, Structure};
+        let frame = |cx: &mut TestAppContext, then: &mut dyn FnMut(&mut gpui_kit::Window, &mut gpui_kit::App)| {
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                then(window, cx)
+            })
+            .unwrap()
+        };
+        frame(cx, &mut |window, _| assert!(window.find(("side-mark", Changes as usize)).visible() && window.try_find("side-peek").is_none()));
+        let whole = cx.update_window(handle.into(), |_, window, _| window.find(("file", 0usize)).bounds()).unwrap();
+        cx.update_window(handle.into(), |_, _, cx| task.update(cx, |t, cx| t.move_panel(Structure, true, cx))).unwrap();
+        task.update(cx, |t, cx| {
+            assert_eq!(t.side, [Some(Changes), Some(Structure)], "moved to the lower half, it is shown there");
+            let session = t.session(cx);
+            assert_eq!((session.side_closed, session.side_panel, session.side_below), (false, 0, Some(2)));
+        });
+        frame(cx, &mut |window, _| assert_eq!(window.find(("file", 0usize)).bounds().origin, whole.origin, "and Changes is above it, where it was"));
+        // Both put away, the strip is all there is of the side.
+        cx.update_window(handle.into(), |_, _, cx| {
+            task.update(cx, |t, cx| {
+                t.close_panel(Changes, cx);
+                t.close_panel(Structure, cx);
+            })
+        })
+        .unwrap();
+        frame(cx, &mut |window, _| assert!(window.try_find(("file", 0usize)).is_none() && window.find(("side-mark", Structure as usize)).visible()));
+        task.update(cx, |t, cx| assert!(t.session(cx).side_closed && t.session(cx).side_below.is_none()));
+        // Not while the side holds a panel: one put there by a click is not taken over by one the pointer passed.
+        cx.update_window(handle.into(), |_, window, cx| {
+            task.update(cx, |t, cx| {
+                t.open_panel(Structure, cx);
+                t.peek_panel(Some(Changes), window, cx);
+            })
+        })
+        .unwrap();
+        cx.executor().advance_clock(Duration::from_millis(800));
+        cx.run_until_parked();
+        task.update(cx, |t, cx| {
+            assert_eq!((t.side, t.side_peek), ([None, Some(Structure)], None));
+            t.close_panel(Structure, cx);
+        });
+        // The pointer rests on a mark: after a while its panel is over the task, and goes a while after the pointer has.
+        cx.update_window(handle.into(), |_, window, cx| task.update(cx, |t, cx| t.peek_panel(Some(Changes), window, cx))).unwrap();
+        frame(cx, &mut |window, _| assert!(window.try_find("side-peek").is_none(), "not at once"));
+        cx.executor().advance_clock(Duration::from_millis(800));
+        cx.run_until_parked();
+        frame(cx, &mut |window, _| assert!(window.find("side-peek").visible() && window.find(("file", 0usize)).visible()));
+        task.update(cx, |t, _| assert_eq!((t.side, t.side_peek), ([None, None], Some(Changes)), "over the task, not held"));
+        cx.update_window(handle.into(), |_, window, cx| task.update(cx, |t, cx| t.peek_panel(None, window, cx))).unwrap();
+        cx.executor().advance_clock(Duration::from_millis(400));
+        cx.run_until_parked();
+        frame(cx, &mut |window, _| assert!(window.try_find("side-peek").is_none()));
+        // A click on the mark holds it, in the half it belongs to.
+        cx.update_window(handle.into(), |_, _, cx| {
+            task.update(cx, |t, cx| {
+                t.move_panel(Structure, false, cx);
+                t.close_panel(Structure, cx);
+                t.open_panel(Changes, cx);
+            })
+        })
+        .unwrap();
+        task.update(cx, |t, _| assert_eq!(t.side, [Some(Changes), None]));
+        // Structure is of the file in view: with a terminal in front it is of none, not of the file that was.
+        let at = |t: &TaskView, file: bool| t.tabs.iter().position(|tab| matches!(tab.kind, TabKind::File(_)) == file).unwrap();
+        cx.update_window(handle.into(), |_, window, cx| task.update(cx, |t, cx| t.activate(at(t, true), window, cx))).unwrap();
+        frame(cx, &mut |_, _| {});
+        task.update(cx, |t, _| assert_eq!(t.structure_file, Some(t.tabs[at(t, true)].id)));
+        cx.update_window(handle.into(), |_, window, cx| task.update(cx, |t, cx| t.activate(at(t, false), window, cx))).unwrap();
+        frame(cx, &mut |_, _| {});
+        task.update(cx, |t, _| assert_eq!(t.structure_file, None));
+        // The tree shows the file in the editor on asking, and closes every folder.
+        cx.update_window(handle.into(), |_, window, cx| {
+            task.update(cx, |t, cx| {
+                t.activate(at(t, true), window, cx);
+                t.open_panel(super::RightPane::Files, cx);
+            })
+        })
+        .unwrap();
+        frame(cx, &mut |window, _| assert!(window.find("tree-locate").visible() && window.find("tree-collapse").visible()));
         assert_eq!(shown(cx), "zero\none\n", "its own save is no change on disk");
 
         // The agent writes the file: a clean buffer follows.
@@ -2352,6 +2541,24 @@ mod open_file_scenario {
         assert_eq!(open_files(cx), ["a.txt", "b.txt"], "a.txt pinned, so no longer the preview either");
         cx.update_window(handle.into(), |_, window, cx| task.update(cx, |t, cx| t.reopen_closed(window, cx))).unwrap();
         assert_eq!(open_files(cx), ["a.txt", "b.txt", "c.txt"]);
+
+        // Set to follow, the tree goes to each file that comes to the front, not to the first only.
+        let before = crate::state::settings();
+        crate::state::set_settings(crate::state::Settings { tree_follows: true, ..before.clone() });
+        cx.update_window(handle.into(), |_, _, cx| task.update(cx, |t, cx| t.open_panel(super::RightPane::Files, cx))).unwrap();
+        let chosen = |cx: &mut TestAppContext| task.update(cx, |t, cx| t.tree.read(cx).selected_item().map(|item| item.id.to_string()));
+        refreshed(cx);
+        for name in ["b.txt", "a.txt", "c.txt", "a.txt"] {
+            let file = repo.join(name);
+            cx.update_window(handle.into(), |_, window, cx| {
+                task.update(cx, |t, cx| t.open_file(file.clone(), 0, window, cx));
+                window.render_frame(cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            assert_eq!(chosen(cx).as_deref(), Some(name));
+        }
+        crate::state::set_settings(before);
 
         task.update(cx, |t, cx| t.shut_down(cx));
         cx.update_window(handle.into(), |_, window, _| window.remove_window()).ok();

@@ -36,12 +36,15 @@ pub type SymbolSource = Arc<dyn Fn(&str) -> Vec<Hit> + Send + Sync>;
 pub const DETAIL: char = '\u{1f}';
 
 /// A declaration for the outline: nesting depth, label, 0-based line.
+#[derive(Clone)]
 pub struct OutlineItem {
     pub depth: usize,
     pub label: String,
     pub line: u32,
     /// The declaration's last line.
     pub end: u32,
+    /// Not for use from outside where it is declared, as far as its words tell.
+    pub private: bool,
 }
 
 #[derive(Clone)]

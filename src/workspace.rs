@@ -187,7 +187,9 @@ pub struct Workspace {
     pub sidebar_peek: bool,
     pub(crate) peek_wait: Task<()>,
     /// In the GNOME dash; asked once, not while the menu opens.
-    pub pinned: bool,
+    /// How the app stands with the desktop, and whether it was told once that it is not listed there.
+    pub desk: crate::desktop::Standing,
+    told_unlisted: bool,
     pub sysmon: Entity<crate::sysmon::SysMon>,
     /// Filters the sidebar's tasks.
     pub search: Entity<InputState>,
@@ -309,6 +311,8 @@ impl Workspace {
         if let Some(width) = saved.side_panel_width {
             cx.set_global(SidePanelWidth(px(width)));
         }
+        let side = crate::task::SideLayout::default();
+        cx.set_global(crate::task::SideLayout { below: saved.side_lower.unwrap_or(side.below), split: saved.side_split.map(px) });
         crate::zoom::init(saved.zoom, cx);
 
         let (hook_tx, hook_rx) = async_channel::unbounded::<agent::HookEvent>();
@@ -534,7 +538,8 @@ impl Workspace {
             sidebar_rail: saved.sidebar_rail,
             sidebar_peek: false,
             peek_wait: Task::ready(()),
-            pinned: false,
+            desk: Default::default(),
+            told_unlisted: saved.told_unlisted,
             search: {
                 let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search tasks…"));
                 cx.subscribe(&search, |_, _, _: &InputEvent, cx| cx.notify()).detach();
@@ -636,11 +641,12 @@ impl Workspace {
             }
         }
         this.sync_worktrees(window, cx);
-        if crate::desktop::can_pin() {
-            cx.spawn(async move |this, cx| {
-                let pinned = cx.background_spawn(async { crate::desktop::is_pinned() }).await;
-                let _ = this.update(cx, |this, cx| {
-                    this.pinned = pinned;
+        if crate::desktop::can_list() {
+            cx.spawn_in(window, async move |this, cx| {
+                let desk = cx.background_spawn(async { crate::desktop::standing() }).await;
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.desk = desk;
+                    this.tell_unlisted(window, cx);
                     cx.notify();
                 });
             })
@@ -838,6 +844,9 @@ impl Workspace {
             sidebar_width: Some(f32::from(self.sidebar_width)),
             sidebar_rail: self.sidebar_rail,
             side_panel_width: cx.try_global::<SidePanelWidth>().map(|w| f32::from(w.0)),
+            side_lower: cx.try_global::<crate::task::SideLayout>().map(|layout| layout.below),
+            side_split: cx.try_global::<crate::task::SideLayout>().and_then(|layout| layout.split).map(f32::from),
+            told_unlisted: self.told_unlisted,
             active_collapsed: self.active_collapsed,
             starred_collapsed: self.starred_collapsed,
             presenting: self.presenting.as_ref().map(|p| state::PresentingState { kept: p.kept.iter().cloned().collect(), since: p.since }),
@@ -1714,6 +1723,70 @@ impl Workspace {
                         }
                         window.push_notification(Notification::error(e).title("Could not create the task"), cx);
                     }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// A binary downloaded and run is in no list of applications, and
+    /// cannot be found there or pinned: said once, with the way to add it.
+    /// Not written by itself: files in the home folder are the user's to ask for.
+    fn tell_unlisted(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A run on a scratch state is a test: the launcher is the user's own.
+        if self.desk.listed || self.told_unlisted || cfg!(test) || std::env::var_os("IDEAE_STATE").is_some() {
+            return;
+        }
+        self.told_unlisted = true;
+        self.save_later(cx);
+        let this = cx.weak_entity();
+        let note = Notification::info("It is not in the list of applications yet: it cannot be found there or pinned. Window → Add to Applications does the same later.")
+            .title("Add ideae to your applications?")
+            .autohide(false)
+            .action(move |_, _, cx| {
+                let (this, me) = (this.clone(), cx.entity().downgrade());
+                gpui_kit::component::button::Button::new("list-app").xsmall().outline().label("Add to Applications").on_click(move |_, window, cx| {
+                    let _ = this.update(cx, |this, cx| this.list_app(window, cx));
+                    let _ = me.update(cx, |note, cx| note.dismiss(window, cx));
+                })
+            });
+        window.push_notification(note, cx);
+    }
+
+    /// Lists the app with the applications: a launcher entry and its icon,
+    /// or a Start menu shortcut. Off the UI thread, and told how it went.
+    pub fn list_app(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
+            let (done, desk) = cx.background_spawn(async { (crate::desktop::install(), crate::desktop::standing()) }).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.desk = desk;
+                let note = match done {
+                    Ok(told) => Notification::info(told),
+                    Err(why) => Notification::error(why),
+                };
+                window.push_notification(note.title("Add to Applications"), cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Pins the app to the GNOME dash, or takes it off; the entry is
+    /// written first when there is none.
+    pub fn toggle_pin(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pinned = self.desk.pinned;
+        cx.spawn_in(window, async move |this, cx| {
+            let (done, desk) = cx
+                .background_spawn(async move {
+                    let done = if pinned { Ok(crate::desktop::unpin()) } else { crate::desktop::pin() };
+                    (done, crate::desktop::standing())
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.desk = desk;
+                if let Err(why) = done {
+                    window.push_notification(Notification::error(why).title("Pin to dash"), cx);
                 }
                 cx.notify();
             });

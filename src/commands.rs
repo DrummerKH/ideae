@@ -173,7 +173,7 @@ pub struct InHand {
     pub(crate) git: [bool; GitCommand::ALL.len()],
     /// Which of Agent, Changes, History and Shell is the front tab; which side panel shows.
     pub(crate) front: Option<crate::task::FrontTab>,
-    pub(crate) panel: Option<crate::task::RightPane>,
+    pub(crate) panels: [bool; 4],
 }
 
 impl InHand {
@@ -199,19 +199,19 @@ impl InHand {
             services_waiting: false,
             git: [false; GitCommand::ALL.len()],
             front: None,
-            panel: None,
+            panels: [false; 4],
         }
     }
 
     pub(crate) fn of(t: &crate::workspace::TaskEntry, cx: &App) -> Self {
         let Some(view) = t.view.as_ref().map(|v| v.read(cx)) else { return Self::basic(t) };
         let (running, waiting) = view.services_running_and_waiting(cx);
-        let crate::task::TabsState { closable, file, back, forward, reopen, front, panel } = view.tabs_state();
+        let crate::task::TabsState { closable, file, back, forward, reopen, front, panels } = view.tabs_state();
         InHand {
             closable,
             file,
             front,
-            panel,
+            panels,
             back,
             forward,
             reopen,

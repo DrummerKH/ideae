@@ -47,7 +47,9 @@ struct Shown {
     fullscreen: bool,
     maximized: bool,
     /// Pinned to the dash; none where there is no dash to pin to.
+    /// Where there is a GNOME dash: whether the app is pinned to it. And, where an app has to be listed to be found: whether it is.
     pinned: Option<bool>,
+    listed: Option<bool>,
 }
 
 #[derive(Clone, PartialEq, gpui_kit::Action)]
@@ -145,19 +147,8 @@ impl Workspace {
             zoomed: crate::zoom::any_set(cx),
             fullscreen: window.is_fullscreen(),
             maximized: window.is_maximized(),
-            pinned: crate::desktop::can_pin().then_some(self.pinned),
-        }
-    }
-
-    /// Writes the launcher entry and adds it to the dash, or takes it off.
-    fn toggle_pin(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let result = if self.pinned { Ok(crate::desktop::unpin()) } else { crate::desktop::pin() };
-        match result {
-            Ok(()) => {
-                self.pinned = !self.pinned;
-                cx.notify();
-            }
-            Err(err) => window.push_notification(gpui_kit::component::notification::Notification::error(err).title("Pin to dash"), cx),
+            pinned: self.desk.dash.then_some(self.desk.pinned),
+            listed: crate::desktop::can_list().then_some(self.desk.listed),
         }
     }
 
@@ -177,7 +168,7 @@ actions!(
     ideae,
     [
         FindAndReplace, AddProject, PresentationMode, PowerSaving, Restart, KeyboardShortcuts, About, BringAllToFront, CloseWindow, Documentation, Hide, HideOthers, ShowAll,
-        Minimize, ZoomWindow, FullScreen, ResetTextSize, PinToDash, OpenMenuBar
+        Minimize, ZoomWindow, FullScreen, ResetTextSize, PinToDash, ListApp, OpenMenuBar
     ]
 );
 
@@ -194,6 +185,7 @@ pub fn init(cx: &mut App) {
         cx.on_action(|_: &FullScreen, cx| in_window(cx, |_, window, _| window.toggle_fullscreen()));
         cx.on_action(|_: &ResetTextSize, cx| crate::zoom::reset_all(cx));
         cx.on_action(|_: &PinToDash, cx| in_window(cx, |w, window, cx| w.toggle_pin(window, cx)));
+        cx.on_action(|_: &ListApp, cx| in_window(cx, |w, window, cx| w.list_app(window, cx)));
     }
     // The window's own handlers are out of reach while a dialog holds focus,
     // nothing does, or the window is in the Dock: these still have to work.
@@ -718,7 +710,7 @@ fn menus(shown: Shown) -> Vec<Menu> {
     let app = state::APP_ID;
     let Shown {
         dialog, switches, power_saving, presenting, focus_mode, projects, project, task: in_hand, replace, spaces, space, group, showing_group, group_settled, judging, edit, save, find, zoomed,
-        fullscreen, maximized, pinned,
+        fullscreen, maximized, pinned, listed,
     } = shown;
     // Under a dialog only Edit's, the window's and the app's own but Quit do something.
     let free = !dialog;
@@ -736,7 +728,7 @@ fn menus(shown: Shown) -> Vec<Menu> {
         when(open, key(name, id))
     };
     let front = in_hand.and_then(|t| t.front);
-    let panel = in_hand.and_then(|t| t.panel);
+    let panel = |pane: RightPane| in_hand.is_some_and(|t| t.panels[pane as usize]);
     let has = |name: &'static str, id: &str, has: fn(&InHand) -> bool| {
         debug_assert!(REACHED.contains(&id), "{id} is out of reach with nothing focused");
         when(open && in_hand.is_some_and(|t| has(&t)), key(name, id))
@@ -766,19 +758,21 @@ fn menus(shown: Shown) -> Vec<Menu> {
         has("Close Tab", "close_tab", |t| t.closable),
         has("Reopen Closed Tab", "reopen_tab", |t| t.reopen),
         sep(),
+        // Where JetBrains has it: of the whole app at work, not of what the window shows.
+        checked(power_saving, when(true, act("Power Save Mode", PowerSaving))),
+        sep(),
     ];
     let mut view = vec![
         checked(front == Some(FrontTab::Agent), has("Agent Tab", "agent", |t| t.agent)),
         checked(front == Some(FrontTab::Changes), in_task("Changes Tab", "changes")),
         checked(front == Some(FrontTab::Shell), in_task("Shell Tab", "shell")),
         sep(),
-        checked(panel == Some(RightPane::Changes), in_task("Changes Panel", "changes_panel")),
-        checked(panel == Some(RightPane::Files), in_task("Files Panel", "files_panel")),
-        checked(panel == Some(RightPane::Structure), in_task("Structure Panel", "structure_panel")),
-        checked(panel == Some(RightPane::Run), in_task("Run Panel", "run_panel")),
+        checked(panel(RightPane::Changes), in_task("Changes Panel", "changes_panel")),
+        checked(panel(RightPane::Files), in_task("Files Panel", "files_panel")),
+        checked(panel(RightPane::Structure), in_task("Structure Panel", "structure_panel")),
+        checked(panel(RightPane::Run), in_task("Run Panel", "run_panel")),
         sep(),
         checked(focus_mode, in_task("Focus Mode", "focus_mode")),
-        checked(power_saving, when(true, act("Power Save Mode", PowerSaving))),
         when(true, act(if presenting { "End Presentation" } else { "Presentation Mode…" }, PresentationMode)),
         sep(),
         MenuItem::submenu(Menu::new("Code").items(vec![
@@ -807,9 +801,6 @@ fn menus(shown: Shown) -> Vec<Menu> {
         window.extend([act("Zoom", ZoomWindow), sep(), act("Bring All to Front", BringAllToFront)]);
     } else {
         file.extend([when(true, key("Settings…", "settings")), sep()]);
-        if let Some(pinned) = pinned {
-            file.push(act(if pinned { "Unpin from Dash" } else { "Pin to Dash" }, PinToDash));
-        }
         // Without a daemon to keep the agents, closing the window is Exit.
         if cfg!(unix) {
             file.push(act("Close Window", CloseWindow));
@@ -817,6 +808,19 @@ fn menus(shown: Shown) -> Vec<Menu> {
         file.extend([act("Restart", Restart), when(true, key("Exit", "quit"))]);
         view.extend([sep(), checked(fullscreen, act("Full Screen", FullScreen))]);
         window.push(checked(maximized, act("Maximize", ZoomWindow)));
+        // Of the app's place on the desktop, with the window's: not a thing done to a file.
+        // A binary run as it was downloaded is in no list: this puts it there. Listed, it can be pinned where there is a dash.
+        let desk: Vec<MenuItem> = [
+            (listed == Some(false)).then(|| act("Add to Applications", ListApp)),
+            pinned.map(|pinned| act(if pinned { "Unpin from Dash" } else { "Pin to Dash" }, PinToDash)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !desk.is_empty() {
+            window.push(sep());
+            window.extend(desk);
+        }
         help.extend([sep(), act(format!("About {app}"), About)]);
     }
     let mut menus = Vec::new();
@@ -951,10 +955,31 @@ mod tests {
         of(menus, menu).into_iter().find(|(name, _)| name == item).unwrap_or_else(|| panic!("no {item} in {menu}")).1
     }
 
+    /// A binary run as it was downloaded is in no list of applications:
+    /// Window has the way to add it, and where there is a dash, to pin it.
+    /// Power Save Mode is the app's, in File.
+    #[test]
+    fn the_app_is_added_to_the_applications_and_pinned_from_window() {
+        let window = |listed: Option<bool>, pinned: Option<bool>| -> Vec<String> {
+            let menus = super::menus(Shown { listed, pinned, ..Default::default() });
+            of(&menus, "Window").into_iter().map(|(name, _)| name).filter(|name| name.contains("Applications") || name.contains("Dash")).collect()
+        };
+        if cfg!(target_os = "macos") {
+            assert!(window(Some(false), Some(false)).is_empty(), "the .app in Applications is all it takes");
+        } else {
+            assert_eq!(window(Some(false), None), ["Add to Applications"], "no dash: listed, and no more to offer");
+            assert_eq!(window(Some(false), Some(false)), ["Add to Applications", "Pin to Dash"]);
+            assert_eq!(window(Some(true), Some(true)), ["Unpin from Dash"]);
+            assert!(window(Some(true), None).is_empty() && window(None, None).is_empty());
+        }
+        let menus = super::menus(Shown::default());
+        assert!(of(&menus, "File").iter().any(|(name, _)| name == "Power Save Mode") && !of(&menus, "View").iter().any(|(name, _)| name == "Power Save Mode"));
+    }
+
     /// Every item has an action, and no menu says the same thing twice.
     #[test]
     fn the_menus_are_made() {
-        let menus = super::menus(Shown { projects: true, project: true, task: Some(InHand { main: false, side: false, ready: true, grouped: true, starred: false, open: true, agent: true, agent_ended: true, closable: true, file: true, back: true, forward: true, reopen: true, services: true, services_running: true, services_waiting: true, git: [true; 9], front: Some(FrontTab::Agent), panel: None }), spaces: vec!["Work".into()], ..Default::default() });
+        let menus = super::menus(Shown { projects: true, project: true, task: Some(InHand { main: false, side: false, ready: true, grouped: true, starred: false, open: true, agent: true, agent_ended: true, closable: true, file: true, back: true, forward: true, reopen: true, services: true, services_running: true, services_waiting: true, git: [true; 9], front: Some(FrontTab::Agent), panels: [false; 4] }), spaces: vec!["Work".into()], ..Default::default() });
         let titles: Vec<_> = menus.iter().map(|m| m.name.as_ref()).collect();
         // Linux and Windows have no menu named after the app: its items are in File and Help.
         assert_eq!(titles[usize::from(cfg!(target_os = "macos"))..], ["File", "Edit", "View", "Navigate", "Task", "Git", "Window", "Help"]);
@@ -1002,7 +1027,7 @@ mod tests {
         assert!(!live(&none, "Task", "Rename Task…") && !live(&none, "Git", "Commit…") && !live(&none, "Task", "Star Task"));
         assert!(!live(&none, "File", "Archive Merged Tasks…") && !live(&none, "File", "New Task…") && !live(&none, "View", "Agent Tab"));
 
-        let task = InHand { main: false, side: false, ready: true, grouped: false, starred: true, open: true, agent: true, agent_ended: false, closable: true, file: false, back: false, forward: false, reopen: false, services: true, services_running: false, services_waiting: true, git: [true; 9], front: Some(FrontTab::Agent), panel: None };
+        let task = InHand { main: false, side: false, ready: true, grouped: false, starred: true, open: true, agent: true, agent_ended: false, closable: true, file: false, back: false, forward: false, reopen: false, services: true, services_running: false, services_waiting: true, git: [true; 9], front: Some(FrontTab::Agent), panels: [false; 4] };
         let one = super::menus(Shown { task: Some(task), projects: true, project: true, ..Default::default() });
         assert!(live(&one, "File", "New Task…") && live(&one, "View", "Agent Tab") && live(&one, "Task", "Unstar Task") && live(&one, "Task", "Archive Task") && live(&one, "Git", "Pull"));
         assert!(!live(&one, "Task", "Stop All in Run Panel"));
@@ -1095,7 +1120,7 @@ mod bar {
     }
 
     fn task() -> InHand {
-        InHand { main: true, side: false, ready: true, grouped: false, starred: false, open: true, agent: true, agent_ended: false, closable: true, file: false, back: false, forward: false, reopen: false, services: false, services_running: false, services_waiting: false, git: [true; 9], front: None, panel: None }
+        InHand { main: true, side: false, ready: true, grouped: false, starred: false, open: true, agent: true, agent_ended: false, closable: true, file: false, back: false, forward: false, reopen: false, services: false, services_running: false, services_waiting: false, git: [true; 9], front: None, panels: [false; 4] }
     }
 
     fn click_label(window: &mut Window, label: &str, cx: &mut gpui_kit::App) {

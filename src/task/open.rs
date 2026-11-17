@@ -181,8 +181,9 @@ impl TaskView {
         // Structure panel, which marks where it is.
         cx.observe(&file, |this, file, cx| {
             let dirty = file.read(cx).dirty;
+            let structure = this.panel_shown(RightPane::Structure);
             let Some(tab) = this.tabs.iter_mut().find(|t| matches!(&t.kind, TabKind::File(f) if *f == file)) else { return };
-            let follows = this.right == RightPane::Structure && this.structure_file == Some(tab.id);
+            let follows = structure && this.structure_file == Some(tab.id);
             let kept = dirty && std::mem::take(&mut tab.preview);
             if std::mem::replace(&mut tab.dirty, dirty) != dirty || follows || kept {
                 cx.notify();

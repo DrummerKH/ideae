@@ -5,6 +5,7 @@ use super::*;
 /// The width of the right side panel, the same in every task.
 pub struct SidePanelWidth(pub Pixels);
 impl Global for SidePanelWidth {}
+pub use strip::{Assets, SideLayout};
 
 impl TaskView {
     /// The tabs and panels, to open the same way after a restart.
@@ -61,12 +62,9 @@ impl TaskView {
             review: self.changes.read(cx).review.clone(),
             viewed: self.viewed.clone(),
             bookmarks: self.all_bookmarks(cx),
-            side_panel: match self.right {
-                RightPane::Changes => 0,
-                RightPane::Files => 1,
-                RightPane::Structure => 2,
-                RightPane::Run => 3,
-            },
+            side_panel: self.side[0].map_or(0, |pane| pane as u8),
+            side_closed: self.side[0].is_none(),
+            side_below: self.side[1].map(|pane| pane as u8),
         }
     }
 
@@ -130,12 +128,9 @@ impl TaskView {
             c.review = review;
             cx.notify();
         });
-        self.right = match session.side_panel {
-            1 => RightPane::Files,
-            2 => RightPane::Structure,
-            3 => RightPane::Run,
-            _ => RightPane::Changes,
-        };
+        let pane = |ix: u8| strip::PANES[usize::from(ix.min(3))];
+        self.side = [(!session.side_closed).then(|| pane(session.side_panel)), session.side_below.map(pane)];
+        self.keyed = self.side[0].or(self.side[1]).unwrap_or(RightPane::Changes);
         self.structure_file = self.focused_ix().filter(|&ix| matches!(self.tabs[ix].kind, TabKind::File(_))).map(|ix| self.tabs[ix].id);
         self.sync_visibility(cx);
         self.show_diff_if_seen(cx);

@@ -27,6 +27,7 @@ src/task/          one task, a module: what is private to it is seen by all of i
   branch_bar.rs    the branch line above the tabs
   branches.rs      the branches of the repository: open, compare, delete
   panels.rs        the tab bar and the side panels
+  strip.rs         the side: the strip of the panels' marks, a panel in each half, one come over the task from its mark
   nav.rs           back and forward
   lookups.rs       outline, usages and places, installing a language server
   file.rs          an open file: editor, save and reload, blame, the language server's bridge
@@ -67,6 +68,7 @@ src/naming.rs      branch names from task titles
 src/services.rs    `.ideae.toml` services (Run ▾): per-task port slots, IDEAE_PORT_<NAME>
 src/project_config.rs  `.ideae.toml` [task] (setup, teardown, check, copy), your own over the file, suggestions, runs
 vendor/            patched gpui-component, gpui-base, gpui-cn, gpui-fast-linux, gpui-fast-macos; changes marked `ideae patch`
+assets/side-icons/ the marks of the side's strip (Lucide's drawings, served by `task::Assets` over the kit's)
 assets/icon/       the app icon: ideae.svg, and the .icns and .ico made from it by scripts/icons.py
 scripts/           Xvfb driver for UI checks, wayland.sh (the same in a headless GNOME Shell), check.sh (the tests to run before a push), icons.py, macos-app.sh (a .app around a binary)
 ```

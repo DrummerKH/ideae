@@ -370,13 +370,8 @@ impl TaskView {
     }
 
     pub(super) fn show_run_panel(&mut self, cx: &mut Context<Self>) {
-        self.right = RightPane::Run;
-        if self.narrow {
-            self.side_over = true;
-        }
-        self.refresh_services(cx);
-        self.watch_listening(cx);
-        cx.notify();
+        self.side_over = true;
+        self.open_panel(RightPane::Run, cx);
     }
 
     /// The Run panel's top: what new tasks of the project get, and how it

@@ -300,7 +300,7 @@ impl TaskView {
     /// The Files panel's tree, built when the panel is the one shown: it
     /// holds every path again, several times over, in every open task.
     pub(super) fn fill_tree(&mut self, cx: &mut Context<Self>) {
-        let shown = self.visible && self.right == RightPane::Files;
+        let shown = self.visible && self.panel_shown(RightPane::Files);
         if self.tree_stale && shown {
             self.tree_stale = false;
             let ignored: &[String] = if self.tree_hides_ignored { &[] } else { &self.tree_ignored };

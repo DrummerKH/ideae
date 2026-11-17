@@ -96,8 +96,8 @@ it wrote to since your last prompt.
 
 By a task in the sidebar, a small dial shows how full its agent's context is
 (yellow from three quarters, red from nine tenths; the numbers when the
-pointer rests on the task). The title bar shows what all the agents took in
-the last 24 hours. A session that has used more than a limit you set is told
+pointer rests on the task). The title bar can show what all the agents took
+in the last 24 hours (Settings → Title bar). A session that has used more than a limit you set is told
 of once (Settings → Agents).
 
 ## Variants
@@ -178,6 +178,25 @@ all: what is removed stays under `refs/ideae/variants` for two weeks.
   past a limit the file tabs left longest close. Tabs can be pinned.
 - Replace in files (Ctrl+Shift+R) shows every match with what it becomes.
 - Autosave when you leave a file; Markdown has a Preview.
+
+## The side
+
+A strip at the window's right edge has a mark for each panel: Changes,
+Files, Structure, Run (Alt+1 to 4). A click shows or hides a panel. The
+side has two halves, a panel in each: Changes and Files are of the upper
+one, Structure and Run of the lower, and a mark dragged to the other end of
+the strip moves its panel there. With nothing shown the strip is all there
+is of the side, and the pointer resting on a mark brings its panel over the
+task until it leaves.
+
+Each panel's title has what acts on it. Changes: a tree of folders or a
+list of files (beside a diff too), and Stage all. Files: follow the file in
+the editor, show it once, close every folder. Structure: only what is
+public, with or without fields, in the order of the names. Structure is of
+the file in view: with a terminal in front it shows none.
+
+A file's tab has the icon of its kind and its name in the color git gives
+it, as in the Files panel.
 
 ## Files panel
 

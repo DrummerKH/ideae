@@ -1356,6 +1356,23 @@ pub fn head_pushed(has_upstream: bool, ahead: u32, has_base: bool, ahead_of_base
     }
 }
 
+/// Takes the last commit back: its changes are staged again, as they were
+/// before it was made, and nothing in the files changes. For a commit that
+/// is nowhere but here; `hash` is the one the asker saw, and another in
+/// its place is left alone. Gives a line to tell, then the commit's message.
+pub fn undo_commit(root: &Path, hash: &str) -> Result<String, String> {
+    let head = git(root, &["rev-parse", "HEAD"]).unwrap_or_default();
+    if hash.is_empty() || !head.trim().starts_with(hash) {
+        return Err("the last commit is another one now".into());
+    }
+    if git(root, &["rev-parse", "--verify", "--quiet", "HEAD~1"]).is_none_or(|parent| parent.trim().is_empty()) {
+        return Err("it is the first commit: there is nothing to go back to".into());
+    }
+    let message = last_message(root).unwrap_or_default();
+    run(root, "git", &["reset", "--soft", "HEAD~1"])?;
+    Ok(format!("Undone {hash}: its changes are staged again\n{message}"))
+}
+
 /// The whole message of the last commit.
 pub fn last_message(root: &Path) -> Option<String> {
     git(root, &["log", "-1", "--format=%B"]).map(|m| m.trim_end().to_string())
@@ -3121,6 +3138,24 @@ mod edge_tests {
         std::fs::create_dir_all(&dir).unwrap();
         sh(&dir, "git init -q -b main .; git config user.email t@t; git config user.name t");
         dir.canonicalize().unwrap()
+    }
+
+    /// The last commit is undone: its changes staged again, the files as
+    /// they were, its message given back. Not another commit than the one
+    /// asked about, and not the first.
+    #[test]
+    fn the_last_commit_is_taken_back_with_its_changes_staged() {
+        let dir = repo("undo");
+        sh(&dir, "echo one > a.txt; git add a.txt; git commit -qm base; echo two >> a.txt; echo new > b.txt; git add -A; git commit -qm 'second thoughts' -m 'and why'; echo three >> a.txt");
+        let (base, second) = (out(&dir, "git rev-parse --short HEAD~1").trim().to_string(), out(&dir, "git rev-parse --short HEAD").trim().to_string());
+        assert_eq!(undo_commit(&dir, &base).unwrap_err(), "the last commit is another one now");
+        let told = undo_commit(&dir, &second).unwrap();
+        assert_eq!(told, format!("Undone {second}: its changes are staged again\nsecond thoughts\n\nand why"));
+        assert_eq!(out(&dir, "git rev-parse --short HEAD").trim(), base);
+        assert_eq!(out(&dir, "git diff --cached --name-only"), "a.txt\nb.txt\n", "what it changed is staged");
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one\ntwo\nthree\n", "no file changed, nor what was not committed yet");
+        assert!(undo_commit(&dir, &base).unwrap_err().starts_with("it is the first commit"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// One change of a file that is also renamed and made executable is

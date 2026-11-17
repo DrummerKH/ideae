@@ -138,12 +138,13 @@ pub fn with_file_list(diff: &Entity<DiffState>, id: &'static str, body: impl Int
     }
     let state = diff.read(cx);
     let files = state.files();
-    let print = files.as_ptr() as usize ^ files.len();
+    let flat = crate::state::with_settings(|s| s.changes_flat);
+    let print = files.as_ptr() as usize ^ files.len() ^ (usize::from(flat) << 1);
     let tree = FILE_TREES.with_borrow_mut(|trees| match trees.get(id) {
         Some((seen, tree)) if *seen == print => tree.clone(),
         _ => {
             let paths: Vec<(usize, &str)> = files.iter().enumerate().map(|(ix, f)| (ix, f.path().as_ref())).collect();
-            let tree = Rc::new(change_tree(&paths));
+            let tree = Rc::new(changes_shown(&paths));
             trees.insert(id, (print, tree.clone()));
             tree
         }
@@ -204,7 +205,8 @@ pub fn with_file_list(diff: &Entity<DiffState>, id: &'static str, body: impl Int
                             let target = diff.clone();
                             row.pl(px(8. + 12. * *depth as f32 + 11.))
                                 .when(top.as_ref() == Some(&path), |row| row.bg(accent))
-                                .child(div().min_w_0().flex_1().truncate().child(name))
+                                .child(div().min_w_0().flex_shrink_0().max_w_full().truncate().child(name))
+                                .child(div().min_w_0().flex_1().truncate().text_xs().text_color(muted).children(folder_shown(&path)))
                                 .child(div().flex_shrink_0().text_xs().text_color(green).child(format!("+{}", file.additions())))
                                 .child(div().flex_shrink_0().text_xs().text_color(red).child(format!("−{}", file.deletions())))
                                 .on_click(move |_, _, cx| target.update(cx, |d, cx| d.scroll_to_file(&path, cx)))
@@ -524,7 +526,7 @@ pub(super) fn outline(path: &std::path::Path, text: &str) -> Vec<crate::finder::
     let Some(tree) = parser.parse(text, None) else { return Vec::new() };
     let mut items = Vec::new();
     let data = matches!(name, "json" | "yaml" | "xml");
-    collect_declarations(tree.root_node(), text, data, 0, &mut items);
+    collect_declarations(tree.root_node(), text, (!data).then_some(name), 0, &mut items);
     items
 }
 
@@ -647,10 +649,10 @@ fn data_name(node: tree_sitter::Node, text: &str) -> Option<(String, String)> {
 
 /// The declarations under `node`; in a `data` file (YAML, JSON, XML) its
 /// keys and tags instead.
-fn collect_declarations(node: tree_sitter::Node, text: &str, data: bool, depth: usize, items: &mut Vec<crate::finder::OutlineItem>) {
+fn collect_declarations(node: tree_sitter::Node, text: &str, language: Option<&str>, depth: usize, items: &mut Vec<crate::finder::OutlineItem>) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        let named = if data { data_name(child, text) } else { declaration_name(child, text) };
+        let named = if language.is_none() { data_name(child, text) } else { declaration_name(child, text) };
         match named {
             Some((short, name)) => {
                 items.push(crate::finder::OutlineItem {
@@ -658,11 +660,42 @@ fn collect_declarations(node: tree_sitter::Node, text: &str, data: bool, depth: 
                     label: format!("{short} {name}"),
                     line: head_line(child) as u32,
                     end: last_line(child) as u32,
+                    private: language.is_some_and(|language| is_private(language, child, &name, text)),
                 });
-                collect_declarations(child, text, data, depth + 1, items);
+                collect_declarations(child, text, language, depth + 1, items);
             }
-            None => collect_declarations(child, text, data, depth, items),
+            None => collect_declarations(child, text, language, depth, items),
         }
+    }
+}
+
+/// Whether a declaration is private, read from the syntax tree: the
+/// modifier the grammar has on it (`private`, Rust's missing `pub`), not
+/// the text of its line. Two languages have no such word and say it by the
+/// name: Go's lower case, Python's underscore.
+fn is_private(language: &str, node: tree_sitter::Node, name: &str, text: &str) -> bool {
+    // The modifiers a grammar hangs on a declaration, whatever it calls them: `visibility_modifier`, `modifiers`, `accessibility_modifier`.
+    let mut cursor = node.walk();
+    let modifiers: Vec<&str> = node
+        .children(&mut cursor)
+        .filter(|child| {
+            let kind = child.kind();
+            kind.contains("visibility") || kind.contains("accessibility") || kind.contains("modifier")
+        })
+        .filter_map(|child| text.get(child.byte_range()))
+        .collect();
+    let says = |word: &str| modifiers.iter().any(|modifier| modifier.split(|c: char| !c.is_alphanumeric()).any(|w| w == word));
+    match language {
+        "rust" => {
+            // What a trait asks for, and what an impl gives it, is as public as the trait; so are an enum's variants. An impl itself is of its type.
+            let kind = node.kind();
+            let of_a_trait = std::iter::successors(node.parent(), |up| up.parent())
+                .any(|up| up.kind() == "trait_item" || (up.kind() == "impl_item" && up.child_by_field_name("trait").is_some()) || up.kind() == "enum_variant_list");
+            !says("pub") && !of_a_trait && kind != "impl_item"
+        }
+        "go" => name.chars().next().is_some_and(|c| c.is_lowercase() || c == '_'),
+        "python" => name.starts_with('_') && !name.starts_with("__init__"),
+        _ => says("private") || name.starts_with('#'),
     }
 }
 
@@ -779,6 +812,24 @@ mod places_tests {
 mod outline_tests {
     use super::outline;
     use std::path::Path;
+
+    #[test]
+    fn what_is_private_is_told_by_its_words() {
+        let private = |path: &str, text: &str| -> Vec<String> {
+            outline(Path::new(path), text).into_iter().filter(|i| i.private).map(|i| i.label.rsplit(' ').next().unwrap_or_default().to_string()).collect()
+        };
+        let rust = "pub struct Open {}\nstruct Kept {}\nimpl Open {\n    pub fn seen(&self) {}\n    fn hidden(&self) {}\n}\npub(crate) fn near() {}\n\
+            pub trait Says {\n    fn say(&self);\n}\nimpl Says for Open {\n    fn say(&self) {}\n}\n";
+        assert_eq!(private("a.rs", rust), ["Kept", "hidden"], "a trait's own, and what an impl gives it, are as public as the trait");
+        let ts = "class A {\n  open() {}\n  private kept() {}\n  #hash() {}\n}\n";
+        assert_eq!(private("a.ts", ts), ["kept", "#hash"]);
+        let kt = "class A {\n    fun open() {}\n    private fun kept() {}\n}\n";
+        assert_eq!(private("a.kt", kt), ["kept"]);
+        assert_eq!(private("m.go", "package m\n\nfunc Open() {}\n\nfunc kept() {}\n"), ["kept"]);
+        assert_eq!(private("a.py", "def open():\n    pass\n\ndef _kept():\n    pass\n"), ["_kept"]);
+        let java = "class A {\n    public void open() {}\n    private void kept() {}\n}\n";
+        assert_eq!(private("A.java", java), ["kept"]);
+    }
 
     #[test]
     fn go_declarations() {

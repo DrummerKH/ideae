@@ -2177,7 +2177,7 @@ pub(crate) mod tests {
         let project = ProjectState { path: repo.clone(), check: "test -f made.txt".into(), check_auto: true, ..Default::default() };
         let saved = State { projects: vec![project], ..Default::default() };
         std::fs::write(dir.join("state.json"), serde_json::to_string(&saved).unwrap()).unwrap();
-        crate::state::set_settings(crate::state::Settings { agent: judge.display().to_string(), agents: Vec::new(), notifications: false, pr_status: false, ..Default::default() });
+        crate::state::set_settings(crate::state::Settings { agent: judge.display().to_string(), agents: Vec::new(), notifications: false, pr_status: false, show_tokens: true, ..Default::default() });
         cx.update(|cx| {
             gpui_kit::init(cx);
             gpui_cn::init(cx);

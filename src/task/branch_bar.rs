@@ -52,6 +52,10 @@ impl TaskView {
                         .on_click(cx.listener(|this, _, _, cx| {
                             cx.stop_propagation();
                             this.side_over = !this.side_over;
+                            // With no panel held there is nothing to bring: Changes comes.
+                            if this.side_over && !this.side_in_view() {
+                                this.open_panel(RightPane::Changes, cx);
+                            }
                             cx.notify();
                         })),
                 )
@@ -103,6 +107,19 @@ impl TaskView {
                     .cursor_pointer()
                     .child(format!("· {} {}", b.last_hash, b.last_subject)),
             )
+            .when(!b.last_hash.is_empty(), |bar| {
+                bar.child(
+                    Button::new("take-back")
+                        .xsmall()
+                        .ghost()
+                        .child(svg().path("side-icons/undo-2.svg").size(px(14.)).text_color(cx.theme().muted_foreground))
+                        .tooltip(if b.head_pushed { "Revert the last commit: it is pushed, a new commit undoes it" } else { "Undo the last commit: its changes are staged again" })
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.take_back_last_commit(window, cx)
+                        })),
+                )
+            })
             .children(self.render_auto_badges(cx))
             .children(self.render_pr_feedback(cx))
             .child(

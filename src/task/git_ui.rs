@@ -217,18 +217,7 @@ impl TaskView {
                         .xsmall()
                         .ghost()
                         .label(all_label)
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            let paths: Vec<String> = this
-                                .files
-                                .iter()
-                                .filter(|f| {
-                                    let s = this.state_of(&f.path);
-                                    if stage { s.unstaged } else { s.staged }
-                                })
-                                .map(|f| f.path.to_string())
-                                .collect();
-                            this.stage_paths(paths, stage, window, cx)
-                        })),
+                        .on_click(cx.listener(move |this, _, window, cx| this.stage_all(stage, window, cx))),
                 )
         };
         let rows = Rc::new(self.change_rows(&staged, &unstaged));
@@ -260,19 +249,37 @@ impl TaskView {
             .child(gpui_kit::component::scroll::Scrollbar::vertical(&self.changes_scroll))
     }
 
+    /// Stages every change, or takes every one out of the index.
+    pub(super) fn stage_all(&mut self, stage: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let paths: Vec<String> = self
+            .files
+            .iter()
+            .filter(|f| {
+                let state = self.state_of(&f.path);
+                if stage { state.unstaged } else { state.staged }
+            })
+            .map(|f| f.path.to_string())
+            .collect();
+        self.stage_paths(paths, stage, window, cx)
+    }
+
     /// The rows of the Changes panel, top to bottom.
     fn change_rows(&self, staged: &[usize], unstaged: &[usize]) -> Vec<ChangeRow> {
         let mut rows = Vec::new();
+        // The two are told apart when there are both: one alone is what the panel's title says.
+        let both = !staged.is_empty() && !unstaged.is_empty();
         if !staged.is_empty() {
-            rows.push(ChangeRow::Head { staged: true, title: format!("STAGED ({})", staged.len()) });
+            if both {
+                rows.push(ChangeRow::Head { staged: true, title: format!("STAGED ({})", staged.len()) });
+            }
             self.change_tree_rows(&mut rows, staged, true);
         }
         if self.files.is_empty() {
             rows.push(ChangeRow::Nothing);
         } else if !unstaged.is_empty() {
-            let viewed = unstaged.iter().filter(|&&ix| self.is_viewed(ix)).count();
-            let title = if viewed > 0 { format!("CHANGES ({}) · {viewed} viewed", unstaged.len()) } else { format!("CHANGES ({})", unstaged.len()) };
-            rows.push(ChangeRow::Head { staged: false, title });
+            if both {
+                rows.push(ChangeRow::Head { staged: false, title: format!("NOT STAGED ({})", unstaged.len()) });
+            }
             self.change_tree_rows(&mut rows, unstaged, false);
         }
         if !self.stashes.is_empty() {
@@ -365,7 +372,7 @@ impl TaskView {
         let section = if in_staged { "staged" } else { "changes" };
         let paths: Vec<(usize, &str)> = files.iter().map(|&ix| (ix, self.files[ix].path.as_ref())).collect();
         let mut hidden_under: Option<String> = None;
-        for node in change_tree(&paths) {
+        for node in changes_shown(&paths) {
             let path = match &node {
                 ChangeNode::Dir { path, .. } => path.as_str(),
                 ChangeNode::File { ix, .. } => self.files[*ix].path.as_ref(),
@@ -524,9 +531,8 @@ impl TaskView {
             _ => Mark::Modified,
         };
         let id = if in_staged { ix * 2 + 1 } else { ix * 2 };
-        let keyboard = self.side_has_focus.get() && self.right == RightPane::Changes && ix == self.side_selected;
+        let keyboard = self.side_has_focus.get() && self.keyed == RightPane::Changes && ix == self.side_selected;
         let viewed = self.is_viewed(ix);
-        let view_path = file.path.to_string();
         let menu_path = file.path.to_string();
         let view = cx.weak_entity();
         h_flex()
@@ -536,6 +542,7 @@ impl TaskView {
             .border_l_2()
             .border_color(if keyboard { cx.theme().primary } else { gpui_kit::transparent_black() })
             .group("change-row")
+            .relative()
             .pl(px(10. + 14. * depth as f32))
             .pr_3()
             .py_0p5()
@@ -551,33 +558,48 @@ impl TaskView {
                     .child(status)
                     .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(status_tip).build(window, cx)),
             )
-            .child(div().flex_1().min_w_0().truncate().when(viewed, |d| d.text_color(cx.theme().muted_foreground)).child(marked_label(name.into(), Some(mark), viewed, cx)))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_1p5()
+                    .child(div().min_w_0().flex_shrink_0().max_w_full().truncate().when(viewed, |d| d.text_color(cx.theme().muted_foreground)).child(marked_label(name.into(), Some(mark), viewed, cx)))
+                    // As a list, a file has its folder after its name: there is no tree to tell it.
+                    .when_some(folder_shown(&file.path), |row, folder| row.child(div().flex_1().min_w_0().truncate().text_xs().text_color(cx.theme().muted_foreground).child(folder))),
+            )
             .children(self.agent_mark(&file.path))
             .when(viewed, |row| row.child(div().text_xs().text_color(gpui_kit::green()).child("✓")))
             .child(div().text_xs().text_color(gpui_kit::green()).child(format!("+{}", file.additions)))
             .child(div().text_xs().text_color(gpui_kit::red()).child(format!("-{}", file.deletions)))
-            // The actions show on the row under the pointer or the keyboard.
+            // Stage, over the row's end while the pointer or the keyboard is on it: it keeps no room of its own.
+            // Viewed is marked in the diff, and from the row's menu.
             .child(
                 h_flex()
-                    .gap_0p5()
+                    .absolute()
+                    .right_0()
+                    .top_0()
+                    .bottom_0()
+                    .pl_2()
+                    .pr_1()
+                    .bg(cx.theme().accent)
                     .when(!keyboard, |actions| actions.invisible().group_hover("change-row", |s| s.visible()))
                     .child(
-                        Button::new(("viewed", id))
-                            .xsmall()
-                            .ghost()
-                            .label(if viewed { "☑" } else { "☐" })
-                            .tooltip(if viewed { "Viewed; click to mark not viewed" } else { "Mark viewed: it folds in the diff until it changes again" })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.toggle_viewed(&view_path, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new(("stage", id))
-                            .xsmall()
-                            .ghost()
-                            .label(if in_staged { "−" } else { "+" })
-                            .tooltip(if in_staged { "Unstage the file" } else { "Stage the file" })
+                        // A sign to hit, not a letter of the row's size.
+                        div()
+                            .id(("stage", id))
+                            .w(px(26.))
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_sm()
+                            .text_size(px(18.))
+                            .line_height(px(18.))
+                            .font_semibold()
+                            .cursor_pointer()
+                            .hover(|sign| sign.bg(cx.theme().secondary))
+                            .child(if in_staged { "−" } else { "+" })
+                            .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(if in_staged { "Unstage the file" } else { "Stage the file" }).build(window, cx))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 this.stage_paths(vec![stage_path.clone()], !in_staged, window, cx)
@@ -984,6 +1006,43 @@ impl TaskView {
         });
     }
 
+    /// The last commit is taken back, after asking. One that is nowhere but
+    /// here is undone: its changes staged again, its message back in the
+    /// box. One that is pushed stays in the history and is reverted by a
+    /// commit of its opposite: taking it out would be a push that overwrites.
+    pub(super) fn take_back_last_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (hash, subject, pushed) = (self.branch_info.last_hash.clone(), self.branch_info.last_subject.clone(), self.branch_info.head_pushed);
+        if hash.is_empty() {
+            return;
+        }
+        let this = cx.weak_entity();
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            let (this, hash) = (this.clone(), hash.clone());
+            let (title, told, ok) = if pushed {
+                ("Revert the last commit?", "It is pushed, so it stays in the history: a new commit undoes what it changed. On a conflict nothing changes and the agent is asked.", "Revert")
+            } else {
+                ("Undo the last commit?", "It is not pushed, so it is taken out: its changes are staged again and its message is back in the box. No file changes.", "Undo commit")
+            };
+            // Which commit, in a line: a subject can be a paragraph, and read as the dialog's own words.
+            let mut named: String = subject.chars().take(90).collect();
+            if named.len() < subject.len() {
+                named.push('…');
+            }
+            let (title, told) = (title.to_string(), format!("{told}\n\nThe commit: {hash} · {named}"));
+            dialog.confirm().title(title).description(told).ok_text(ok).on_ok(move |_, window, cx| {
+                let hash = hash.clone();
+                let _ = this.update(cx, |this, cx| {
+                    if pushed {
+                        this.commit_action(1, hash, window, cx)
+                    } else {
+                        this.run_action("Undo commit", move |root| git::undo_commit(&root, &hash), false, window, cx)
+                    }
+                });
+                true
+            })
+        });
+    }
+
     /// Runs a git/gh job off the UI thread, shows its outcome under the
     /// buttons, and refreshes. A successful commit clears the message.
     /// What History does with a commit: 0 takes it into this branch, 1
@@ -1127,6 +1186,13 @@ impl TaskView {
                         if label == "Commit" || label == "Amend" {
                             this.commit_input.update(cx, |input, cx| input.set_value("", window, cx));
                             this.amend = None;
+                        }
+                        // The message of the commit taken back, to make it again: unless another is being written.
+                        if let (true, Some((_, message))) = (label == "Undo commit", out.split_once('\n')) {
+                            if this.commit_input.read(cx).value().trim().is_empty() {
+                                let message = message.to_string();
+                                this.commit_input.update(cx, |input, cx| input.set_value(message, window, cx));
+                            }
                         }
                         let summary = out.lines().next().unwrap_or_default().to_string();
                         this.action = Some((true, if summary.is_empty() { format!("{label}: done") } else { summary }));

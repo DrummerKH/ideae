@@ -135,6 +135,14 @@ impl TaskView {
                             .when(dialed, |tab| tab.child(crate::sidebar::context_dial(fill, cx)))
                             .tooltip(move |_, cx| cx.new(|cx| crate::usage::UsageTooltip::new(root.clone(), who.clone(), cx)).into()),
                     )
+                } else if let TabKind::File(file) = &tab.kind {
+                    // As in the Files panel: the icon of its kind, and its name in the color of what git knows of it.
+                    let mark = file.read(cx).path.strip_prefix(&self.root).ok().and_then(|path| self.tree_marks.get(path.to_string_lossy().as_ref()).copied());
+                    let name = match mark {
+                        Some(_) => marked_label(label, mark, false, cx),
+                        None => StyledText::new(label),
+                    };
+                    Tab::new().child(h_flex().gap_1p5().child(crate::file_icons::icon(crate::file_icons::file_kept(&tab.title), cx)).child(name)).when(tab.preview, |tab| tab.italic())
                 } else {
                     Tab::new().label(label).when(tab.preview, |tab| tab.italic())
                 };
@@ -222,82 +230,6 @@ impl TaskView {
         })
     }
 
-    pub(super) fn render_files(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex()
-            .id("changed-files")
-            .track_focus(&self.side_focus)
-            .on_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| this.side_key(e, window, cx)))
-            .size_full()
-            .border_l_1()
-            .border_color(cx.theme().border)
-            .child(
-                h_flex()
-                    .gap_1()
-                    .px_2()
-                    .py_1()
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    .child(
-                        Button::new("pane-changes")
-                            .small()
-                            .ghost()
-                            .label(format!("Changes ({})", self.files.len()))
-                            .selected(self.right == RightPane::Changes)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.right = RightPane::Changes;
-                                this.fill_tree(cx);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("pane-files")
-                            .small()
-                            .ghost()
-                            .label("Files")
-                            .selected(self.right == RightPane::Files)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.right = RightPane::Files;
-                                this.fill_tree(cx);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("pane-structure")
-                            .small()
-                            .ghost()
-                            .label("Structure")
-                            .selected(self.right == RightPane::Structure)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.right = RightPane::Structure;
-                                this.fill_tree(cx);
-                                cx.notify();
-                            })),
-                    )
-                    .child({
-                        let running = self.running_services(cx).len();
-                        Button::new("pane-run")
-                            .small()
-                            .ghost()
-                            .label(if running > 0 { format!("Run ● {running}") } else { "Run".to_string() })
-                            .tooltip(format!("Dev servers and workers of this task ({})", crate::keymap::label("run_panel")))
-                            .selected(self.right == RightPane::Run)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.right = RightPane::Run;
-                                this.fill_tree(cx);
-                                this.refresh_services(cx);
-                                this.watch_listening(cx);
-                                cx.notify();
-                            }))
-                    }),
-            )
-            .when(self.right == RightPane::Run, |this| this.child(self.render_run_panel(cx)))
-            .when(self.right == RightPane::Files, |this| this.child(self.render_tree(cx)))
-            .when(self.right == RightPane::Structure, |this| this.child(self.render_structure(cx)))
-            .when(self.right == RightPane::Changes, |this| {
-                this.child(self.render_change_lists(cx)).child(self.render_commit_box(cx))
-            })
-    }
-
     pub(super) fn render_structure(&self, cx: &mut Context<Self>) -> AnyElement {
         let file = self.structure_file.and_then(|id| {
             self.tabs.iter().find_map(|t| match &t.kind {
@@ -321,7 +253,7 @@ impl TaskView {
         let items = self.structure_items(cx);
         let keyboard = self.side_has_focus.get();
         // The innermost declaration the cursor is in: the last one starting at or above it.
-        let current = items.iter().rposition(|i| i.line <= cursor);
+        let current = at_cursor(&items, cursor);
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         v_flex()
             .id("structure")

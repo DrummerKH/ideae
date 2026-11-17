@@ -139,11 +139,38 @@ pub fn can_pin() -> bool {
     cfg!(target_os = "linux")
 }
 
-pub fn is_pinned() -> bool {
-    if !can_pin() {
-        return false;
+/// How the app stands with the desktop: listed with the applications, and,
+/// where there is a GNOME dash, pinned to it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Standing {
+    pub listed: bool,
+    pub dash: bool,
+    pub pinned: bool,
+}
+
+/// Whether there is anything to do for the app to be listed: on macOS
+/// the .app in Applications is all it takes.
+pub fn can_list() -> bool {
+    cfg!(any(target_os = "linux", windows))
+}
+
+/// Asks the desktop; takes a process on GNOME, so not on the UI thread.
+pub fn standing() -> Standing {
+    #[cfg(target_os = "linux")]
+    {
+        let favorites = favorites();
+        return Standing {
+            listed: desktop_file().is_some_and(|file| file.is_file()),
+            dash: favorites.is_some(),
+            pinned: favorites.is_some_and(|list| list.iter().any(|s| *s == desktop_id())),
+        };
     }
-    favorites().is_some_and(|f| f.iter().any(|s| *s == desktop_id()))
+    #[cfg(windows)]
+    {
+        return Standing { listed: start_menu_link().is_some_and(|link| link.is_file()), dash: false, pinned: false };
+    }
+    #[allow(unreachable_code)]
+    Standing { listed: true, dash: false, pinned: false }
 }
 
 /// Writes the launcher entry and icon, and adds it to the dash.

@@ -282,11 +282,12 @@ impl Workspace {
                     // Not while presenting: the window shows what was chosen, and nothing is added to it by a stray click.
                     .when(!self.is_presenting(), |row| {
                         row.child(
+                            // A folder, not a bare plus: beside the search of tasks that would read as a new task.
                             Button::new("add-project")
                                 .xsmall()
                                 .ghost()
-                                .label("+")
-                                .tooltip("Add project")
+                                .child(svg().path("side-icons/folder-plus.svg").size(px(16.)).text_color(cx.theme().muted_foreground))
+                                .tooltip("Add a project")
                                 .on_click(cx.listener(|this, _, window, cx| this.add_project_dialog(window, cx))),
                         )
                     }),
@@ -528,6 +529,7 @@ impl Workspace {
             })
         };
         let (menu_a, this_a) = (menu.clone(), this.clone());
+        let (presenting, in_hand) = (self.is_presenting(), self.active_project() == Some(pi));
         h_flex()
             .id(SharedString::from(format!("project-{}", p.path.display())))
             .group(group.clone())
@@ -545,16 +547,32 @@ impl Workspace {
                 s.child(div().text_xs().child(if running > 0 { format!("{running} running ▸") } else { "▸".into() }))
             })
             .child(
-                div()
-                    .opacity(0.)
-                    .when(!self.is_presenting(), |s| s.group_hover(group, |s| s.opacity(1.)))
+                h_flex()
+                    .gap_0p5()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    // The project's archived tasks: to find one and bring it back.
                     .child(
-                        Button::new(SharedString::from(format!("project-add-{pi}")))
-                            .xsmall()
-                            .ghost()
-                            .label("+")
-                            .dropdown_menu(move |m, _, _| menu_a(m, this_a.clone())),
+                        div().opacity(0.).when(!presenting, |s| s.group_hover(group.clone(), |s| s.opacity(1.))).child(
+                            Button::new(SharedString::from(format!("project-archived-{pi}")))
+                                .xsmall()
+                                .ghost()
+                                .child(svg().path("side-icons/history.svg").size(px(15.)).text_color(muted))
+                                .tooltip("Archived tasks of the project")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.archived_dialog(Some(pi), window, cx)
+                                })),
+                        ),
+                    )
+                    // A new task: always there for the project in hand, where the next one is most often made; for the others under the pointer.
+                    .child(
+                        div().when(!in_hand || presenting, |s| s.opacity(0.)).when(!presenting, |s| s.group_hover(group, |s| s.opacity(1.))).child(
+                            Button::new(SharedString::from(format!("project-add-{pi}")))
+                                .xsmall()
+                                .ghost()
+                                .child(svg().path("side-icons/plus.svg").size(px(16.)).text_color(muted))
+                                .dropdown_menu(move |m, _, _| menu_a(m, this_a.clone())),
+                        ),
                     ),
             )
             .on_click(cx.listener(move |this, _, _, cx| {

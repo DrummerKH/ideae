@@ -200,7 +200,7 @@ impl TaskView {
                         t.listening = ports;
                         cx.notify();
                     }
-                    t.right == RightPane::Run && t.visible
+                    t.panel_shown(RightPane::Run) && t.visible
                 });
                 if !matches!(shown, Ok(true)) {
                     let _ = this.update(cx, |t, _| t._listening_poll = None);
@@ -317,7 +317,7 @@ impl TaskView {
 
     pub(super) fn render_run_panel(&self, cx: &mut Context<Self>) -> AnyElement {
         let muted = cx.theme().muted_foreground;
-        let mut panel = v_flex().id("run-panel").flex_1().min_h_0().overflow_y_scroll().text_sm();
+        let mut panel = v_flex().id("run-panel").size_full().overflow_y_scroll().track_scroll(&self.run_scroll).text_sm();
         panel = self.render_auto(panel, cx);
         if let Some(error) = &self.services_error {
             panel = panel.child(div().px_3().py_2().text_xs().text_color(gpui_kit::red()).child(error.clone()));
@@ -418,16 +418,16 @@ impl TaskView {
         }
         panel = self.render_listening(panel, cx);
         panel = self.render_found(panel, "ALSO IN THE PROJECT", cx);
-        panel
-            .child(
-                h_flex().px_3().py_2().child(
-                    Button::new("edit-services")
-                        .xsmall()
-                        .ghost()
-                        .label(format!("Edit {}", crate::services::FILE))
-                        .on_click(cx.listener(|this, _, window, cx| this.create_services_file(window, cx))),
-                ),
-            )
-            .into_any_element()
+        let panel = panel.child(
+            h_flex().px_3().py_2().child(
+                Button::new("edit-services")
+                    .xsmall()
+                    .ghost()
+                    .label(format!("Edit {}", crate::services::FILE))
+                    .on_click(cx.listener(|this, _, window, cx| this.create_services_file(window, cx))),
+            ),
+        );
+        // With the bar the other panels show while they are scrolled.
+        div().relative().flex_1().min_h_0().child(panel).child(gpui_kit::component::scroll::Scrollbar::vertical(&self.run_scroll)).into_any_element()
     }
 }

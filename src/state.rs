@@ -13,6 +13,12 @@ pub struct State {
     /// The sidebar is a narrow rail that opens under the pointer.
     pub sidebar_rail: bool,
     pub side_panel_width: Option<f32>,
+    /// The side panels of the lower half (a bit each; not set, Structure
+    /// and Run), and how high it is.
+    pub side_lower: Option<u8>,
+    pub side_split: Option<f32>,
+    /// Told once that the app is not listed with the applications.
+    pub told_unlisted: bool,
     pub active_collapsed: bool,
     pub starred_collapsed: bool,
     /// A presentation that was on: it is on again after a restart, or the
@@ -143,6 +149,16 @@ pub struct Settings {
     pub diff_files: bool,
     /// Its width, as last dragged.
     pub diff_files_width: f32,
+    /// Changed files as a list of paths, not a tree of folders: in the
+    /// Changes panel and beside a diff.
+    pub changes_flat: bool,
+    /// The Files panel goes to the file in the editor by itself.
+    pub tree_follows: bool,
+    /// What the Structure panel leaves out, and whether it is in the
+    /// order of the names instead of the file's.
+    pub structure_public: bool,
+    pub structure_no_fields: bool,
+    pub structure_sorted: bool,
     /// A pull, rebase, pick or revert that would conflict asks the agent
     /// to do it and resolve the conflicts.
     pub conflicts_to_agent: bool,
@@ -203,7 +219,7 @@ impl Default for Settings {
             rail_open_ms: 750,
             theme: "Ayu".into(),
             show_load: true,
-            show_tokens: true,
+            show_tokens: false,
             context_dial: true,
             context_on_tab: true,
             complete_as_typed: true,
@@ -214,6 +230,11 @@ impl Default for Settings {
             diff_unified: false,
             diff_ignore_whitespace: false,
             diff_files: false,
+            changes_flat: false,
+            tree_follows: false,
+            structure_public: false,
+            structure_no_fields: false,
+            structure_sorted: false,
             diff_files_width: 240.,
             conflicts_to_agent: true,
             present_rail: true,
@@ -423,8 +444,11 @@ pub struct TaskSession {
     pub focus_right: bool,
     /// Folders open in the file tree.
     pub expanded: Vec<String>,
-    /// 0 Changes, 1 Files, 2 Structure.
+    /// The panel in the side's upper half: 0 Changes, 1 Files, 2 Structure,
+    /// 3 Run; none when `side_closed`. And the one in its lower half.
     pub side_panel: u8,
+    pub side_closed: bool,
+    pub side_below: Option<u8>,
     /// Review comments not sent to the agent yet.
     pub review: Vec<ReviewNote>,
     /// Changed files marked viewed, with a hash of their diff then.
