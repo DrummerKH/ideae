@@ -13,6 +13,7 @@ mod file_icons;
 mod finder;
 mod git;
 mod graph;
+mod indent;
 mod grammars;
 mod history;
 mod ide;

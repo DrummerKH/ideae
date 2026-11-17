@@ -386,6 +386,10 @@ pub struct TaskView {
     /// It is taken where the discard runs, off the UI thread.
     discard_undo: Option<Arc<std::sync::Mutex<Option<git::FileSnapshot>>>>,
     action: Option<(bool, String)>,
+    /// The last result told by a notification, for when the Changes panel,
+    /// which shows it, is not in view: a Fetch from the branch bar is not
+    /// to go unanswered.
+    told_action: Option<(bool, String)>,
     /// Wakes the refresh loop: file events, actions, the fallback tick.
     refresh_tx: async_channel::Sender<()>,
     /// The branch "Branch vs …" compares with, when picked by hand; shared
@@ -656,6 +660,7 @@ impl TaskView {
             busy: None,
             discard_undo: None,
             action: None,
+            told_action: None,
             refresh_tx,
             base_override,
             _watching: watching,
@@ -1762,6 +1767,14 @@ impl TaskView {
 impl Render for TaskView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.side_has_focus.set(self.side_focus.is_focused(window));
+        if self.action != self.told_action {
+            self.told_action = self.action.clone();
+            let seen = self.right == RightPane::Changes && self.zoomed.is_none();
+            if let Some((ok, message)) = self.action.clone().filter(|_| !seen && self.visible) {
+                let note = if ok { Notification::info(message) } else { Notification::error(message) };
+                window.push_notification(note.title("Git"), cx);
+            }
+        }
         let slot = |this: &Self, right: bool, cx: &mut Context<Self>| -> AnyElement {
             if this.zoomed == Some(right) {
                 div().size_full().into_any_element()

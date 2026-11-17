@@ -39,18 +39,27 @@ pub(super) fn blame_notes(blame: &[Option<Arc<git::BlameLine>>], text: Hsla, tin
     let (oldest, newest) = (times().min().unwrap_or(0), times().max().unwrap_or(0));
     let span = (newest - oldest).max(1) as f32;
     let mut previous: Option<&str> = None;
+    let mut label = SharedString::default();
+    let uncommitted = SharedString::from("not committed");
     let rows = blame
         .iter()
         .map(|line| {
-            let Some(line) = line.as_ref().filter(|l| !l.uncommitted()) else {
+            let Some(line) = line.as_ref() else {
                 previous = None;
                 return None;
             };
             let first = previous != Some(line.hash.as_str());
             previous = Some(&line.hash);
+            if line.uncommitted() {
+                return Some(GutterNote { text: if first { uncommitted.clone() } else { SharedString::default() }, run: uncommitted.clone(), color: text.opacity(0.6), tint: None });
+            }
+            if first {
+                label = blame_label(line).into();
+            }
             let age = (line.time - oldest) as f32 / span;
             Some(GutterNote {
-                text: if first { blame_label(line).into() } else { SharedString::default() },
+                text: if first { label.clone() } else { SharedString::default() },
+                run: label.clone(),
                 color: text,
                 tint: Some(tint.opacity(0.04 + 0.18 * age)),
             })
@@ -104,7 +113,7 @@ impl FileView {
     /// Who changed the line under the pointer, when and why.
     pub(super) fn render_blame_hover(&self, cx: &App) -> Option<AnyElement> {
         let (row, at) = self.blame_hover.filter(|_| self.annotate && !self.dirty)?;
-        let line = self.blame.get(row)?.clone()?;
+        let line = self.blame.get(row)?.clone().filter(|l| !l.uncommitted())?;
         Some(
             deferred(
                 anchored().position(at + point(px(12.), px(16.))).snap_to_window().child(
@@ -161,11 +170,13 @@ mod tests {
                 Some("1970-01-01 Ann".into()),
                 Some(String::new()),
                 Some("1970-01-01 Bob".into()),
-                None,
+                Some("not committed".into()),
                 None,
                 Some("1970-01-01 Ann".into()),
             ]
         );
+        // Each row knows its run's label, for the top row in view.
+        assert_eq!(notes.rows[1].as_ref().map(|n| n.run.to_string()), Some("1970-01-01 Ann".into()));
         // The newer commit is tinted more.
         let tint = |ix: usize| notes.rows[ix].as_ref().unwrap().tint.unwrap().a;
         assert!(tint(2) > tint(0));

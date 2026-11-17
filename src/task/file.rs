@@ -22,6 +22,8 @@ pub struct ShowSidePanel(pub usize);
 pub struct FileView {
     pub(super) path: PathBuf,
     pub(super) editor: Entity<EditorState>,
+    /// How the file is indented: what Tab inserts and formatting is asked for.
+    pub(super) indent: crate::indent::Indent,
     /// The text as last read from or written to disk, and that file's mtime.
     pub(super) saved: Print,
     pub(super) disk_mtime: Option<std::time::SystemTime>,
@@ -828,7 +830,8 @@ impl FileView {
                 this.save(cx);
             }
         };
-        self.ask_server_or(window, cx, |client, uri, _| client.formatting(uri, 4, true), then, without);
+        let indent = self.indent;
+        self.ask_server_or(window, cx, move |client, uri, _| client.formatting(uri, indent.size as u32, !indent.tabs), then, without);
     }
 
     /// Asks for a new name of the symbol under the cursor and gives it that

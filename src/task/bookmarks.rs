@@ -194,7 +194,7 @@ mod tests {
             editor.update(cx, |state, cx| state.toggle_bookmark(0, cx));
             assert_eq!(editor.read(cx).bookmark_rows(), [0, 4]);
 
-            let note = |text: &str| Some(GutterNote { text: text.to_string().into(), color: gpui_kit::black(), tint: Some(gpui_kit::blue()) });
+            let note = |text: &str| Some(GutterNote { text: text.to_string().into(), run: Default::default(), color: gpui_kit::black(), tint: Some(gpui_kit::blue()) });
             let notes = GutterNotes { chars: 20, rows: vec![note("2026-11-03 Ann"), note(""), None, note("2026-11-04 Bob")] };
             editor.update(cx, |state, cx| state.set_gutter_notes(Some(std::rc::Rc::new(notes)), cx));
             window.render_frame(cx);

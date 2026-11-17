@@ -596,7 +596,7 @@ impl Workspace {
         let changed = sides.iter().filter(|&&ti| tasks[ti].side.as_ref().is_some_and(|s| s.dirty || s.ahead > 0)).count();
         let mut text = format!("{} {} {what}agent worktree{}", if open { "▾" } else { "▸" }, sides.len(), if sides.len() == 1 { "" } else { "s" });
         if changed > 0 {
-            text.push_str(&format!(" · {changed} with work"));
+            text.push_str(&format!(" · {changed} changed"));
         }
         let fold = key.clone();
         list = list.child(

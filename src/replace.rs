@@ -31,6 +31,25 @@ pub struct Query {
     pub mask: String,
     /// With `regex`, `$1` and `${name}` are the groups, `$$` a dollar.
     pub replacement: String,
+    /// Case always minded, not only when the query has a capital.
+    pub match_case: bool,
+    /// The replacement takes each match's case: `Store` becomes `Shop`,
+    /// `STORE` becomes `SHOP`, as JetBrains does.
+    pub preserve_case: bool,
+}
+
+/// `replacement` in the case of `found`: all capitals, a first capital, or a
+/// first small letter; else as it is.
+pub fn in_case_of(found: &str, replacement: &str) -> String {
+    let letters: Vec<char> = found.chars().filter(|c| c.is_alphabetic()).collect();
+    let Some(&first) = letters.first() else { return replacement.to_string() };
+    if letters.len() > 1 && letters.iter().all(|c| c.is_uppercase()) {
+        return replacement.to_uppercase();
+    }
+    let mut chars = replacement.chars();
+    let Some(head) = chars.next() else { return String::new() };
+    let head: String = if first.is_uppercase() { head.to_uppercase().collect() } else { head.to_lowercase().collect() };
+    head + chars.as_str()
 }
 
 /// A text without the text: its length and a hash, to tell later whether a
@@ -92,7 +111,13 @@ impl Found {
 
 /// The matcher Find in files would use for the query: smart case.
 pub fn matcher(query: &Query) -> Result<RegexMatcher, String> {
-    let made = if query.regex { crate::search::regex(&query.text) } else { crate::search::literal(&query.text) };
+    let made = if query.match_case {
+        crate::search::exact(&query.text, query.regex)
+    } else if query.regex {
+        crate::search::regex(&query.text)
+    } else {
+        crate::search::literal(&query.text)
+    };
     made.ok_or_else(|| if query.regex { "Not a regular expression".to_string() } else { "Cannot be searched for".to_string() })
 }
 
@@ -120,6 +145,7 @@ pub fn find_in_text(text: &str, matcher: &RegexMatcher, query: &Query, limit: us
             } else {
                 query.replacement.clone()
             };
+            let replacement = if query.preserve_case { in_case_of(&line[m.start()..m.end()], &replacement) } else { replacement };
             let (preview, old, new) = preview(line, m.start()..m.end(), &replacement);
             hits.push(Hit { range: start + m.start()..start + m.end(), line: ix as u32 + 1, replacement, preview, old, new });
             hits.len() < limit
@@ -345,6 +371,8 @@ pub struct ReplaceView {
     replacement: Entity<InputState>,
     mask: Entity<InputState>,
     regex: bool,
+    match_case: bool,
+    preserve_case: bool,
     found: Rc<Found>,
     rows: Rc<Vec<Row>>,
     off_files: HashSet<usize>,
@@ -398,6 +426,8 @@ impl ReplaceView {
             replacement,
             mask,
             regex: false,
+            match_case: false,
+            preserve_case: true,
             found: Rc::default(),
             rows: Rc::default(),
             off_files: HashSet::new(),
@@ -417,6 +447,8 @@ impl ReplaceView {
             regex: self.regex,
             mask: self.mask.read(cx).value().to_string(),
             replacement: self.replacement.read(cx).value().to_string(),
+            match_case: self.match_case,
+            preserve_case: self.preserve_case,
         }
     }
 
@@ -680,6 +712,30 @@ impl Render for ReplaceView {
                     .child(div().w(px(320.)).child(Input::new(&self.mask).small()))
                     .child(div().flex_1().min_w_0().truncate().text_xs().text_color(cx.theme().muted_foreground).child(status))
                     .child(
+                        Button::new("replace-case")
+                            .small()
+                            .ghost()
+                            .label("Aa")
+                            .selected(self.match_case)
+                            .tooltip("Match case. Off, a query in small letters finds any case")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.match_case = !this.match_case;
+                                this.search(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("replace-preserve")
+                            .small()
+                            .ghost()
+                            .label("Preserve case")
+                            .selected(self.preserve_case)
+                            .tooltip("Each replacement takes the case of what it replaces: Store becomes Shop, STORE becomes SHOP")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.preserve_case = !this.preserve_case;
+                                this.search(cx);
+                            })),
+                    )
+                    .child(
                         Button::new("replace-regex")
                             .small()
                             .ghost()
@@ -730,7 +786,16 @@ mod tests {
     use super::{Fingerprint, Outcome, Plan, Query, apply, find, find_in_text, matcher, write};
 
     fn query(text: &str, regex: bool, replacement: &str) -> Query {
-        Query { text: text.into(), regex, mask: String::new(), replacement: replacement.into() }
+        Query { text: text.into(), regex, mask: String::new(), replacement: replacement.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn case_is_kept_or_minded() {
+        let keep = Query { preserve_case: true, ..query("store", false, "shop") };
+        assert_eq!(replaced("store Store STORE\n", &keep), "shop Shop SHOP\n");
+        let exact = Query { match_case: true, ..query("store", false, "shop") };
+        assert_eq!(replaced("store Store STORE\n", &exact), "shop Store STORE\n", "only the same case");
+        assert_eq!(super::in_case_of("x", "Shop"), "shop");
     }
 
     fn replaced(text: &str, q: &Query) -> String {

@@ -37,6 +37,11 @@ pub fn regex(query: &str) -> Option<RegexMatcher> {
     builder().case_smart(true).build(query).ok()
 }
 
+/// As `literal` and `regex`, case always minded (`rg --case-sensitive`).
+pub fn exact(query: &str, is_regex: bool) -> Option<RegexMatcher> {
+    builder().fixed_strings(!is_regex).build(query).ok()
+}
+
 /// `rg -g`: globs separated by commas or spaces, `!` before one leaves those
 /// files out. With only `!` globs every other file still counts.
 pub fn mask(root: &Path, mask: &str) -> Option<Override> {

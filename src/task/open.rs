@@ -40,8 +40,10 @@ impl TaskView {
         };
         let language = lsp::language_for(&path);
         let veiled = self.ignores(&path);
+        let indent = crate::indent::of(&path, &content, &self.root);
         let editor = cx.new(|cx| {
             EditorState::new(window, cx)
+                .tab_size(gpui_kit::component::input::TabSize { tab_size: indent.size, hard_tabs: indent.tabs })
                 .language(language)
                 .line_number(true)
                 .indent_guides(true)
@@ -80,6 +82,7 @@ impl TaskView {
             FileView {
             path: path.clone(),
             editor: editor.clone(),
+            indent,
             saved,
             disk_mtime: mtime(&path),
             dirty: false,

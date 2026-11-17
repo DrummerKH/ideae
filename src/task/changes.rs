@@ -316,7 +316,12 @@ impl ChangesView {
 
 impl Render for ChangesView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mode = self.diff.read(cx).mode();
+        // Split or unified is one choice for every task's Changes, kept over a restart.
+        let wanted = if crate::state::with_settings(|s| s.diff_unified) { DiffMode::Unified } else { DiffMode::Split };
+        if self.diff.read(cx).mode() != wanted {
+            self.diff.update(cx, |d, cx| d.set_mode(wanted, cx));
+        }
+        let mode = wanted;
         let empty = self.diff.read(cx).files().is_empty();
         v_flex()
             .size_full()
@@ -382,6 +387,9 @@ impl Render for ChangesView {
                     .children([("mode-split", "Split", DiffMode::Split, "Old and new side by side"), ("mode-unified", "Unified", DiffMode::Unified, "Old and new one under the other")].map(
                         |(id, label, to, tip)| {
                             Button::new(id).small().ghost().label(label).tooltip(tip).selected(mode == to).on_click(cx.listener(move |this, _, _, cx| {
+                                let mut settings = crate::state::settings();
+                                settings.diff_unified = to == DiffMode::Unified;
+                                crate::state::set_settings(settings);
                                 this.diff.update(cx, |d, cx| d.set_mode(to, cx));
                             }))
                         },

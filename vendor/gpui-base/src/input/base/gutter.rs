@@ -23,6 +23,9 @@ pub struct GutterNotes {
 pub struct GutterNote {
     /// Empty on a row that goes on with the note above it.
     pub text: SharedString,
+    /// The note of the run the row is in: shown on the top row in view when
+    /// the run began above it.
+    pub run: SharedString,
     pub color: Hsla,
     /// Behind the note, the row's height.
     pub tint: Option<Hsla>,

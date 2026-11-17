@@ -3282,18 +3282,21 @@ impl<M: InputModeKind> Element for TextElement<M> {
             last_layout
                 .visible_buffer_lines
                 .iter()
-                .map(|&row| {
+                .enumerate()
+                .map(|(ix, &row)| {
                     let note = notes.rows.get(row)?.as_ref()?;
-                    let shaped = (!note.text.is_empty()).then(|| {
+                    // A run begun above the view is still named, on its top row.
+                    let text = if note.text.is_empty() && ix == 0 { &note.run } else { &note.text };
+                    let shaped = (!text.is_empty()).then(|| {
                         let run = TextRun {
-                            len: note.text.len(),
+                            len: text.len(),
                             font: style.font(),
                             color: note.color,
                             background_color: None,
                             underline: None,
                             strikethrough: None,
                         };
-                        window.text_system().shape_line(note.text.clone(), text_size, &[run], None)
+                        window.text_system().shape_line(text.clone(), text_size, &[run], None)
                     });
                     Some((shaped, note.tint))
                 })

@@ -1236,7 +1236,9 @@ impl Workspace {
         if entry.main || entry.busy.is_some() {
             return;
         }
-        let mut description = format!("Removes the worktree {} and the branch {}.", path.display(), entry.branch);
+        // Under the home folder, as ~/…: the whole path wraps over lines.
+        let shown = std::env::var_os("HOME").and_then(|home| path.strip_prefix(home).ok().map(|rest| format!("~/{}", rest.display()))).unwrap_or_else(|| path.display().to_string());
+        let mut description = format!("Removes the worktree {shown} and the branch {}.", entry.branch);
         if dirty > 0 {
             description.push_str(&format!("\n{dirty} uncommitted file(s) will be lost."));
         }
@@ -1257,6 +1259,7 @@ impl Workspace {
                 .title(title.clone())
                 .description(description.clone())
                 .ok_text("Delete")
+                .ok_variant(gpui_kit::component::button::ButtonVariant::Danger)
                 .on_ok(move |_, window, cx| {
                     let _ = this.update(cx, |this, cx| this.remove_task(&path, window, cx));
                     true

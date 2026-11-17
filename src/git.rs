@@ -1967,6 +1967,27 @@ mod pull_tests {
     }
 
     #[test]
+    fn a_task_leaves_the_remote_branch_and_owns_only_its_commits() {
+        let base = std::env::temp_dir().join(format!("ideae-task-base-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        // The remote added by hand: no origin/HEAD. main has commits not pushed.
+        let script = "git init -q --bare -b main origin.git; git init -q -b main repo; cd repo; git config user.email t@t; git config user.name t; \
+            echo a > a; git add a; git commit -qm one; git remote add origin ../origin.git; git push -q origin main; \
+            for n in 2 3 4; do echo $n > a; git commit -qam $n; done";
+        assert!(std::process::Command::new("sh").arg("-ec").arg(script).current_dir(&base).status().unwrap().success());
+        let repo = base.join("repo");
+        let task = super::create_task_worktree(&repo, "DEV-1_x", false).unwrap();
+        let head = |at: &std::path::Path, rev: &str| super::git(at, &["rev-parse", rev]).unwrap();
+        assert_eq!(head(&task, "HEAD"), head(&repo, "origin/main"), "from the remote's main, not the local one ahead of it");
+        assert_eq!(super::unsaved_work(&task), (0, 0), "nothing of its own to lose");
+        std::fs::write(task.join("b"), "b").unwrap();
+        assert!(std::process::Command::new("sh").arg("-ec").arg("git add b; git -c user.email=t@t -c user.name=t commit -qm own").current_dir(&task).status().unwrap().success());
+        assert_eq!(super::unsaved_work(&task), (0, 1), "its own commit");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn touched_files_since_the_fork() {
         let base = setup("touched");
         sh(&base, "cd a; echo later > h.txt; git add h.txt; git commit -qm later; git push -q origin main
@@ -2130,16 +2151,22 @@ pub fn main_worktree(path: &Path) -> Option<PathBuf> {
 
 /// Fetches the remote's default branch, quietly: no prompt for a password
 /// or key (it fails instead), no gc afterwards, given up after a minute.
-pub fn fetch_base(repo: &Path) -> Result<(), String> {
+/// The remote's default branch without `origin/`: what origin/HEAD names,
+/// else main or master when origin has it (a repository given its remote by
+/// `git remote add` has no origin/HEAD).
+fn remote_default(repo: &Path) -> Option<String> {
     let head = git(repo, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]).map(|s| s.trim().to_string());
-    let branch = match head.as_deref().and_then(|h| h.strip_prefix("origin/")) {
-        Some(branch) => branch.to_string(),
-        None => ["main", "master"]
-            .into_iter()
-            .find(|b| git(repo, &["rev-parse", "--verify", "-q", &format!("refs/remotes/origin/{b}")]).is_some_and(|s| !s.trim().is_empty()))
-            .ok_or("no origin/main or origin/master")?
-            .to_string(),
-    };
+    if let Some(branch) = head.as_deref().and_then(|h| h.strip_prefix("origin/")) {
+        return Some(branch.to_string());
+    }
+    ["main", "master"]
+        .into_iter()
+        .find(|b| git(repo, &["rev-parse", "--verify", "-q", &format!("refs/remotes/origin/{b}")]).is_some_and(|s| !s.trim().is_empty()))
+        .map(str::to_string)
+}
+
+pub fn fetch_base(repo: &Path) -> Result<(), String> {
+    let branch = remote_default(repo).ok_or("no origin/main or origin/master")?;
     fetch_quietly(repo, &["fetch", "--quiet", "--no-auto-maintenance", "origin", &branch])
 }
 
@@ -2181,12 +2208,9 @@ fn fetch_quietly(repo: &Path, args: &[&str]) -> Result<(), String> {
 /// Where a new task branches from: the remote's default branch, fetched
 /// first, else the main worktree's branch.
 fn new_task_base(repo: &Path) -> String {
-    if let Some(remote_head) = git(repo, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]) {
-        let remote_head = remote_head.trim().to_string();
-        if let Some(branch) = remote_head.strip_prefix("origin/") {
-            let _ = git_status(repo, &["fetch", "--quiet", "origin", branch]);
-            return remote_head;
-        }
+    if let Some(branch) = remote_default(repo) {
+        let _ = git_status(repo, &["fetch", "--quiet", "origin", &branch]);
+        return format!("origin/{branch}");
     }
     git(repo, &["rev-parse", "--abbrev-ref", "HEAD"]).map(|s| s.trim().to_string()).unwrap_or_else(|| "HEAD".into())
 }
@@ -2369,11 +2393,18 @@ fn copy_env_files(from: &Path, to: &Path) {
 
 /// What deleting a task's worktree would lose: uncommitted files, commits on
 /// no remote.
+/// What deleting the task at `root` would lose: changed files, and commits
+/// on no remote and on no other local branch (those of main not pushed yet
+/// are main's, not the task's).
 pub fn unsaved_work(root: &Path) -> (usize, usize) {
     let dirty = git(root, &["status", "--porcelain"]).map_or(0, |s| s.lines().count());
-    let unpushed = git(root, &["rev-list", "--count", "HEAD", "--not", "--remotes"])
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0);
+    let own = git(root, &["symbolic-ref", "--short", "-q", "HEAD"]).map(|b| format!("--exclude={}", b.trim()));
+    let mut args = vec!["rev-list", "--count", "HEAD", "--not", "--remotes"];
+    if let Some(own) = own.as_deref() {
+        args.push(own);
+    }
+    args.push("--branches");
+    let unpushed = git(root, &args).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
     (dirty, unpushed)
 }
 
