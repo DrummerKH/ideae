@@ -124,6 +124,7 @@ pub struct Workspace {
     /// The task in view, by worktree path.
     pub active: Option<PathBuf>,
     pub active_collapsed: bool,
+    pub starred_collapsed: bool,
     /// Set while the window is shown to others: what is left in it.
     pub presenting: Option<present::Presenting>,
     /// The spaces, the one in the window (none: all of them), and the
@@ -462,6 +463,7 @@ impl Workspace {
             projects: Vec::new(),
             active: None,
             active_collapsed: saved.active_collapsed,
+            starred_collapsed: saved.starred_collapsed,
             presenting: saved.presenting.as_ref().map(|p| present::Presenting::new(p.kept.iter().cloned().collect(), p.since)),
             spaces: saved.spaces.clone(),
             space: saved.space.clone().filter(|name| saved.spaces.iter().any(|s| &s.name == name)),
@@ -769,6 +771,7 @@ impl Workspace {
             sidebar_rail: self.sidebar_rail,
             side_panel_width: cx.try_global::<SidePanelWidth>().map(|w| f32::from(w.0)),
             active_collapsed: self.active_collapsed,
+            starred_collapsed: self.starred_collapsed,
             presenting: self.presenting.as_ref().map(|p| state::PresentingState { kept: p.kept.iter().cloned().collect(), since: p.since }),
             spaces: self.spaces.clone(),
             space: self.space.clone(),
@@ -1418,6 +1421,7 @@ impl Workspace {
         if let Some(entry) = self.entry_mut(path) {
             entry.starred = !entry.starred;
         }
+        self.save(cx);
         cx.notify();
     }
 

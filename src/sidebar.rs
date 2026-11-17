@@ -159,6 +159,37 @@ impl Workspace {
             }
         }
 
+        // Starred: wherever their project is, below what needs you; as far
+        // as the window shows them (its space, a presentation).
+        if query.is_empty() {
+            let waiting: std::collections::HashSet<(usize, usize)> = self.active_rows(cx).into_iter().collect();
+            let starred: Vec<(usize, usize)> = self
+                .projects
+                .iter()
+                .enumerate()
+                .flat_map(|(pi, p)| p.tasks.iter().enumerate().filter(|(_, t)| t.starred && t.side.is_none()).map(move |(ti, _)| (pi, ti)))
+                .filter(|&(pi, ti)| self.shows(pi, ti) && !waiting.contains(&(pi, ti)))
+                .collect();
+            if !starred.is_empty() {
+                let collapsed = self.starred_collapsed;
+                list = list.child(
+                    section_header(if collapsed { "▸ STARRED" } else { "▾ STARRED" }, cx)
+                        .id("starred-header")
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.starred_collapsed = !this.starred_collapsed;
+                            this.save(cx);
+                            cx.notify();
+                        })),
+                );
+                if !collapsed {
+                    for (pi, ti) in starred {
+                        list = list.child(self.render_task(pi, ti, true, cx));
+                    }
+                }
+            }
+        }
+
         if self.projects.is_empty() {
             list = list.child(
                 div().px_3().py_3().child(
@@ -182,7 +213,9 @@ impl Workspace {
             let show_sides = crate::state::with_settings(|s| s.show_side_worktrees);
             let (sides, tasks): (Vec<usize>, Vec<usize>) = tasks.into_iter().partition(|&ti| p.tasks[ti].side.is_some());
             let sides: Vec<usize> = if show_sides { sides } else { Vec::new() };
-            let tasks: Vec<usize> = if query.is_empty() { tasks } else { tasks.into_iter().chain(sides.iter().copied()).collect() };
+            let mut tasks: Vec<usize> = if query.is_empty() { tasks } else { tasks.into_iter().chain(sides.iter().copied()).collect() };
+            // The main checkout, then the starred, then the rest in their order.
+            tasks.sort_by_key(|&ti| (!p.tasks[ti].main, !p.tasks[ti].starred));
             let sides = if query.is_empty() { sides } else { Vec::new() };
             let parents: std::collections::HashSet<&std::path::Path> = tasks.iter().map(|&ti| p.tasks[ti].path.as_path()).collect();
             let side_parent = |ti: usize| p.tasks[ti].side.as_ref().and_then(|s| s.parent.as_deref()).filter(|parent| parents.contains(parent));
@@ -423,6 +456,7 @@ impl Workspace {
         let this = cx.weak_entity();
         let spaces: Vec<(String, String)> = self.spaces.iter().map(|s| (s.name.clone(), s.mark())).collect();
         let in_space = p.space.clone();
+        let merged = p.tasks.iter().filter(|t| !t.main && t.pr.as_ref().is_some_and(|pr| pr.state == crate::pr::PrState::Merged)).count();
         let menu = move |menu: PopupMenu, this: WeakEntity<Workspace>| {
             let (spaces, in_space) = (spaces.clone(), in_space.clone());
             let settings = this.clone();
@@ -433,9 +467,12 @@ impl Workspace {
             .item(PopupMenuItem::new("New task…").on_click(move |_, window, cx| {
                 let _ = b.update(cx, |w, cx| w.new_task_dialog(pi, window, cx));
             }))
-            .item(PopupMenuItem::new("Clean up merged tasks…").on_click(move |_, window, cx| {
-                let _ = d.update(cx, |w, cx| w.clean_up_merged(pi, window, cx));
-            }))
+            // Only when there is something to clean up, and how much.
+            .when(merged > 0, |menu| {
+                menu.item(PopupMenuItem::new(format!("Delete {merged} merged task{}…", if merged == 1 { "" } else { "s" })).on_click(move |_, window, cx| {
+                    let _ = d.update(cx, |w, cx| w.clean_up_merged(pi, window, cx));
+                }))
+            })
             .item(PopupMenuItem::new("Project settings…").on_click(move |_, window, cx| {
                 let _ = settings.update(cx, |w, cx| w.project_settings(pi, window, cx));
             }))
@@ -458,9 +495,6 @@ impl Workspace {
                 }))
                 .separator()
             })
-            .item(PopupMenuItem::new("Remove from list…").on_click(move |_, window, cx| {
-                let _ = c.update(cx, |w, cx| w.remove_project(pi, window, cx));
-            }))
         };
         let (menu_a, this_a) = (menu.clone(), this.clone());
         h_flex()

@@ -479,6 +479,17 @@ impl Workspace {
                 let _ = this.update(cx, |w, cx| w.save_project_settings(&project, config, only_me, window, cx));
             }
         };
+        let remove = {
+            let (this, project) = (this.clone(), project.clone());
+            move |window: &mut Window, cx: &mut App| {
+                window.close_dialog(cx);
+                let _ = this.update(cx, |w, cx| {
+                    if let Some(pi) = w.projects.iter().position(|p| p.path == project) {
+                        w.remove_project(pi, window, cx);
+                    }
+                });
+            }
+        };
         let ask = {
             let this = this.clone();
             move |window: &mut Window, cx: &mut App| {
@@ -504,6 +515,7 @@ impl Workspace {
             let (setup, teardown, check, copy, rows, only_me) = (setup.clone(), teardown.clone(), check.clone(), copy.clone(), rows.clone(), only_me.clone());
             let (save, ask, fill, allow, file_trust, file_key, file_error) =
                 (save.clone(), ask.clone(), fill.clone(), allow.clone(), file_trust.clone(), file_key.clone(), file_error.clone());
+            let remove = remove.clone();
             dialog
                 .title(format!("Project settings · {name}"))
                 .w(px(760.))
@@ -590,7 +602,18 @@ impl Workspace {
                             .child(field("Teardown", "Runs when a task is closed or deleted", Textarea::new(&teardown).into_any_element()))
                             .child(field("Check", "Runs when the agent finishes a turn; ✓ or ✗ on the task", Input::new(&check).into_any_element()))
                             .child(field("Files to copy", "Ignored files a new worktree gets from the main checkout", Input::new(&copy).into_any_element()))
-                            .child(field("Services", "Started from Run: name, command, port", services.into_any_element())),
+                            .child(field("Services", "Started from Run: name, command, port", services.into_any_element()))
+                            .child({
+                                let remove = remove.clone();
+                                h_flex()
+                                    .pt_3()
+                                    .mt_1()
+                                    .gap_2()
+                                    .border_t_1()
+                                    .border_color(cx.theme().border)
+                                    .child(div().flex_1().text_xs().text_color(cx.theme().muted_foreground).child("The project leaves the list; its folder, tasks' worktrees and branches stay on disk."))
+                                    .child(Button::new("project-remove").small().ghost().label("Remove from the list…").on_click(move |_, window, cx| remove(window, cx)))
+                            }),
                     )
                 })
                 .footer({

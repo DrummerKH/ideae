@@ -14,6 +14,7 @@ pub struct State {
     pub sidebar_rail: bool,
     pub side_panel_width: Option<f32>,
     pub active_collapsed: bool,
+    pub starred_collapsed: bool,
     /// A presentation that was on: it is on again after a restart, or the
     /// restart would show everything.
     pub presenting: Option<PresentingState>,
