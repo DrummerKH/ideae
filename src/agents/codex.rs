@@ -91,7 +91,8 @@ impl Adapter for Codex {
     }
 
     fn usage(&self, transcript: &Path) -> Option<crate::usage::Usage> {
-        rollout_usage(&std::fs::read_to_string(transcript).ok()?)
+        let file = std::fs::File::open(transcript).ok()?;
+        rollout_usage(std::io::BufReader::new(file))
     }
 
     fn resumes(&self) -> bool {
@@ -165,16 +166,19 @@ fn find_rollout(sessions: &Path, id: &str) -> Option<PathBuf> {
 
 /// What a session used, from its `token_count` events: the totals of the
 /// last, the context of the latest turn, and what the last day took.
-pub fn rollout_usage(text: &str) -> Option<crate::usage::Usage> {
+/// Read a line at a time: a long session's rollout is many megabytes,
+/// read again whenever it grows.
+pub fn rollout_usage(reader: impl std::io::BufRead) -> Option<crate::usage::Usage> {
+    let has = |line: &[u8], word: &[u8]| line.windows(word.len()).any(|w| w == word);
     let mut usage = crate::usage::Usage::default();
     let day_ago = crate::state::now().saturating_sub(86_400);
     let mut before = 0u64;
     let mut seen = false;
-    for line in text.lines() {
-        if !line.contains("token_count") && !line.contains("turn_context") {
+    for line in reader.split(b'\n').map_while(Result::ok) {
+        if !has(&line, b"token_count") && !has(&line, b"turn_context") {
             continue;
         }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&line) else { continue };
         let payload = &v["payload"];
         if v["type"] == "turn_context" {
             if let Some(model) = payload["model"].as_str() {
@@ -275,12 +279,12 @@ mod tests {
             count(&now, 5000, 3000, 300, 4000),
         ]
         .join("\n");
-        let u = rollout_usage(&text).unwrap();
+        let u = rollout_usage(text.as_bytes()).unwrap();
         assert_eq!((u.input, u.cache_read, u.output, u.context, u.window, u.answers), (2000, 3000, 300, 4000, 272_000, 2));
         assert_eq!(u.recent, 2300 - 1100, "the day's share");
         assert_eq!(u.model, "gpt-5-codex");
         assert!((u.fill() - 4000. / 272_000.).abs() < 1e-6);
-        assert!(rollout_usage("{}").is_none());
+        assert!(rollout_usage(&b"{}"[..]).is_none());
     }
 
     #[test]
