@@ -139,6 +139,10 @@ pub struct Settings {
     pub diff_unified: bool,
     /// Diffs leave out changes of whitespace and blank lines.
     pub diff_ignore_whitespace: bool,
+    /// Diffs show their files in a column beside them.
+    pub diff_files: bool,
+    /// Its width, as last dragged.
+    pub diff_files_width: f32,
     /// A pull, rebase, pick or revert that would conflict asks the agent
     /// to do it and resolve the conflicts.
     pub conflicts_to_agent: bool,
@@ -209,6 +213,8 @@ impl Default for Settings {
             format_on_save: false,
             diff_unified: false,
             diff_ignore_whitespace: false,
+            diff_files: false,
+            diff_files_width: 240.,
             conflicts_to_agent: true,
             present_rail: true,
             present_veil: true,

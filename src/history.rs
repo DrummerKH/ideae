@@ -853,6 +853,7 @@ impl Render for HistoryView {
                                         .flex_wrap()
                                         .gap_x_1()
                                         .ml(px(-6.))
+                                        .child(crate::task::files_button("commit-files").xsmall())
                                         .children([("commit-pick", "Cherry-pick", "Take this commit into the task's branch", 0), ("commit-revert", "Revert", "Commit the opposite of this commit", 1), ("commit-task", "New task from here", "A task in a worktree of its own, starting at this commit", 2)].map(
                                             |(id, label, tip, what)| {
                                                 let (task, hash) = (self.task.clone(), c.hash.clone());
@@ -874,12 +875,15 @@ impl Render for HistoryView {
                                                     let _ = task.update(cx, |t, cx| t.compare_with(hash, None, window, cx));
                                                 })
                                         })
-                                        .child(crate::task::whitespace_button("commit-whitespace").xsmall()),
+                                        .child(crate::task::whitespace_button("commit-whitespace").xsmall())
+                                        .children(crate::task::fold_buttons(&self.diff, "commit").map(|b| b.xsmall())),
                                 ),
                         )
                     })
                     .child(
-                        div().flex_1().min_h_0().child(
+                        div().flex_1().min_h_0().child(crate::task::with_file_list(
+                            &self.diff,
+                            "commit-file-list",
                             // Wrapped: unwrapped rows lose the vertical scrollbar here.
                             Diff::new(&self.diff)
                                 .line_number(true)
@@ -899,7 +903,8 @@ impl Render for HistoryView {
                                     let line = position.line().saturating_sub(1) as u32;
                                     let _ = task.update(cx, |t, cx| t.open_file(path, line, window, cx));
                                 }),
-                        ),
+                            cx,
+                        )),
                     ),
             )
     }

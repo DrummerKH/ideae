@@ -111,6 +111,140 @@ pub fn whitespace_button(id: &'static str) -> Button {
         .on_click(move |_, _, cx| set_ignore_whitespace(!on, cx))
 }
 
+/// The switch for the column of a diff's files, one choice for every diff.
+pub fn files_button(id: &'static str) -> Button {
+    let on = crate::state::with_settings(|s| s.diff_files);
+    Button::new(id).small().ghost().icon(gpui_kit::assets::IconName::PanelLeft).tooltip("The changed files beside the diff; a click goes to one").selected(on).on_click(move |_, _, cx| {
+        let mut settings = crate::state::settings();
+        settings.diff_files = !on;
+        crate::state::set_settings(settings);
+        cx.refresh_windows();
+    })
+}
+
+thread_local! {
+    /// The tree of each list's files, made again when its diff gets other files.
+    static FILE_TREES: std::cell::RefCell<HashMap<&'static str, (usize, Rc<Vec<ChangeNode>>)>> = std::cell::RefCell::default();
+    /// Folders folded, by list and path; a few at most.
+    static FOLDED: std::cell::RefCell<HashSet<(&'static str, String)>> = std::cell::RefCell::default();
+}
+
+/// The diff, with its files as a tree in a column beside it when that is
+/// on: folders that fold, each file with its counts; the one at the top of
+/// the view lit, a click goes to it. The column's width is dragged.
+pub fn with_file_list(diff: &Entity<DiffState>, id: &'static str, body: impl IntoElement, cx: &App) -> AnyElement {
+    if !crate::state::with_settings(|s| s.diff_files) {
+        return body.into_any_element();
+    }
+    let state = diff.read(cx);
+    let files = state.files();
+    let print = files.as_ptr() as usize ^ files.len();
+    let tree = FILE_TREES.with_borrow_mut(|trees| match trees.get(id) {
+        Some((seen, tree)) if *seen == print => tree.clone(),
+        _ => {
+            let paths: Vec<(usize, &str)> = files.iter().enumerate().map(|(ix, f)| (ix, f.path().as_ref())).collect();
+            let tree = Rc::new(change_tree(&paths));
+            trees.insert(id, (print, tree.clone()));
+            tree
+        }
+    });
+    let rows: Rc<Vec<usize>> = Rc::new(FOLDED.with_borrow(|folded| {
+        let mut hidden: Option<String> = None;
+        (0..tree.len())
+            .filter(|&i| {
+                let path = match &tree[i] {
+                    ChangeNode::Dir { path, .. } => path.as_str(),
+                    ChangeNode::File { ix, .. } => files.get(*ix).map_or("", |f| f.path().as_ref()),
+                };
+                if hidden.as_deref().is_some_and(|dir| path.starts_with(dir) && path[dir.len()..].starts_with('/')) {
+                    return false;
+                }
+                hidden = None;
+                if let ChangeNode::Dir { path, .. } = &tree[i]
+                    && folded.contains(&(id, path.clone()))
+                {
+                    hidden = Some(path.clone());
+                }
+                true
+            })
+            .collect()
+    }));
+    let top = state.top_file();
+    let (muted, accent, green, red) = (cx.theme().muted_foreground, cx.theme().accent, cx.theme().green, cx.theme().red);
+    let list = {
+        let diff = diff.clone();
+        uniform_list(id, rows.len(), move |range, _, cx| {
+            let files = diff.read(cx).files();
+            range
+                .filter_map(|r| rows.get(r).map(|&i| (r, &tree[i])))
+                .map(|(r, node)| {
+                    let row = h_flex().id(r).w_full().overflow_hidden().px_2().h(px(24.)).gap_1().text_sm().cursor_pointer().hover(|row| row.bg(accent.opacity(0.6)));
+                    match node {
+                        ChangeNode::Dir { path, label, depth } => {
+                            let folded = FOLDED.with_borrow(|f| f.contains(&(id, path.clone())));
+                            let key = (id, path.clone());
+                            row.pl(px(8. + 12. * *depth as f32))
+                                .text_color(muted)
+                                .child(div().flex_shrink_0().w(px(10.)).child(if folded { "▸" } else { "▾" }))
+                                .child(div().min_w_0().truncate().child(label.clone()))
+                                .on_click(move |_, window, _| {
+                                    FOLDED.with_borrow_mut(|f| {
+                                        if !f.remove(&key) {
+                                            f.insert(key.clone());
+                                        }
+                                    });
+                                    window.refresh();
+                                })
+                                .into_any_element()
+                        }
+                        ChangeNode::File { ix, depth } => {
+                            let Some(file) = files.get(*ix) else { return div().into_any_element() };
+                            let path = file.path().clone();
+                            let name = path.rsplit('/').next().unwrap_or_default().to_string();
+                            let target = diff.clone();
+                            row.pl(px(8. + 12. * *depth as f32 + 11.))
+                                .when(top.as_ref() == Some(&path), |row| row.bg(accent))
+                                .child(div().min_w_0().flex_1().truncate().child(name))
+                                .child(div().flex_shrink_0().text_xs().text_color(green).child(format!("+{}", file.additions())))
+                                .child(div().flex_shrink_0().text_xs().text_color(red).child(format!("−{}", file.deletions())))
+                                .on_click(move |_, _, cx| target.update(cx, |d, cx| d.scroll_to_file(&path, cx)))
+                                .into_any_element()
+                        }
+                    }
+                })
+                .collect()
+        })
+        .size_full()
+    };
+    let width = px(crate::state::with_settings(|s| s.diff_files_width).clamp(120., 600.));
+    gpui_kit::component::resizable::h_resizable(SharedString::from(format!("{id}-split")))
+        .on_resize(|state, _, cx| {
+            let Some(width) = state.read(cx).sizes().first().copied() else { return };
+            let mut settings = crate::state::settings();
+            settings.diff_files_width = f32::from(width);
+            crate::state::set_settings(settings);
+        })
+        .child(
+            gpui_kit::component::resizable::resizable_panel()
+                .size(width)
+                .size_range(px(120.)..px(600.))
+                .fixed()
+                .child(div().size_full().overflow_hidden().child(list)),
+        )
+        .child(gpui_kit::component::resizable::resizable_panel().child(div().size_full().min_w_0().child(body)))
+        .into_any_element()
+}
+
+/// Collapse all and Expand all, as the Changes tab has them.
+pub fn fold_buttons(diff: &Entity<DiffState>, prefix: &'static str) -> [Button; 2] {
+    [("collapse-all", "Collapse all", true, "Every file to its header"), ("expand-all", "Expand all", false, "Every file open")].map(|(id, label, folded, tip)| {
+        let diff = diff.clone();
+        Button::new(SharedString::from(format!("{prefix}-{id}"))).small().ghost().label(label).tooltip(tip).on_click(move |_, _, cx| {
+            diff.update(cx, |d, cx| d.set_all_collapsed(folded, cx));
+        })
+    })
+}
+
 /// What a diff tab shows, read again when whitespace is shown or left out:
 /// the title, then the patch.
 pub type DiffSource = std::sync::Arc<dyn Fn() -> (String, String) + Send + Sync>;
@@ -161,6 +295,7 @@ impl Render for DiffTab {
                     .py_1()
                     .border_b_1()
                     .border_color(cx.theme().border)
+                    .child(files_button("diff-files"))
                     .children([("diff-split", "Split", DiffMode::Split), ("diff-unified", "Unified", DiffMode::Unified)].map(|(id, label, to)| {
                         let diff = self.diff.clone();
                         Button::new(id).small().ghost().label(label).selected(mode == to).on_click(move |_, _, cx| {
@@ -172,10 +307,16 @@ impl Render for DiffTab {
                         })
                     }))
                     .child(whitespace_button("diff-whitespace"))
+                    .children(fold_buttons(&self.diff, "diff"))
                     .child(div().pl_2().min_w_0().truncate().text_sm().text_color(cx.theme().muted_foreground).child(self.what.clone())),
             )
             // Wrapped: unwrapped, the two sides share the longest line's width.
-            .child(div().flex_1().min_h_0().child(Diff::new(&self.diff).line_number(true).soft_wrap(true).code_font_size(crate::zoom::size(crate::zoom::Kind::Changes, cx))))
+            .child(div().flex_1().min_h_0().child(with_file_list(
+                &self.diff,
+                "diff-file-list",
+                Diff::new(&self.diff).line_number(true).soft_wrap(true).code_font_size(crate::zoom::size(crate::zoom::Kind::Changes, cx)),
+                cx,
+            )))
     }
 }
 
@@ -196,7 +337,7 @@ pub fn show_diff_dialog(title: String, files: Vec<DiffFile>, window: &mut Window
             // longest line's width and the right one goes past the dialog's edge.
             let mode = diff.read(cx).mode();
             content
-                .child(h_flex().gap_1().pb_1().children([("compare-split", "Split", DiffMode::Split), ("compare-unified", "Unified", DiffMode::Unified)].map(|(id, label, to)| {
+                .child(h_flex().gap_1().pb_1().child(files_button("compare-files")).children([("compare-split", "Split", DiffMode::Split), ("compare-unified", "Unified", DiffMode::Unified)].map(|(id, label, to)| {
                     let diff = diff.clone();
                     Button::new(id).small().ghost().label(label).selected(mode == to).on_click(move |_, _, cx| {
                         // The one choice of mode, as the Changes tab's buttons make it.
@@ -206,7 +347,12 @@ pub fn show_diff_dialog(title: String, files: Vec<DiffFile>, window: &mut Window
                         diff.update(cx, |d, cx| d.set_mode(to, cx));
                     })
                 })))
-                .child(div().h(height).child(Diff::new(&diff).line_number(true).soft_wrap(true).code_font_size(crate::zoom::size(crate::zoom::Kind::Changes, cx))))
+                .child(div().h(height).child(with_file_list(
+                    &diff,
+                    "compare-file-list",
+                    Diff::new(&diff).line_number(true).soft_wrap(true).code_font_size(crate::zoom::size(crate::zoom::Kind::Changes, cx)),
+                    cx,
+                )))
         })
     });
 }

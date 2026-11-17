@@ -512,6 +512,7 @@ impl Render for ChangesView {
                     .py_1()
                     .border_b_1()
                     .border_color(cx.theme().border)
+                    .child(files_button("changes-files"))
                     .child(
                         Button::new("scope-uncommitted")
                             .small()
@@ -656,7 +657,10 @@ impl Render for ChangesView {
                     let view = cx.weak_entity();
                     let add_view = cx.weak_entity();
                     let staging = self.scope == DiffScope::Uncommitted;
-                    this.child(
+                    let files = self.diff.clone();
+                    this.child(with_file_list(
+                        &files,
+                        "changes-file-list",
                         Diff::new(&self.diff)
                             .annotations(
                                 notes
@@ -747,7 +751,8 @@ impl Render for ChangesView {
                             // Unwrapped split puts the new side past the right edge
                             // when any line is long, so split always wraps.
                             .soft_wrap(mode == DiffMode::Split),
-                    )
+                        cx,
+                    ))
                 }
             }))
     }
