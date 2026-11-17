@@ -316,8 +316,9 @@ mod editing_tests {
 /// methods, types… nested as in the source. Calls and expressions are left
 /// out even when the grammar gives them a name.
 pub(super) fn outline(path: &std::path::Path, text: &str) -> Vec<crate::finder::OutlineItem> {
+    let name = lsp::language_for(path);
     let Some(language) = gpui_kit::component::highlighter::LanguageRegistry::singleton()
-        .language(lsp::language_for(path))
+        .language(name)
         .and_then(|c| c.language)
     else {
         return Vec::new();
@@ -328,7 +329,8 @@ pub(super) fn outline(path: &std::path::Path, text: &str) -> Vec<crate::finder::
     }
     let Some(tree) = parser.parse(text, None) else { return Vec::new() };
     let mut items = Vec::new();
-    collect_declarations(tree.root_node(), text, 0, &mut items);
+    let data = matches!(name, "json" | "yaml" | "xml");
+    collect_declarations(tree.root_node(), text, data, 0, &mut items);
     items
 }
 
@@ -449,41 +451,12 @@ fn data_name(node: tree_sitter::Node, text: &str) -> Option<(String, String)> {
     }
 }
 
-pub(super) fn collect_declarations(node: tree_sitter::Node, text: &str, depth: usize, items: &mut Vec<crate::finder::OutlineItem>) {
+/// The declarations under `node`; in a `data` file (YAML, JSON, XML) its
+/// keys and tags instead.
+fn collect_declarations(node: tree_sitter::Node, text: &str, data: bool, depth: usize, items: &mut Vec<crate::finder::OutlineItem>) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        let kind = child.kind();
-        let declaration = ["function", "method", "class", "interface", "struct", "enum", "trait", "impl", "object", "type_spec", "type_alias", "type_item", "module", "namespace", "property", "field", "const_spec", "const_item", "static_item"]
-            .iter()
-            .any(|k| kind.contains(k))
-            && !["call", "invocation", "reference", "expression", "parameter", "argument", "literal", "access", "body", "list", "initializer"]
-                .iter()
-                .any(|k| kind.contains(k))
-            && !kind.ends_with("identifier")
-            // A field's type or a class's body is not a declaration of its own.
-            && !kind.ends_with("_type");
-        let name = declaration
-            .then(|| {
-                child
-                    .child_by_field_name("name")
-                    .or_else(|| child.child_by_field_name("type"))
-                    .or_else(|| first_identifier(child, 3))
-            })
-            .flatten()
-            .and_then(|n| text.get(n.byte_range()))
-            .map(|n| n.lines().next().unwrap_or(n).to_string());
-        let named = match name {
-            Some(name) => {
-                let short = kind
-                    .trim_end_matches("_declaration")
-                    .trim_end_matches("_definition")
-                    .trim_end_matches("_item")
-                    .trim_end_matches("_spec")
-                    .replace('_', " ");
-                Some((short, name))
-            }
-            None => data_name(child, text),
-        };
+        let named = if data { data_name(child, text) } else { declaration_name(child, text) };
         match named {
             Some((short, name)) => {
                 items.push(crate::finder::OutlineItem {
@@ -492,11 +465,46 @@ pub(super) fn collect_declarations(node: tree_sitter::Node, text: &str, depth: u
                     line: head_line(child) as u32,
                     end: last_line(child) as u32,
                 });
-                collect_declarations(child, text, depth + 1, items);
+                collect_declarations(child, text, data, depth + 1, items);
             }
-            None => collect_declarations(child, text, depth, items),
+            None => collect_declarations(child, text, data, depth, items),
         }
     }
+}
+
+/// What `node` declares, its kind and its name, if it is a declaration:
+/// not a call, a pattern (`Some(x)` in a match), a bound or a parameter,
+/// whatever word the grammar's name for it has in it.
+fn declaration_name(node: tree_sitter::Node, text: &str) -> Option<(String, String)> {
+    let kind = node.kind();
+    let has = |words: &[&str]| words.iter().any(|w| kind.contains(w));
+    // A function made where it is used is a declaration only when it is given a name.
+    let anonymous = matches!(kind, "arrow_function" | "function" | "function_expression" | "lambda" | "lambda_expression" | "closure_expression");
+    let declaration = has(&["function", "method", "class", "interface", "struct", "enum", "trait", "impl", "object", "type_spec", "type_alias", "type_item", "module", "namespace", "property", "field", "const_spec", "const_item", "static_item"])
+        && !has(&["call", "invocation", "reference", "expression", "parameter", "argument", "literal", "access", "body", "list", "initializer", "pattern", "heritage", "clause", "superclass", "super_interfaces", "bound", "generic_function", "primary_constructor"])
+        && !kind.ends_with("identifier")
+        // A field's type or a class's body is not a declaration of its own.
+        && !kind.ends_with("_type")
+        // JavaScript's `{ a: 1 }`; Kotlin's and Scala's are `object_declaration`.
+        && kind != "object";
+    let name = if anonymous {
+        node.parent().filter(|p| p.kind() == "variable_declarator").and_then(|p| p.child_by_field_name("name"))?
+    } else if declaration {
+        let by_type = has(&["impl"]).then(|| node.child_by_field_name("type")).flatten();
+        // Kotlin names a class by a type identifier, after which its constructor's parameters come.
+        let mut cursor = node.walk();
+        let type_name = node.named_children(&mut cursor).find(|c| c.kind() == "type_identifier");
+        node.child_by_field_name("name").or(by_type).or(type_name).or_else(|| first_identifier(node, 3))?
+    } else {
+        return None;
+    };
+    let name = text.get(name.byte_range())?;
+    let short = if anonymous {
+        "function".to_string()
+    } else {
+        kind.trim_end_matches("_declaration").trim_end_matches("_definition").trim_end_matches("_item").trim_end_matches("_spec").replace('_', " ")
+    };
+    Some((short, name.lines().next().unwrap_or(name).to_string()))
 }
 
 #[cfg(test)]
@@ -598,6 +606,19 @@ mod outline_tests {
     fn lines(path: &str, text: &str) -> Vec<(String, u32, u32)> {
         crate::grammars::register();
         outline(Path::new(path), text).into_iter().map(|i| (format!("{}{}", "  ".repeat(i.depth), i.label), i.line, i.end)).collect()
+    }
+
+    #[test]
+    fn patterns_calls_and_clauses_are_not_declarations() {
+        let rust = "struct P { x: u32 }\nfn f(o: Option<P>) {\n    match o { Some(P { x }) => {}, None => {} }\n    if let Ok(v) = parse::<u32>(\"1\") {}\n}\nimpl<T: 'static> Tr for P {}\n";
+        assert_eq!(
+            lines("a.rs", rust).into_iter().map(|(l, _, _)| l).collect::<Vec<_>>(),
+            ["struct P", "  field x", "function f", "impl P"]
+        );
+        let ts = "export const run = async (req) => { list.map((item) => item.id); return { ok: true }; };\nclass A extends B implements C {}\n";
+        assert_eq!(lines("a.ts", ts).into_iter().map(|(l, _, _)| l).collect::<Vec<_>>(), ["function run", "class A"]);
+        let kt = "class A(val p: Int) : B() {\n    fun run() {}\n}\n";
+        assert_eq!(lines("a.kt", kt).into_iter().map(|(l, _, _)| l).collect::<Vec<_>>(), ["class A", "  function run"]);
     }
 
     #[test]
@@ -1018,4 +1039,3 @@ pub(super) fn show_document_handler(task: WeakEntity<TaskView>, this_path: PathB
         task.update(cx, |task, cx| task.open_file(target, line, window, cx)).is_ok()
     })
 }
-

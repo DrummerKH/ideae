@@ -16,6 +16,9 @@ enum Scope {
     App,
     Editor,
     Terminal,
+    /// The Changes tab's diff, while it has the keyboard: single letters, as
+    /// nothing is typed there.
+    Review,
 }
 
 pub struct Shortcut {
@@ -84,6 +87,16 @@ pub static SHORTCUTS: &[Shortcut] = &[
     shortcut!("unfold", "Unfold", "ctrl-=", Editor, task::Unfold),
     shortcut!("fold_all", "Fold all", "ctrl-shift--", Editor, task::FoldAll),
     shortcut!("unfold_all", "Unfold all", "ctrl-shift-=", Editor, task::UnfoldAll),
+    shortcut!("review_next_change", "Next change", "j", Review, task::NextChange),
+    shortcut!("review_prev_change", "Previous change", "k", Review, task::PrevChange),
+    shortcut!("next_difference", "Next difference", "f7", Review, task::NextChange),
+    shortcut!("prev_difference", "Previous difference", "shift-f7", Review, task::PrevChange),
+    shortcut!("review_next_file", "Next file", "n", Review, task::NextChangedFile),
+    shortcut!("review_prev_file", "Previous file", "p", Review, task::PrevChangedFile),
+    shortcut!("review_viewed", "Viewed, then the next file", "v", Review, task::ToggleFileViewed),
+    shortcut!("review_stage", "Stage the change", "s", Review, task::StageChange),
+    shortcut!("review_revert", "Revert the change", "r", Review, task::RevertChange),
+    shortcut!("review_comment", "Comment on the change", "c", Review, task::CommentOnChange),
     shortcut!("bookmark", "Toggle bookmark", "f11", Editor, task::ToggleBookmark),
     shortcut!("bookmarks", "Bookmarks", "shift-f11", NotInTerminal, task::ShowBookmarks),
     shortcut!("next_bookmark", "Next bookmark", "alt-pagedown", Editor, task::NextBookmark),
@@ -113,6 +126,7 @@ impl Shortcut {
         match self.scope {
             Scope::Editor => "Editor",
             Scope::Terminal => "Terminal",
+            Scope::Review => "Changes",
             _ => "Window",
         }
     }
@@ -143,6 +157,7 @@ impl Shortcut {
             Scope::App => vec![bind(None, action())],
             Scope::Editor => vec![bind(Some("Input"), action())],
             Scope::Terminal => vec![bind(terminal, action())],
+            Scope::Review => vec![bind(Some("Changes > Diff"), action())],
         };
         made.into_iter().filter_map(Result::ok).collect()
     }

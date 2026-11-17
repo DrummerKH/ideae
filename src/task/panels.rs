@@ -337,7 +337,7 @@ impl TaskView {
                                         // "function open" read slowly down a list: a colored
                                         // letter for the kind, the word in the tooltip.
                                         let (kind, name) = item.label.rsplit_once(' ').unwrap_or(("", item.label.as_str()));
-                                        let (mark, color) = kind_mark(kind);
+                                        let (mark, color) = crate::finder::kind_mark(kind);
                                         let kind = SharedString::from(kind.to_string());
                                         div()
                                             .id(("decl", ix))
@@ -379,31 +379,4 @@ impl TaskView {
             )
             .into_any_element()
     }
-}
-
-/// A declaration's kind as a letter and a color, as IDEs mark them.
-fn kind_mark(kind: &str) -> (&'static str, Hsla) {
-    let has = |words: &[&str]| words.iter().any(|w| kind.contains(w));
-    let (mark, hue) = if has(&["method"]) {
-        ("m", 0.58)
-    } else if has(&["function", "fn"]) {
-        ("f", 0.58)
-    } else if has(&["interface", "trait", "protocol"]) {
-        ("I", 0.38)
-    } else if has(&["enum"]) {
-        ("E", 0.78)
-    } else if has(&["impl"]) {
-        ("i", 0.78)
-    } else if has(&["class", "struct", "object", "record"]) {
-        ("C", 0.08)
-    } else if has(&["type"]) {
-        ("T", 0.48)
-    } else if has(&["module", "namespace", "package", "mod"]) {
-        ("M", 0.12)
-    } else if has(&["field", "property", "const", "static", "var", "let"]) {
-        ("v", 0.15)
-    } else {
-        return ("·", hsla(0., 0., 0.5, 1.));
-    };
-    (mark, hsla(hue, 0.6, 0.5, 1.))
 }

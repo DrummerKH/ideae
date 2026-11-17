@@ -49,6 +49,7 @@ mod pr;
 mod replace;
 mod annotate;
 mod bookmarks;
+mod change_popup;
 mod file_tree;
 use file_tree::*;
 use git_ui::*;
@@ -1331,6 +1332,7 @@ impl TaskView {
             Some(TabKind::Terminal(view)) => view.read(cx).state.read(cx).focus_handle().is_focused(window),
             Some(TabKind::File(file)) => file.read(cx).editor.read(cx).focus_handle(cx).is_focused(window),
             Some(TabKind::Browser(view)) => view.focus_handle(cx).is_focused(window),
+            Some(TabKind::Changes) => self.changes.read(cx).diff.read(cx).focus_handle(cx).is_focused(window),
             _ => self.focus.is_focused(window),
         }
     }
@@ -1351,6 +1353,8 @@ impl TaskView {
                 file.read(cx).editor.read(cx).focus_handle(cx).focus(window, cx)
             }
             Some(TabKind::Browser(view)) => view.focus_handle(cx).focus(window, cx),
+            // Its keys (J, K, N, V…) are the diff's.
+            Some(TabKind::Changes) => self.changes.read(cx).diff.read(cx).focus_handle(cx).focus(window, cx),
             _ => self.focus.focus(window, cx),
         }
     }

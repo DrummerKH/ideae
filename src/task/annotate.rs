@@ -99,6 +99,7 @@ impl FileView {
                 self.blame_hover = *at;
                 cx.notify();
             }
+            GutterEvent::Change(row) => self.show_change(*row, cx),
             GutterEvent::Click(row) => {
                 let Some(line) = self.blame.get(*row).cloned().flatten().filter(|l| !l.uncommitted()) else { return };
                 // Once this file is no longer being updated: the task reads it.

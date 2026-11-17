@@ -4,7 +4,7 @@
 use std::{path::PathBuf, rc::Rc, sync::Arc, time::Duration};
 
 use gpui_kit::component::{
-    ActiveTheme as _, IndexPath, Selectable as _, Sizable as _, WindowExt as _,
+    ActiveTheme as _, IndexPath, Selectable as _, Sizable as _, StyledExt as _, WindowExt as _,
     button::ButtonVariants as _,
     command::{Command, CommandGroup, CommandItem, CommandState},
     h_flex, v_flex,
@@ -133,7 +133,11 @@ impl Finder {
     ) {
         let hits = items
             .into_iter()
-            .map(|i| Hit { path: path.clone(), line: i.line + 1, col: 0, text: format!("{}{}", "    ".repeat(i.depth), i.label), ranges: Vec::new() })
+            .map(|i| {
+                let (kind, name) = i.label.rsplit_once(' ').unwrap_or(("", i.label.as_str()));
+                let text = format!("{}{name}{DETAIL}{kind}", "  ".repeat(i.depth));
+                Hit { path: path.clone(), line: i.line + 1, col: 0, text, ranges: Vec::new() }
+            })
             .collect();
         Self::open_with(FinderKind::Outline, root, Arc::default(), hits, task, window, cx)
     }
@@ -354,7 +358,7 @@ impl Finder {
                 let hits = self
                     .outline
                     .iter()
-                    .filter(|h| needle.is_empty() || h.text.to_lowercase().contains(&needle))
+                    .filter(|h| needle.is_empty() || h.text.split(DETAIL).next().unwrap_or_default().to_lowercase().contains(&needle))
                     .cloned()
                     .collect();
                 self.set_hits(hits, cx);
@@ -452,7 +456,7 @@ fn item(hit: &Hit, kind: FinderKind) -> CommandItem {
     let hit = hit.clone();
     let label = match kind {
         FinderKind::Files => hit.path.clone(),
-        FinderKind::Outline => hit.text.clone(),
+        FinderKind::Outline => hit.text.split(DETAIL).next().unwrap_or_default().trim().to_string(),
         FinderKind::Symbols => format!("{} {}:{}", hit.text, hit.path, hit.line),
         FinderKind::Pick => hit.text.clone(),
         FinderKind::Grep | FinderKind::Places => format!("{}:{} {}", hit.path, hit.line, hit.text),
@@ -463,6 +467,28 @@ fn item(hit: &Hit, kind: FinderKind) -> CommandItem {
             None => (String::new(), hit.path.clone()),
         };
         match kind {
+            // A declaration as the Structure panel shows it: its kind's
+            // letter, its name indented by its depth.
+            FinderKind::Outline if hit.text.contains(DETAIL) => {
+                let (name, what) = hit.text.split_once(DETAIL).unwrap_or((&hit.text, ""));
+                let depth = (name.len() - name.trim_start().len()) / 2;
+                let (mark, color) = kind_mark(what);
+                h_flex()
+                    .gap_3()
+                    .min_w_0()
+                    .flex_1()
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1p5()
+                            .pl(px(14. * depth as f32))
+                            .child(div().w(px(12.)).flex_none().text_xs().font_semibold().text_color(color).child(mark))
+                            .child(div().min_w_0().truncate().text_sm().child(name.trim_start().to_string())),
+                    )
+                    .child(div().flex_none().text_xs().text_color(cx.theme().muted_foreground).child(format!(":{}", hit.line)))
+                    .into_any_element()
+            }
             FinderKind::Outline => h_flex()
                 .gap_3()
                 .min_w_0()
@@ -537,6 +563,34 @@ fn item(hit: &Hit, kind: FinderKind) -> CommandItem {
                 .into_any_element(),
         }
     })
+}
+
+/// A declaration's kind as a letter and a color, as IDEs mark them: the
+/// Structure panel's and Go to declaration's rows.
+pub fn kind_mark(kind: &str) -> (&'static str, Hsla) {
+    let has = |words: &[&str]| words.iter().any(|w| kind.contains(w));
+    let (mark, hue) = if has(&["method", "constructor"]) {
+        ("m", 0.58)
+    } else if has(&["function", "fn"]) {
+        ("f", 0.58)
+    } else if has(&["interface", "trait", "protocol"]) {
+        ("I", 0.38)
+    } else if has(&["enum"]) {
+        ("E", 0.78)
+    } else if has(&["impl"]) {
+        ("i", 0.78)
+    } else if has(&["class", "struct", "object", "record"]) {
+        ("C", 0.08)
+    } else if has(&["type"]) {
+        ("T", 0.48)
+    } else if has(&["module", "namespace", "package", "mod"]) {
+        ("M", 0.12)
+    } else if has(&["field", "property", "const", "static", "var", "let"]) {
+        ("v", 0.15)
+    } else {
+        return ("·", hsla(0., 0., 0.5, 1.));
+    };
+    (mark, hsla(hue, 0.6, 0.5, 1.))
 }
 
 /// The line without its indent, the matches marked.

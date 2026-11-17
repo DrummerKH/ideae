@@ -62,7 +62,8 @@ impl TaskView {
             cx.observe(&editor, |this: &mut FileView, editor, cx| {
                 let Position { line, character } = editor.read(cx).cursor_position();
                 this.cursor_col = character;
-                if line != this.cursor_line {
+                // The popup of a change follows its line as the editor scrolls.
+                if line != this.cursor_line || this.change_popup.is_some() {
                     this.cursor_line = line;
                     cx.notify();
                 }
@@ -116,6 +117,8 @@ impl TaskView {
             occurrence: None,
             committed: None,
             _marks: Task::ready(()),
+            change_runs: Rc::default(),
+            change_popup: None,
             problems_seen: 0,
             signature: None,
             _signature: Task::ready(()),

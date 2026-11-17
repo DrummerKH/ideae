@@ -26,7 +26,8 @@ src/task/          one task, a module: what is private to it is seen by all of i
   nav.rs           back and forward
   lookups.rs       outline, usages and places, installing a language server
   file.rs          an open file: editor, save and reload, blame, the language server's bridge
-  changes.rs       the Changes tab: the diff, review notes, single changes
+  changes.rs       the Changes tab: the diff, review notes, single changes, review by keys (J/K, N/P, V, S, R, C)
+  change_popup.rs  a change of an open file, from its mark in the gutter: what was there, Revert, Stage
   term.rs          a terminal tab
   session.rs       session save/restore, language servers asleep
   services.rs      the Run panel

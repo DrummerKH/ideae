@@ -78,6 +78,9 @@ pub struct FileView {
     /// changed since; None for a file that commit lacks.
     pub(super) committed: Option<Arc<str>>,
     pub(super) _marks: Task<()>,
+    /// The changes the gutter marks, and the one opened from its mark.
+    pub(super) change_runs: Rc<Vec<crate::edit::ChangeRun>>,
+    pub(super) change_popup: Option<super::change_popup::ChangePopup>,
     /// The count of the language server's reports when its problems were
     /// last put into the editor.
     pub(super) problems_seen: u64,
@@ -294,6 +297,7 @@ impl FileView {
         let Some(committed) = self.committed.clone() else {
             // Nothing to compare with: git ignores it, or there is no repository.
             self.editor.update(cx, |state, cx| state.set_line_marks(LineMarks::default(), cx));
+            self.change_runs = Rc::default();
             return;
         };
         self._marks = cx.spawn(async move |this, cx| {
@@ -302,8 +306,10 @@ impl FileView {
             }
             // Taken once typing pauses, not on every key: it is the whole file.
             let Ok(text) = this.update(cx, |this, cx| this.editor.read(cx).value()) else { return };
-            let changes = cx.background_spawn(async move { crate::edit::line_changes(&committed, &text) }).await;
+            let runs = cx.background_spawn(async move { crate::edit::change_runs(&committed, &text) }).await;
             let _ = this.update(cx, |this, cx| {
+                let changes = crate::edit::LineChanges::of(&runs);
+                this.change_runs = Rc::new(runs);
                 let (added, changed, gone) = (hsla(0.33, 0.6, 0.45, 1.), hsla(0.58, 0.7, 0.55, 1.), hsla(0.0, 0.7, 0.55, 1.));
                 let mut marks = LineMarks::default();
                 marks.rows.extend(changes.added.into_iter().map(|row| (row, added)));
@@ -316,6 +322,7 @@ impl FileView {
 
     pub(super) fn on_edit(&mut self, cx: &mut Context<Self>) {
         self.edit_version += 1;
+        self.change_popup = None;
         self.mark_changes(true, cx);
         let typed = {
             let state = self.editor.read(cx);
@@ -1215,6 +1222,13 @@ impl Render for FileView {
                     }))
                     .children(self.render_signature(cx))
                     .children(self.render_blame_hover(cx))
+                    .children(self.render_change_popup(cx))
+                    .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                        if this.change_popup.is_some() && event.keystroke.key == "escape" {
+                            this.close_change(cx);
+                            cx.stop_propagation();
+                        }
+                    }))
                     .child(crate::zoom::wheel(crate::zoom::Kind::Editor)).child(
                     Editor::new(&self.editor)
                         // Replaces the built-in menu, so its items are listed again.

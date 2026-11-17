@@ -35,7 +35,13 @@ pub struct ChangesView {
     pub(super) selected_code: String,
     /// Each shown file's part of the patch, hashed: what the selection was made in.
     pub(super) shown_keys: Rc<HashMap<String, u64>>,
+    /// Where the keyboard review is: the file, and in it the change (its
+    /// `git::Hunk` line and side) the keys act on.
+    pub(super) review_file: Option<SharedString>,
+    pub(super) review_change: Option<(u32, bool)>,
 }
+
+actions!(ideae_review, [NextChange, PrevChange, NextChangedFile, PrevChangedFile, ToggleFileViewed, StageChange, RevertChange, CommentOnChange]);
 
 /// Lists the repository's branches, newest first, into `known`.
 pub(super) fn load_branches<T: 'static>(root: PathBuf, known: Rc<std::cell::RefCell<Vec<String>>>, cx: &mut Context<T>) {
@@ -79,6 +85,8 @@ impl ChangesView {
             branches,
             hunks: Rc::default(),
             staged: Rc::default(),
+            review_file: None,
+            review_change: None,
         }
     }
 
@@ -314,6 +322,159 @@ impl ChangesView {
     }
 }
 
+/// Reviewing by keys: J/K and F7 from change to change, N/P from file to
+/// file, V, S, R and C on the one at hand.
+impl ChangesView {
+    /// The files in the order shown.
+    fn shown_files(&self, cx: &App) -> Vec<SharedString> {
+        self.diff.read(cx).files().iter().map(|f| f.path().clone()).collect()
+    }
+
+    /// The file the keys act on: the one moved to last, else the one at the top.
+    fn review_file(&self, cx: &App) -> Option<SharedString> {
+        let files = self.shown_files(cx);
+        self.review_file.clone().filter(|f| files.contains(f)).or_else(|| self.diff.read(cx).top_file())
+    }
+
+    /// The changes in the order shown, those of folded files left out
+    /// unless every file is folded.
+    fn review_order(&self, cx: &App) -> Vec<usize> {
+        let diff = self.diff.read(cx);
+        let by_file = |open_only: bool| -> Vec<usize> {
+            let mut order = Vec::new();
+            for file in diff.files() {
+                if open_only && diff.is_file_collapsed(file.path()) {
+                    continue;
+                }
+                order.extend(self.hunks.iter().enumerate().filter(|(_, h)| h.path == file.path().as_ref()).map(|(i, _)| i));
+            }
+            order
+        };
+        let open = by_file(true);
+        if open.is_empty() { by_file(false) } else { open }
+    }
+
+    /// The change the keys act on, if it is still there.
+    fn review_hunk(&self, cx: &App) -> Option<git::Hunk> {
+        let (line, modified) = self.review_change?;
+        let file = self.review_file(cx)?;
+        self.hunks.iter().find(|h| h.path == file.as_ref() && h.line == line && h.modified == modified).cloned()
+    }
+
+    fn step_change(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let order = self.review_order(cx);
+        if order.is_empty() {
+            return;
+        }
+        let file = self.review_file(cx);
+        let at = |i: usize| &self.hunks[order[i]];
+        let in_file = |i: usize| file.as_ref().is_some_and(|f| at(i).path == f.as_ref());
+        let current = self.review_change.and_then(|(line, modified)| (0..order.len()).find(|&i| in_file(i) && at(i).line == line && at(i).modified == modified));
+        let next = match current {
+            Some(i) if forward => (i + 1) % order.len(),
+            Some(i) => (i + order.len() - 1) % order.len(),
+            // Gone (reverted) or none yet: from where it was in its file, else
+            // from the file at the top.
+            None => {
+                let near = self.review_change.and_then(|(line, _)| match forward {
+                    true => (0..order.len()).find(|&i| in_file(i) && at(i).line >= line),
+                    false => (0..order.len()).rev().find(|&i| in_file(i) && at(i).line < line),
+                });
+                near.or_else(|| (0..order.len()).find(|&i| in_file(i))).unwrap_or(0)
+            }
+        };
+        let hunk = self.hunks[order[next]].clone();
+        self.select_change(&hunk, true, cx);
+    }
+
+    /// Marks `hunk` as the change at hand by selecting its lines.
+    fn select_change(&mut self, hunk: &git::Hunk, scroll: bool, cx: &mut Context<Self>) {
+        let (first, last) = change_lines(hunk);
+        let side = if hunk.modified { DiffSide::Modified } else { DiffSide::Original };
+        let range = DiffLineRange::new(hunk.path.clone(), side, first as usize, last as usize);
+        self.diff.update(cx, |d, cx| {
+            if scroll {
+                d.scroll_to_line_in_view(DiffLinePosition::new(hunk.path.clone(), side, first as usize), cx);
+            }
+            d.set_selected_lines(Some(range.clone()), cx);
+        });
+        self.review_file = Some(hunk.path.clone().into());
+        self.review_change = Some((hunk.line, hunk.modified));
+        self.selection = Some(range);
+        cx.notify();
+    }
+
+    /// The next or previous file, or the next one not viewed (`unviewed`).
+    fn step_file(&mut self, forward: bool, unviewed: bool, cx: &mut Context<Self>) {
+        let files = self.shown_files(cx);
+        if files.is_empty() {
+            return;
+        }
+        let current = self.review_file(cx).and_then(|f| files.iter().position(|p| *p == f));
+        let viewed = |path: &str| unviewed && self.task.upgrade().is_some_and(|t| t.read(cx).is_path_viewed(path));
+        let count = files.len();
+        let target = (1..=count)
+            .map(|step| match (current, forward) {
+                (Some(i), true) => (i + step) % count,
+                (Some(i), false) => (i + count - step % count) % count,
+                (None, _) => step - 1,
+            })
+            .find(|&i| !viewed(&files[i]));
+        let Some(target) = target else { return };
+        let path = files[target].clone();
+        self.diff.update(cx, |d, cx| d.scroll_to_file(&path, cx));
+        self.review_file = Some(path.clone());
+        self.review_change = None;
+        self.selection = None;
+        match self.hunks.iter().find(|h| h.path == path.as_ref()).cloned() {
+            Some(hunk) if !self.diff.read(cx).is_file_collapsed(&path) => self.select_change(&hunk, false, cx),
+            _ => self.diff.update(cx, |d, cx| d.set_selected_lines(None, cx)),
+        }
+        cx.notify();
+    }
+
+    /// V: the file viewed (it folds) and on to the next one not viewed; or
+    /// not viewed any more, staying.
+    fn toggle_file_viewed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.review_file(cx) else { return };
+        self.review_file = Some(path.clone());
+        let (task, view) = (self.task.clone(), cx.weak_entity());
+        // The task updates this view as it folds the file.
+        window.defer(cx, move |_, cx| {
+            let Ok(viewed) = task.update(cx, |t, cx| {
+                t.toggle_viewed(&path, cx);
+                t.is_path_viewed(&path)
+            }) else {
+                return;
+            };
+            if viewed {
+                let _ = view.update(cx, |c, cx| c.step_file(true, true, cx));
+            }
+        });
+    }
+
+    fn act_on_change(&mut self, revert: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(hunk) = self.review_hunk(cx) else { return };
+        if !revert && self.scope != DiffScope::Uncommitted {
+            return;
+        }
+        let staged = self.staged.contains(&(hunk.path.clone(), hunk.changes.clone()));
+        let task = self.task.clone();
+        window.defer(cx, move |window, cx| {
+            let _ = task.update(cx, |t, cx| match revert {
+                true => t.revert_hunk(hunk, window, cx),
+                false => t.stage_hunk(hunk, !staged, window, cx),
+            });
+        });
+    }
+
+    fn comment_on_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(hunk) = self.review_hunk(cx) else { return self.comment_selection(window, cx) };
+        self.select_change(&hunk, false, cx);
+        self.comment_selection(window, cx);
+    }
+}
+
 impl Render for ChangesView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Split or unified is one choice for every task's Changes, kept over a restart.
@@ -411,9 +572,25 @@ impl Render for ChangesView {
                             .text_color(cx.theme().muted_foreground)
                             .child("ⓘ")
                             .tooltip(|window, cx| {
+                                let key = crate::keymap::label;
                                 gpui_kit::component::tooltip::Tooltip::new(format!(
-                                    "{} a line to open the file there. Select lines by their numbers to comment on them or send them to the agent (right-click).",
-                                    crate::keys::label("Ctrl+Click")
+                                    "{} a line to open the file there. Select lines by their numbers to comment on them or send them to the agent (right-click).\n\n\
+                                     In the diff:\n\
+                                     {} / {}, {} / {}   the next / previous change\n\
+                                     {} / {}   the next / previous file\n\
+                                     {}   the file viewed, on to the next\n\
+                                     {} stage, {} revert, {} comment on the change",
+                                    crate::keys::label("Ctrl+Click"),
+                                    key("review_next_change"),
+                                    key("review_prev_change"),
+                                    key("next_difference"),
+                                    key("prev_difference"),
+                                    key("review_next_file"),
+                                    key("review_prev_file"),
+                                    key("review_viewed"),
+                                    key("review_stage"),
+                                    key("review_revert"),
+                                    key("review_comment"),
                                 ))
                                 .build(window, cx)
                             }),
@@ -431,8 +608,16 @@ impl Render for ChangesView {
                     }),
             )
             .children(self.render_review(cx))
-            .child(div().id("changes-diff").relative().flex_1().min_h_0()
+            .child(div().id("changes-diff").key_context("Changes").relative().flex_1().min_h_0()
                 .child(crate::zoom::wheel(crate::zoom::Kind::Changes))
+                .on_action(cx.listener(|this, _: &NextChange, _, cx| this.step_change(true, cx)))
+                .on_action(cx.listener(|this, _: &PrevChange, _, cx| this.step_change(false, cx)))
+                .on_action(cx.listener(|this, _: &NextChangedFile, _, cx| this.step_file(true, false, cx)))
+                .on_action(cx.listener(|this, _: &PrevChangedFile, _, cx| this.step_file(false, false, cx)))
+                .on_action(cx.listener(|this, _: &ToggleFileViewed, window, cx| this.toggle_file_viewed(window, cx)))
+                .on_action(cx.listener(|this, _: &StageChange, window, cx| this.act_on_change(false, window, cx)))
+                .on_action(cx.listener(|this, _: &RevertChange, window, cx| this.act_on_change(true, window, cx)))
+                .on_action(cx.listener(|this, _: &CommentOnChange, window, cx| this.comment_on_change(window, cx)))
                 .on_action(cx.listener(|this, _: &SendDiffToAgent, window, cx| this.send_selection(window, cx)))
                 .on_action(cx.listener(|this, _: &CommentOnDiff, window, cx| this.comment_selection(window, cx)))
                 .context_menu(|menu, _, _| {
@@ -549,7 +734,7 @@ impl Render for ChangesView {
 }
 
 /// The first and last line a change covers on the side `line` is on.
-fn change_lines(hunk: &git::Hunk) -> (u32, u32) {
+pub(super) fn change_lines(hunk: &git::Hunk) -> (u32, u32) {
     let sign = if hunk.modified { '+' } else { '-' };
     let count = hunk.changes.lines().filter(|l| l.starts_with(sign)).count().max(1) as u32;
     (hunk.line.saturating_sub(count - 1), hunk.line)

@@ -32,11 +32,17 @@ pub struct GutterNote {
 }
 
 /// The pointer over a note of the gutter, with where it is in the window,
-/// or a click on one: by buffer row.
+/// or a click on one: by buffer row. `Change` is a click on the mark of a
+/// change (see [`super::LineMarks`]) at the gutter's right edge.
 pub enum GutterEvent {
     Hover(Option<(usize, Point<Pixels>)>),
     Click(usize),
+    Change(usize),
 }
+
+/// How far left of the gutter's right edge a click is on a change's mark:
+/// the mark and the margin around it, short of the fold icons.
+const CHANGE_MARK_REACH: Pixels = px(6.);
 
 pub(super) type GutterListener = Rc<dyn Fn(&GutterEvent, &mut Window, &mut App)>;
 
@@ -168,8 +174,9 @@ impl<M: InputModeKind> InputBaseState<M> {
         }
     }
 
-    /// A press in the gutter: a left one on a note is the note's; a right
-    /// one is remembered for the menu. True when the press is taken.
+    /// A press in the gutter: a left one on a change's mark or on a note is
+    /// theirs; a right one is remembered for the menu. True when the press
+    /// is taken.
     pub(super) fn gutter_press_at(
         &mut self,
         position: Point<Pixels>,
@@ -181,6 +188,15 @@ impl<M: InputModeKind> InputBaseState<M> {
         if right {
             self.gutter.pressed = at.map(|(row, _)| row);
             return false;
+        }
+        if let Some((row, _)) = at
+            && let Some(layout) = self.last_layout.as_ref()
+            && position.x - self.input_bounds.origin.x >= layout.line_number_width - CHANGE_MARK_REACH
+            && (self.line_marks.rows.contains_key(&row) || self.line_marks.gone_before.contains_key(&row))
+            && let Some(listener) = self.gutter.listener.clone()
+        {
+            window.defer(cx, move |window, cx| listener(&GutterEvent::Change(row), window, cx));
+            return true;
         }
         let Some((row, true)) = at else { return false };
         let has_note = self.gutter.notes.as_ref().is_some_and(|notes| notes.rows.get(row).is_some_and(Option::is_some));

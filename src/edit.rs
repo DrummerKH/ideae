@@ -23,18 +23,53 @@ pub struct LineChanges {
     pub gone_before: Vec<usize>,
 }
 
+#[cfg(test)]
 pub fn line_changes(committed: &str, now: &str) -> LineChanges {
-    use similar::DiffOp;
-    let mut found = LineChanges::default();
-    for op in similar::TextDiff::from_lines(committed, now).ops() {
-        match *op {
-            DiffOp::Equal { .. } => {}
-            DiffOp::Insert { new_index, new_len, .. } => found.added.extend(new_index..new_index + new_len),
-            DiffOp::Replace { new_index, new_len, .. } => found.changed.extend(new_index..new_index + new_len),
-            DiffOp::Delete { new_index, .. } => found.gone_before.push(new_index),
+    LineChanges::of(&change_runs(committed, now))
+}
+
+impl LineChanges {
+    pub fn of(runs: &[ChangeRun]) -> Self {
+        let mut found = LineChanges::default();
+        for run in runs {
+            match (run.old.is_empty(), run.new.is_empty()) {
+                (true, _) => found.added.extend(run.new.clone()),
+                (false, false) => found.changed.extend(run.new.clone()),
+                (false, true) => found.gone_before.push(run.new.start),
+            }
         }
+        found
     }
-    found
+}
+
+/// One change of the text: the rows it had and the rows it has now, either
+/// empty when lines were only added or only taken away.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChangeRun {
+    pub old: Range<usize>,
+    pub new: Range<usize>,
+}
+
+impl ChangeRun {
+    /// Whether its mark in the gutter is on `row`: one of its rows, or for
+    /// lines only taken away, the row before which they were.
+    pub fn is_at(&self, row: usize) -> bool {
+        self.new.contains(&row) || (self.new.is_empty() && self.new.start == row)
+    }
+}
+
+pub fn change_runs(committed: &str, now: &str) -> Vec<ChangeRun> {
+    use similar::DiffOp;
+    similar::TextDiff::from_lines(committed, now)
+        .ops()
+        .iter()
+        .filter_map(|op| match *op {
+            DiffOp::Equal { .. } => None,
+            DiffOp::Insert { old_index, new_index, new_len } => Some(ChangeRun { old: old_index..old_index, new: new_index..new_index + new_len }),
+            DiffOp::Replace { old_index, old_len, new_index, new_len } => Some(ChangeRun { old: old_index..old_index + old_len, new: new_index..new_index + new_len }),
+            DiffOp::Delete { old_index, old_len, new_index } => Some(ChangeRun { old: old_index..old_index + old_len, new: new_index..new_index }),
+        })
+        .collect()
 }
 
 /// The edit that makes `new` of `old`: the part of it that differs, so
@@ -283,6 +318,12 @@ mod tests {
         assert_eq!(line_changes(committed, "one\nfour\n"), LineChanges { gone_before: vec![1], ..Default::default() });
         assert_eq!(line_changes(committed, "one\ntwo\nthree\n"), LineChanges { gone_before: vec![3], ..Default::default() }, "the end is gone");
         assert_eq!(line_changes("", "a\nb\n"), LineChanges { added: vec![0, 1], ..Default::default() });
+        // A change knows the rows it had, for the gutter's popup to show them.
+        let runs = change_runs(committed, "one\nTWO\nTHREE\nfour\nfive\n");
+        assert_eq!(runs, [ChangeRun { old: 1..3, new: 1..3 }, ChangeRun { old: 4..4, new: 4..5 }]);
+        let gone = change_runs(committed, "one\nfour\n");
+        assert_eq!(gone, [ChangeRun { old: 1..3, new: 1..1 }]);
+        assert!(gone[0].is_at(1) && !gone[0].is_at(0));
     }
 
     #[test]

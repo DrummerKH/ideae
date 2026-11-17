@@ -917,6 +917,16 @@ impl DiffState {
         }
     }
 
+    /// ideae patch: as [`Self::scroll_to_line`], the line a third down the
+    /// view: below the sticky header, with what leads to it above.
+    pub fn scroll_to_line_in_view(&mut self, position: DiffLinePosition, cx: &mut Context<Self>) {
+        if self.line_index(&position).is_none() {
+            return;
+        }
+        self.scroll_to_line(position, cx);
+        self.list.scroll_by(-(self.viewport.height / 3.).round());
+    }
+
     /// Scrolls to the header of the file at `path`, a [`DiffFile::path`].
     /// ideae patch: the file whose rows are at the top of the view.
     pub fn top_file(&self) -> Option<SharedString> {
