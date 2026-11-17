@@ -25,6 +25,7 @@ mod naming;
 mod palette;
 mod pr;
 mod procs;
+mod project_config;
 mod replace;
 mod said;
 mod search;

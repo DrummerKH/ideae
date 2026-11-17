@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub const FILE: &str = ".ideae.toml";
 const PORT_STEP: u32 = 100;
@@ -37,25 +37,19 @@ url = "http://localhost:{port}"
 # env = { PORT = "{port}" }
 "#;
 
-#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Service {
     pub name: String,
     pub command: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
     /// Relative to the task's root.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-}
-
-#[derive(Deserialize, Default)]
-struct Config {
-    #[serde(default)]
-    service: Vec<Service>,
 }
 
 /// What the top of a new `.ideae.toml` says.
@@ -163,9 +157,17 @@ pub fn detect(root: &Path) -> Vec<Found> {
     out
 }
 
-/// Adds `service` to the task's `.ideae.toml`, making the file when missing.
+/// Adds `service` to what the task at `root` has: the settings kept for
+/// yourself when there are, else the `.ideae.toml` it reads, made when missing.
 pub fn add(root: &Path, service: &Service) -> Result<(), String> {
-    let path = root.join(FILE);
+    let project = crate::project_config::project_of(root);
+    if let Some(mut own) = crate::project_config::own(&project) {
+        own.service.push(service.clone());
+        crate::project_config::set_own(&project, Some(own));
+        return Ok(());
+    }
+    let dir = if !root.join(FILE).exists() && project.join(FILE).exists() { project } else { root.to_path_buf() };
+    let path = dir.join(FILE);
     let mut text = std::fs::read_to_string(&path).unwrap_or_else(|_| HEADER.to_string());
     let quote = |s: &str| toml::Value::String(s.to_string()).to_string();
     if !text.ends_with('\n') {
@@ -181,10 +183,13 @@ pub fn add(root: &Path, service: &Service) -> Result<(), String> {
     std::fs::write(&path, text).map_err(|e| format!("{FILE}: {e}"))
 }
 
-/// The services of the task at `root`, or why the file could not be read.
+/// The services of the task at `root`, or why they could not be read.
 pub fn load(root: &Path) -> Result<Vec<Service>, String> {
-    let Ok(text) = std::fs::read_to_string(root.join(FILE)) else { return Ok(Vec::new()) };
-    toml::from_str::<Config>(&text).map(|c| c.service).map_err(|e| format!("{FILE}: {e}"))
+    let resolved = crate::project_config::resolve(root);
+    match resolved.error {
+        Some(e) => Err(e),
+        None => Ok(resolved.config.service),
+    }
 }
 
 impl Service {
@@ -357,7 +362,8 @@ fn owner(_: u16) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, detect, load, task_env};
+    use super::{detect, load, task_env};
+    use crate::project_config::Config;
 
     #[test]
     fn finds_scripts_and_adds_them() {

@@ -227,6 +227,17 @@ pub struct ProjectState {
     /// changed since it spoke.
     pub verdicts: std::collections::BTreeMap<String, crate::workspace::variants::Run>,
     pub stale_verdicts: Vec<String>,
+    /// Project settings kept for yourself ("Only for me"): used in place
+    /// of the repository's `.ideae.toml`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub own: Option<crate::project_config::Config>,
+    /// Whether the commands of `.ideae.toml` may run, by their trust key:
+    /// asked once for each version of them.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub trusted: std::collections::BTreeMap<String, bool>,
+    /// Hints asked not to be shown again.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hints_off: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq)]

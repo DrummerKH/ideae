@@ -273,7 +273,7 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
                 .item(switch(
                     draft,
                     "Copy .env files",
-                    "New worktrees get the main checkout's ignored .env* files.",
+                    "New worktrees get the main checkout's ignored .env* files, unless the project's settings name the files to copy.",
                     |s| s.copy_env,
                     |s, v| s.copy_env = v,
                 )),

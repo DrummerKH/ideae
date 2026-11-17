@@ -4046,6 +4046,7 @@ dependencies = [
  "sha2 0.10.9",
  "similar",
  "toml 0.8.23",
+ "toml_edit 0.22.27",
  "tree-sitter",
  "tree-sitter-batch",
  "tree-sitter-containerfile",

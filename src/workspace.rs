@@ -67,6 +67,7 @@ pub struct TaskEntry {
     pub side: Option<side::Side>,
 }
 
+pub mod automation;
 pub mod present;
 pub mod side;
 pub mod spaces;
@@ -94,12 +95,27 @@ pub struct Project {
     /// and whether it runs by itself when the variants have finished.
     pub check: String,
     pub check_auto: bool,
+    /// Whether the commands of `.ideae.toml` may run, by their trust key;
+    /// and the hints not to show again. The settings kept for yourself are
+    /// in project_config, read from any thread.
+    pub trusted: std::collections::BTreeMap<String, bool>,
+    pub hints_off: std::collections::BTreeSet<String>,
 }
 
 impl Project {
     fn new(path: PathBuf) -> Self {
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
-        Self { path, name, space: None, collapsed: false, tasks: Vec::new(), check: String::new(), check_auto: false }
+        Self {
+            path,
+            name,
+            space: None,
+            collapsed: false,
+            tasks: Vec::new(),
+            check: String::new(),
+            check_auto: false,
+            trusted: Default::default(),
+            hints_off: Default::default(),
+        }
     }
 }
 
@@ -207,6 +223,8 @@ pub struct Workspace {
     reading_variants: bool,
     /// What to tell every agent of the group in view.
     pub group_message: Entity<InputState>,
+    /// Setups, teardowns, checks and what they wait for.
+    auto: automation::AutoState,
 }
 
 impl Workspace {
@@ -331,6 +349,7 @@ impl Workspace {
                     for view in this.views() {
                         view.update(cx, |t, cx| t.shut_down_at_quit(cx));
                     }
+                    this.teardown_at_quit();
                     #[cfg(unix)]
                     if let Some(daemon) = crate::daemon::client::get() {
                         daemon.shutdown();
@@ -528,6 +547,7 @@ impl Workspace {
             shared: Default::default(),
             fetched: Default::default(),
             build: crate::build_watch::BuildWatch::new(),
+            auto: Default::default(),
         };
         this.restore(&saved, window, cx);
         this.tell_what_is_hidden();
@@ -655,6 +675,9 @@ impl Workspace {
             project.collapsed = p.collapsed;
             project.check = p.check.clone();
             project.check_auto = p.check_auto;
+            project.trusted = p.trusted.clone();
+            project.hints_off = p.hints_off.iter().cloned().collect();
+            crate::project_config::set_own(&p.path, p.own.clone());
             // What the judge said and how the checks went: paid for, kept.
             for (group, verdict) in &p.verdicts {
                 self.judges.insert(group.clone(), verdict.clone());
@@ -763,6 +786,9 @@ impl Workspace {
                     collapsed: p.collapsed,
                     check: p.check.clone(),
                     check_auto: p.check_auto,
+                    own: crate::project_config::own(&p.path),
+                    trusted: p.trusted.clone(),
+                    hints_off: p.hints_off.iter().cloned().collect(),
                     verdicts: self
                         .judges
                         .iter()
@@ -846,6 +872,9 @@ impl Workspace {
             return None;
         }
         let slot = self.port_slot_for(path);
+        if let Some((pi, _)) = self.find(path) {
+            crate::project_config::register(path, &self.projects[pi].path);
+        }
         let entry = self.entry_mut(path)?;
         let (root, branch, session, pr) = (entry.path.clone(), entry.branch.clone(), entry.session.clone(), entry.pr.clone());
         let view = cx.new(|cx| {
@@ -856,7 +885,7 @@ impl Workspace {
             t.pr = pr;
             t
         });
-        cx.subscribe(&view, |_, _, _: &TaskEvent, cx| cx.notify()).detach();
+        cx.subscribe_in(&view, window, |this, view, event: &TaskEvent, window, cx| this.on_task_event(view, event, window, cx)).detach();
         self.entry_mut(path)?.view = Some(view.clone());
         Some(view)
     }
@@ -1201,9 +1230,13 @@ impl Workspace {
         }
         let entry = &mut self.projects[pi].tasks[ti];
         view.update(cx, |t, cx| t.shut_down(cx));
+        let tears_down = !entry.main;
         // The main thread shows only while it runs.
         if entry.main {
             self.projects[pi].tasks.remove(ti);
+        }
+        if tears_down {
+            self.teardown(path, window, cx);
         }
         if self.active.as_deref() == Some(path) {
             self.active = None;
@@ -1285,7 +1318,9 @@ impl Workspace {
         entry.busy = Some("deleting…".into());
         let (path, branch, unlock) = (path.to_path_buf(), entry.branch.clone(), entry.locked.is_some());
         cx.notify();
+        let torn_down = self.torn_down(&path);
         cx.spawn_in(window, async move |this, cx| {
+            torn_down.await;
             let task_path = path.clone();
             let result = cx
                 .background_spawn(async move { git::remove_task_worktree(&repo, &task_path, &branch, unlock) })
@@ -1651,7 +1686,16 @@ impl Workspace {
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let copy_env = state::settings().copy_env;
-            let result = cx.background_spawn(async move { git::create_task_worktree(&repo, &branch, copy_env) }).await;
+            let result = cx
+                .background_spawn(async move {
+                    let copy = crate::project_config::resolve(&repo).config.task.copy;
+                    let made = git::create_task_worktree(&repo, &branch, copy_env && copy.is_none());
+                    if let (Ok(dir), Some(copy)) = (&made, copy) {
+                        crate::project_config::copy_ignored(&repo, dir, &copy);
+                    }
+                    made
+                })
+                .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 match result {
                     Ok(_) => {
@@ -1659,6 +1703,7 @@ impl Workspace {
                             entry.busy = None;
                         }
                         this.switch(&path, window, cx);
+                        this.task_made(&path, window, cx);
                         // To its own agent: the task in view is another when the switch did not happen.
                         let view = this.entry_mut(&path).and_then(|entry| entry.view.clone());
                         if let (false, Some(view)) = (prompt.is_empty(), view) {
@@ -1919,6 +1964,9 @@ impl Workspace {
         let last = &mut self.projects[pi].tasks[ti].last_active;
         if state::now().saturating_sub(*last) >= 60 || turn_over {
             *last = state::now();
+        }
+        if turn_over && !event.replayed && !more_coming {
+            self.after_turn(&event.task, window, cx);
         }
         if turn_over {
             self.projects[pi].tasks[ti].done_at = state::now();

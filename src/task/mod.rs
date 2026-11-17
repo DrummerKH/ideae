@@ -45,6 +45,7 @@ mod changes;
 mod session;
 mod change_tree;
 mod services;
+mod auto;
 mod pr;
 mod replace;
 mod annotate;
@@ -64,6 +65,7 @@ pub use annotate::ToggleBlame;
 pub use bookmarks::{NextBookmark, PrevBookmark, ShowBookmarks, ToggleBookmark};
 use change_tree::*;
 use pr::*;
+pub use auto::AutoAsk;
 
 // ---------------------------------------------------------------- task
 
@@ -252,6 +254,9 @@ struct ChangedFile {
 
 pub enum TaskEvent {
     Changed,
+    /// Something only the workspace does: the project's settings, or a
+    /// setup or a check, which run as the project's trust allows.
+    Auto(AutoAsk),
 }
 
 impl EventEmitter<TaskEvent> for TaskView {}
@@ -299,6 +304,8 @@ pub struct TaskView {
     /// Ports the task's processes listen on, while the Run panel shows.
     listening: Vec<crate::services::Listening>,
     _listening_poll: Option<Task<()>>,
+    /// The project's setup and check, as they went in this task.
+    auto: auto::Auto,
     hook_socket: Option<String>,
     /// Numbers terminals so each has a unique element id and default title.
     terminal_seq: usize,
@@ -623,6 +630,7 @@ impl TaskView {
             services,
             services_error: None,
             services_found: Vec::new(),
+            auto: Default::default(),
             listening: Vec::new(),
             _listening_poll: None,
             hook_socket,

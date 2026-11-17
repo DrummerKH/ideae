@@ -42,7 +42,9 @@ Claude Code and git should be installed.
   that warns before conflicting, branches, history, stashes.
 - **Terminals** that outlive the window, and **browser tabs** whose elements
   can be picked for the agent.
-- **[Services](docs/services.md)** each task runs on ports of its own.
+- **[Project settings](docs/services.md)**: a setup for each new worktree, a
+  check after each turn of its agent, a teardown, and services each task runs
+  on ports of its own.
 - Themes, spaces for sorting projects, a presentation mode.
 
 More in [docs/features.md](docs/features.md); notes for each system in

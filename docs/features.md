@@ -6,7 +6,9 @@ Add a repository, start a task from a title. The title becomes a branch
 (`DEV-123 Fix login` gives `DEV-123_fixLogin`, any other text a slug with a
 random suffix). The task gets a worktree in `<repo>.worktrees/<branch>`,
 branched from the remote's default branch, with the main checkout's ignored
-`.env*` files copied in.
+`.env*` files copied in. A project's [settings](services.md) can install
+what it needs there, check the agent's work after each turn and clean up
+when the task goes.
 
 Worktrees made outside the app show up as tasks too. Those an agent made for
 itself (Claude Code's subagents in `.claude/worktrees/`, a try in a temporary

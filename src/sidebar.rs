@@ -425,6 +425,7 @@ impl Workspace {
         let in_space = p.space.clone();
         let menu = move |menu: PopupMenu, this: WeakEntity<Workspace>| {
             let (spaces, in_space) = (spaces.clone(), in_space.clone());
+            let settings = this.clone();
             let (a, b, c, d) = (this.clone(), this.clone(), this.clone(), this);
             menu.item(PopupMenuItem::new("Open main thread").on_click(move |_, window, cx| {
                 let _ = a.update(cx, |w, cx| w.open_main(pi, window, cx));
@@ -434,6 +435,9 @@ impl Workspace {
             }))
             .item(PopupMenuItem::new("Clean up merged tasks…").on_click(move |_, window, cx| {
                 let _ = d.update(cx, |w, cx| w.clean_up_merged(pi, window, cx));
+            }))
+            .item(PopupMenuItem::new("Project settings…").on_click(move |_, window, cx| {
+                let _ = settings.update(cx, |w, cx| w.project_settings(pi, window, cx));
             }))
             .separator()
             // Which space it is of: one of them, or none, which is all.
@@ -712,6 +716,8 @@ impl Workspace {
         if let Some(busy) = &t.busy {
             details.push(busy.to_string());
         }
+        // How the project's setup and check went in it.
+        let auto_marks = t.view.as_ref().map(|v| v.read(cx).auto_marks()).unwrap_or_default();
         let needs = if in_active { None } else { needs };
         // What its agent said: the start under the task in Needs you, the whole in its tooltip.
         let said = t.view.as_ref().and_then(|v| self.said_shown(v, cx));
@@ -895,6 +901,7 @@ impl Workspace {
                                     }),
                             )
                         })
+                        .children(auto_marks.into_iter().map(|(mark, color)| div().flex_none().text_color(color).child(mark)))
                         // What may be cut off, then what may not.
                         .child(div().flex_1().min_w_0().truncate().text_color(muted).child(details.join(" · ")))
                         .when(!fixed.is_empty(), |row| row.child(div().flex_none().max_w(relative(0.6)).truncate().text_color(muted).child(fixed.join(" · ")))),

@@ -207,14 +207,15 @@ impl TaskView {
     pub(super) fn refresh_services(&mut self, cx: &mut Context<Self>) {
         let root = self.root.clone();
         cx.spawn(async move |this, cx| {
-            let (loaded, found) = cx.background_spawn(async move { (crate::services::load(&root), crate::services::detect(&root)) }).await;
+            let (resolved, found) = cx.background_spawn(async move { (crate::project_config::resolve(&root), crate::services::detect(&root)) }).await;
             let _ = this.update(cx, |this, cx| {
-                match loaded {
-                    Ok(services) => {
-                        this.services = services;
+                match resolved.error {
+                    None => {
+                        this.services = resolved.config.service;
+                        this.auto.configured = resolved.config.task;
                         this.services_error = None;
                     }
-                    Err(e) => this.services_error = Some(e),
+                    Some(e) => this.services_error = Some(e),
                 }
                 let known: HashSet<String> = this.services.iter().map(|s| s.name.clone()).collect();
                 this.services_found = found.into_iter().filter(|f| !known.contains(&f.service.name)).collect();
@@ -311,6 +312,7 @@ impl TaskView {
     pub(super) fn render_run_panel(&self, cx: &mut Context<Self>) -> AnyElement {
         let muted = cx.theme().muted_foreground;
         let mut panel = v_flex().id("run-panel").flex_1().min_h_0().overflow_y_scroll().text_sm();
+        panel = self.render_auto(panel, cx);
         if let Some(error) = &self.services_error {
             panel = panel.child(div().px_3().py_2().text_xs().text_color(gpui_kit::red()).child(error.clone()));
         }
@@ -336,6 +338,14 @@ impl TaskView {
                         .px_3()
                         .py_3()
                         .child(
+                            Button::new("set-up-services")
+                                .small()
+                                .outline()
+                                .label("Set up services…")
+                                .tooltip("Project settings: services, and what runs for every new task")
+                                .on_click(cx.listener(|_, _, _, cx| cx.emit(TaskEvent::Auto(AutoAsk::Settings)))),
+                        )
+                        .child(
                             Button::new("describe-services")
                                 .small()
                                 .ghost()
@@ -350,6 +360,7 @@ impl TaskView {
                 .into_any_element();
         }
         let running: Vec<String> = self.running_services(cx).into_iter().map(|(n, _)| n).collect();
+        panel = panel.child(div().px_3().pt_2().text_xs().text_color(muted).child("SERVICES"));
         for (ix, service) in self.services.iter().enumerate() {
             let name = service.name.clone();
             let on = running.contains(&name);

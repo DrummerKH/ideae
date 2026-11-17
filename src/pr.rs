@@ -265,6 +265,59 @@ fn checks(rollup: &Value) -> Checks {
     if pending { Checks::Pending } else { Checks::Passed }
 }
 
+/// The most of a failed CI log sent on: its end, where the error is.
+const LOG_LINES: usize = 120;
+const LOG_BYTES: usize = 12 * 1024;
+
+/// The latest failed run of `branch`'s workflows: its address, and the end
+/// of the log of the steps that failed. Run off the UI thread.
+pub fn failed_log(root: &Path, branch: &str) -> Result<(String, String), String> {
+    let gh = |args: &[&str]| {
+        let out = crate::procs::command("gh").current_dir(root).env("GH_PROMPT_DISABLED", "1").args(args).output().map_err(|e| format!("gh: {e}"))?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        }
+    };
+    let runs: Value = serde_json::from_str(&gh(&["run", "list", "--branch", branch, "--limit", "20", "--json", "databaseId,conclusion,url"])?).map_err(|e| e.to_string())?;
+    let failed = runs
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|r| matches!(r["conclusion"].as_str(), Some("failure" | "timed_out" | "startup_failure")))
+        .ok_or_else(|| format!("No failed run of {branch} found"))?;
+    let id = failed["databaseId"].as_u64().ok_or("A run without an id")?.to_string();
+    let url = failed["url"].as_str().unwrap_or_default().to_string();
+    let log = gh(&["run", "view", &id, "--log-failed"])?;
+    Ok((url, log_tail(&log)))
+}
+
+/// `gh run view --log-failed` gives "job<TAB>step<TAB>time line": the line
+/// is what counts, the last of them, within bounds.
+fn log_tail(log: &str) -> String {
+    let lines: Vec<String> = log
+        .lines()
+        .map(|line| {
+            let text = line.splitn(3, '\t').nth(2).unwrap_or(line);
+            // The timestamp: 2024-05-01T10:00:00.1234567Z
+            match text.split_once(' ') {
+                Some((time, rest)) if time.len() > 20 && time.ends_with('Z') && time.as_bytes()[4] == b'-' => rest.to_string(),
+                _ => text.to_string(),
+            }
+        })
+        .collect();
+    let mut out = crate::project_config::plain(lines[lines.len().saturating_sub(LOG_LINES)..].join("\n").as_bytes());
+    if out.len() > LOG_BYTES {
+        let mut cut = out.len() - LOG_BYTES;
+        while !out.is_char_boundary(cut) {
+            cut += 1;
+        }
+        out = out[cut..].to_string();
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Checks, PrState, parse, parse_feedback};
@@ -346,5 +399,12 @@ mod tests {
         assert!(message.contains("b.rs:9 (outdated"), "{message}");
         assert!(message.contains("rev: rename this"));
         assert!(message.contains("Review by rev:\nNeeds tests"));
+    }
+
+    #[test]
+    fn a_failed_log_keeps_its_lines_and_their_end() {
+        let log = (0..300).map(|i| format!("build\tRun tests\t2024-05-01T10:00:00.1234567Z line {i}")).collect::<Vec<_>>().join("\n");
+        let tail = super::log_tail(&log);
+        assert!(tail.starts_with("line 180\n") && tail.ends_with("line 299"), "{tail}");
     }
 }

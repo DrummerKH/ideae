@@ -569,7 +569,14 @@ impl Workspace {
                 .background_spawn(async move {
                     // The commit the first one was made from; where it forked, when that was not kept.
                     let from = like.and_then(|(path, base)| Some(base).filter(|b| !b.is_empty()).or_else(|| git::fork_point(&path)));
-                    git::create_variant_worktrees(&job_repo, &job_branches, from.as_deref(), copy_env)
+                    let copy = crate::project_config::resolve(&job_repo).config.task.copy;
+                    let made = git::create_variant_worktrees(&job_repo, &job_branches, from.as_deref(), copy_env && copy.is_none());
+                    if let (Ok((_, made)), Some(copy)) = (&made, copy) {
+                        for dir in made.iter().flatten() {
+                            crate::project_config::copy_ignored(&job_repo, dir, &copy);
+                        }
+                    }
+                    made
                 })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -592,6 +599,7 @@ impl Workspace {
                             let text = full_prompt(&entry.prompt, &entry.note);
                             if let Some(view) = this.load(&path, window, cx) {
                                 view.update(cx, |t, cx| t.queue_prompt(text, true, window, cx));
+                                this.task_made(&path, window, cx);
                             }
                         }
                         Err(e) => {
@@ -898,7 +906,12 @@ impl Workspace {
         let rename = kept.as_ref().zip(keep).filter(|((_, branch), keep)| branch != group && !pushed.contains(*keep)).map(|_| group.to_string());
         let (winner, name) = (keep.map(Path::to_path_buf), kept.map(|k| k.0));
         let branch = winner.as_ref().and_then(|w| self.entry_mut(w)).map(|t| t.branch.clone()).unwrap_or_default();
+        // Their teardowns end before their worktrees go.
+        let torn_down: Vec<_> = gone.iter().map(|(loser, _, _)| self.torn_down(loser)).collect();
         cx.spawn_in(window, async move |this, cx| {
+            for done in torn_down {
+                done.await;
+            }
             let (job_repo, job_winner, job_gone) = (repo.clone(), winner.clone(), gone.clone());
             let (removed, renamed) = cx
                 .background_spawn(async move {

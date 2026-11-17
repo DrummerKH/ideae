@@ -9,7 +9,8 @@ cargo test -- --ignored \
   an_open_file \
   two_variants \
   the_tasks_of_the_last_run \
-  a_window_that_does_not_read
+  a_window_that_does_not_read \
+  a_task_is_set_up_checked_and_torn_down
 
 if rustup target list --installed 2>/dev/null | grep -q x86_64-pc-windows-gnu; then
   cargo check --target x86_64-pc-windows-gnu --target-dir target/win

@@ -103,6 +103,7 @@ impl TaskView {
                     .cursor_pointer()
                     .child(format!("· {} {}", b.last_hash, b.last_subject)),
             )
+            .children(self.render_auto_badges(cx))
             .children(self.render_pr_feedback(cx))
             .child(
                 Button::new("log")

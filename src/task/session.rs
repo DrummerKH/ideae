@@ -173,6 +173,7 @@ impl TaskView {
 
     pub(super) fn end(&mut self, strays: bool, cx: &mut Context<Self>) {
         self.save_all_now(cx);
+        self.auto.stop();
         let task = self.root.display().to_string();
         let socket = self.hook_socket.clone().filter(|_| strays);
         // Before the terminals go: what they started is told by them.
