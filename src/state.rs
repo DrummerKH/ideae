@@ -104,6 +104,9 @@ pub struct Settings {
     /// The worktrees agents make for themselves are listed, folded under
     /// the task they came from.
     pub show_side_worktrees: bool,
+    /// What the agent said shows under its task in Needs you, in the row's
+    /// tooltip and in the notification.
+    pub show_said: bool,
     /// A file opened to look at (a jump, a search result) takes the place of
     /// the one opened that way before, until it is edited.
     pub preview_tabs: bool,
@@ -136,6 +139,7 @@ impl Default for Settings {
             fetch_minutes: 5,
             preview_tabs: true,
             show_side_worktrees: true,
+            show_said: true,
             tab_limit: 12,
             check_updates: true,
             hump_words: false,

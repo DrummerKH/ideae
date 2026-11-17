@@ -260,6 +260,15 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
                 )),
         ),
         SettingPage::new("Tasks").default_open(true).group(
+            SettingGroup::new().title("Agents")
+                .item(switch(
+                    draft,
+                    "What the agent said",
+                    "A finished task in Needs you shows the start of its agent's last answer, and one that waits shows what it asks; the task's tooltip and the notification have it too. Never while presenting.",
+                    |s| s.show_said,
+                    |s, v| s.show_said = v,
+                )),
+        ).group(
             SettingGroup::new().title("New tasks")
                 .item(switch(
                     draft,

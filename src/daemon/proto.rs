@@ -51,6 +51,8 @@ pub struct Hook {
     /// The file a tool call is about to change.
     #[serde(default)]
     pub file: Option<String>,
+    #[serde(default)]
+    pub said: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

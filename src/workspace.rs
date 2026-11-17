@@ -267,6 +267,7 @@ impl Workspace {
                 message: h.message,
                 kind: h.kind,
                 file: h.file,
+                said: h.said,
                 replayed,
             };
             match crate::daemon::client::connect(move |h| {
@@ -1887,7 +1888,9 @@ impl Workspace {
         let turn_over = status == agent::AgentStatus::Done && matches!(was, agent::AgentStatus::Working | agent::AgentStatus::NeedsInput(_));
         // A message that waited for this goes out now: the agent is not done yet.
         let more_coming = turn_over && view.read(cx).has_queued_message();
-        view.update(cx, |t, cx| {
+        let heard = view.update(cx, |t, cx| {
+            let said = (t.agent_said.clone(), t.agent_asks.clone());
+            t.hear(&event, &status);
             t.set_agent_status(status.clone(), seen, cx);
             let before = t.agent_shown();
             t.follow_agent(&event.event, event.file.as_deref());
@@ -1903,6 +1906,7 @@ impl Workspace {
             if turn_over && !event.replayed {
                 t.deliver_queued(window, cx);
             }
+            said != (t.agent_said.clone(), t.agent_asks.clone())
         });
         // A variant at work again: what the judge said is of before.
         if let (Some(group), "UserPromptSubmit") = (&group, event.event.as_str()) {
@@ -1933,16 +1937,15 @@ impl Workspace {
             self.hold_notice(&event.task);
         }
         if status.is_attention() && !seen && !hidden && status != was && !event.replayed && state::settings().notifications {
+            let said = self.said_shown(&view, cx);
             let body = match (&status, &group) {
-                (agent::AgentStatus::NeedsInput(message), Some(_)) => {
+                (agent::AgentStatus::NeedsInput(_), Some(_)) => {
                     label = format!("{label} · {variant}");
-                    Some(message.clone())
+                    Some(crate::said::notice(&status, said.as_deref()))
                 }
-                (agent::AgentStatus::NeedsInput(message), None) => Some(message.clone()),
-                // One word for the group, when its last variant is done.
                 // A group tells when it is ready to look at: after the judge (variants.rs).
                 (_, Some(_)) => None,
-                (_, None) => Some("Finished".to_string()),
+                (_, None) => Some(crate::said::notice(&status, said.as_deref())),
             };
             if let Some(body) = body {
                 let (tx, path) = (self.open_task_tx.clone(), event.task.clone());
@@ -1952,9 +1955,23 @@ impl Workspace {
             }
         }
         // The rest reaches the list through the task, when it shows another way.
-        if status != was || turn_over {
+        if status != was || turn_over || heard {
             cx.notify();
         }
+    }
+
+    /// What the agent of a task said, as far as it is to be shown: not
+    /// while presenting, not when turned off. Whole, for a notification.
+    pub fn said_shown(&self, view: &Entity<crate::task::TaskView>, cx: &App) -> Option<SharedString> {
+        if self.is_presenting() || !state::with_settings(|s| s.show_said) {
+            return None;
+        }
+        let v = view.read(cx);
+        match v.agent_status {
+            agent::AgentStatus::NeedsInput(_) => v.agent_asks.as_ref(),
+            _ => v.agent_said.as_ref(),
+        }
+        .map(|said| said.whole.clone())
     }
 
     /// Power saving: stops every language server and starts none until

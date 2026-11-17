@@ -261,8 +261,14 @@ fn serve(shared: Shared, stream: UnixStream) {
             }
             Frame::Msg(Msg::Shutdown) => shutdown(&shared),
             Frame::Msg(Msg::Upgrade { exe }) => handover::give(&shared, &exe),
-            Frame::Msg(Msg::Hook(hook)) => {
+            Frame::Msg(Msg::Hook(mut hook)) => {
                 let mut s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                // A window that comes later hears only this one: the reminder
+                // after a turn, or the question after a tool call, keeps
+                // what the agent said before it.
+                if hook.said.is_none() {
+                    hook.said = s.hooks.get(&hook.task).filter(|before| carries(before, &hook)).and_then(|before| before.said.clone());
+                }
                 if s.clients.is_empty() {
                     notify(&hook);
                 }
@@ -449,6 +455,34 @@ fn shutdown(shared: &Shared) -> ! {
     std::process::exit(0);
 }
 
+fn event_of(hook: &Hook) -> crate::agent::HookEvent {
+    crate::agent::HookEvent {
+        task: hook.task.clone().into(),
+        event: hook.event.clone(),
+        message: hook.message.clone(),
+        kind: hook.kind.clone(),
+        file: hook.file.clone(),
+        said: hook.said.clone(),
+        replayed: false,
+    }
+}
+
+/// Whether what was said before still holds for a later report without
+/// words of its own: a turn's last words for the reminder after it, a tool
+/// call's for the question about it.
+fn carries(before: &Hook, now: &Hook) -> bool {
+    use crate::agent::AgentStatus::{Done, NeedsInput};
+    if now.event != "Notification" {
+        return false;
+    }
+    match (event_of(before).status(), event_of(now).status()) {
+        (Some(Done), Some(Done)) => true,
+        (Some(NeedsInput(_)), Some(NeedsInput(_))) => true,
+        (_, Some(NeedsInput(_))) => before.event == "PreToolUse",
+        _ => false,
+    }
+}
+
 /// No window to show it: an agent that wants the user says so on the desktop.
 fn notify(hook: &Hook) {
     // The window may have changed it since this daemon started.
@@ -456,19 +490,9 @@ fn notify(hook: &Hook) {
     if !saved.settings.notifications || !saved.tells_of(std::path::Path::new(&hook.task)) {
         return;
     }
-    let event = crate::agent::HookEvent {
-        task: hook.task.clone().into(),
-        event: hook.event.clone(),
-        message: hook.message.clone(),
-        kind: hook.kind.clone(),
-        file: hook.file.clone(),
-        replayed: false,
-    };
-    let Some(status) = event.status().filter(|s| s.is_attention()) else { return };
-    let body = match status {
-        crate::agent::AgentStatus::NeedsInput(message) => message,
-        _ => "Finished".into(),
-    };
+    let Some(status) = event_of(hook).status().filter(|s| s.is_attention()) else { return };
+    let said = hook.said.as_deref().filter(|_| saved.settings.show_said && saved.presenting.is_none());
+    let body = crate::said::notice(&status, said);
     let task = std::path::Path::new(&hook.task).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let path = std::path::PathBuf::from(&hook.task);
     crate::desktop::notify_with(&task, &body, move || crate::desktop::open_window_on(&path));
@@ -681,6 +705,26 @@ mod handover {
 mod tests {
     use super::*;
     use std::io::Read as _;
+
+    #[test]
+    fn a_report_without_words_keeps_those_that_still_hold() {
+        let hook = |event: &str, kind: Option<&str>, message: Option<&str>| Hook {
+            task: "/w/t".into(),
+            event: event.into(),
+            message: message.map(Into::into),
+            kind: kind.map(Into::into),
+            file: None,
+            said: Some("x".into()),
+        };
+        let (stop, tool) = (hook("Stop", None, None), hook("PreToolUse", None, Some("Running ls")));
+        let idle = hook("Notification", Some("idle_prompt"), Some("Claude is waiting for your input"));
+        let asks = hook("Notification", Some("permission_prompt"), Some("Claude needs your permission to use Bash"));
+        assert!(carries(&stop, &idle), "the reminder after a turn");
+        assert!(carries(&tool, &asks), "the question about a tool call");
+        assert!(!carries(&tool, &idle), "a turn cut short said nothing to keep");
+        assert!(!carries(&stop, &asks), "a turn's words are no question");
+        assert!(!carries(&stop, &hook("UserPromptSubmit", None, None)));
+    }
 
     /// A program that prints without end, into a window that reads nothing:
     /// what waits for the window stays a few megabytes, the program held

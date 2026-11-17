@@ -713,6 +713,13 @@ impl Workspace {
             details.push(busy.to_string());
         }
         let needs = if in_active { None } else { needs };
+        // What its agent said: the start under the task in Needs you, the whole in its tooltip.
+        let said = t.view.as_ref().and_then(|v| self.said_shown(v, cx));
+        let lead = t.view.as_ref().filter(|_| in_active && said.is_some()).and_then(|v| {
+            let v = v.read(cx);
+            let asks = matches!(v.agent_status, AgentStatus::NeedsInput(_));
+            if asks { v.agent_asks.as_ref() } else { v.agent_said.as_ref() }.map(|said| (said.lead.clone(), asks))
+        });
         let pr = t.pr.clone().filter(|_| pr_status);
         let overlaps = self.overlaps(project, &path);
         let whole_branch = t.branch.clone();
@@ -896,6 +903,21 @@ impl Workspace {
             .when_some(needs, |s, message| {
                 s.child(div().pl(px(18.)).text_xs().truncate().text_color(hsla(0.08, 0.9, 0.55, 1.)).child(message))
             })
+            .when_some(lead, |s, (lead, asks)| {
+                s.child(
+                    div()
+                        .id(SharedString::from(format!("said-{}", path.display())))
+                        .pl(px(18.))
+                        .pb_0p5()
+                        .min_w_0()
+                        .text_size(px(11.))
+                        .line_height(px(15.))
+                        .line_clamp(if asks { 2 } else { 3 })
+                        .text_ellipsis()
+                        .text_color(if asks { hsla(0.08, 0.9, 0.55, 0.9) } else { muted.opacity(0.9) })
+                        .child(lead),
+                )
+            })
             // A click on a task, current or not, lands in its agent.
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.switch(&click_path, window, cx);
@@ -936,6 +958,10 @@ impl Workspace {
                 crate::usage::tokens(usage.recent)
             ));
         }
+        if let Some(said) = said {
+            told.push_str("\n\n");
+            told.push_str(&said);
+        }
         let (pressed, left) = (path.clone(), path.clone());
         row = row
             .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, _, cx| {
@@ -949,7 +975,10 @@ impl Workspace {
                 }
             }));
         if self.menu_on.as_ref() != Some(&path) {
-            row = row.tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(told.clone()).build(window, cx));
+            row = row.tooltip(move |window, cx| {
+                let told = told.clone();
+                gpui_kit::component::tooltip::Tooltip::element(move |_, _| div().max_w(px(420.)).child(told.clone())).build(window, cx)
+            });
         }
         row.context_menu(menu).into_any_element()
     }

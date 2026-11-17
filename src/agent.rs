@@ -61,6 +61,9 @@ pub struct HookEvent {
     pub kind: Option<String>,
     /// The file a tool call is about to change.
     pub file: Option<String>,
+    /// What the agent said ([`crate::said`]): a turn's last words, or what
+    /// a tool call waits for.
+    pub said: Option<String>,
     /// The daemon's record of an earlier event, handed over on connect: it
     /// sets the status but notifies nobody again.
     pub replayed: bool,
@@ -318,6 +321,7 @@ fn parse_line(line: &str) -> Option<HookEvent> {
         message: v["message"].as_str().map(str::to_string),
         kind: v["kind"].as_str().map(str::to_string),
         file: v["file"].as_str().map(str::to_string),
+        said: v["said"].as_str().map(str::to_string),
         replayed: false,
     })
 }
@@ -380,12 +384,18 @@ pub fn run_hook(event: &str) {
         "PreToolUse" => activity(&payload),
         _ => payload["message"].as_str().map(str::to_string),
     };
+    let said = match event {
+        "Stop" => crate::said::last_words(&payload),
+        "PreToolUse" => crate::said::asks(&payload),
+        _ => None,
+    };
     let line = json!({
         "task": task,
         "event": event,
         "message": message,
         "kind": payload["notification_type"].as_str(),
         "file": if event == "PreToolUse" { edited_file(&payload) } else { None },
+        "said": said,
     });
     #[cfg(unix)]
     if Path::new(&socket).file_name().is_some_and(|name| name.to_string_lossy().starts_with("daemon")) {
@@ -395,6 +405,7 @@ pub fn run_hook(event: &str) {
             message: line["message"].as_str().map(str::to_string),
             kind: line["kind"].as_str().map(str::to_string),
             file: line["file"].as_str().map(str::to_string),
+            said,
         });
         return;
     }
@@ -406,7 +417,7 @@ mod tests {
     use super::*;
 
     fn note(message: &str, kind: Option<&str>) -> Option<AgentStatus> {
-        HookEvent { task: PathBuf::new(), event: "Notification".into(), message: Some(message.into()), kind: kind.map(Into::into), file: None, replayed: false }
+        HookEvent { task: PathBuf::new(), event: "Notification".into(), message: Some(message.into()), kind: kind.map(Into::into), file: None, said: None, replayed: false }
             .status()
     }
 

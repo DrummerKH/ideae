@@ -262,6 +262,11 @@ pub struct TaskView {
     pub agent_status: crate::agent::AgentStatus,
     /// What the working agent does now: its latest tool call, in words.
     pub agent_activity: Option<String>,
+    /// The last words of the agent's last turn, and what it waits on now.
+    pub agent_said: Option<crate::said::Said>,
+    pub agent_asks: Option<crate::said::Said>,
+    /// What the latest tool call would do, for when it is asked about.
+    agent_pending: Option<String>,
     /// The file the agent is writing to now, and those it wrote to since
     /// the last prompt: marked in the Changes and Files panels.
     agent_editing: Option<SharedString>,
@@ -601,6 +606,9 @@ impl TaskView {
             branch: branch.into(),
             agent_status: crate::agent::AgentStatus::Unknown,
             agent_activity: None,
+            agent_said: None,
+            agent_asks: None,
+            agent_pending: None,
             agent_editing: None,
             agent_touched: Rc::default(),
             changed_paths: Rc::default(),
@@ -1256,6 +1264,38 @@ impl TaskView {
         if changed {
             cx.emit(TaskEvent::Changed);
             cx.notify();
+        }
+    }
+
+    /// Keeps what the agent said: a turn's last words until the next
+    /// prompt, a question until it is answered. A report without words (the
+    /// reminder after a turn) leaves them as they were.
+    pub fn hear(&mut self, event: &crate::agent::HookEvent, status: &crate::agent::AgentStatus) {
+        use crate::said::Said;
+        match (event.event.as_str(), status) {
+            ("SessionStart" | "UserPromptSubmit", _) => {
+                self.agent_said = None;
+                self.agent_asks = None;
+                self.agent_pending = None;
+            }
+            ("PreToolUse", _) => {
+                self.agent_asks = None;
+                self.agent_pending = event.said.clone().or_else(|| event.message.clone());
+            }
+            ("Stop", _) => {
+                self.agent_asks = None;
+                if let Some(said) = event.said.as_deref().and_then(Said::new) {
+                    self.agent_said = Some(said);
+                }
+            }
+            ("Notification", crate::agent::AgentStatus::NeedsInput(_)) => {
+                let asks = event.said.clone().or_else(|| self.agent_pending.take());
+                self.agent_asks = asks.as_deref().and_then(Said::new);
+            }
+            ("Notification", crate::agent::AgentStatus::Done) if self.agent_said.is_none() => {
+                self.agent_said = event.said.as_deref().and_then(Said::new);
+            }
+            _ => {}
         }
     }
 

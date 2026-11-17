@@ -2178,7 +2178,7 @@ pub(crate) mod tests {
             cx.update_window(handle.into(), |_, window, cx| workspace.update(cx, |w, cx| act(w, window, cx))).unwrap();
             cx.run_until_parked();
         };
-        let hook = |task: &std::path::Path, event: &str| HookEvent { task: task.to_path_buf(), event: event.into(), message: None, kind: None, file: None, replayed: false };
+        let hook = |task: &std::path::Path, event: &str| HookEvent { task: task.to_path_buf(), event: event.into(), message: None, kind: None, file: None, said: None, replayed: false };
 
         step(cx, &mut |w, window, cx| w.create_task(0, "Fix login".into(), "Make the file.".into(), vec![String::new(), "With the smallest patch.".into()], window, cx));
         let (group, paths) = workspace.update(cx, |w, _| {
