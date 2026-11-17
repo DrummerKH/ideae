@@ -2193,6 +2193,12 @@ pub struct BranchRow {
 }
 
 pub fn branch_rows(root: &Path) -> Vec<BranchRow> {
+    branch_rows_of(root, true)
+}
+
+/// As `branch_rows`; without `detail`, nothing of the worktrees that hold
+/// them (`changed`, `agent`, `about`): a `git status` each.
+pub fn branch_rows_of(root: &Path, detail: bool) -> Vec<BranchRow> {
     let base = base_ref(root).unwrap_or_else(|| "HEAD".into());
     let listed = |merged: bool| {
         let mut args = vec!["for-each-ref", "--sort=-committerdate", "--format=%(refname)%1f%(refname:short)%1f%(committerdate:relative)%1f%(subject)"];
@@ -2218,7 +2224,7 @@ pub fn branch_rows(root: &Path) -> Vec<BranchRow> {
     let changed = |path: &Path| -> Vec<String> {
         git(path, &["status", "--porcelain"]).unwrap_or_default().lines().filter_map(|l| l.get(3..)).map(|p| p.rsplit(" -> ").next().unwrap_or(p).to_string()).collect()
     };
-    listed(false)
+    let mut rows: Vec<BranchRow> = listed(false)
         .lines()
         .filter_map(|line| {
             let mut parts = line.split('\x1f');
@@ -2229,15 +2235,13 @@ pub fn branch_rows(root: &Path) -> Vec<BranchRow> {
                 return None;
             }
             let held = (!remote).then(|| held.get(&name).cloned()).flatten();
+            let from = held.as_deref().filter(|_| detail).and_then(|path| crate::workspace::side::made_by_agent(path, &paths));
             Some(BranchRow {
                 merged: merged.contains(full),
                 ahead: ahead.get(full).copied(),
-                changed: held.as_deref().map(changed).unwrap_or_default(),
-                agent: held.as_deref().is_some_and(|path| crate::workspace::side::made_by_agent(path, &paths).is_some()),
-                about: held.as_deref().and_then(|path| {
-                    let from = crate::workspace::side::made_by_agent(path, &paths)?;
-                    crate::workspace::side::about(path, from.as_deref().or(paths.first().map(PathBuf::as_path))?)
-                }),
+                changed: Vec::new(),
+                agent: from.is_some(),
+                about: held.as_deref().zip(from).and_then(|(path, from)| crate::workspace::side::about(path, from.as_deref().or(paths.first().map(PathBuf::as_path))?)),
                 held,
                 when: parts.next()?.to_string(),
                 subject: parts.next().unwrap_or_default().to_string(),
@@ -2245,7 +2249,19 @@ pub fn branch_rows(root: &Path) -> Vec<BranchRow> {
                 remote,
             })
         })
-        .collect()
+        .collect();
+    if detail {
+        // A few at a time: each worktree's status is a process of its own.
+        let mut pending: Vec<&mut BranchRow> = rows.iter_mut().filter(|r| r.held.is_some()).collect();
+        for chunk in pending.chunks_mut(8) {
+            std::thread::scope(|scope| {
+                for row in chunk.iter_mut() {
+                    scope.spawn(|| row.changed = row.held.as_deref().map(changed).unwrap_or_default());
+                }
+            });
+        }
+    }
+    rows
 }
 
 /// Deletes a branch: here, or on its remote (`origin/x` is told to drop

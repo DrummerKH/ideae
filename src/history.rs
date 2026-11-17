@@ -400,7 +400,7 @@ impl HistoryView {
         let (root, task, this) = (self.root.clone(), self.task.clone(), cx.weak_entity());
         cx.spawn_in(window, async move |_, cx| {
             let from = root.clone();
-            let rows = cx.background_spawn(async move { git::branch_rows(&from) }).await;
+            let rows = cx.background_spawn(async move { git::branch_rows_of(&from, false) }).await;
             let detail = crate::finder::DETAIL;
             let mut items = vec![crate::finder::Hit { text: format!("This task's branch{detail}what is checked out here"), path: OWN.into(), line: 0, col: 0, ranges: Vec::new() }];
             items.extend(rows.into_iter().map(|row| crate::finder::Hit {
