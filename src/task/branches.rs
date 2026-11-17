@@ -188,14 +188,21 @@ impl TaskView {
         cx.spawn_in(window, async move |this, cx| {
             // A commit's whole hash says no more than its first ten characters.
             let shown = if rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_hexdigit()) { rev[..10].to_string() } else { rev.clone() };
-            let title = match &file {
-                Some(file) => format!("{file}: {shown} on the left, as it is now on the right"),
-                None => format!("{shown} on the left, the working tree on the right"),
-            };
-            let files = cx
+            let named = shown.clone();
+            let (title, files) = cx
                 .background_spawn(async move {
-                    let rev = git::as_worked_on(&root, &rev);
-                    DiffFile::parse(&git::diff_against(&root, &rev, file.as_deref())).map(with_languages).unwrap_or_default()
+                    let shown = named;
+                    let (patch, title) = match git::work_of(&root, &rev, file.as_deref()) {
+                        Some((patch, base)) => (patch, format!("what {shown} did since {}, with what is not committed there yet", &base[..base.len().min(10)])),
+                        None => (
+                            git::diff_against(&root, &rev, file.as_deref()),
+                            match &file {
+                                Some(file) => format!("{file}: {shown} on the left, as it is now on the right"),
+                                None => format!("{shown} on the left, the working tree on the right"),
+                            },
+                        ),
+                    };
+                    (title, DiffFile::parse(&patch).map(with_languages).unwrap_or_default())
                 })
                 .await;
             let _ = this.update_in(cx, |task, window, cx| task.show_diff_tab(format!("⇄ {shown}"), title, files, window, cx));

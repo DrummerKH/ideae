@@ -2337,16 +2337,21 @@ pub fn refs(root: &Path) -> Vec<(String, String)> {
 
 /// The worktree against `rev`, all of it or the one file: what is here
 /// that the commit, tag or branch does not have.
-/// What to compare with for `rev`: a branch checked out in another worktree
-/// is that worktree as it is, with what is not committed yet (an agent's
-/// work in progress); anything else is itself.
-pub fn as_worked_on(root: &Path, rev: &str) -> String {
+/// What a branch checked out in another worktree has done since it left
+/// this one's HEAD, with what is not committed there yet (an agent's work in
+/// progress): the patch and the commit it starts from. None for any other `rev`.
+pub fn work_of(root: &Path, rev: &str, file: Option<&str>) -> Option<(String, String)> {
     let here = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let there = worktrees(root).into_iter().find(|w| w.branch == rev && w.path.canonicalize().unwrap_or_else(|_| w.path.clone()) != here);
-    match there.and_then(|w| worktree_snapshot(&w.path, true)) {
-        Some(commit) if commit != "HEAD" => commit,
-        _ => rev.to_string(),
+    let there = worktrees(root).into_iter().find(|w| w.branch == rev && w.path.canonicalize().unwrap_or_else(|_| w.path.clone()) != here)?;
+    let now = worktree_snapshot(&there.path, true)?;
+    let now = if now == "HEAD" { rev.to_string() } else { now };
+    let base = git(root, &["merge-base", "HEAD", rev])?.trim().to_string();
+    let mut args = vec!["diff", base.as_str(), now.as_str()];
+    args.extend_from_slice(DIFF_ARGS);
+    if let Some(file) = file {
+        args.extend(["--", file]);
     }
+    Some((git(root, &args)?, base))
 }
 
 pub fn diff_against(root: &Path, rev: &str, file: Option<&str>) -> String {
@@ -3106,21 +3111,22 @@ mod edge_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A branch an agent works on in its own worktree is compared as it is
-    /// there, new files too, and that worktree's index is left alone.
+    /// A branch an agent works on in its own worktree is what it did there,
+    /// new files too and not what this one did since; its index is left alone.
     #[test]
-    fn a_branch_in_another_worktree_is_compared_as_it_is_there() {
+    fn a_branch_in_another_worktree_is_its_work_since_it_left() {
         let dir = repo("worked-on");
         sh(&dir, "echo one > f.txt; git add f.txt; git commit -qm base; git worktree add -q -b agent \"../$(basename \"$PWD\")-agent\"");
         let there = dir.with_file_name(format!("{}-agent", dir.file_name().unwrap().to_string_lossy()));
         sh(&there, "echo two >> f.txt; echo new > n.txt; echo ignored > i.log; echo '*.log' > .gitignore");
         let index = there.join(out(&there, "git rev-parse --git-path index").trim());
         let before = std::fs::read(&index).unwrap();
-        let diff = diff_against(&dir, &as_worked_on(&dir, "agent"), None);
-        assert!(diff.contains("-two") && diff.contains("-new"), "{diff}");
+        sh(&dir, "echo main >> f.txt; git commit -qam later");
+        let (diff, _) = work_of(&dir, "agent", None).unwrap();
+        assert!(diff.contains("+two") && diff.contains("+new") && !diff.contains("main"), "{diff}");
         assert!(!diff.contains("ignored"), "{diff}");
         assert_eq!(std::fs::read(&index).unwrap(), before);
-        assert_eq!(as_worked_on(&dir, "main-or-none"), "main-or-none");
+        assert!(work_of(&dir, "main", None).is_none());
         let _ = std::fs::remove_dir_all(&there);
         let _ = std::fs::remove_dir_all(&dir);
     }
