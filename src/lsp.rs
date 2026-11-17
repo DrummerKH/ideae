@@ -24,6 +24,7 @@ type Progress = Arc<Mutex<HashMap<String, String>>>;
 type Import = Arc<Mutex<ImportState>>;
 /// What the server last found wrong in each file, by uri, and a count of
 /// its reports: a file's view looks again when that moved.
+type Opened = Arc<Mutex<HashSet<String>>>;
 type Problems = Arc<Mutex<(u64, HashMap<String, (u64, Vec<lsp_types::Diagnostic>)>)>>;
 
 /// The server's import of the build: its errors so far, and how it ended.
@@ -122,7 +123,7 @@ pub struct LspClient {
     pending: Pending,
     next_id: AtomicI64,
     ready: (Mutex<Option<Result<(), String>>>, Condvar),
-    opened: Mutex<HashSet<String>>,
+    opened: Opened,
     progress: Progress,
     import: Import,
     problems: Problems,
@@ -469,16 +470,18 @@ impl LspClient {
         let reader_import = import.clone();
         let problems: Problems = Arc::default();
         let reader_problems = problems.clone();
+        let opened: Opened = Arc::default();
+        let reader_opened = opened.clone();
         thread::Builder::new()
             .name(format!("lsp-read-{program}"))
-            .spawn(move || read_loop(stdout, reader_out, reader_pending, reader_progress, reader_import, reader_problems))?;
+            .spawn(move || read_loop(stdout, reader_out, reader_pending, reader_progress, reader_import, reader_problems, reader_opened))?;
 
         let client = Arc::new(Self {
             out,
             pending,
             next_id: AtomicI64::new(1),
             ready: (Mutex::new(None), Condvar::new()),
-            opened: Mutex::default(),
+            opened,
             progress,
             import,
             problems,
@@ -1034,13 +1037,13 @@ fn write_message(stdin: &mut ChildStdin, message: &Value) -> Result<()> {
     Ok(())
 }
 
-fn read_loop(stdout: impl Read, out: mpsc::Sender<Out>, pending: Pending, progress: Progress, import: Import, problems: Problems) {
-    read_messages(stdout, out, &pending, progress, import, problems);
+fn read_loop(stdout: impl Read, out: mpsc::Sender<Out>, pending: Pending, progress: Progress, import: Import, problems: Problems, opened: Opened) {
+    read_messages(stdout, out, &pending, progress, import, problems, opened);
     // The server is gone: what waits for its answer need not wait out its time.
     pending.lock().unwrap().clear();
 }
 
-fn read_messages(stdout: impl Read, out: mpsc::Sender<Out>, pending: &Pending, progress: Progress, import: Import, problems: Problems) {
+fn read_messages(stdout: impl Read, out: mpsc::Sender<Out>, pending: &Pending, progress: Progress, import: Import, problems: Problems, opened: Opened) {
     let mut reader = BufReader::new(stdout);
     loop {
         let mut length = None;
@@ -1092,6 +1095,13 @@ fn read_messages(stdout: impl Read, out: mpsc::Sender<Out>, pending: &Pending, p
                     continue;
                 };
                 let mut problems = problems.lock().unwrap();
+                // A server tells of every file it looked at, most with
+                // nothing: kept only for an open one, whose editor clears
+                // what was told before.
+                if found.is_empty() && !opened.lock().unwrap().contains(uri) {
+                    problems.1.remove(uri);
+                    continue;
+                }
                 problems.0 += 1;
                 let report = problems.0;
                 problems.1.insert(uri.to_string(), (report, found));
