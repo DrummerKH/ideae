@@ -572,97 +572,109 @@ pub fn restore(repo: &Path, archive: &Path, meta: &Meta, plan: &Plan) -> Result<
         Start::Origin => crate::git::create_task_worktree(repo, &plan.branch, plan.copy_env && crate::project_config::resolve(repo).config.task.copy.is_none())?,
         Start::PrBranch(branch) => crate::git::remote_branch_worktree(repo, branch, plan.copy_env && crate::project_config::resolve(repo).config.task.copy.is_none())?,
     };
-    if let Some(copy) = crate::project_config::resolve(repo).config.task.copy {
-        crate::project_config::copy_ignored(repo, &path, &copy);
-    }
-    let branch = match &plan.start {
-        Start::Origin => plan.branch.clone(),
-        Start::PrBranch(branch) => branch.clone(),
-    };
-    let start_word = match &plan.start {
-        Start::Origin => crate::git::base_ref(&path).unwrap_or_else(|| "the main branch".into()),
-        Start::PrBranch(branch) => format!("the PR's branch {branch}"),
-    };
-    let base = git(&path, &["rev-parse", "HEAD"]).map(|h| h.trim().to_string()).unwrap_or_default();
-    let mut restored = Restored { path: path.clone(), branch, base, start_word, ..Default::default() };
-    let git_path = |name: &str| -> PathBuf {
-        git(&path, &["rev-parse", "--path-format=absolute", "--git-path", name]).map(|p| PathBuf::from(p.trim())).unwrap_or_else(|_| path.join(name))
-    };
-
-    // One pass through the archive: the work to a place of the worktree's
-    // own git folder, the sessions where their agents look.
-    let bundle = git_path("ideae-unpushed.bundle");
-    let patch = git_path("ideae-uncommitted.patch");
-    let bases: Vec<Option<PathBuf>> = plan.profiles.iter().map(|p| p.as_ref().and_then(|p| p.adapter().session_base(p, &path))).collect();
-    let mut archive_file = open(archive)?;
-    for entry in archive_file.entries().map_err(|e| e.to_string())? {
-        let mut entry = entry.map_err(|e| e.to_string())?;
-        let name = entry.path().map_err(|e| e.to_string())?.to_string_lossy().replace('\\', "/");
-        let target = match name.as_str() {
-            BUNDLE if plan.commits => Some(bundle.clone()),
-            PATCH if plan.changes => Some(patch.clone()),
-            _ => name.strip_prefix("sessions/").and_then(|rest| {
-                let (n, rel) = rest.split_once('/')?;
-                let base = bases.get(n.parse::<usize>().ok()?)?.as_ref()?;
-                Some(base.join(safe_rel(rel)?)).filter(|t| !t.exists())
-            }),
+    // Whatever goes wrong from here takes the worktree and its branch with it:
+    // left, they would come back as a plain task.
+    let filled = (|| -> Result<Restored, String> {
+        if let Some(copy) = crate::project_config::resolve(repo).config.task.copy {
+            crate::project_config::copy_ignored(repo, &path, &copy);
+        }
+        let branch = match &plan.start {
+            Start::Origin => plan.branch.clone(),
+            Start::PrBranch(branch) => branch.clone(),
         };
-        let Some(target) = target else { continue };
-        if let Some(dir) = target.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        }
-        let mut out = File::create(&target).map_err(|e| format!("{}: {e}", target.display()))?;
-        std::io::copy(&mut entry, &mut out).map_err(|e| format!("{}: {e}", target.display()))?;
-        out.flush().map_err(|e| e.to_string())?;
-        if name.starts_with("sessions/") {
-            restored.placed += 1;
-        }
-    }
+        let start_word = match &plan.start {
+            Start::Origin => crate::git::base_ref(&path).unwrap_or_else(|| "the main branch".into()),
+            Start::PrBranch(branch) => format!("the PR's branch {branch}"),
+        };
+        let base = git(&path, &["rev-parse", "HEAD"]).map(|h| h.trim().to_string()).unwrap_or_default();
+        let mut restored = Restored { path: path.clone(), branch, base, start_word, ..Default::default() };
+        let git_path = |name: &str| -> PathBuf {
+            git(&path, &["rev-parse", "--path-format=absolute", "--git-path", name]).map(|p| PathBuf::from(p.trim())).unwrap_or_else(|_| path.join(name))
+        };
 
-    restored.commits = match (meta.unpushed.is_empty(), plan.commits) {
-        (true, _) => Applied::None,
-        (false, false) => Applied::Left,
-        (false, true) => {
-            let keep = format!("refs/ideae/restored/{}", key_of(archive));
-            let bundle_s = bundle.to_string_lossy().into_owned();
-            let fetched = git(&path, &["fetch", "-q", &bundle_s, &format!("HEAD:{keep}")]);
-            let picked = fetched.and_then(|_| {
-                let mut args = vec!["cherry-pick".to_string(), "--allow-empty".into()];
-                args.extend(meta.unpushed.iter().rev().map(|c| c.sha.clone()));
-                let args: Vec<&str> = args.iter().map(String::as_str).collect();
-                git(&path, &args).inspect_err(|_| {
-                    let _ = git(&path, &["cherry-pick", "--abort"]);
-                })
-            });
-            match picked {
-                Ok(_) => {
-                    let _ = git(&path, &["update-ref", "-d", &keep]);
-                    let _ = std::fs::remove_file(&bundle);
-                    Applied::Done
-                }
-                Err(why) => {
-                    let kept = if git(&path, &["rev-parse", "--verify", "-q", &keep]).is_ok() { keep } else { bundle_s };
-                    Applied::Failed { why: first_line(&why), kept }
-                }
+        // One pass through the archive: the work to a place of the worktree's
+        // own git folder, the sessions where their agents look.
+        let bundle = git_path("ideae-unpushed.bundle");
+        let patch = git_path("ideae-uncommitted.patch");
+        let bases: Vec<Option<PathBuf>> = plan.profiles.iter().map(|p| p.as_ref().and_then(|p| p.adapter().session_base(p, &path))).collect();
+        let mut archive_file = open(archive)?;
+        for entry in archive_file.entries().map_err(|e| e.to_string())? {
+            let mut entry = entry.map_err(|e| e.to_string())?;
+            let name = entry.path().map_err(|e| e.to_string())?.to_string_lossy().replace('\\', "/");
+            let target = match name.as_str() {
+                BUNDLE if plan.commits => Some(bundle.clone()),
+                PATCH if plan.changes => Some(patch.clone()),
+                _ => name.strip_prefix("sessions/").and_then(|rest| {
+                    let (n, rel) = rest.split_once('/')?;
+                    let base = bases.get(n.parse::<usize>().ok()?)?.as_ref()?;
+                    Some(base.join(safe_rel(rel)?)).filter(|t| !t.exists())
+                }),
+            };
+            let Some(target) = target else { continue };
+            if let Some(dir) = target.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            }
+            let mut out = File::create(&target).map_err(|e| format!("{}: {e}", target.display()))?;
+            std::io::copy(&mut entry, &mut out).map_err(|e| format!("{}: {e}", target.display()))?;
+            out.flush().map_err(|e| e.to_string())?;
+            if name.starts_with("sessions/") {
+                restored.placed += 1;
             }
         }
-    };
-    restored.changes = match (meta.uncommitted.is_empty(), plan.changes) {
-        (true, _) => Applied::None,
-        (false, false) => Applied::Left,
-        (false, true) => {
-            let patch_s = patch.to_string_lossy().into_owned();
-            let applied = git(&path, &["apply", "--check", "--binary", &patch_s]).and_then(|_| git(&path, &["apply", "--binary", &patch_s]));
-            match applied {
-                Ok(_) => {
-                    let _ = std::fs::remove_file(&patch);
-                    Applied::Done
+
+        restored.commits = match (meta.unpushed.is_empty(), plan.commits) {
+            (true, _) => Applied::None,
+            (false, false) => Applied::Left,
+            (false, true) => {
+                let keep = format!("refs/ideae/restored/{}", key_of(archive));
+                let bundle_s = bundle.to_string_lossy().into_owned();
+                let fetched = git(&path, &["fetch", "-q", &bundle_s, &format!("HEAD:{keep}")]);
+                let picked = fetched.and_then(|_| {
+                    let mut args = vec!["cherry-pick".to_string(), "--allow-empty".into()];
+                    args.extend(meta.unpushed.iter().rev().map(|c| c.sha.clone()));
+                    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                    git(&path, &args).inspect_err(|_| {
+                        let _ = git(&path, &["cherry-pick", "--abort"]);
+                    })
+                });
+                match picked {
+                    Ok(_) => {
+                        let _ = git(&path, &["update-ref", "-d", &keep]);
+                        let _ = std::fs::remove_file(&bundle);
+                        Applied::Done
+                    }
+                    Err(why) => {
+                        let kept = if git(&path, &["rev-parse", "--verify", "-q", &keep]).is_ok() { keep } else { bundle_s };
+                        Applied::Failed { why: first_line(&why), kept }
+                    }
                 }
-                Err(why) => Applied::Failed { why: first_line(&why), kept: patch_s },
             }
-        }
-    };
-    Ok(restored)
+        };
+        restored.changes = match (meta.uncommitted.is_empty(), plan.changes) {
+            (true, _) => Applied::None,
+            (false, false) => Applied::Left,
+            (false, true) => {
+                let patch_s = patch.to_string_lossy().into_owned();
+                let applied = git(&path, &["apply", "--check", "--binary", &patch_s]).and_then(|_| git(&path, &["apply", "--binary", &patch_s]));
+                match applied {
+                    Ok(_) => {
+                        let _ = std::fs::remove_file(&patch);
+                        Applied::Done
+                    }
+                    Err(why) => Applied::Failed { why: first_line(&why), kept: patch_s },
+                }
+            }
+        };
+        Ok(restored)
+    })();
+    if filled.is_err() {
+        let branch = match &plan.start {
+            Start::Origin => plan.branch.as_str(),
+            Start::PrBranch(branch) => branch.as_str(),
+        };
+        let _ = crate::git::remove_task_worktree(repo, &path, branch, false);
+    }
+    filled
 }
 
 fn first_line(text: &str) -> String {
@@ -914,6 +926,11 @@ mod tests {
 
         let plan = Plan { start: Start::Origin, branch: crate::git::free_branch_name(&repo, "fix"), commits: true, changes: true, profiles: vec![Some(claude)], copy_env: false };
         assert_eq!(plan.branch, "fix-2", "origin has a fix");
+        // An archive it cannot read: no worktree or branch is left of the try.
+        let broken = Plan { branch: "broken".into(), ..plan.clone() };
+        assert!(restore(&repo, &dir.join("a-file"), &written, &broken).is_err());
+        assert!(!crate::git::branch_exists(&repo, "broken"), "its branch went with it");
+        assert!(!git(&repo, &["worktree", "list"]).unwrap().contains("broken"), "and its worktree");
         let restored = restore(&repo, &dest, &written, &plan).unwrap();
         let at = &restored.path;
         assert_eq!((&restored.commits, &restored.changes, restored.placed), (&Applied::Done, &Applied::Done, 2));
