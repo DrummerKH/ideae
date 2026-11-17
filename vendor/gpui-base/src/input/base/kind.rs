@@ -245,6 +245,23 @@ pub trait InputModeKind: sealed::Sealed + Sized + 'static {
         false
     }
 
+    /// ideae patch: takes the completion menu's selected item, when Tab should.
+    fn accept_completion_menu_item(
+        _state: &mut InputBaseState<Self>,
+        _window: &mut Window,
+        _cx: &mut gpui::Context<InputBaseState<Self>>,
+    ) -> bool {
+        false
+    }
+
+    /// ideae patch: a newline was typed; an inline completion may be asked for.
+    fn after_newline(
+        _state: &mut InputBaseState<Self>,
+        _window: &mut Window,
+        _cx: &mut gpui::Context<InputBaseState<Self>>,
+    ) {
+    }
+
     /// Whether an inline completion is waiting to be accepted.
     fn has_inline_completion(_state: &InputBaseState<Self>) -> bool {
         false
@@ -367,6 +384,8 @@ pub struct EditorExtras {
     pub(crate) hover_popover: Option<HoverPopoverState>,
     pub(crate) hover_definition: HoverDefinition,
     pub(crate) context_menu_task: Task<anyhow::Result<()>>,
+    /// ideae patch: completions were asked and have not answered; no inline suggestion meanwhile.
+    pub(crate) completion_pending: bool,
 }
 
 impl Default for EditorExtras {
@@ -380,6 +399,7 @@ impl Default for EditorExtras {
             hover_popover: None,
             hover_definition: HoverDefinition::default(),
             context_menu_task: Task::ready(Ok(())),
+            completion_pending: false,
         }
     }
 }

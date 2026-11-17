@@ -123,8 +123,8 @@ pub use lsp::{
     CompletionMenuOptions, CompletionMenuState, CompletionProvider, DefinitionProvider,
     DocumentColorProvider, DocumentRangeSemanticTokensProvider, HoverPopoverState, HoverProvider,
     INLAY_HINTS_KEY, InlayHintsProvider,
-    InputOverlayKind, Lsp, ShowDocumentHandler, highlight_characters, highlight_contains,
-    highlight_prefix,
+    InputOverlayKind, Lsp, ShowDocumentHandler, expand_snippet, highlight_characters,
+    highlight_contains, highlight_prefix,
 };
 pub use lsp_types::Position;
 pub use mask_pattern::MaskPattern;

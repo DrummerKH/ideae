@@ -158,8 +158,20 @@ impl RenderOnce for CompletionMenuItem {
                     .gap_3()
                     .justify_between()
                     // ideae patch: the name keeps its room; a long type is cut, not the name.
-                    .child(div().flex_shrink_0().child(StyledText::new(item.label.clone()).with_highlights(highlights)))
-                    .when_some(item.detail.as_ref(), |this, detail| {
+                    // The label's details follow it (`(x: Int)`), and on the right what tells
+                    // items of one name apart (their package), else the detail.
+                    .child(
+                        h_flex()
+                            .flex_shrink_0()
+                            .child(StyledText::new(item.label.clone()).with_highlights(highlights))
+                            .when_some(
+                                item.label_details.as_ref().and_then(|d| d.detail.clone()),
+                                |this, detail| this.child(div().text_color(cx.theme().muted_foreground).child(detail)),
+                            ),
+                    )
+                    .when_some(
+                        item.label_details.as_ref().and_then(|d| d.description.as_ref()).or(item.detail.as_ref()),
+                        |this, detail| {
                         this.child(
                             div().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().child(
                                 Label::new(detail.clone())
@@ -168,7 +180,8 @@ impl RenderOnce for CompletionMenuItem {
                                     .italic(),
                             ),
                         )
-                    }),
+                    },
+                    ),
             )
             .children(self.children)
     }
@@ -383,7 +396,11 @@ impl CompletionMenu {
                 .iter()
                 .enumerate()
                 .max_by_key(|(_, item)| {
-                    item.label.len() + item.detail.as_ref().map(|d| d.len()).unwrap_or(0)
+                    let details = item.label_details.as_ref();
+                    let right = details.and_then(|d| d.description.as_ref()).or(item.detail.as_ref());
+                    item.label.len()
+                        + details.and_then(|d| d.detail.as_ref()).map_or(0, |d| d.len())
+                        + right.map_or(0, |d| d.len())
                 })
                 .map(|(ix, _)| ix)
                 .unwrap_or(0);

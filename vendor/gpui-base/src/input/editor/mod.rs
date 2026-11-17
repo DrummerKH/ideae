@@ -82,6 +82,22 @@ impl InputModeKind for EditorMode {
         state.accept_inline_completion(window, cx)
     }
 
+    fn accept_completion_menu_item(
+        state: &mut InputBaseState<Self>,
+        window: &mut Window,
+        cx: &mut gpui::Context<InputBaseState<Self>>,
+    ) -> bool {
+        state.accept_completion_menu_item(window, cx)
+    }
+
+    fn after_newline(
+        state: &mut InputBaseState<Self>,
+        window: &mut Window,
+        cx: &mut gpui::Context<InputBaseState<Self>>,
+    ) {
+        state.schedule_inline_completion(window, cx);
+    }
+
     fn has_inline_completion(state: &InputBaseState<Self>) -> bool {
         state.has_inline_completion()
     }
@@ -275,6 +291,10 @@ impl crate::input::InputExtras for super::EditorExtras {
     }
 
     fn inline_completion_item(&self) -> Option<&lsp_types::InlineCompletionItem> {
+        // ideae patch: never painted under an open completion menu.
+        if self.context_menu_content.completion.open {
+            return None;
+        }
         self.inline_completion.item.as_ref()
     }
 

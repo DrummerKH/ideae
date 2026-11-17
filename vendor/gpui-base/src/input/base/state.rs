@@ -2552,6 +2552,10 @@ impl<M: InputModeKind> InputBaseState<M> {
                     self.replace_text_in_range_silent(None, &new_line_text, window, cx);
                     self.pause_blink_cursor(cx);
                 }
+                // ideae patch: the next line may be predicted.
+                if self.selections.is_single() {
+                    M::after_newline(self, window, cx);
+                }
             }
         } else {
             // Single line input or submit-on-enter: just emit the event

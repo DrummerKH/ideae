@@ -10,6 +10,8 @@ pub mod assets;
 mod http;
 pub mod prompt;
 pub mod server;
+#[cfg(test)]
+mod routing_tests;
 
 use std::{
     cell::RefCell,
@@ -142,6 +144,12 @@ impl CompletionProvider for Provider {
         match &self.inner {
             Some(inner) => inner.resolve_completions(indices, completions, cx),
             None => Task::ready(Ok(false)),
+        }
+    }
+
+    fn completion_inserted(&self, item: &lsp_types::CompletionItem, before: &Rope, range: std::ops::Range<usize>, after: &Rope, window: &mut Window, cx: &mut App) {
+        if let Some(inner) = &self.inner {
+            inner.completion_inserted(item, before, range, after, window, cx);
         }
     }
 

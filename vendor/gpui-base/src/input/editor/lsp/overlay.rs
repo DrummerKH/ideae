@@ -170,7 +170,18 @@ impl InputBaseState<EditorMode> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // ideae patch: without an edit of its own, an item takes the place of the word typed, not of a `.` that asked for it.
         let mut range = fallback_range;
+        if range.end <= self.text.len() {
+            let word: usize = self
+                .text
+                .chars_at(range.end)
+                .reversed()
+                .take_while(|ch| ch.is_alphanumeric() || *ch == '_')
+                .map(char::len_utf8)
+                .sum();
+            range.start = range.start.max(range.end - word);
+        }
         let mut new_text = item.label.clone();
         if let Some(edit) = item.text_edit.as_ref() {
             match edit {
@@ -187,13 +198,37 @@ impl InputBaseState<EditorMode> {
             }
         } else if let Some(insert_text) = item.insert_text.as_ref() {
             new_text.clone_from(insert_text);
-            range = range.end..range.end;
         }
+        // ideae patch: a snippet goes in as text, the caret at its first stop; the server adds the rest after.
+        let caret = (item.insert_text_format == Some(lsp_types::InsertTextFormat::SNIPPET)).then(|| {
+            let (text, caret) = crate::input::expand_snippet(&new_text);
+            new_text = text;
+            caret
+        });
+        let range = range.start.min(self.text.len())..range.end.clamp(range.start, self.text.len());
+        let before = self.text.clone();
         self.completion_inserting = true;
-        let range = self.range_to_utf16(&range);
-        self.replace_text_in_range_silent(Some(range), &new_text, window, cx);
+        let range_utf16 = self.range_to_utf16(&range);
+        self.replace_text_in_range_silent(Some(range_utf16), &new_text, window, cx);
         self.completion_inserting = false;
+        if let Some(caret) = caret {
+            let at = range.start;
+            self.set_selected_range(at + caret.start..at + caret.end, cx);
+        }
         self.focus(window, cx);
+        if let Some(provider) = self.extras.lsp.completion_provider.clone() {
+            let after = self.text.clone();
+            provider.completion_inserted(item, &before, range, &after, window, cx);
+        }
+        // ideae patch: once the menu's item is in, a suggestion may follow it.
+        self.schedule_inline_completion(window, cx);
+    }
+
+    /// ideae patch: the inline suggestion as it is painted, none under an open menu.
+    #[doc(hidden)]
+    pub fn inline_completion_text(&self) -> Option<&str> {
+        use crate::input::InputExtras as _;
+        self.extras.inline_completion_item().map(|item| item.insert_text.as_str())
     }
 
     #[doc(hidden)]

@@ -1310,10 +1310,82 @@ impl CompletionProvider for LspBridge {
             cx.background_spawn(crate::procs::on_thread(move || {
                 // The server answers about the text it has: this one, typed a moment ago.
                 client.did_change(&path, 0, &text.to_string())?;
-                client.completion(&uri, pos, trigger.trigger_character)
+                let items = match client.completion(&uri, pos, trigger.trigger_character)? {
+                    lsp_types::CompletionResponse::Array(items) => items,
+                    lsp_types::CompletionResponse::List(list) => list.items,
+                };
+                let typed: String = text.chars_at(offset).reversed().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                let typed: String = typed.chars().rev().collect();
+                Ok(lsp_types::CompletionResponse::Array(lsp::arrange_completions(items, &typed)))
             }))
             .await
         })
+    }
+
+    /// What the server adds to an item taken from the menu: what it left
+    /// out of the list (asked for now), the edits beside it (an import),
+    /// then its command, whose edits and caret the server asks back for.
+    fn completion_inserted(
+        &self,
+        item: &lsp_types::CompletionItem,
+        before: &Rope,
+        range: std::ops::Range<usize>,
+        after: &Rope,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let resolve = item.additional_text_edits.is_none() && self.client.resolves_completions();
+        if !resolve && item.additional_text_edits.as_ref().is_none_or(Vec::is_empty) && item.command.is_none() {
+            return;
+        }
+        let inserted = after.len() + range.len() - before.len();
+        let (client, path, file, item) = (self.client.clone(), self.path.clone(), self.file.clone(), item.clone());
+        let (before, after) = (before.clone(), after.clone());
+        window
+            .spawn(cx, async move |cx| {
+                let item = if resolve {
+                    let (client, asked) = (client.clone(), item.clone());
+                    let resolved = cx.background_spawn(crate::procs::on_thread(move || client.resolve_completion(&asked))).await;
+                    // Some servers answer with the item alone, without what it had.
+                    resolved.map(|r| lsp_types::CompletionItem { command: r.command.clone().or(item.command.clone()), ..r }).unwrap_or(item)
+                } else {
+                    item
+                };
+                if let Some(edits) = item.additional_text_edits.filter(|e| !e.is_empty()) {
+                    let unchanged = after.clone();
+                    let new = cx
+                        .background_spawn(async move {
+                            lsp::apply_edits_around(&before.to_string(), range, inserted, &after.to_string(), &edits)
+                        })
+                        .await;
+                    file.update_in(cx, |file, window, cx| {
+                        if *file.editor.read(cx).text() == unchanged {
+                            file.edit(window, cx, |text, selection| crate::edit::rewrite(text, &new, selection.start));
+                        }
+                    })?;
+                }
+                let Some(command) = item.command else { return anyhow::Ok(()) };
+                let text = file.read_with(cx, |file, cx| file.editor.read(cx).text().clone())?;
+                let done = cx
+                    .background_spawn(crate::procs::on_thread(move || {
+                        client.did_change(&path, 0, &text.to_string())?;
+                        client.execute_command(&command)
+                    }))
+                    .await?;
+                file.update_in(cx, |file, window, cx| {
+                    for edit in &done.edits {
+                        file.apply_workspace_edit(edit, window, cx, |_, _, _| {});
+                    }
+                    let Some((uri, selection)) = done.show else { return };
+                    if lsp::uri_to_path(&uri).as_deref() != Some(file.path.as_path()) {
+                        return;
+                    }
+                    let text = file.editor.read(cx).text().to_string();
+                    let (start, end) = (lsp::offset_of(&text, &selection.start), lsp::offset_of(&text, &selection.end));
+                    file.editor.update(cx, |state, cx| state.set_selected_range(start..end, cx));
+                })
+            })
+            .detach();
     }
 
     fn is_completion_trigger(&self, _: usize, new_text: &str, _: &mut App) -> bool {

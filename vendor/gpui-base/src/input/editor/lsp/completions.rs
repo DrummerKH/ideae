@@ -104,6 +104,126 @@ pub fn highlight_characters(query: &str, item: &CompletionItem) -> Vec<Range<usi
     ranges
 }
 
+/// ideae patch: an LSP snippet as plain text, and where the caret goes.
+///
+/// Tabstops (`$1`, `${1}`), placeholders (`${1:name}`, nested), choices
+/// (`${1|a,b|}`, the first) and variables (`$TM_FILENAME`, `${VAR:default}`,
+/// their default) become their text. The returned range is the first
+/// tabstop's text (`$1` before `$2`, `$0` last), selected when it has a
+/// placeholder; with no tabstop, the end.
+pub fn expand_snippet(snippet: &str) -> (String, Range<usize>) {
+    let mut out = String::with_capacity(snippet.len());
+    let mut stops: Vec<(u32, Range<usize>)> = Vec::new();
+    expand_snippet_into(&mut snippet.chars().peekable(), &mut out, &mut stops, false);
+    let first = stops
+        .iter()
+        .filter(|(n, _)| *n > 0)
+        .min_by_key(|(n, _)| *n)
+        .or_else(|| stops.iter().find(|(n, _)| *n == 0))
+        .map(|(_, range)| range.clone());
+    let end = out.len();
+    (out, first.unwrap_or(end..end))
+}
+
+fn expand_snippet_into(
+    chars: &mut std::iter::Peekable<std::str::Chars>,
+    out: &mut String,
+    stops: &mut Vec<(u32, Range<usize>)>,
+    nested: bool,
+) {
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some(next @ ('$' | '}' | '\\')) => out.push(next),
+                Some(next) => {
+                    out.push('\\');
+                    out.push(next);
+                }
+                None => out.push('\\'),
+            },
+            '}' if nested => return,
+            '$' => match chars.peek().copied() {
+                Some(d) if d.is_ascii_digit() => {
+                    let n = snippet_number(chars);
+                    stops.push((n, out.len()..out.len()));
+                }
+                Some('{') => {
+                    chars.next();
+                    if chars.peek().is_some_and(|d| d.is_ascii_digit()) {
+                        let n = snippet_number(chars);
+                        let start = out.len();
+                        match chars.next() {
+                            Some(':') => expand_snippet_into(chars, out, stops, true),
+                            Some('|') => {
+                                let mut first = true;
+                                while let Some(c) = chars.next() {
+                                    match c {
+                                        '|' => {
+                                            if chars.peek() == Some(&'}') {
+                                                chars.next();
+                                            }
+                                            break;
+                                        }
+                                        ',' => first = false,
+                                        '\\' => {
+                                            if let (true, Some(next)) = (first, chars.next()) {
+                                                out.push(next);
+                                            }
+                                        }
+                                        c if first => out.push(c),
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                        stops.push((n, start..out.len()));
+                    } else {
+                        while chars.peek().is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_') {
+                            chars.next();
+                        }
+                        match chars.next() {
+                            Some(':') => expand_snippet_into(chars, out, stops, true),
+                            Some('}') | None => {}
+                            Some(_) => {
+                                let mut depth = 1;
+                                for c in chars.by_ref() {
+                                    match c {
+                                        '{' => depth += 1,
+                                        '}' => {
+                                            depth -= 1;
+                                            if depth == 0 {
+                                                break;
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(v) if v.is_ascii_alphabetic() || v == '_' => {
+                    while chars.peek().is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_') {
+                        chars.next();
+                    }
+                }
+                _ => out.push('$'),
+            },
+            c => out.push(c),
+        }
+    }
+}
+
+fn snippet_number(chars: &mut std::iter::Peekable<std::str::Chars>) -> u32 {
+    let mut n = 0u32;
+    while let Some(d) = chars.peek().and_then(|c| c.to_digit(10)) {
+        n = n.saturating_mul(10).saturating_add(d);
+        chars.next();
+    }
+    n
+}
+
 fn chars_eq_ignore_case(left: char, right: char) -> bool {
     left == right
         || left.eq_ignore_ascii_case(&right)
@@ -202,6 +322,19 @@ pub trait CompletionProvider {
         Task::ready(Ok(false))
     }
 
+    /// ideae patch: `item` went in over `range` of `before`, which is now
+    /// `after`; what the server adds to it (imports, a command) follows here.
+    fn completion_inserted(
+        &self,
+        _item: &CompletionItem,
+        _before: &Rope,
+        _range: Range<usize>,
+        _after: &Rope,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) {
+    }
+
     /// Determines if the completion should be triggered based on the given byte offset.
     ///
     /// This is called on the main thread.
@@ -213,6 +346,14 @@ pub(crate) struct InlineCompletion {
     pub(crate) item: Option<InlineCompletionItem>,
     /// Task for debouncing inline completion requests
     pub(crate) task: Task<Result<InlineCompletionResponse>>,
+    /// ideae patch: the suggestion the last clear took away, for an edit that types along it.
+    pub(crate) cleared: Option<ClearedInlineCompletion>,
+}
+
+pub(crate) struct ClearedInlineCompletion {
+    item: InlineCompletionItem,
+    cursor: usize,
+    len: usize,
 }
 
 impl Default for InlineCompletion {
@@ -220,6 +361,7 @@ impl Default for InlineCompletion {
         Self {
             item: None,
             task: Task::ready(Ok(InlineCompletionResponse::Array(vec![]))),
+            cleared: None,
         }
     }
 }
@@ -227,7 +369,7 @@ impl Default for InlineCompletion {
 impl InputBaseState<EditorMode> {
     pub(crate) fn handle_completion_trigger(
         &mut self,
-        _range: &Range<usize>,
+        range: &Range<usize>,
         new_text: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -239,6 +381,11 @@ impl InputBaseState<EditorMode> {
         let Some(provider) = self.extras.lsp.completion_provider.clone() else {
             return;
         };
+
+        // ideae patch: typing what the suggestion shows keeps the rest of it, and no menu comes over it.
+        if self.follow_inline_completion(range, new_text, cx) {
+            return;
+        }
 
         // Always schedule inline completion (debounced).
         // It will check if menu is open before showing the suggestion.
@@ -374,7 +521,9 @@ impl InputBaseState<EditorMode> {
     ) {
         let new_offset = self.cursor();
         let revision = self.document_revision;
+        let invoked = completion_context.trigger_kind == lsp_types::CompletionTriggerKind::INVOKED;
         self.extras.context_menu_task = Task::ready(Ok(()));
+        self.extras.completion_pending = true;
         self.extras.context_menu_content.code_action.open = false;
         self.extras
             .context_menu_content
@@ -399,6 +548,7 @@ impl InputBaseState<EditorMode> {
 
             editor
                 .update_in(cx, |editor, window, cx| {
+                    editor.extras.completion_pending = false;
                     if !editor.focus_handle.is_focused(window)
                         || editor.document_revision != revision
                         || editor.cursor() != new_offset
@@ -409,6 +559,14 @@ impl InputBaseState<EditorMode> {
                         return;
                     }
 
+                    // ideae patch: the menu wins over a suggestion; with nothing to show, a typed word may get one.
+                    if completions.is_empty() {
+                        if !invoked && !editor.has_inline_completion() {
+                            editor.schedule_inline_completion(window, cx);
+                        }
+                    } else {
+                        editor.clear_inline_completion(cx);
+                    }
                     editor.extras.context_menu_content.completion.open = !completions.is_empty();
                     editor.extras.context_menu_content.completion.items = completions;
                     editor.extras.context_menu_content.completion.bump();
@@ -424,7 +582,24 @@ impl InputBaseState<EditorMode> {
         self.extras.context_menu_content.completion.open = false;
         self.extras.context_menu_content.code_action.open = false;
         self.extras.context_menu_task = Task::ready(Ok(()));
+        self.extras.completion_pending = false;
         cx.notify();
+    }
+
+    /// ideae patch: Tab on an open completion menu takes its selected item.
+    pub(crate) fn accept_completion_menu_item(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.extras.context_menu_content.completion.open {
+            return false;
+        }
+        let enter = crate::input::Enter {
+            secondary: false,
+            shift: false,
+        };
+        self.handle_action_for_context_menu(Box::new(enter), window, cx)
     }
 
     pub(crate) fn is_context_menu_open(&self, _cx: &gpui::App) -> bool {
@@ -493,7 +668,8 @@ impl InputBaseState<EditorMode> {
                 }
 
                 // Don't fetch if completion menu is open
-                if editor.is_context_menu_open(cx) {
+                // ideae patch: or is still being asked for.
+                if editor.is_context_menu_open(cx) || editor.extras.completion_pending {
                     return None;
                 }
 
@@ -518,7 +694,7 @@ impl InputBaseState<EditorMode> {
                 }
 
                 // Don't show if completion menu opened while we were fetching
-                if editor.is_context_menu_open(cx) {
+                if editor.is_context_menu_open(cx) || editor.extras.completion_pending {
                     return;
                 }
 
@@ -543,8 +719,54 @@ impl InputBaseState<EditorMode> {
 
     /// Clear the inline completion suggestion.
     pub(crate) fn clear_inline_completion(&mut self, cx: &mut Context<Self>) {
-        self.extras.inline_completion = InlineCompletion::default();
+        let cleared = self.extras.inline_completion.item.take().map(|item| ClearedInlineCompletion {
+            item,
+            cursor: self.cursor(),
+            len: self.text.len(),
+        });
+        self.extras.inline_completion = InlineCompletion {
+            cleared,
+            ..InlineCompletion::default()
+        };
         cx.notify();
+    }
+
+    /// ideae patch: an edit that typed the start of the suggestion just
+    /// cleared, at its cursor, brings back the rest of it.
+    fn follow_inline_completion(
+        &mut self,
+        range: &Range<usize>,
+        new_text: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(cleared) = self.extras.inline_completion.cleared.take() else {
+            return false;
+        };
+        if !range.is_empty()
+            || range.start != cleared.cursor
+            || new_text.is_empty()
+            || new_text.contains('\n')
+            || !self.selections.is_single()
+            || self.ime_marked_range.is_some()
+            || self.cursor() != range.start + new_text.len()
+            || self.text.len() != cleared.len + new_text.len()
+        {
+            return false;
+        }
+        let mut item = cleared.item;
+        match item.insert_text.strip_prefix(new_text) {
+            Some(rest) if !rest.is_empty() => item.insert_text = rest.to_string(),
+            _ => return false,
+        }
+        if let Some(replaced) = item.range.as_mut() {
+            if replaced.end.line == replaced.start.line {
+                replaced.end.character += new_text.encode_utf16().count() as u32;
+            }
+            replaced.start = self.text.offset_to_position(self.cursor());
+        }
+        self.extras.inline_completion.item = Some(item);
+        cx.notify();
+        true
     }
 
     /// Accept the inline completion, inserting it at the cursor position.
@@ -567,6 +789,8 @@ impl InputBaseState<EditorMode> {
         let range_utf16 = self.range_to_utf16(&(cursor..end));
         let completion_text = completion_item.insert_text;
         self.replace_text_in_range_silent(Some(range_utf16), &completion_text, window, cx);
+        // ideae patch: what comes after it is asked for at once.
+        self.schedule_inline_completion(window, cx);
         true
     }
 }

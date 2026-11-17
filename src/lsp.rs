@@ -25,6 +25,9 @@ type Import = Arc<Mutex<ImportState>>;
 /// What the server last found wrong in each file, by uri, and a count of
 /// its reports: a file's view looks again when that moved.
 type Opened = Arc<Mutex<HashSet<String>>>;
+/// While a command of ours runs: the edits and the place the server asked
+/// the editor to apply and show (`workspace/applyEdit`, `window/showDocument`).
+type Commanded = Arc<Mutex<Option<Vec<(String, Value)>>>>;
 type Problems = Arc<Mutex<(u64, HashMap<String, (u64, Vec<lsp_types::Diagnostic>)>)>>;
 
 /// The server's import of the build: its errors so far, and how it ended.
@@ -130,10 +133,20 @@ pub struct LspClient {
     /// `capabilities` from the server's answer to `initialize`.
     capabilities: Mutex<Value>,
     child: Mutex<Option<Child>>,
+    commanded: Commanded,
+    /// One command at a time: what the server asks while it runs is its.
+    command: Mutex<()>,
 }
 
 /// Power saving: no language servers run, none start.
 pub static POWER_SAVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What a command asked of the editor: edits, then a place to show.
+#[derive(Debug, Default)]
+pub struct CommandDone {
+    pub edits: Vec<lsp_types::WorkspaceEdit>,
+    pub show: Option<(String, lsp_types::Range)>,
+}
 
 /// The server for a file: its language id, its name, the executable to run
 /// (a name on PATH or a path ideae installed it at) and its arguments.
@@ -599,10 +612,12 @@ impl LspClient {
         let opened: Opened = Arc::default();
         let reader_opened = opened.clone();
         let reader_settings = settings(program);
+        let commanded: Commanded = Arc::default();
+        let reader_commanded = commanded.clone();
         thread::Builder::new()
             .name(format!("lsp-read-{program}"))
             .spawn(move || {
-                read_loop(stdout, reader_out, reader_pending, reader_progress, reader_import, reader_problems, reader_opened, reader_settings)
+                read_loop(stdout, reader_out, reader_pending, reader_progress, reader_import, reader_problems, reader_opened, reader_commanded, reader_settings)
             })?;
 
         let client = Arc::new(Self {
@@ -616,6 +631,8 @@ impl LspClient {
             problems,
             capabilities: Mutex::new(Value::Null),
             child: Mutex::new(Some(child)),
+            commanded,
+            command: Mutex::new(()),
         });
 
         let init = client.clone();
@@ -656,7 +673,14 @@ impl LspClient {
                         "references": {},
                         "synchronization": { "didSave": false },
                         // Plain text to insert: the editor has no snippets.
-                        "completion": { "completionItem": { "snippetSupport": false, "documentationFormat": ["markdown", "plaintext"] } },
+                        "completion": {
+                            "completionItem": {
+                                "snippetSupport": true,
+                                "labelDetailsSupport": true,
+                                "documentationFormat": ["markdown", "plaintext"],
+                                "resolveSupport": { "properties": ["additionalTextEdits", "command", "detail", "documentation"] },
+                            },
+                        },
                         "publishDiagnostics": {},
                         "codeAction": {
                             "codeActionLiteralSupport": { "codeActionKind": { "valueSet": ["quickfix", "refactor", "source"] } },
@@ -684,9 +708,10 @@ impl LspClient {
                         "workspaceFolders": true,
                         "configuration": true,
                         "workspaceEdit": { "documentChanges": true },
+                        "applyEdit": true,
                         "symbol": {},
                     },
-                    "window": { "workDoneProgress": true },
+                    "window": { "workDoneProgress": true, "showDocument": { "support": true } },
                 },
             }),
         )?;
@@ -844,6 +869,37 @@ impl LspClient {
         };
         let value = self.raw_request("textDocument/completion", params)?;
         Ok(serde_json::from_value::<Option<lsp_types::CompletionResponse>>(value)?.unwrap_or(lsp_types::CompletionResponse::Array(Vec::new())))
+    }
+
+    /// Whether an item may come with only part of itself, the rest asked for.
+    pub fn resolves_completions(&self) -> bool {
+        self.capabilities.lock().unwrap()["completionProvider"]["resolveProvider"] == true
+    }
+
+    /// completionItem/resolve: the item with what the server left out of the list.
+    pub fn resolve_completion(&self, item: &lsp_types::CompletionItem) -> Result<lsp_types::CompletionItem> {
+        let value = self.raw_request("completionItem/resolve", serde_json::to_value(item)?)?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// workspace/executeCommand, with the edits and the place the server
+    /// asked to apply and show while it ran.
+    pub fn execute_command(&self, command: &lsp_types::Command) -> Result<CommandDone> {
+        let _one = self.command.lock().unwrap_or_else(|e| e.into_inner());
+        *self.commanded.lock().unwrap() = Some(Vec::new());
+        let params = json!({ "command": command.command, "arguments": command.arguments.clone().unwrap_or_default() });
+        let answer = self.raw_request("workspace/executeCommand", params);
+        let asked = self.commanded.lock().unwrap().take().unwrap_or_default();
+        answer?;
+        let mut done = CommandDone::default();
+        for (method, params) in asked {
+            if method == "workspace/applyEdit" {
+                done.edits.extend(serde_json::from_value::<lsp_types::WorkspaceEdit>(params["edit"].clone()).ok());
+            } else if let (Some(uri), Ok(selection)) = (params["uri"].as_str(), serde_json::from_value::<lsp_types::Range>(params["selection"].clone())) {
+                done.show = Some((uri.to_string(), selection));
+            }
+        }
+        Ok(done)
     }
 
     /// The characters after which the server wants to be asked to complete.
@@ -1077,13 +1133,48 @@ pub fn edits_by_file(edit: &lsp_types::WorkspaceEdit) -> Vec<(PathBuf, Vec<lsp_t
 /// `text` with the edits made: each range is of the text as it was.
 /// Columns count characters, as the client told the server.
 pub fn apply_edits(text: &str, edits: &[lsp_types::TextEdit]) -> String {
+    let offset = offsets(text);
+    let ranges = edits.iter().map(|e| (offset(&e.range.start), offset(&e.range.end), e.new_text.as_str())).collect();
+    apply_ranges(text, ranges)
+}
+
+/// A position of `text` to its byte offset; past the end, the end.
+fn offsets(text: &str) -> impl Fn(&lsp_types::Position) -> usize + '_ {
     let lines: Vec<usize> = std::iter::once(0).chain(text.match_indices('\n').map(|(i, _)| i + 1)).collect();
-    let offset = |pos: &lsp_types::Position| {
+    move |pos: &lsp_types::Position| {
         let Some(&start) = lines.get(pos.line as usize) else { return text.len() };
         let line = &text[start..lines.get(pos.line as usize + 1).map_or(text.len(), |next| next - 1)];
         start + line.char_indices().nth(pos.character as usize).map_or(line.len(), |(i, _)| i)
-    };
-    let mut ranges: Vec<(usize, usize, &str)> = edits.iter().map(|e| (offset(&e.range.start), offset(&e.range.end), e.new_text.as_str())).collect();
+    }
+}
+
+/// The byte offset of a place the server named in `text`.
+pub fn offset_of(text: &str, pos: &lsp_types::Position) -> usize {
+    offsets(text)(pos)
+}
+
+/// The edits that come with a completion (an import), placed in `before`,
+/// made in `after`: `before` with `range` replaced by `inserted` bytes.
+/// One that reaches into what the completion replaced is left out.
+pub fn apply_edits_around(before: &str, range: std::ops::Range<usize>, inserted: usize, after: &str, edits: &[lsp_types::TextEdit]) -> String {
+    let offset = offsets(before);
+    let ranges = edits
+        .iter()
+        .filter_map(|e| {
+            let (start, end) = (offset(&e.range.start), offset(&e.range.end));
+            if end <= range.start {
+                Some((start, end, e.new_text.as_str()))
+            } else if start >= range.end {
+                Some((start - range.end + range.start + inserted, end - range.end + range.start + inserted, e.new_text.as_str()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    apply_ranges(after, ranges)
+}
+
+fn apply_ranges(text: &str, mut ranges: Vec<(usize, usize, &str)>) -> String {
     // From the end, so that what is before an edit keeps its place.
     ranges.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
     // What is still as it was: an edit that reaches into one already made
@@ -1107,6 +1198,58 @@ pub fn apply_edits(text: &str, edits: &[lsp_types::TextEdit]) -> String {
     }
     out.push_str(&text[at..]);
     out
+}
+
+/// A server's completions as the menu lists them: those the typed word
+/// does not match left out (by `filterText`, else the label, its letters
+/// in order), in the server's order (`sortText`, else the label), and an
+/// item that is another's twin in all that is shown and done merged into
+/// it. Twins in look that differ in what they add (an import) show it.
+pub fn arrange_completions(items: Vec<lsp_types::CompletionItem>, typed: &str) -> Vec<lsp_types::CompletionItem> {
+    let typed: Vec<char> = typed.chars().flat_map(char::to_lowercase).collect();
+    let matches = |item: &lsp_types::CompletionItem| {
+        let mut wanted = typed.iter().peekable();
+        for c in item.filter_text.as_deref().unwrap_or(&item.label).chars().flat_map(char::to_lowercase) {
+            if wanted.peek() == Some(&&c) {
+                wanted.next();
+            }
+        }
+        wanted.peek().is_none()
+    };
+    let mut items: Vec<lsp_types::CompletionItem> = items.into_iter().filter(matches).collect();
+    items.sort_by(|a, b| a.sort_text.as_deref().unwrap_or(&a.label).cmp(b.sort_text.as_deref().unwrap_or(&b.label)));
+    let new_text = |item: &lsp_types::CompletionItem| match &item.text_edit {
+        Some(lsp_types::CompletionTextEdit::Edit(edit)) => Some(edit.new_text.clone()),
+        Some(lsp_types::CompletionTextEdit::InsertAndReplace(edit)) => Some(edit.new_text.clone()),
+        None => item.insert_text.clone(),
+    };
+    let look = |item: &lsp_types::CompletionItem| {
+        serde_json::to_string(&(&item.label, item.kind, &item.detail, &item.label_details)).unwrap_or_default()
+    };
+    let mut seen: HashSet<String> = HashSet::new();
+    items.retain(|item| {
+        let does = serde_json::to_string(&(new_text(item), &item.additional_text_edits, item.command.as_ref().map(|c| &c.command))).unwrap_or_default();
+        seen.insert(look(item) + &does)
+    });
+    let mut looks: HashMap<String, usize> = HashMap::new();
+    for item in &items {
+        *looks.entry(look(item)).or_default() += 1;
+    }
+    for item in &mut items {
+        if looks.get(&look(item)).copied().unwrap_or(0) < 2 {
+            continue;
+        }
+        let Some(added) = item.additional_text_edits.as_ref().and_then(|edits| edits.iter().map(|e| e.new_text.trim()).find(|t| !t.is_empty())) else {
+            continue;
+        };
+        let added = added.lines().next().unwrap_or_default().to_string();
+        let details = item.label_details.get_or_insert_default();
+        details.description = Some(match details.description.take() {
+            Some(was) => format!("{was} · {added}"),
+            None => added,
+        });
+    }
+    items
 }
 
 fn position_params(uri: &str, pos: lsp_types::Position) -> Value {
@@ -1198,9 +1341,10 @@ fn read_loop(
     import: Import,
     problems: Problems,
     opened: Opened,
+    commanded: Commanded,
     settings: Value,
 ) {
-    read_messages(stdout, out, &pending, progress, import, problems, opened, &settings);
+    read_messages(stdout, out, &pending, progress, import, problems, opened, &commanded, &settings);
     // The server is gone: what waits for its answer need not wait out its time.
     pending.lock().unwrap().clear();
 }
@@ -1214,6 +1358,7 @@ fn read_messages(
     import: Import,
     problems: Problems,
     opened: Opened,
+    commanded: &Commanded,
     settings: &Value,
 ) {
     let mut reader = BufReader::new(stdout);
@@ -1243,9 +1388,25 @@ fn read_messages(
         match (message.get("id"), message.get("method")) {
             // A request from the server. Answer so it never waits on us.
             (Some(id), Some(method)) => {
+                let method = method.as_str().unwrap_or_default();
                 let result = if method == "workspace/configuration" {
                     let items = message["params"]["items"].as_array().map(Vec::as_slice).unwrap_or_default();
                     Value::Array(items.iter().map(|item| section(settings, item["section"].as_str().unwrap_or_default())).collect())
+                } else if method == "workspace/applyEdit" || method == "window/showDocument" {
+                    // Applied by the editor once the command answers; asked
+                    // outside of one, refused rather than left undone unsaid.
+                    let taken = match commanded.lock().unwrap().as_mut() {
+                        Some(asked) => {
+                            asked.push((method.to_string(), message["params"].clone()));
+                            true
+                        }
+                        None => false,
+                    };
+                    match method {
+                        "workspace/applyEdit" if taken => json!({ "applied": true }),
+                        "workspace/applyEdit" => json!({ "applied": false, "failureReason": "only during a command the editor ran" }),
+                        _ => json!({ "success": taken }),
+                    }
                 } else {
                     Value::Null
                 };
@@ -1519,6 +1680,76 @@ fn server_env(program: &str) -> Vec<(&'static str, PathBuf)> {
         std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Android/Sdk"))
     };
     sdk.filter(|dir| dir.is_dir()).map(|dir| ("ANDROID_HOME", dir)).into_iter().collect()
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use lsp_types::{CompletionItem, CompletionItemLabelDetails, Position, Range, TextEdit};
+
+    fn item(label: &str, sort: &str) -> CompletionItem {
+        CompletionItem { label: label.into(), sort_text: Some(sort.into()), ..Default::default() }
+    }
+
+    fn import(line: &str) -> Option<Vec<TextEdit>> {
+        Some(vec![TextEdit { range: Range::new(Position::new(0, 0), Position::new(0, 0)), new_text: format!("{line}\n") }])
+    }
+
+    #[test]
+    fn twins_are_merged_and_namesakes_told_apart() {
+        let package = |label: &str, sort: &str, package: Option<&str>| CompletionItem {
+            label_details: package.map(|p| CompletionItemLabelDetails { detail: None, description: Some(p.into()) }),
+            ..item(label, sort)
+        };
+        let items = vec![
+            package("Main", "1", Some("app")),
+            package("Main", "2", Some("app")),
+            package("Main", "3", Some("tools")),
+            CompletionItem { additional_text_edits: import("import a.Main"), ..item("Main", "4") },
+            CompletionItem { additional_text_edits: import("import b.Main"), ..item("Main", "5") },
+            CompletionItem { additional_text_edits: import("import b.Main"), ..item("Main", "6") },
+            item("main", "0"),
+        ];
+        let shown: Vec<(String, Option<String>)> = super::arrange_completions(items, "Ma")
+            .into_iter()
+            .map(|i| (i.label, i.label_details.and_then(|d| d.description)))
+            .collect();
+        let expected = [
+            ("main", None),
+            ("Main", Some("app")),
+            ("Main", Some("tools")),
+            ("Main", Some("import a.Main")),
+            ("Main", Some("import b.Main")),
+        ];
+        assert_eq!(shown, expected.map(|(l, d)| (l.to_string(), d.map(str::to_string))));
+    }
+
+    #[test]
+    fn the_typed_word_filters_and_sort_text_orders() {
+        let items = vec![
+            item("zeta", "2"),
+            CompletionItem { filter_text: Some("println".into()), ..item("println!", "1") },
+            item("print", "3"),
+            item("other", "0"),
+        ];
+        let labels: Vec<String> = super::arrange_completions(items, "PRn").into_iter().map(|i| i.label).collect();
+        assert_eq!(labels, ["println!", "print"]);
+        assert_eq!(super::arrange_completions(vec![item("b", "2"), item("a", "1")], "").len(), 2);
+    }
+
+    #[test]
+    fn edits_beside_a_completion_land_around_it() {
+        let before = "fn main() {\n    Has\n}\n";
+        let at = before.find("Has").unwrap();
+        let after = before.replace("Has", "HashMap::new()");
+        let edits = vec![
+            TextEdit { range: Range::new(Position::new(0, 0), Position::new(0, 0)), new_text: "use std::collections::HashMap;\n\n".into() },
+            TextEdit { range: Range::new(Position::new(2, 1), Position::new(2, 1)), new_text: " // end".into() },
+            TextEdit { range: Range::new(Position::new(1, 5), Position::new(1, 6)), new_text: "x".into() },
+        ];
+        let made = super::apply_edits_around(before, at..at + 3, "HashMap::new()".len(), &after, &edits);
+        assert_eq!(made, "use std::collections::HashMap;\n\nfn main() {\n    HashMap::new()\n} // end\n");
+        assert_eq!(super::offset_of("ab\nc你d", &Position::new(1, 2)), 7);
+    }
 }
 
 #[cfg(test)]
@@ -2013,6 +2244,165 @@ mod server_tests {
         drop(client);
         let _ = std::fs::remove_dir_all(&base);
         Answers { hover, definition, hints }
+    }
+
+    fn position_of(text: &str, offset: usize) -> lsp_types::Position {
+        let line_start = text[..offset].rfind('\n').map_or(0, |i| i + 1);
+        let line = text[..line_start].matches('\n').count() as u32;
+        lsp_types::Position::new(line, text[line_start..offset].chars().count() as u32)
+    }
+
+    /// The first file with `|` where the cursor is: completion there, the
+    /// item `chosen` picks taken as the editor takes it (its edit or
+    /// snippet over the typed word, resolved, the edits beside it, then its
+    /// command and what that asks back). The text after it, and the cursor.
+    fn accept(program: &str, files: &[(&str, &str)], chosen: &dyn Fn(&lsp_types::CompletionItem) -> bool) -> (String, usize) {
+        let base = std::env::temp_dir().join(format!("ideae-accept-{program}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let text = files[0].1.replace('|', "");
+        let cursor = files[0].1.find('|').unwrap();
+        for (i, (name, content)) in files.iter().enumerate() {
+            let path = base.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, if i == 0 { text.as_str() } else { content }).unwrap();
+        }
+        let file = base.join(files[0].0);
+        let (language, _, args) = known(&file).unwrap();
+        let command = locate(program).unwrap_or_else(|| panic!("{program} is not installed"));
+        let root = project_root(program, &file, &base);
+        let options = crate::lsp_install::init_options(program, &command);
+        let client = LspClient::spawn(program, &command, args, &root, options).unwrap();
+        client.did_open(&file, language, &text).unwrap();
+        let uri = path_to_uri(&file);
+        let typed: String = text[..cursor].chars().rev().take_while(|c| c.is_alphanumeric() || *c == '_').collect::<Vec<_>>().into_iter().rev().collect();
+        let started = std::time::Instant::now();
+        let item = loop {
+            let items = match client.completion(&uri, position_of(&text, cursor), None) {
+                Ok(lsp_types::CompletionResponse::Array(items)) => items,
+                Ok(lsp_types::CompletionResponse::List(list)) => list.items,
+                Err(_) => Vec::new(),
+            };
+            if let Some(item) = arrange_completions(items, &typed).into_iter().find(|item| chosen(item)) {
+                break item;
+            }
+            assert!(started.elapsed() < Duration::from_secs(240), "{program}: the item never came");
+            thread::sleep(Duration::from_secs(1));
+        };
+        eprintln!("{program}: {}", serde_json::to_string(&item).unwrap());
+
+        let word = cursor - typed.len();
+        let (mut range, mut new_text) = (word..cursor, item.label.clone());
+        match &item.text_edit {
+            Some(lsp_types::CompletionTextEdit::Edit(edit)) => {
+                range = offset_of(&text, &edit.range.start)..offset_of(&text, &edit.range.end);
+                new_text.clone_from(&edit.new_text);
+            }
+            Some(lsp_types::CompletionTextEdit::InsertAndReplace(edit)) => {
+                range = offset_of(&text, &edit.replace.start)..offset_of(&text, &edit.replace.end);
+                new_text.clone_from(&edit.new_text);
+            }
+            None => new_text = item.insert_text.clone().unwrap_or(new_text),
+        }
+        let mut caret = new_text.len()..new_text.len();
+        if item.insert_text_format == Some(lsp_types::InsertTextFormat::SNIPPET) {
+            (new_text, caret) = gpui_kit::base::input::expand_snippet(&new_text);
+        }
+        let mut after = format!("{}{new_text}{}", &text[..range.start], &text[range.end..]);
+        let mut at = range.start + caret.start;
+        let item = if item.additional_text_edits.is_none() && client.resolves_completions() {
+            let resolved = client.resolve_completion(&item).unwrap();
+            lsp_types::CompletionItem { command: resolved.command.clone().or(item.command), ..resolved }
+        } else {
+            item
+        };
+        if let Some(edits) = &item.additional_text_edits {
+            let made = apply_edits_around(&text, range.clone(), new_text.len(), &after, edits);
+            at += made.len() - after.len();
+            after = made;
+        }
+        if let Some(command) = &item.command {
+            client.did_change(&file, 0, &after).unwrap();
+            let done = client.execute_command(command).unwrap();
+            for edit in &done.edits {
+                for (path, edits) in edits_by_file(edit) {
+                    assert_eq!(path.canonicalize().unwrap(), file.canonicalize().unwrap());
+                    after = apply_edits(&after, &edits);
+                }
+            }
+            if let Some((_, selection)) = done.show {
+                at = offset_of(&after, &selection.start);
+            }
+        }
+        drop(client);
+        let _ = std::fs::remove_dir_all(&base);
+        (after, at)
+    }
+
+    /// rust-analyzer: a type not imported yet comes with its `use`, a
+    /// method as a snippet with the caret inside its parentheses.
+    #[test]
+    #[ignore]
+    fn rust_analyzer_completion_imports_and_snippets() {
+        let cargo = ("Cargo.toml", "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+        let main = "fn main() {\n    let m: HashMa| = Default::default();\n}\n";
+        let (text, _) = accept("rust-analyzer", &[("src/main.rs", main), cargo], &|item| item.label.starts_with("HashMap"));
+        assert!(text.starts_with("use std::collections::HashMap;\n"), "{text}");
+        assert!(text.contains("let m: HashMap<> = "), "the caret between the brackets: {text}");
+
+        let main = "fn main() {\n    let mut v: Vec<u8> = Vec::new();\n    v.pu|\n}\n";
+        let (text, at) = accept("rust-analyzer", &[("src/main.rs", main), cargo], &|item| item.label.starts_with("push"));
+        assert!(text.contains("v.push("), "{text}");
+        assert_eq!(&text[at - 1..at], "(", "the caret inside: {text}");
+    }
+
+    /// gopls: a package not imported yet gets its import.
+    #[test]
+    #[ignore]
+    fn gopls_completion_imports() {
+        let main = "package main\n\nfunc main() {\n\t_ = strings.Spl|\n}\n";
+        let (text, _) = accept("gopls", &[("main.go", main), ("go.mod", "module example.com/m\n\ngo 1.21\n")], &|item| item.label == "Split");
+        assert!(text.contains("import \"strings\""), "{text}");
+        assert!(text.contains("strings.Split("), "{text}");
+    }
+
+    /// kotlin-lsp: the item's edit is empty; its command asks the editor
+    /// to make the edit and to put the caret after it.
+    #[test]
+    #[ignore]
+    fn kotlin_lsp_completion_by_command() {
+        let main = "data class Point(val x: Int, val yield: Int)\n\nfun main() {\n    val p = Point(1, 2)\n    println(p.yi|)\n}\n";
+        let files = [
+            ("src/main/kotlin/Main.kt", main),
+            ("settings.gradle.kts", "rootProject.name = \"p\"\n"),
+            ("build.gradle.kts", "plugins { kotlin(\"jvm\") version \"2.1.0\" }\nrepositories { mavenCentral() }\n"),
+        ];
+        let (text, at) = accept("kotlin-lsp", &files, &|item| item.label == "yield");
+        assert!(text.contains("println(p.yield)"), "{text}");
+        assert_eq!(&text[at..at + 1], ")", "the caret after it: {text}");
+    }
+
+    /// basedpyright: a name from the standard library not imported yet.
+    #[test]
+    #[ignore]
+    fn basedpyright_completion_imports() {
+        let main = "def main():\n    return OrderedDic|\n";
+        let (text, _) = accept("basedpyright-langserver", &[("main.py", main), ("pyproject.toml", "[project]\nname = \"p\"\n")], &|item| {
+            item.label == "OrderedDict" && serde_json::to_string(item).unwrap().contains("collections")
+        });
+        assert!(text.contains("from collections import OrderedDict"), "{text}");
+        assert!(text.contains("return OrderedDict"), "{text}");
+    }
+
+    /// typescript-language-server: an export of another file, imported.
+    #[test]
+    #[ignore]
+    fn typescript_completion_imports() {
+        let main = "const x = greetEvery|\n";
+        let other = "export function greetEveryone(): string { return \"hi\" }\n";
+        let files = [("a.ts", main), ("b.ts", other), ("package.json", "{}\n"), ("tsconfig.json", "{}\n")];
+        let (text, _) = accept("typescript-language-server", &files, &|item| item.label == "greetEveryone");
+        assert!(text.contains("import { greetEveryone } from \"./b\""), "{text}");
+        assert!(text.contains("const x = greetEveryone"), "{text}");
     }
 
     #[test]

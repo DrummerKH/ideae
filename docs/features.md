@@ -143,6 +143,21 @@ all: what is removed stays under `refs/ideae/variants` for two weeks.
   steps through them), fixes (Alt+Enter), rename everywhere (Shift+F6),
   reformat (Ctrl+Alt+L, or on save), parameter info (Ctrl+P), names colored
   by what they are, Ctrl+N for a class or function anywhere in the project.
+- A completion goes in whole: the server's edit or snippet (the caret at
+  its first stop), the import it adds, and its command with the edit and
+  caret that asks for (kotlin-lsp completes that way). Items that are the
+  same in all that is shown and done are listed once; items of one name
+  show what tells them apart (a package, the import).
+- Completion and edit prediction, one at a time, as in Zed:
+  - the menu wins. While it is open or being asked for, no prediction is
+    shown or asked; one shown goes when the menu comes. Tab and Enter take
+    the menu's item, Esc closes it. A prediction is asked again after an
+    item is taken, or when the typed word leaves the menu empty; after Esc,
+    at the next edit.
+  - Ctrl+Space opens only the menu and drops a prediction.
+  - with only a prediction: Tab takes it (and the next is asked), Esc
+    drops it, Enter is a newline (and the next line is asked). Typing what it shows keeps the rest of it,
+    with no menu over it; typing anything else drops it.
 - The declarations you are inside of stay at the top as you scroll.
 - File structure (Ctrl+F12), syntax-aware selection, folding, the next
   occurrence of a selection (Alt+J), lines deleted, duplicated, moved and
