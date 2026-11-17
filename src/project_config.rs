@@ -664,6 +664,9 @@ mod tests {
         assert_eq!(s.setup, ["npm ci"]);
         assert_eq!(s.check, "./gradlew test", "npm's placeholder is no test");
         assert!(suggest(&scratch("suggest-empty")).is_empty());
+        for name in ["suggest", "suggest-rust-go", "suggest-npm", "suggest-empty"] {
+            let _ = std::fs::remove_dir_all(scratch(name));
+        }
     }
 
     #[test]
@@ -728,6 +731,7 @@ mod tests {
         set_own(&project, Some(Config::default()));
         assert!(!resolve(&task).from_file);
         set_own(&project, None);
+        let _ = (std::fs::remove_dir_all(project), std::fs::remove_dir_all(task));
     }
 
     #[test]
@@ -743,6 +747,7 @@ mod tests {
         assert!(slow.timed_out && !slow.ok());
         assert_eq!(tail("1\n2\n3\n", 2), "2\n3");
         assert_eq!(plain(b"10%\r50%\r100%\ndone"), "100%\ndone");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -758,5 +763,6 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&status).unwrap(), "1");
         let text = plain(&out.stdout);
         assert!(text.contains("its") && text.contains("Setup failed") && !text.contains("never"), "{text}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
