@@ -1049,6 +1049,11 @@ pub(super) fn show_document_handler(task: WeakEntity<TaskView>, this_path: PathB
             return false;
         }
         let line = params.selection.map(|r| r.start.line).unwrap_or(0);
-        task.update(cx, |task, cx| task.open_file(target, line, window, cx)).is_ok()
+        // Deferred too: the target can replace this editor's preview tab.
+        let task = task.clone();
+        window.defer(cx, move |window, cx| {
+            let _ = task.update(cx, |task, cx| task.open_file(target, line, window, cx));
+        });
+        true
     })
 }
