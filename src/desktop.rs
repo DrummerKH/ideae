@@ -277,7 +277,9 @@ fn start_menu_link() -> Option<PathBuf> {
 /// An entry written earlier points at where the binary was then, and its
 /// icon is the one of that build: follow both.
 pub fn refresh_entry() {
-    if !can_pin() {
+    // A run on a scratch state is a test, often of a build in some other
+    // worktree: the launcher keeps pointing at the user's own.
+    if !can_pin() || std::env::var_os("IDEAE_STATE").is_some() {
         return;
     }
     let (Some(file), Ok(exe)) = (desktop_file(), exe()) else { return };
