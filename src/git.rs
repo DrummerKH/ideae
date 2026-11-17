@@ -1489,7 +1489,15 @@ impl BlameLine {
 
 /// Who last changed each line (index 0 is line 1), by `git blame --porcelain`.
 pub fn blame(root: &Path, file: &Path) -> Vec<Option<std::sync::Arc<BlameLine>>> {
-    let Some(out) = git(root, &["blame", "--porcelain", "--", &file.to_string_lossy()]) else {
+    // Whitespace and line endings are no change of who wrote a line.
+    let mut args = vec!["blame", "--porcelain", "-w"];
+    // Commits that only reformatted, as GitHub's blame leaves them out.
+    if root.join(".git-blame-ignore-revs").is_file() {
+        args.extend(["--ignore-revs-file", ".git-blame-ignore-revs"]);
+    }
+    let file = file.to_string_lossy();
+    args.extend(["--", &file]);
+    let Some(out) = git(root, &args) else {
         return Vec::new();
     };
     // A commit is told once and shared by its lines: a file has thousands
@@ -2973,7 +2981,8 @@ mod blame_tests {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         let script = "git init -q -b main .; git config user.email t@t; git config user.name Ann; printf 'one\\ntwo\\nthree\\n' > f.txt; git add f.txt; git commit -qm first
-            git config user.name Bob; printf 'one\\nTWO\\nthree\\n' > f.txt; git commit -qam second";
+            git config user.name Bob; printf 'one\\nTWO\\nthree\\n' > f.txt; git commit -qam second
+            git config user.name Cy; printf 'one\\r\\nTWO\\r\\n  three\\r\\n' > f.txt; git commit -qam endings";
         assert!(Command::new("bash").arg("-ec").arg(script).current_dir(&base).status().unwrap().success());
         let lines = blame(&base, &base.join("f.txt"));
         let told: Vec<(&str, &str)> = lines.iter().map(|l| l.as_ref().map(|l| (l.author.as_str(), l.summary.as_str())).unwrap()).collect();
