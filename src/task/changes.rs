@@ -402,6 +402,22 @@ impl Render for ChangesView {
                             }))
                         },
                     ))
+                    .child(
+                        div()
+                            .id("changes-hint")
+                            .ml_auto()
+                            .px_1()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("ⓘ")
+                            .tooltip(|window, cx| {
+                                gpui_kit::component::tooltip::Tooltip::new(format!(
+                                    "{} a line to open the file there. Select lines by their numbers to comment on them or send them to the agent (right-click).",
+                                    crate::keys::label("Ctrl+Click")
+                                ))
+                                .build(window, cx)
+                            }),
+                    )
                     .when_some(self.selection.clone(), |this, range| {
                         this.child(
                             Button::new("open-at-line")
@@ -412,13 +428,7 @@ impl Render for ChangesView {
                                     this.open_selection(window, cx)
                                 })),
                         )
-                    })
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("Ctrl+click a line to open the file there"),
-                    ),
+                    }),
             )
             .children(self.render_review(cx))
             .child(div().id("changes-diff").relative().flex_1().min_h_0()
@@ -440,13 +450,7 @@ impl Render for ChangesView {
                     let notes = Rc::new(self.review.clone());
                     let view = cx.weak_entity();
                     let add_view = cx.weak_entity();
-                    // Under each change, what can be done with it alone.
-                    let (hunks, task, staging) = (self.hunks.clone(), self.task.clone(), self.scope == DiffScope::Uncommitted);
-                    let in_index = self.staged.clone();
-                    let hunk_notes = hunks.iter().enumerate().map(|(i, h)| {
-                        let side = if h.modified { DiffSide::Modified } else { DiffSide::Original };
-                        DiffAnnotation::line(("hunk", i), DiffLinePosition::new(h.path.clone(), side, h.line as usize))
-                    });
+                    let staging = self.scope == DiffScope::Uncommitted;
                     this.child(
                         Diff::new(&self.diff)
                             .annotations(
@@ -457,42 +461,13 @@ impl Render for ChangesView {
                                         let side = if n.modified_side { DiffSide::Modified } else { DiffSide::Original };
                                         DiffAnnotation::line(("review-note", i), DiffLinePosition::new(n.path.clone(), side, n.line))
                                     })
-                                    .chain(hunk_notes)
                                     .collect::<Vec<_>>(),
                             )
                             .render_annotation(move |annotation, _, cx| {
-                                let (kind, i) = match annotation.id() {
-                                    ElementId::NamedInteger(kind, i) => (kind.clone(), *i as usize),
-                                    _ => (SharedString::default(), usize::MAX),
+                                let i = match annotation.id() {
+                                    ElementId::NamedInteger(_, i) => *i as usize,
+                                    _ => usize::MAX,
                                 };
-                                if kind.as_ref() == "hunk" {
-                                    let Some(hunk) = hunks.get(i).cloned() else { return div().into_any_element() };
-                                    let (revert, stage, staged) = (task.clone(), task.clone(), hunk.clone());
-                                    return h_flex()
-                                        .justify_end()
-                                        .gap_1()
-                                        .px_2()
-                                        .child(
-                                            Button::new(("hunk-revert", i))
-                                                .xsmall()
-                                                .ghost()
-                                                .label("↺ revert")
-                                                .tooltip("Take this change back; the rest of the file stays (Undo follows)")
-                                                .on_click(move |_, window, cx| {
-                                                    let _ = revert.update(cx, |t, cx| t.revert_hunk(hunk.clone(), window, cx));
-                                                }),
-                                        )
-                                        .when(staging, |row| {
-                                            let is_staged = in_index.contains(&(staged.path.clone(), staged.changes.clone()));
-                                            let (label, tip) = if is_staged { ("− unstage", "Take this change out of what is staged") } else { ("+ stage", "Stage this change alone") };
-                                            row.child(Button::new(("hunk-stage", i)).xsmall().ghost().label(label).tooltip(tip).on_click(
-                                                move |_, window, cx| {
-                                                    let _ = stage.update(cx, |t, cx| t.stage_hunk(staged.clone(), !is_staged, window, cx));
-                                                },
-                                            ))
-                                        })
-                                        .into_any_element();
-                                }
                                 let text = notes.get(i).map(|n| n.text.clone()).unwrap_or_default();
                                 let view = view.clone();
                                 h_flex()
@@ -534,6 +509,19 @@ impl Render for ChangesView {
                                         .child(open_file_button(&root, &task, file, &lines))
                                 }
                             })
+                            .render_header_status({
+                                let task = self.task.clone();
+                                move |file, _, cx| {
+                                    let task = task.upgrade()?;
+                                    let untracked = task.read(cx).file_states.get(file.path().as_ref()).is_some_and(|s| s.change == git::Change::Untracked);
+                                    untracked.then(|| SharedString::new_static("Untracked"))
+                                }
+                            })
+                            // What can be done with each change alone, on the row of its hunk.
+                            .render_hunk_suffix({
+                                let (hunks, task, in_index) = (self.hunks.clone(), self.task.clone(), self.staged.clone());
+                                move |file, original, modified, _, _| hunk_actions(file, original, modified, &hunks, &task, &in_index, staging)
+                            })
                             .on_line_click({
                                 let (root, task) = (self.root.clone(), self.task.clone());
                                 move |position, event, window, cx| {
@@ -558,4 +546,83 @@ impl Render for ChangesView {
                 }
             }))
     }
+}
+
+/// The first and last line a change covers on the side `line` is on.
+fn change_lines(hunk: &git::Hunk) -> (u32, u32) {
+    let sign = if hunk.modified { '+' } else { '-' };
+    let count = hunk.changes.lines().filter(|l| l.starts_with(sign)).count().max(1) as u32;
+    (hunk.line.saturating_sub(count - 1), hunk.line)
+}
+
+/// Revert and Stage for the changes in one hunk of the diff: buttons for
+/// the one change it has, menus naming their lines for several.
+fn hunk_actions(
+    file: &DiffFile,
+    original: std::ops::Range<usize>,
+    modified: std::ops::Range<usize>,
+    hunks: &Rc<Vec<git::Hunk>>,
+    task: &WeakEntity<TaskView>,
+    in_index: &Rc<HashSet<(String, String)>>,
+    staging: bool,
+) -> Option<AnyElement> {
+    use gpui_kit::component::menu::PopupMenuItem;
+    let path = file.path().as_ref();
+    let inside: Vec<usize> = hunks
+        .iter()
+        .enumerate()
+        .filter(|(_, h)| h.path == path && (if h.modified { &modified } else { &original }).contains(&(h.line as usize)))
+        .map(|(i, _)| i)
+        .collect();
+    let &first = inside.first()?;
+    let is_staged = |h: &git::Hunk| in_index.contains(&(h.path.clone(), h.changes.clone()));
+    const REVERT_TIP: &str = "Take this change back; the rest of the file stays (Undo follows)";
+    let mut row = h_flex().flex_none().gap_0p5();
+    if inside.len() == 1 {
+        let hunk = hunks[first].clone();
+        let staged = is_staged(&hunk);
+        let (revert, stage, staged_hunk) = (task.clone(), task.clone(), hunk.clone());
+        row = row.child(Button::new(("hunk-revert", first)).xsmall().ghost().label("↺ Revert").tooltip(REVERT_TIP).on_click(move |_, window, cx| {
+            let _ = revert.update(cx, |t, cx| t.revert_hunk(hunk.clone(), window, cx));
+        }));
+        if staging {
+            let (label, tip) = if staged { ("− Unstage", "Take this change out of what is staged") } else { ("+ Stage", "Stage this change alone") };
+            row = row.child(Button::new(("hunk-stage", first)).xsmall().ghost().label(label).tooltip(tip).on_click(move |_, window, cx| {
+                let _ = stage.update(cx, |t, cx| t.stage_hunk(staged_hunk.clone(), !staged, window, cx));
+            }));
+        }
+        return Some(row.into_any_element());
+    }
+    let named = |h: &git::Hunk| match change_lines(h) {
+        (a, b) if a == b => format!("Line {b}"),
+        (a, b) => format!("Lines {a}–{b}"),
+    };
+    let (revert_hunks, revert_task) = (hunks.clone(), task.clone());
+    let revert_inside = inside.clone();
+    row = row.child(Button::new(("hunk-revert", first)).xsmall().ghost().label("↺ Revert ▾").tooltip("Take one of the changes here back; the rest of the file stays (Undo follows)").dropdown_menu(
+        move |mut menu, _, _| {
+            for &i in &revert_inside {
+                let (hunk, task) = (revert_hunks[i].clone(), revert_task.clone());
+                menu = menu.item(PopupMenuItem::new(named(&hunk)).on_click(move |_, window, cx| {
+                    let _ = task.update(cx, |t, cx| t.revert_hunk(hunk.clone(), window, cx));
+                }));
+            }
+            menu
+        },
+    ));
+    if staging {
+        let (stage_hunks, stage_task, in_index) = (hunks.clone(), task.clone(), in_index.clone());
+        row = row.child(Button::new(("hunk-stage", first)).xsmall().ghost().label("Stage ▾").tooltip("Stage or unstage one of the changes here alone").dropdown_menu(move |mut menu, _, _| {
+            for &i in &inside {
+                let (hunk, task) = (stage_hunks[i].clone(), stage_task.clone());
+                let staged = in_index.contains(&(hunk.path.clone(), hunk.changes.clone()));
+                let label = format!("{} {}", if staged { "Unstage" } else { "Stage" }, named(&hunk).to_lowercase());
+                menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                    let _ = task.update(cx, |t, cx| t.stage_hunk(hunk.clone(), !staged, window, cx));
+                }));
+            }
+            menu
+        }));
+    }
+    Some(row.into_any_element())
 }

@@ -584,7 +584,7 @@ pub(super) fn viewed_checkbox(task: &WeakEntity<TaskView>, file: &DiffFile, cx: 
         .into_any_element()
 }
 
-/// "open" in a diff file's header: the file as it is now, at the first line
+/// "Open" in a diff file's header: the file as it is now, at the first line
 /// this diff changes in it (from `first_lines`, built from the patch shown).
 pub fn open_file_button(
     root: &PathBuf,
@@ -602,7 +602,7 @@ pub fn open_file_button(
     Button::new(SharedString::from(format!("open-{key}")))
         .xsmall()
         .ghost()
-        .label("open")
+        .label("Open")
         .on_click(move |_, window, cx| {
             cx.stop_propagation();
             let path = path.clone();

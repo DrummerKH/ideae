@@ -192,6 +192,10 @@ type AnnotationRenderer = Rc<dyn Fn(&DiffAnnotation, &mut Window, &mut App) -> A
 type RangeHandler = Rc<dyn Fn(&DiffLineRange, &mut Window, &mut App)>;
 type ClickHandler = Rc<dyn Fn(&DiffLinePosition, &ClickEvent, &mut Window, &mut App)>;
 type HoverHandler = Rc<dyn Fn(Option<&DiffLinePosition>, &mut Window, &mut App)>;
+type StatusRenderer = Rc<dyn Fn(&DiffFile, &mut Window, &mut App) -> Option<SharedString>>;
+type HunkRenderer = Rc<
+    dyn Fn(&DiffFile, std::ops::Range<usize>, std::ops::Range<usize>, &mut Window, &mut App) -> Option<AnyElement>,
+>;
 
 #[derive(Default)]
 struct HeaderSlots {
@@ -199,6 +203,10 @@ struct HeaderSlots {
     prefix: Option<FileRenderer>,
     title_suffix: Option<FileRenderer>,
     suffix: Option<FileRenderer>,
+    // ideae patch: the word for how the file changed, and what goes at the
+    // end of a hunk's metadata row.
+    status: Option<StatusRenderer>,
+    hunk_suffix: Option<HunkRenderer>,
 }
 
 #[derive(Default)]
@@ -381,6 +389,30 @@ impl Diff {
         E: IntoElement,
     {
         self.header.suffix = Some(file_renderer(render));
+        self
+    }
+    /// ideae patch: names how a file changed in its default header in place
+    /// of the word for its status (`None` keeps that word): the patch alone
+    /// cannot tell a file git does not know from one added to the index.
+    pub fn render_header_status<F>(mut self, render: F) -> Self
+    where
+        F: Fn(&DiffFile, &mut Window, &mut App) -> Option<SharedString> + 'static,
+    {
+        self.header.status = Some(Rc::new(render));
+        self
+    }
+    /// ideae patch: content at the end of each hunk's metadata row, given the
+    /// one-based lines the hunk covers on the original and modified sides
+    /// (empty where it has none): actions on the hunk without a row of their own.
+    pub fn render_hunk_suffix<F, E>(mut self, render: F) -> Self
+    where
+        F: Fn(&DiffFile, std::ops::Range<usize>, std::ops::Range<usize>, &mut Window, &mut App) -> Option<E>
+            + 'static,
+        E: IntoElement,
+    {
+        self.header.hunk_suffix = Some(Rc::new(move |file, original, modified, window, cx| {
+            render(file, original, modified, window, cx).map(IntoElement::into_any_element)
+        }));
         self
     }
     /// Compatibility alias for [`Self::render_annotation`].
@@ -925,7 +957,7 @@ fn render_row(
     match row {
         DisplayRow::File(file) => render_file_header(*file, None, &code, window, cx),
         DisplayRow::Notice(file) => render_notice(&code.files[*file], cx),
-        DisplayRow::Hunk { file, hunk } => render_hunk_separator(*file, *hunk, &code, cx),
+        DisplayRow::Hunk { file, hunk } => render_hunk_separator(*file, *hunk, &code, window, cx),
         DisplayRow::Fold { file, pairs } => render_fold(*file, pairs.clone(), &code, cx),
         DisplayRow::Conflict {
             file,
@@ -938,7 +970,7 @@ fn render_row(
             modified,
             changed,
         } => {
-            if code.mode == DiffMode::Split && !code.files[*file].is_single_column() {
+            if code.mode == DiffMode::Split && !code.files[*file].is_one_column() {
                 h_flex()
                     .items_stretch()
                     .w_full()
@@ -988,9 +1020,11 @@ fn render_hunk_separator(
     file: usize,
     hunk: usize,
     code: &CodePresentation,
-    cx: &App,
+    window: &mut Window,
+    cx: &mut App,
 ) -> AnyElement {
-    let hunks = code.files[file].hunks();
+    let document = &code.files[file];
+    let hunks = document.hunks();
     let row = h_flex()
         .w_full()
         .px_3()
@@ -998,10 +1032,25 @@ fn render_hunk_separator(
         .text_xs()
         .text_color(cx.theme().muted_foreground);
     match code.hunk_separator {
-        DiffHunkSeparator::Metadata => row
-            .h_6()
-            .child(hunks[hunk].label().clone())
-            .into_any_element(),
+        DiffHunkSeparator::Metadata => {
+            // ideae patch: the hunk's actions at the end of its row.
+            let suffix = code.header.hunk_suffix.as_ref().and_then(|render| {
+                let lines = |side| {
+                    let ixs = hunks[hunk].lines(side);
+                    if ixs.is_empty() {
+                        return 0..0;
+                    }
+                    document.line_number(side, ixs.start)..document.line_number(side, ixs.end - 1) + 1
+                };
+                let (original, modified) = (lines(DiffSide::Original), lines(DiffSide::Modified));
+                render(document, original, modified, window, cx)
+            });
+            row.h_6()
+                .gap_2()
+                .child(div().flex_1().min_w_0().truncate().child(hunks[hunk].label().clone()))
+                .children(suffix)
+                .into_any_element()
+        }
         DiffHunkSeparator::LineInfo => {
             let hidden = hunks[hunk].hidden_lines_before(hunk.checked_sub(1).map(|ix| &hunks[ix]));
             if hidden == 0 {
@@ -1199,7 +1248,9 @@ fn render_file_header(
         let prefix = slot(&code.header.prefix, window, cx);
         let title_suffix = slot(&code.header.title_suffix, window, cx);
         let suffix = slot(&code.header.suffix, window, cx);
+        let named = code.header.status.as_ref().and_then(|render| render(document, window, cx));
         let status = match document.status() {
+            _ if named.is_some() => named.map(|named| named.to_string().into()),
             DiffFileStatus::Added => Some(t!("Diff.AddedFile")),
             DiffFileStatus::Deleted => Some(t!("Diff.DeletedFile")),
             DiffFileStatus::Renamed => Some(t!("Diff.RenamedFile")),
@@ -1471,6 +1522,8 @@ fn render_unified_cell(
 ) -> AnyElement {
     let (original, modified) = pair;
     let single_column = code.files[file].is_single_column();
+    // ideae patch: a file added or deleted, in split mode, takes the whole row.
+    let one_column = single_column || (code.mode == DiffMode::Split && code.files[file].is_one_column());
     let counterpart = code.files[file].lines(side)[ix].counterpart();
     let other_ix = if side == DiffSide::Original {
         modified
@@ -1490,6 +1543,8 @@ fn render_unified_cell(
     }
     let gutters = if single_column {
         [Some((DiffSide::Modified, modified)), None]
+    } else if one_column {
+        [Some((side, if side == DiffSide::Original { original } else { modified })), None]
     } else {
         [
             Some((DiffSide::Original, original)),
@@ -1497,7 +1552,7 @@ fn render_unified_cell(
         ]
     };
     v_flex()
-        .w(if single_column {
+        .w(if one_column {
             code.content_width
         } else {
             code.column_width

@@ -298,7 +298,7 @@ impl TaskView {
                         Button::new(("listening-open", l.port as usize))
                             .xsmall()
                             .ghost()
-                            .label("open")
+                            .label("Open")
                             .tooltip(format!("Open {url} in a Web tab"))
                             .on_click(cx.listener(move |this, _, window, cx| this.open_browser(&url, window, cx))),
                     ),
@@ -380,7 +380,7 @@ impl TaskView {
                             .child(div().text_xs().text_color(muted).truncate().child(command)),
                     )
                     .when(on, |row| {
-                        row.child(action("svc-logs", "logs", "Its terminal".into(), |t, n, w, cx| {
+                        row.child(action("svc-logs", "Logs", "Its terminal".into(), |t, n, w, cx| {
                             if let Some(ix) = t.service_ix(n, cx) {
                                 t.activate(ix, w, cx);
                             }
@@ -394,7 +394,7 @@ impl TaskView {
                     .when(!on, |row| row.child(action("svc-start", "▶", "Start".into(), TaskView::start_service)))
                     .when(service.url.is_some(), |row| {
                         let url = service.url(&self.services, self.port_slot).unwrap_or_default();
-                        row.child(action("svc-open", "open", format!("Open {url} in a Web tab"), TaskView::open_service))
+                        row.child(action("svc-open", "Open", format!("Open {url} in a Web tab"), TaskView::open_service))
                     }),
             );
         }

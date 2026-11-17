@@ -102,12 +102,12 @@ impl TaskView {
                         Button::new("suggest-message")
                             .small()
                             .ghost()
-                            .label("Write")
+                            .label("✦ Write")
                             .disabled(busy || self.files.is_empty())
                             .tooltip(if staged > 0 {
-                                "Claude writes the message for the staged changes"
+                                "Have Claude write the commit message for the staged changes, into the box"
                             } else {
-                                "Claude writes the message for all the changes"
+                                "Have Claude write the commit message for all the changes, into the box"
                             })
                             .on_click(cx.listener(|this, _, window, cx| this.suggest_message(window, cx))),
                     ),
@@ -204,8 +204,8 @@ impl TaskView {
             range
                 .map(|at| {
                     let row = match &rows[at] {
-                        ChangeRow::Head { staged: true, title } => section("unstage-all", title.clone(), "unstage all", false, cx).into_any_element(),
-                        ChangeRow::Head { staged: false, title } => section("stage-all", title.clone(), "stage all", true, cx).into_any_element(),
+                        ChangeRow::Head { staged: true, title } => section("unstage-all", title.clone(), "Unstage all", false, cx).into_any_element(),
+                        ChangeRow::Head { staged: false, title } => section("stage-all", title.clone(), "Stage all", true, cx).into_any_element(),
                         ChangeRow::Nothing => div().px_3().text_sm().text_color(cx.theme().muted_foreground).child("No uncommitted changes").into_any_element(),
                         ChangeRow::StashHead => div().px_3().text_xs().text_color(cx.theme().muted_foreground).child(format!("STASHES ({})", this.stashes.len())).into_any_element(),
                         ChangeRow::File { ix, depth, in_staged } if *ix < this.files.len() => this.render_change_row(*ix, *depth, *in_staged, cx),
@@ -288,9 +288,9 @@ impl TaskView {
                                 .bg(cx.theme().accent)
                                 .opacity(0.)
                                 .group_hover(group, |s| s.opacity(1.))
-                                .child(act("stash-apply", "apply", "Bring it back and keep it in the list", stash.clone(), cx))
-                                .child(act("stash-pop", "pop", "Bring it back and take it off the list", stash.clone(), cx))
-                                .child(act("stash-drop", "drop", "Throw it away", stash.clone(), cx)),
+                                .child(act("stash-apply", "Apply", "Bring it back and keep it in the list", stash.clone(), cx))
+                                .child(act("stash-pop", "Pop", "Bring it back and take it off the list", stash.clone(), cx))
+                                .child(act("stash-drop", "Drop", "Throw it away", stash.clone(), cx)),
                         )
                         .on_click(cx.listener(move |this, _, window, cx| this.show_stash(name.clone(), window, cx)))
                 )
@@ -476,11 +476,13 @@ impl TaskView {
         let deleted = matches!(file.status, DiffFileStatus::Deleted);
         // The tree shows the folders.
         let name = file.path.rsplit_once('/').map_or(file.path.to_string(), |(_, name)| name.to_string());
-        let status = match file.status {
-            DiffFileStatus::Added => "A",
-            DiffFileStatus::Deleted => "D",
-            DiffFileStatus::Renamed => "R",
-            _ => "M",
+        let untracked = self.file_states.get(file.path.as_ref()).is_some_and(|state| state.change == git::Change::Untracked);
+        let (status, status_tip) = match file.status {
+            _ if untracked => ("U", "Untracked (not added)"),
+            DiffFileStatus::Added => ("A", "Added"),
+            DiffFileStatus::Deleted => ("D", "Deleted"),
+            DiffFileStatus::Renamed => ("R", "Renamed"),
+            _ => ("M", "Modified"),
         };
         // Colored as in the Files tree, and gray when gone.
         let mark = match (file.status, self.file_states.get(file.path.as_ref()).map(|state| state.change)) {
@@ -494,7 +496,7 @@ impl TaskView {
         let keyboard = self.side_has_focus.get() && self.right == RightPane::Changes && ix == self.side_selected;
         let viewed = self.is_viewed(ix);
         let view_path = file.path.to_string();
-        let discard_path = file.path.to_string();
+        let menu_path = file.path.to_string();
         let view = cx.weak_entity();
         h_flex()
             .id(("file", id))
@@ -510,7 +512,14 @@ impl TaskView {
             .text_sm()
             .cursor_pointer()
             .hover(|s| s.bg(cx.theme().accent))
-            .child(div().w(px(12.)).text_color(cx.theme().muted_foreground).child(status))
+            .child(
+                div()
+                    .id(("file-status", id))
+                    .w(px(12.))
+                    .text_color(cx.theme().muted_foreground)
+                    .child(status)
+                    .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(status_tip).build(window, cx)),
+            )
             .child(div().flex_1().min_w_0().truncate().when(viewed, |d| d.text_color(cx.theme().muted_foreground)).child(marked_label(name.into(), Some(mark), viewed, cx)))
             .children(self.agent_mark(&file.path))
             .when(viewed, |row| row.child(div().text_xs().text_color(gpui_kit::green()).child("✓")))
@@ -525,8 +534,8 @@ impl TaskView {
                         Button::new(("viewed", id))
                             .xsmall()
                             .ghost()
-                            .label(if viewed { "✓" } else { "○" })
-                            .tooltip(if viewed { "Viewed; click to unmark" } else { "Mark as viewed until it changes again" })
+                            .label(if viewed { "☑" } else { "☐" })
+                            .tooltip(if viewed { "Viewed; click to mark not viewed" } else { "Mark viewed: it folds in the diff until it changes again" })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
                                 this.toggle_viewed(&view_path, cx)
@@ -537,7 +546,7 @@ impl TaskView {
                             .xsmall()
                             .ghost()
                             .label(if in_staged { "−" } else { "+" })
-                            .tooltip(if in_staged { "Unstage" } else { "Stage" })
+                            .tooltip(if in_staged { "Unstage the file" } else { "Stage the file" })
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 this.stage_paths(vec![stage_path.clone()], !in_staged, window, cx)
@@ -551,15 +560,28 @@ impl TaskView {
             .context_menu(move |menu, _, _| {
                 use gpui_kit::component::menu::PopupMenuItem;
                 let (open_view, open_path) = (view.clone(), open_path.clone());
-                let (discard_view, discard_path) = (view.clone(), discard_path.clone());
-                menu.when(!deleted, |menu| {
+                let (stage_view, stage_path) = (view.clone(), menu_path.clone());
+                let (viewed_view, viewed_path) = (view.clone(), menu_path.clone());
+                let (discard_view, discard_path) = (view.clone(), menu_path.clone());
+                let (absolute, relative) = (open_path.to_string_lossy().to_string(), menu_path.clone());
+                menu.item(PopupMenuItem::new(if in_staged { "Unstage" } else { "Stage" }).on_click(move |_, window, cx| {
+                    let path = stage_path.clone();
+                    stage_view.update(cx, |this, cx| this.stage_paths(vec![path], !in_staged, window, cx)).ok();
+                }))
+                .item(PopupMenuItem::new(if viewed { "Mark not viewed" } else { "Mark viewed" }).on_click(move |_, _, cx| {
+                    viewed_view.update(cx, |this, cx| this.toggle_viewed(&viewed_path, cx)).ok();
+                }))
+                .when(!deleted, |menu| {
                     menu.item(PopupMenuItem::new("Open").on_click(move |_, window, cx| {
                         let path = open_path.clone();
                         open_view.update(cx, |this, cx| this.open_file(path, open_line, window, cx)).ok();
                     }))
                 })
+                .separator()
+                .item(PopupMenuItem::new("Copy path").on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(absolute.clone()))))
+                .item(PopupMenuItem::new("Copy relative path").on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(relative.clone()))))
                 .when(!in_staged, |menu| {
-                    menu.item(PopupMenuItem::new("Discard changes").on_click(move |_, window, cx| {
+                    menu.separator().item(PopupMenuItem::new("Discard changes").on_click(move |_, window, cx| {
                         let path = discard_path.clone();
                         discard_view.update(cx, |this, cx| this.confirm_discard(path, window, cx)).ok();
                     }))

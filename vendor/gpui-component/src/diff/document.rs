@@ -541,6 +541,12 @@ impl DiffFile {
             DiffFileStatus::Unchanged | DiffFileStatus::Conflicted
         )
     }
+    /// ideae patch: whether the file has one column in split mode too: one
+    /// added or deleted has nothing on its other side.
+    pub(crate) fn is_one_column(&self) -> bool {
+        self.is_single_column()
+            || matches!(self.status(), DiffFileStatus::Added | DiffFileStatus::Deleted)
+    }
     /// Merge conflicts in working-file order; slice indices identify resolutions.
     pub fn conflicts(&self) -> &[DiffConflict] {
         &self.inner.conflicts
