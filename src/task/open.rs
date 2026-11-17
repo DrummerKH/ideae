@@ -54,7 +54,12 @@ impl TaskView {
             state.jump_to_position(Position::new(line, col), JUMP_AT, window, cx);
         });
         let predict = crate::predict::provider(None, &path, &self.root, editor.read(cx).text().clone(), cx);
-        editor.update(cx, |state, _| state.lsp_mut().completion_provider = Some(predict));
+        editor.update(cx, |state, _| {
+            let lsp = state.lsp_mut();
+            lsp.completion_provider = Some(predict);
+            // Kotlin's and Java's names with their types do not fit in 320 px.
+            lsp.completion_menu.max_width = px(560.);
+        });
 
         let saved = super::file::Print::of(&content);
         let root = self.root.clone();

@@ -157,13 +157,16 @@ impl RenderOnce for CompletionMenuItem {
                     .w_full()
                     .gap_3()
                     .justify_between()
-                    .child(StyledText::new(item.label.clone()).with_highlights(highlights))
+                    // ideae patch: the name keeps its room; a long type is cut, not the name.
+                    .child(div().flex_shrink_0().child(StyledText::new(item.label.clone()).with_highlights(highlights)))
                     .when_some(item.detail.as_ref(), |this, detail| {
                         this.child(
-                            Label::new(detail.clone())
-                                .text_color(cx.theme().muted_foreground)
-                                .when(deprecated, |this| this.line_through())
-                                .italic(),
+                            div().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().child(
+                                Label::new(detail.clone())
+                                    .text_color(cx.theme().muted_foreground)
+                                    .when(deprecated, |this| this.line_through())
+                                    .italic(),
+                            ),
                         )
                     }),
             )

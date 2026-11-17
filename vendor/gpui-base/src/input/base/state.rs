@@ -186,6 +186,36 @@ fn humps(word: &str) -> Vec<std::ops::Range<usize>> {
 }
 
 /// ideae patch: where the last hump of a word starts.
+// ideae patch: words in code, for Ctrl+Backspace, Ctrl+Delete and Ctrl+arrows.
+fn is_code_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Where the word before the end of `left` starts: whitespace before the
+/// end is passed over, then a run of word characters or of other signs.
+fn code_word_start(left: &str) -> usize {
+    let trimmed = left.trim_end();
+    let Some(last) = trimmed.chars().next_back() else { return 0 };
+    let word = is_code_word_char(last);
+    let mut start = trimmed.len();
+    for (i, c) in trimmed.char_indices().rev() {
+        if c.is_whitespace() || is_code_word_char(c) != word {
+            break;
+        }
+        start = i;
+    }
+    start
+}
+
+/// The word after the start of `right`: where it starts, past whitespace, and ends.
+fn code_word_end(right: &str) -> (usize, usize) {
+    let start = right.len() - right.trim_start().len();
+    let Some(first) = right[start..].chars().next() else { return (start, start) };
+    let word = is_code_word_char(first);
+    let end = right[start..].char_indices().find(|&(_, c)| c.is_whitespace() || is_code_word_char(c) != word).map_or(right.len(), |(i, _)| start + i);
+    (start, end)
+}
+
 pub fn last_hump_start(word: &str) -> usize {
     humps(word).last().map_or(0, |hump| hump.start)
 }
@@ -1922,18 +1952,24 @@ impl<M: InputModeKind> InputBaseState<M> {
         }
 
         let offset = self.offset_from_utf16(self.offset_to_utf16(offset));
-        // FIXME: Avoid to_string
+        // ideae patch: in code a word is a run of letters, digits and `_`, or
+        // of other signs: `.` ends `app.in`, which Unicode's rules for prose
+        // keep as one word. Only this line and the one above are read.
+        if self.is_code_editor() {
+            let row = self.text.offset_to_point(offset).row;
+            let from = self.text.line_start_offset(row.saturating_sub(1));
+            let left = self.text.slice(from..offset).to_string();
+            let start = code_word_start(&left);
+            let humps = HUMP_WORDS.load(std::sync::atomic::Ordering::Relaxed) && left[start..].chars().next().is_some_and(is_code_word_char);
+            let start = if humps { start + last_hump_start(left[start..].trim_end()) } else { start };
+            return self.token_boundary(from + start, Bias::Left);
+        }
         let left_part = self.text.slice(0..offset).to_string();
 
         let target = UnicodeSegmentation::split_word_bound_indices(left_part.as_str())
             .rfind(|(_, s)| !s.trim_start().is_empty())
             .map(|(i, _)| i)
             .unwrap_or(0);
-        // ideae patch: in code, to the start of the last hump of the word.
-        let target = match self.is_code_editor() && HUMP_WORDS.load(std::sync::atomic::Ordering::Relaxed) {
-            true => target + last_hump_start(left_part[target..].trim_end()),
-            false => target,
-        };
         self.token_boundary(target, Bias::Left)
     }
 
@@ -1945,13 +1981,22 @@ impl<M: InputModeKind> InputBaseState<M> {
         }
 
         let offset = self.offset_from_utf16(self.offset_to_utf16(offset));
+        // ideae patch: as `previous_start_of_word_at`, this line and the next.
+        if self.is_code_editor() {
+            let row = self.text.offset_to_point(offset).row;
+            let last = self.text.offset_to_point(self.text.len()).row;
+            let to = self.text.line_end_offset((row + 1).min(last));
+            let right = self.text.slice(offset..to).to_string();
+            let (start, end) = code_word_end(&right);
+            let humps = HUMP_WORDS.load(std::sync::atomic::Ordering::Relaxed) && right[start..].chars().next().is_some_and(is_code_word_char);
+            let end = if humps { start + first_hump_end(&right[start..end]) } else { end };
+            return self.token_boundary(offset + end, Bias::Right);
+        }
         let right_part = self.text.slice(offset..self.text.len()).to_string();
 
-        // ideae patch: in code, to the end of the first hump of the word.
-        let humps = self.is_code_editor() && HUMP_WORDS.load(std::sync::atomic::Ordering::Relaxed);
         let target = UnicodeSegmentation::split_word_bound_indices(right_part.as_str())
             .find(|(_, s)| !s.trim_start().is_empty())
-            .map(|(i, s)| offset + i + if humps { first_hump_end(s) } else { s.len() })
+            .map(|(i, s)| offset + i + s.len())
             .unwrap_or(self.text.len());
         self.token_boundary(target, Bias::Right)
     }
@@ -5302,6 +5347,32 @@ impl<M: InputModeKind> Render for InputBaseState<M> {
         M::register_actions(element, &entity, window)
             .test_support()
             .track_focus(&self.focus_handle)
+    }
+}
+
+// ideae patch
+#[cfg(test)]
+mod code_word_tests {
+    use super::{code_word_end, code_word_start};
+
+    #[test]
+    fn a_dot_ends_a_word_in_code() {
+        fn at(left: &str) -> &str {
+            &left[code_word_start(left)..]
+        }
+        assert_eq!(at("MainApplication.app.in"), "in");
+        assert_eq!(at("MainApplication.app."), ".");
+        assert_eq!(at("foo(bar, "), ", ");
+        assert_eq!(at("x -> "), "-> ");
+        assert_eq!(at("let été"), "été");
+        assert_eq!(at("    "), "    ");
+        fn next(right: &str) -> (&str, &str) {
+            let (start, end) = code_word_end(right);
+            (&right[..start], &right[start..end])
+        }
+        assert_eq!(next("app.in"), ("", "app"));
+        assert_eq!(next(".in"), ("", "."));
+        assert_eq!(next("  ::new()"), ("  ", "::"));
     }
 }
 
