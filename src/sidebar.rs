@@ -774,21 +774,15 @@ impl Workspace {
             let (pa, pb, pc, pd) = (menu_path.clone(), menu_path.clone(), menu_path.clone(), menu_path.clone());
             let (e, f, pe, pf) = (this.clone(), this.clone(), menu_path.clone(), menu_path.clone());
             let branch = branch.clone();
-            menu.item(PopupMenuItem::new(if starred { "Unstar" } else { "Star" }).on_click(move |_, _, cx| {
-                let _ = a.update(cx, |w, cx| w.toggle_star(&pa, cx));
-            }))
-            .when(running, |m| {
-                m.item(PopupMenuItem::new(if main { "Close main thread" } else { "Close" }).on_click(
-                    move |_, window, cx| {
-                        let _ = b.update(cx, |w, cx| w.close_task(&pb, window, cx));
-                    },
-                ))
-            })
-            .when(!main, |m| {
+            // What it is called and how it is found; its variants; its end.
+            menu.when(!main, |m| {
                 m.item(PopupMenuItem::new("Rename…").on_click(move |_, window, cx| {
                     let _ = d.update(cx, |w, cx| w.rename_task_dialog(&pd, window, cx));
                 }))
             })
+            .item(PopupMenuItem::new(if starred { "Unstar" } else { "Star" }).on_click(move |_, _, cx| {
+                let _ = a.update(cx, |w, cx| w.toggle_star(&pa, cx));
+            }))
             .item(PopupMenuItem::new("Copy branch name").on_click(move |_, _, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(branch.clone()));
             }))
@@ -803,8 +797,16 @@ impl Workspace {
                         }))
                     })
             })
+            .when(running || !main, |m| m.separator())
+            .when(running, |m| {
+                m.item(PopupMenuItem::new(if main { "Close main thread" } else { "Close" }).on_click(
+                    move |_, window, cx| {
+                        let _ = b.update(cx, |w, cx| w.close_task(&pb, window, cx));
+                    },
+                ))
+            })
             .when(!main, |m| {
-                m.separator().item(PopupMenuItem::new("Delete…").on_click(move |_, window, cx| {
+                m.item(PopupMenuItem::new("Delete…").on_click(move |_, window, cx| {
                     let _ = c.update(cx, |w, cx| w.delete_task(&pc, window, cx));
                 }))
             })
