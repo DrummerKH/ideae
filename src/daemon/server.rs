@@ -433,7 +433,17 @@ fn pump(shared: Shared, id: String, handle: Arc<Mutex<Box<dyn ByteHandle>>>, sin
 
 /// Ends a session's program and everything in its session.
 fn kill(shared: &Shared, id: &str) {
-    let Some(session) = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).sessions.remove(id) else { return };
+    let mut s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(session) = s.sessions.remove(id) else { return };
+    // A task with no terminal left has no agent to report: what it last
+    // said is not handed to the next window.
+    if let Some((task, _)) = id.rsplit_once('#') {
+        let prefix = format!("{task}#");
+        if !s.sessions.keys().any(|other| other.starts_with(&prefix)) {
+            s.hooks.remove(task);
+        }
+    }
+    drop(s);
     session.sink.close();
     session.handle.lock().unwrap_or_else(std::sync::PoisonError::into_inner).close();
 }
