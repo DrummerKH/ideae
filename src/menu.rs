@@ -19,6 +19,8 @@ use crate::{keymap, state};
 struct Shown {
     /// A dialog is up: what would open another, or act under it, is grey.
     dialog: bool,
+    /// The switches of Settings the View menu has, as they are.
+    switches: Switches,
     power_saving: bool,
     presenting: bool,
     focus_mode: bool,
@@ -68,10 +70,62 @@ pub struct Git(pub GitCommand);
 #[action(namespace = ideae, no_json)]
 pub struct GoToSpace(pub Option<String>);
 
+/// A setting turned on or off from the View menu.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Switch {
+    TypeHints,
+    EditPrediction,
+    BlameAtLineEnd,
+    IgnoreWhitespace,
+    DiffFiles,
+}
+
+#[derive(Clone, PartialEq, gpui_kit::Action)]
+#[action(namespace = ideae, no_json)]
+pub struct Toggle(pub Switch);
+
+#[derive(Clone, Copy, Default)]
+struct Switches {
+    type_hints: bool,
+    edit_prediction: bool,
+    blame_at_line_end: bool,
+    ignore_whitespace: bool,
+    diff_files: bool,
+}
+
+impl Switches {
+    fn now() -> Self {
+        state::with_settings(|s| Switches {
+            type_hints: s.inlay_hints,
+            edit_prediction: s.edit_prediction == Some(true),
+            blame_at_line_end: s.blame_at_line_end,
+            ignore_whitespace: s.diff_ignore_whitespace,
+            diff_files: s.diff_files,
+        })
+    }
+}
+
+/// The setting flipped as Settings would: what it changes changes at once
+/// (hints, the prediction server, diffs read again).
+fn toggle(what: Switch, w: &mut Workspace, cx: &mut Context<Workspace>) {
+    let mut new = state::settings();
+    match what {
+        Switch::TypeHints => new.inlay_hints = !new.inlay_hints,
+        // Turned on here is consent to its download, as the offer's "Turn on".
+        Switch::EditPrediction => new.edit_prediction = Some(new.edit_prediction != Some(true)),
+        Switch::BlameAtLineEnd => new.blame_at_line_end = !new.blame_at_line_end,
+        Switch::IgnoreWhitespace => new.diff_ignore_whitespace = !new.diff_ignore_whitespace,
+        Switch::DiffFiles => new.diff_files = !new.diff_files,
+    }
+    w.apply_settings(new, cx);
+    cx.refresh_windows();
+}
+
 impl Workspace {
     fn shown(&self, dialog: bool, window: &Window, cx: &App) -> Shown {
         Shown {
             dialog,
+            switches: Switches::now(),
             replace: window.is_action_available(&input::Replace, cx),
             spaces: self.spaces.iter().map(|s| s.name.clone()).collect(),
             space: self.space.clone(),
@@ -135,7 +189,7 @@ pub fn init(cx: &mut App) {
     } else {
         // Alt pressed and let go alone: gpui tells it as a keystroke of its own,
         // so Alt with another key is still that key's.
-        cx.bind_keys([KeyBinding::new("alt", OpenMenuBar, None)]);
+        cx.bind_keys([alt_alone()]);
         cx.on_action(|_: &OpenMenuBar, cx| toggle_bar(cx));
         cx.on_action(|_: &FullScreen, cx| in_window(cx, |_, window, _| window.toggle_fullscreen()));
         cx.on_action(|_: &ResetTextSize, cx| crate::zoom::reset_all(cx));
@@ -235,6 +289,10 @@ pub fn init(cx: &mut App) {
         opens(cx, move |w, window, cx| w.switch_space(to, window, cx))
     });
     cx.on_action(|_: &PowerSaving, cx| in_window(cx, |w, _, cx| w.toggle_power_saving(cx)));
+    cx.on_action(|a: &Toggle, cx| {
+        let what = a.0;
+        in_window(cx, move |w, _, cx| toggle(what, w, cx))
+    });
     cx.on_action(|_: &FindAndReplace, cx| in_window(cx, |_, window, cx| window.dispatch_action(Box::new(input::Replace), cx)));
     cx.on_action(|a: &Unkeyed, cx| {
         if let Some(shortcut) = keymap::find(a.0) {
@@ -570,6 +628,12 @@ pub fn bar(collapsed: bool, cx: &mut App) -> Option<gpui_kit::Entity<AppMenuBar>
 }
 
 /// After the key's dispatch: the window cannot be entered while it is the one dispatching.
+/// Alt pressed and let go alone; not in a terminal, whose programs take Alt
+/// themselves (readline, mc, vim).
+fn alt_alone() -> KeyBinding {
+    KeyBinding::new("alt", OpenMenuBar, Some("!Terminal"))
+}
+
 fn toggle_bar(cx: &mut App) {
     cx.defer(|cx| {
         let (Some(window), Some(bar)) = (cx.try_global::<Target>().map(|t| t.window), cx.try_global::<Bar>().map(|b| b.0.clone())) else { return };
@@ -653,7 +717,7 @@ fn menus(shown: Shown) -> Vec<Menu> {
     let sep = MenuItem::separator;
     let app = state::APP_ID;
     let Shown {
-        dialog, power_saving, presenting, focus_mode, projects, project, task: in_hand, replace, spaces, space, group, showing_group, group_settled, judging, edit, save, find, zoomed,
+        dialog, switches, power_saving, presenting, focus_mode, projects, project, task: in_hand, replace, spaces, space, group, showing_group, group_settled, judging, edit, save, find, zoomed,
         fullscreen, maximized, pinned,
     } = shown;
     // Under a dialog only Edit's, the window's and the app's own but Quit do something.
@@ -716,6 +780,16 @@ fn menus(shown: Shown) -> Vec<Menu> {
         checked(focus_mode, in_task("Focus Mode", "focus_mode")),
         checked(power_saving, when(true, act("Power Save Mode", PowerSaving))),
         when(true, act(if presenting { "End Presentation" } else { "Presentation Mode…" }, PresentationMode)),
+        sep(),
+        MenuItem::submenu(Menu::new("Code").items(vec![
+            checked(switches.type_hints, when(true, act("Type Hints", Toggle(Switch::TypeHints)))),
+            checked(switches.edit_prediction, when(true, act("Edit Prediction", Toggle(Switch::EditPrediction)))),
+            checked(switches.blame_at_line_end, when(true, act("Who Changed the Line, at Its End", Toggle(Switch::BlameAtLineEnd)))),
+        ])),
+        MenuItem::submenu(Menu::new("Diffs").items(vec![
+            checked(switches.ignore_whitespace, when(true, act("Ignore Whitespace", Toggle(Switch::IgnoreWhitespace)))),
+            checked(switches.diff_files, when(true, act("Changed Files Beside Them", Toggle(Switch::DiffFiles)))),
+        ])),
     ];
     if !mac {
         view.push(when(zoomed, act("Text of Its Usual Size", ResetTextSize)));
@@ -1101,7 +1175,7 @@ mod bar {
     fn alt_alone_opens_it(cx: &mut TestAppContext) {
         let (handle, bar, _) = open(cx, Shown::default(), true);
         cx.update(|cx| {
-            cx.bind_keys([KeyBinding::new("alt", OpenMenuBar, None)]);
+            cx.bind_keys([super::alt_alone()]);
             cx.on_action(|_: &OpenMenuBar, cx| super::toggle_bar(cx));
             cx.set_global(super::Bar(bar.clone()));
             cx.set_global(super::Target { window: handle, workspace: gpui_kit::WeakEntity::new_invalid() });

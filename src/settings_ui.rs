@@ -768,7 +768,9 @@ fn key_groups(
                             let subscription = cx.intercept_keystrokes(move |event, window, cx| {
                                 let Some(id) = recording.get() else { return };
                                 let k = &event.keystroke;
+                                // A modifier alone waits for its key; it opens nothing meanwhile (Alt, the menu bar).
                                 if matches!(k.key.as_str(), "shift" | "control" | "alt" | "platform" | "function" | "") {
+                                    cx.stop_propagation();
                                     return;
                                 }
                                 cx.stop_propagation();
