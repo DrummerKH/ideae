@@ -76,6 +76,9 @@ pub struct Settings {
     /// Minutes a task out of view keeps its language servers.
     pub lsp_idle_minutes: u32,
     pub notifications: bool,
+    /// A notification has the agent's words (its answer, its question);
+    /// off, only "Finished" or "Needs your answer".
+    pub notify_said: bool,
     /// Copy the main checkout's ignored `.env*` files into new worktrees.
     pub copy_env: bool,
     pub pr_status: bool,
@@ -164,6 +167,7 @@ impl Default for Settings {
             lsp_off: Vec::new(),
             lsp_idle_minutes: 15,
             notifications: true,
+            notify_said: true,
             copy_env: true,
             pr_status: true,
             fetch_minutes: 5,

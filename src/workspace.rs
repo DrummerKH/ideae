@@ -1947,14 +1947,15 @@ impl Workspace {
         }
         if status.is_attention() && !seen && !hidden && status != was && !event.replayed && state::settings().notifications {
             let said = self.said_shown(&view, cx);
+            let words = state::with_settings(|s| s.notify_said && s.show_said) && !self.is_presenting();
             let body = match (&status, &group) {
                 (agent::AgentStatus::NeedsInput(_), Some(_)) => {
                     label = format!("{label} · {variant}");
-                    Some(crate::said::notice(&status, said.as_deref()))
+                    Some(crate::said::notice(&status, said.as_deref(), words))
                 }
                 // A group tells when it is ready to look at: after the judge (variants.rs).
                 (_, Some(_)) => None,
-                (_, None) => Some(crate::said::notice(&status, said.as_deref())),
+                (_, None) => Some(crate::said::notice(&status, said.as_deref(), words)),
             };
             if let Some(body) = body {
                 let (tx, path) = (self.open_task_tx.clone(), event.task.clone());

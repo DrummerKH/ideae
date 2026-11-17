@@ -234,8 +234,11 @@ impl Said {
 }
 
 /// A desktop notification's text: what the agent asks, or what it did.
-pub fn notice(status: &crate::agent::AgentStatus, said: Option<&str>) -> String {
+/// Without `words`, only which of the two it is.
+pub fn notice(status: &crate::agent::AgentStatus, said: Option<&str>, words: bool) -> String {
     match (status, said) {
+        (crate::agent::AgentStatus::NeedsInput(_), _) if !words => "Needs your answer".into(),
+        (_, _) if !words => "Finished".into(),
         // The question its tool call asked is the message already.
         (crate::agent::AgentStatus::NeedsInput(message), Some(said)) if said.starts_with(message.trim_end_matches('…')) => lead(said, 160),
         (crate::agent::AgentStatus::NeedsInput(message), Some(said)) => format!("{message}\n{}", lead(said, 140)),
@@ -267,12 +270,14 @@ mod tests {
     }
 
     #[test]
-    fn notices() {
+    fn notices_with_and_without_words() {
         use crate::agent::AgentStatus::{Done, NeedsInput};
         let asks = NeedsInput("Which database?".into());
-        assert_eq!(notice(&asks, Some("Which database? (+1 more)")), "Which database? (+1 more)");
-        assert_eq!(notice(&NeedsInput("Needs permission".into()), Some("$ rm x")), "Needs permission\n$ rm x");
-        assert_eq!(notice(&Done, Some("All done.")), "All done.");
+        assert_eq!(notice(&asks, Some("Which database? (+1 more)"), true), "Which database? (+1 more)");
+        assert_eq!(notice(&NeedsInput("Needs permission".into()), Some("$ rm x"), true), "Needs permission\n$ rm x");
+        assert_eq!(notice(&Done, Some("All done."), true), "All done.");
+        assert_eq!(notice(&asks, Some("Which database?"), false), "Needs your answer");
+        assert_eq!(notice(&Done, Some("All done."), false), "Finished");
     }
 
     fn assistant(id: &str, content: Value) -> String {

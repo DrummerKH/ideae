@@ -152,6 +152,13 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
                 ))
                 .item(switch(
                     draft,
+                    "Show what the agent said in notifications",
+                    "Its last answer or its question. Off, a notification says only Finished or Needs your answer, with the task's name. Never while presenting.",
+                    |s| s.notify_said,
+                    |s, v| s.notify_said = v,
+                ))
+                .item(switch(
+                    draft,
                     "Check for updates",
                     "Release builds ask GitHub for a newer release now and then.",
                     |s| s.check_updates,

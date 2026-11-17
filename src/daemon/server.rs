@@ -504,8 +504,9 @@ fn notify(hook: &Hook) {
         return;
     }
     let Some(status) = event_of(hook).status().filter(|s| s.is_attention()) else { return };
-    let said = hook.said.as_deref().filter(|_| saved.settings.show_said && saved.presenting.is_none());
-    let body = crate::said::notice(&status, said);
+    let words = saved.settings.notify_said && saved.settings.show_said && saved.presenting.is_none();
+    let said = hook.said.as_deref().filter(|_| words);
+    let body = crate::said::notice(&status, said, words);
     let task = std::path::Path::new(&hook.task).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let path = std::path::PathBuf::from(&hook.task);
     crate::desktop::notify_with(&task, &body, move || crate::desktop::open_window_on(&path));
