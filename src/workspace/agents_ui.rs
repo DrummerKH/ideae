@@ -70,7 +70,12 @@ impl Workspace {
     /// Which agent a task runs now.
     pub fn task_profile(&self, path: &Path, cx: &App) -> Option<agents::Profile> {
         let (pi, ti) = self.find(path)?;
-        let t = &self.projects[pi].tasks[ti];
+        self.task_profile_at(pi, ti, cx)
+    }
+
+    /// As `task_profile`, for a row the list has in hand.
+    pub fn task_profile_at(&self, pi: usize, ti: usize, cx: &App) -> Option<agents::Profile> {
+        let t = self.projects.get(pi)?.tasks.get(ti)?;
         if let Some(launch) = t.view.as_ref().and_then(|v| v.read(cx).launch.clone()) {
             return Some(launch.profile);
         }

@@ -130,8 +130,10 @@ impl Workspace {
         let query = self.search.read(cx).value().trim().to_lowercase();
         let mut list = v_flex().id("sidebar-list").flex_1().min_h_0().overflow_y_scroll().pb_2();
 
+        // Read once: Needs you lists them, Starred leaves them out.
+        let active = if query.is_empty() { self.active_rows(cx) } else { Vec::new() };
+        let waiting: std::collections::HashSet<(usize, usize)> = active.iter().copied().collect();
         if query.is_empty() {
-            let active = self.active_rows(cx);
             if !active.is_empty() {
                 let collapsed = self.active_collapsed;
                 list = list.child(
@@ -162,7 +164,6 @@ impl Workspace {
         // Starred: wherever their project is, below what needs you; as far
         // as the window shows them (its space, a presentation).
         if query.is_empty() {
-            let waiting: std::collections::HashSet<(usize, usize)> = self.active_rows(cx).into_iter().collect();
             let starred: Vec<(usize, usize)> = self
                 .projects
                 .iter()
@@ -202,6 +203,7 @@ impl Workspace {
             );
         }
         let mut shown = 0;
+        let show_sides = crate::state::with_settings(|s| s.show_side_worktrees);
         for pi in 0..self.projects.len() {
             let p = &self.projects[pi];
             let project_hit = query.is_empty() || p.name.to_lowercase().contains(&query);
@@ -210,7 +212,6 @@ impl Workspace {
                 .collect();
             // The agents' own worktrees go under the task they came from, or
             // at the end, folded; a search lists them as it finds them.
-            let show_sides = crate::state::with_settings(|s| s.show_side_worktrees);
             let (sides, tasks): (Vec<usize>, Vec<usize>) = tasks.into_iter().partition(|&ti| p.tasks[ti].side.is_some());
             let sides: Vec<usize> = if show_sides { sides } else { Vec::new() };
             let mut tasks: Vec<usize> = if query.is_empty() { tasks } else { tasks.into_iter().chain(sides.iter().copied()).collect() };
@@ -711,7 +712,7 @@ impl Workspace {
         let running = t.view.is_some();
         // With more than one agent: which one it runs, as a letter.
         let several = crate::state::with_settings(|s| s.several_agents());
-        let agent_mark = if several && t.side.is_none() { self.task_profile(&path, cx) } else { None };
+        let agent_mark = if several && t.side.is_none() { self.task_profile_at(pi, ti, cx) } else { None };
         let guessed = t.view.as_ref().is_some_and(|v| v.read(cx).status_guessed);
 
         let ((glyph, changes, unseen, needs), unpushed) = match &t.view {
