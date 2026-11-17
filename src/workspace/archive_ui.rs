@@ -220,6 +220,8 @@ impl Workspace {
 
     /// Deletes the archives older than Settings say, in the background.
     pub(super) fn clean_up_archives(&mut self, cx: &mut Context<Self>) {
+        // Java's index of a worktree that is gone, with the archives' sweep.
+        cx.background_spawn(async move { crate::lsp::prune_jdtls() }).detach();
         let days = state::with_settings(|s| s.archive_keep_days);
         if days == 0 {
             return;

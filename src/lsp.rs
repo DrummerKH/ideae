@@ -1471,8 +1471,36 @@ fn project_args(program: &str, root: &Path) -> Vec<std::ffi::OsString> {
     use sha2::Digest as _;
     let hash = sha2::Sha256::digest(root.to_string_lossy().as_bytes());
     let name: String = hash.iter().take(8).map(|b| format!("{b:02x}")).collect();
-    let data = crate::state::data_home().join("ideae").join("jdtls").join(name);
+    let data = jdtls_home().join(name);
+    // Which project it is of, for `prune_jdtls` once the worktree is gone.
+    let (marker, project) = (data.join(PROJECT_MARK), root.to_path_buf());
+    std::thread::spawn(move || {
+        let _ = std::fs::create_dir_all(marker.parent().unwrap_or(&marker));
+        let _ = std::fs::write(&marker, project.to_string_lossy().as_bytes());
+    });
     vec!["-data".into(), data.into_os_string()]
+}
+
+const PROJECT_MARK: &str = ".ideae-project";
+
+fn jdtls_home() -> PathBuf {
+    crate::state::data_home().join("ideae").join("jdtls")
+}
+
+/// jdtls keeps an index per project, tens of MB: those of worktrees that
+/// are gone go. Run off the UI thread.
+pub fn prune_jdtls() {
+    prune_jdtls_in(&jdtls_home());
+}
+
+fn prune_jdtls_in(home: &Path) {
+    let Ok(entries) = std::fs::read_dir(home) else { return };
+    for entry in entries.flatten() {
+        let project = std::fs::read_to_string(entry.path().join(PROJECT_MARK)).ok();
+        if project.is_some_and(|project| !Path::new(project.trim()).exists()) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 /// Variables a server needs that the user's environment does not give.
@@ -1848,6 +1876,22 @@ mod language_tests {
 #[cfg(test)]
 mod configuration_tests {
     use super::*;
+
+    /// A jdtls workspace goes with its project; one without a mark is not ours to judge.
+    #[test]
+    fn jdtls_workspaces_of_projects_gone_are_pruned() {
+        let home = std::env::temp_dir().join(format!("ideae-jdtls-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        for (name, project) in [("kept", Some(home.clone())), ("gone", Some(home.join("no-such-project"))), ("unmarked", None)] {
+            std::fs::create_dir_all(home.join(name)).unwrap();
+            if let Some(project) = project {
+                std::fs::write(home.join(name).join(PROJECT_MARK), project.to_string_lossy().as_bytes()).unwrap();
+            }
+        }
+        prune_jdtls_in(&home);
+        assert!(home.join("kept").exists() && home.join("unmarked").exists() && !home.join("gone").exists());
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     /// kotlin-lsp shows a kind of hint only when it is named as on.
     #[test]

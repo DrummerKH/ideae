@@ -1781,14 +1781,25 @@ pub fn between(ours: &Path, theirs: &Path, files: &[String]) -> String {
         if a == b {
             continue;
         }
+        let text = |side: &Option<Vec<u8>>| String::from_utf8(side.clone().unwrap_or_default()).ok().filter(|text| !text.contains('\0'));
+        let (old, new) = (text(&a), text(&b));
+        // Whitespace left out: git tells what else differs, or that nothing does.
+        if ignore_whitespace() && a.is_some() && b.is_some() && old.is_some() && new.is_some() {
+            let (left, right) = (ours.join(file), theirs.join(file));
+            let args = ["diff", "--no-index", "--no-color", "--no-ext-diff", "--ignore-all-space", "--ignore-blank-lines", "--unified=3"];
+            let out = git(ours, &[&args[..], &[&*left.to_string_lossy(), &*right.to_string_lossy()]].concat()).unwrap_or_default();
+            if let Some(at) = out.find("\n@@") {
+                patch.push_str(&format!("diff --git a/{file} b/{file}\n--- a/{file}\n+++ b/{file}\n{}", &out[at + 1..]));
+            }
+            continue;
+        }
         patch.push_str(&format!("diff --git a/{file} b/{file}\n"));
         match (&a, &b) {
             (None, _) => patch.push_str("new file mode 100644\n"),
             (_, None) => patch.push_str("deleted file mode 100644\n"),
             _ => {}
         }
-        let text = |side: &Option<Vec<u8>>| String::from_utf8(side.clone().unwrap_or_default()).ok().filter(|text| !text.contains('\0'));
-        let (Some(old), Some(new)) = (text(&a), text(&b)) else {
+        let (Some(old), Some(new)) = (old, new) else {
             patch.push_str(&format!("Binary files a/{file} and b/{file} differ\n"));
             continue;
         };
@@ -2046,6 +2057,25 @@ mod pull_tests {
         sh(&a, "git apply ../ab.patch");
         assert_eq!(std::fs::read_to_string(a.join("f.txt")).unwrap(), "one\ntwo\nthree\n");
         assert!(!a.join("gone.txt").exists() && std::fs::read_to_string(a.join("made.txt")).unwrap() == "new\n");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// With whitespace left out, two variants that differ by a reindent and
+    /// a blank line are the same, and a real change is all there is.
+    #[test]
+    fn variants_compared_without_whitespace() {
+        let base = setup("between-ws");
+        let (a, b) = (base.join("a"), base.join("b"));
+        sh(&base, "cd a; printf 'fn f() {\\na();\\n}\\n' > same.rs; printf 'x\\ny\\n' > real.rs; printf '\\000\\001' > blob.bin
+            cd ../b; printf 'fn f() {\\n    a();\\n\\n}\\n' > same.rs; printf '  x\\nY\\n' > real.rs; printf '\\000\\002' > blob.bin");
+        let files: Vec<String> = ["same.rs", "real.rs", "blob.bin"].map(String::from).to_vec();
+        super::IGNORE_WHITESPACE.set(true);
+        let patch = between(&a, &b, &files);
+        super::IGNORE_WHITESPACE.set(false);
+        assert!(!patch.contains("same.rs"), "{patch}");
+        assert!(patch.contains("diff --git a/real.rs b/real.rs") && patch.contains("-y") && patch.contains("+Y") && !patch.contains("-x"), "{patch}");
+        assert!(patch.contains("Binary files a/blob.bin and b/blob.bin differ"), "{patch}");
+        assert_eq!(gpui_kit::component::diff::DiffFile::parse(&patch).unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(&base);
     }
 
