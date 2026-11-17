@@ -177,6 +177,11 @@ pub trait FrameHandle: 'static {
         let _ = selection;
         None
     }
+    /// ideae patch: bytes of output the source parsed so far; 0 when it
+    /// does not count them.
+    fn output_seen(&self) -> u64 {
+        0
+    }
     /// Stop the source. Idempotent.
     fn close(&self);
 }

@@ -127,6 +127,7 @@ pub struct TerminalState {
     pub(crate) row_cache: crate::terminal::element::RowCache,
     pub(crate) image_cache: crate::terminal::images::ImageCache,
     pressed_keys: HashSet<String>,
+    typed_at: Option<std::time::Instant>,
     right_click_passthrough: bool,
     hovered_link: Option<(u16, Link)>,
     scroll: ScrollAccumulator,
@@ -171,6 +172,7 @@ impl TerminalState {
             row_cache: crate::terminal::element::RowCache::default(),
             image_cache: crate::terminal::images::ImageCache::default(),
             pressed_keys: HashSet::new(),
+            typed_at: None,
             right_click_passthrough: true,
             hovered_link: None,
             scroll: ScrollAccumulator::default(),
@@ -317,6 +319,20 @@ impl TerminalState {
             self.hovered_link = None;
         }
         cx.notify();
+    }
+
+    /// ideae patch: bytes of output the program wrote so far, counted
+    /// while hidden too; with [`Self::typed_at`] it tells a program at work
+    /// from one that echoes what is typed or went quiet.
+    #[must_use]
+    pub fn output_seen(&self) -> u64 {
+        self.handle.as_ref().map_or(0, |handle| handle.output_seen())
+    }
+
+    /// ideae patch: when keys, text or a paste were last sent to the program.
+    #[must_use]
+    pub fn typed_at(&self) -> Option<std::time::Instant> {
+        self.typed_at
     }
 
     /// The frame being drawn.
@@ -700,6 +716,9 @@ impl TerminalState {
         let Some(handle) = &self.handle else {
             return;
         };
+        if matches!(input, TerminalInput::Key(_) | TerminalInput::Text(_) | TerminalInput::Paste(_)) {
+            self.typed_at = Some(std::time::Instant::now());
+        }
         let scroll = !matches!(input, TerminalInput::Scroll(_) | TerminalInput::Focus(_))
             && self.is_scrolled();
         let _ = handle.input(input);

@@ -12,7 +12,7 @@
 use std::collections::VecDeque;
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -430,6 +430,7 @@ impl ByteSink {
             wake: Condvar::new(),
             room: Condvar::new(),
             closing: AtomicBool::new(false),
+            output: AtomicU64::new(0),
         });
         (ByteSink { shared: shared.clone() }, DetachedSink { shared })
     }
@@ -513,6 +514,9 @@ struct Shared {
     /// Signals a source in [`ByteSink::wait_for_room`].
     room: Condvar,
     closing: AtomicBool,
+    /// ideae patch: bytes of output parsed so far, hidden or not: how a
+    /// host tells a program that writes from one that went quiet.
+    output: AtomicU64,
 }
 
 impl std::fmt::Debug for Mailbox {
@@ -697,6 +701,7 @@ pub(crate) fn spawn(
         wake: Condvar::new(),
         room: Condvar::new(),
         closing: AtomicBool::new(false),
+        output: AtomicU64::new(0),
     });
     let handle = EngineHandle {
         shared: shared.clone(),
@@ -818,6 +823,10 @@ impl FrameHandle for EngineHandle {
 
     fn request_frame(&self) {
         Self::request_frame(self);
+    }
+
+    fn output_seen(&self) -> u64 {
+        self.shared.output.load(Ordering::Relaxed)
     }
 
     fn set_colors(&self, colors: TerminalColors) {
@@ -1051,6 +1060,7 @@ impl Owner {
         }
         if !reads.is_empty() {
             for chunk in reads {
+                self.shared.output.fetch_add(chunk.len() as u64, Ordering::Relaxed);
                 self.core.write(&chunk, &mut self.effects);
             }
             self.compression_deadline = Some(Instant::now() + COMPRESSION_IDLE);
@@ -1351,6 +1361,11 @@ impl Owner {
         if changed {
             self.dirty = true;
             self.force = true;
+        }
+        // ideae patch: a bell or a notification is told at once, with the
+        // frame already shown, so a hidden terminal reports it too.
+        if effects.bells > 0 || !effects.notifications.is_empty() {
+            self.publish();
         }
         Ok(())
     }
