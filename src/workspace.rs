@@ -877,8 +877,10 @@ impl Workspace {
         }
         let entry = self.entry_mut(path)?;
         let (root, branch, session, pr) = (entry.path.clone(), entry.branch.clone(), entry.session.clone(), entry.pr.clone());
+        let fill = self.usage.get(path).map_or(0., |(_, usage)| usage.fill());
         let view = cx.new(|cx| {
             let mut t = TaskView::new(root, branch, agent, socket, slot, window, cx);
+            t.context_fill = fill;
             // Servers start when the task comes into view (switch).
             t.lsp_asleep = true;
             t.restore(&session, window, cx);
@@ -2073,6 +2075,15 @@ impl Workspace {
                         if state::with_settings(|s| s.notifications) && !window.is_window_active() {
                             crate::desktop::notify("Tokens", &told);
                         }
+                    }
+                    let fill = usage.fill();
+                    if let Some(view) = this.find(&path).and_then(|(pi, ti)| this.projects[pi].tasks[ti].view.clone()) {
+                        view.update(cx, |t, cx| {
+                            if t.context_fill != fill {
+                                t.context_fill = fill;
+                                cx.notify();
+                            }
+                        });
                     }
                     this.usage.insert(path, (written, usage));
                     cx.notify();

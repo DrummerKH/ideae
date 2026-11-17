@@ -415,6 +415,8 @@ pub struct TaskView {
     /// In a narrow window the side panel is over the task, shown on asking.
     narrow: bool,
     side_over: bool,
+    /// How full the agent's context is, from 0 to 1, as the workspace last read it.
+    pub context_fill: f32,
     told_action: Option<(bool, String)>,
     /// Wakes the refresh loop: file events, actions, the fallback tick.
     refresh_tx: async_channel::Sender<()>,
@@ -693,6 +695,7 @@ impl TaskView {
             discard_undo: None,
             action: None,
             told_action: None,
+            context_fill: 0.,
             narrow: false,
             side_over: false,
             refresh_tx,

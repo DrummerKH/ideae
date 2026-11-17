@@ -49,15 +49,15 @@ fn section_header(label: &'static str, cx: &App) -> Div {
 }
 
 /// A ring filled clockwise from the top as far as the context is full:
-/// yellow when it will soon be squeezed, red when that is about to happen.
-fn context_dial(fill: f32, cx: &App) -> impl IntoElement {
-    let color = if fill >= 0.9 { DIAL_RED } else if fill >= 0.75 { DIAL_AMBER } else { DIAL_BLUE };
+/// quiet while there is room, yellow when it will soon be squeezed, red
+/// when that is about to happen.
+pub(crate) fn context_dial(fill: f32, cx: &App) -> impl IntoElement {
+    let color = if fill >= 0.9 { DIAL_RED } else if fill >= 0.75 { DIAL_AMBER } else { cx.theme().muted_foreground };
     dial("context-dial", fill, color, cx.theme().foreground)
 }
 
 /// Colors that show on a light ground as on a dark one: the theme's
 /// yellow is all but white on white.
-pub(crate) const DIAL_BLUE: Hsla = Hsla { h: 0.58, s: 0.8, l: 0.5, a: 1. };
 pub(crate) const DIAL_AMBER: Hsla = Hsla { h: 0.09, s: 0.95, l: 0.5, a: 1. };
 pub(crate) const DIAL_RED: Hsla = Hsla { h: 0.0, s: 0.8, l: 0.52, a: 1. };
 

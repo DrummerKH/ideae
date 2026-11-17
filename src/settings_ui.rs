@@ -177,6 +177,13 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
                 ))
                 .item(switch(
                     draft,
+                    "Context dial on the agent's tab",
+                    "On the agent's tab of the task in view, how full its context is.",
+                    |s| s.context_on_tab,
+                    |s, v| s.context_on_tab = v,
+                ))
+                .item(switch(
+                    draft,
                     "Worktrees agents made",
                     "Those an agent made for itself (Claude Code's subagents, a try in a temporary folder), folded under the task they came from, opened without an agent. Off, they are not listed.",
                     |s| s.show_side_worktrees,

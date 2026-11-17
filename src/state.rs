@@ -95,6 +95,8 @@ pub struct Settings {
     pub show_tokens: bool,
     /// A task in the sidebar shows how full its agent's context is.
     pub context_dial: bool,
+    /// So does the agent's tab of the task in view.
+    pub context_on_tab: bool,
     /// The language server's completions come up as you type, not only
     /// when asked for; its colors for names are drawn; a file is
     /// reformatted when saved by hand.
@@ -152,6 +154,7 @@ impl Default for Settings {
             show_load: true,
             show_tokens: true,
             context_dial: true,
+            context_on_tab: true,
             complete_as_typed: true,
             semantic_colors: true,
             format_on_save: false,

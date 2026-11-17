@@ -120,10 +120,14 @@ impl TaskView {
                 let dragged = DraggedTab { tab_id: tab.id, title: label.clone() };
                 let item = if tab.title == "agent" {
                     let root = self.root.clone();
+                    let fill = self.context_fill;
+                    let dialed = fill > 0. && crate::state::with_settings(|s| s.context_on_tab);
                     Tab::new().child(
-                        div()
+                        h_flex()
                             .id("agent-usage")
+                            .gap_1p5()
                             .child(label)
+                            .when(dialed, |tab| tab.child(crate::sidebar::context_dial(fill, cx)))
                             .tooltip(move |_, cx| cx.new(|cx| crate::usage::UsageTooltip::new(root.clone(), cx)).into()),
                     )
                 } else {
