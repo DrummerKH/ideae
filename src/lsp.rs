@@ -818,7 +818,32 @@ impl LspClient {
         Ok(serde_json::from_value::<Option<lsp_types::SemanticTokens>>(value)?.unwrap_or_default())
     }
 
-    /// textDocument/inlayHint: the types and parameter names the server
+    /// What a server asks of its settings by `workspace/configuration`; null,
+/// and it takes its defaults.
+fn configuration(section: &str) -> Value {
+    match section {
+        // kotlin-lsp shows only the kinds of hints named here as on; with
+        // none it shows none.
+        "jetbrains.kotlin" => {
+            const ON: &[&str] = &[
+                "parameters",
+                "parameters.compiled",
+                "type.property",
+                "type.variable",
+                "type.function.return",
+                "type.function.parameter",
+                "lambda.return",
+                "lambda.receivers.parameters",
+                "value.ranges",
+                "value.kotlin.time",
+            ];
+            json!({ "hints": ON.iter().map(|kind| (kind.to_string(), Value::Bool(true))).collect::<serde_json::Map<_, _>>() })
+        }
+        _ => Value::Null,
+    }
+}
+
+/// textDocument/inlayHint: the types and parameter names the server
     /// would show in a range; none from a server that has no hints.
     pub fn inlay_hints(&self, uri: &str, range: lsp_types::Range) -> Result<Vec<lsp_types::InlayHint>> {
         self.wait_ready()?;
@@ -1089,8 +1114,8 @@ fn read_messages(stdout: impl Read, out: mpsc::Sender<Out>, pending: &Pending, p
             // A request from the server. Answer so it never waits on us.
             (Some(id), Some(method)) => {
                 let result = if method == "workspace/configuration" {
-                    let n = message["params"]["items"].as_array().map_or(0, Vec::len);
-                    Value::Array(vec![Value::Null; n])
+                    let items = message["params"]["items"].as_array().map(Vec::as_slice).unwrap_or_default();
+                    Value::Array(items.iter().map(|item| LspClient::configuration(item["section"].as_str().unwrap_or_default())).collect())
                 } else {
                     Value::Null
                 };
@@ -1549,5 +1574,19 @@ mod language_tests {
         assert_eq!(of("main.tf"), "hcl");
         assert_eq!(super::extension_of(Path::new("/a/phpunit.xml.dist")), "xml");
         assert_eq!(super::extension_of(Path::new("/a/Makefile")), "");
+    }
+}
+
+#[cfg(test)]
+mod configuration_tests {
+    use super::*;
+
+    /// kotlin-lsp shows a kind of hint only when it is named as on.
+    #[test]
+    fn kotlin_lsp_is_told_which_hints_to_show() {
+        let kotlin = LspClient::configuration("jetbrains.kotlin");
+        assert_eq!(kotlin["hints"]["type.variable"], Value::Bool(true));
+        assert_eq!(kotlin["hints"]["parameters"], Value::Bool(true));
+        assert_eq!(LspClient::configuration("intelephense"), Value::Null);
     }
 }
