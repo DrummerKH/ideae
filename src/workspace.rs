@@ -2211,6 +2211,11 @@ impl Workspace {
             theme::choose(&new.theme, cx);
             theme::apply_everywhere(self.appearance, cx);
         }
+        if old.inlay_hints != new.inlay_hints || old.blame_at_line_end != new.blame_at_line_end {
+            for view in self.views() {
+                view.update(cx, |t, cx| t.code_settings_changed(cx));
+            }
+        }
         if old.gutter_since_base != new.gutter_since_base {
             for view in self.views() {
                 view.update(cx, |t, cx| t.reload_gutters(cx));

@@ -540,6 +540,7 @@ impl LspClient {
                                 "activeParameterSupport": true,
                             },
                         },
+                        "inlayHint": {},
                         "semanticTokens": {
                             "requests": { "range": true, "full": true },
                             "tokenTypes": SEMANTIC_TYPES.map(|(name, _)| name),
@@ -815,6 +816,22 @@ impl LspClient {
             self.raw_request("textDocument/semanticTokens/full", json!({ "textDocument": { "uri": uri } }))?
         };
         Ok(serde_json::from_value::<Option<lsp_types::SemanticTokens>>(value)?.unwrap_or_default())
+    }
+
+    /// textDocument/inlayHint: the types and parameter names the server
+    /// would show in a range; none from a server that has no hints.
+    pub fn inlay_hints(&self, uri: &str, range: lsp_types::Range) -> Result<Vec<lsp_types::InlayHint>> {
+        self.wait_ready()?;
+        let supported = {
+            let capabilities = self.capabilities.lock().unwrap();
+            let provider = &capabilities["inlayHintProvider"];
+            provider.as_bool().unwrap_or(provider.is_object())
+        };
+        if !supported {
+            return Ok(Vec::new());
+        }
+        let value = self.raw_request("textDocument/inlayHint", json!({ "textDocument": { "uri": uri }, "range": range }))?;
+        Ok(serde_json::from_value::<Option<Vec<lsp_types::InlayHint>>>(value)?.unwrap_or_default())
     }
 
     /// textDocument/rename: every edit that gives the symbol its new name.
@@ -1395,6 +1412,15 @@ mod tests {
         // `fn greeting`: the first token named is the function, at 0:3.
         let first = tokens.data.iter().find(|t| legend[t.token_type as usize] == "function").unwrap();
         assert_eq!((first.delta_start, first.length), (3, 8));
+        // `let   words`: its type, after the name.
+        let hints = client.inlay_hints(&uri, all).unwrap();
+        let words = hints.iter().find(|h| h.position == lsp_types::Position::new(5, 15)).unwrap_or_else(|| panic!("no hint after `words`: {hints:?}"));
+        let label = match &words.label {
+            lsp_types::InlayHintLabel::String(label) => label.clone(),
+            lsp_types::InlayHintLabel::LabelParts(parts) => parts.iter().map(|p| p.value.as_str()).collect(),
+        };
+        assert!(label.contains("String"), "{hints:?}");
+        assert_eq!(words.kind, Some(lsp_types::InlayHintKind::TYPE));
         let _ = std::fs::remove_dir_all(&root);
     }
 
