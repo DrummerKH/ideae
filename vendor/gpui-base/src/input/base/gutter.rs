@@ -4,7 +4,7 @@
 
 use std::{ops::Range, rc::Rc};
 
-use gpui::{App, Context, Hsla, Pixels, Point, SharedString, Window, px};
+use gpui::{AnyView, App, Context, Hsla, Pixels, Point, SharedString, Window, px};
 
 use super::{InputBaseState, RopeExt as _, kind::InputModeKind};
 
@@ -40,11 +40,8 @@ pub enum GutterEvent {
     Change(usize),
 }
 
-/// How far left of the gutter's right edge a click is on a change's mark:
-/// the mark and the margin around it, short of the fold icons.
-const CHANGE_MARK_REACH: Pixels = px(6.);
-
 pub(super) type GutterListener = Rc<dyn Fn(&GutterEvent, &mut Window, &mut App)>;
+pub(super) type ChangeTooltip = Rc<dyn Fn(&mut Window, &mut App) -> AnyView>;
 
 #[derive(Default)]
 pub(super) struct Gutter {
@@ -57,6 +54,8 @@ pub(super) struct Gutter {
     /// move; None leaves no room for them.
     pub(super) bookmarks: Option<Vec<usize>>,
     pub(super) bookmark_color: Hsla,
+    /// Shown over a change's mark.
+    pub(super) change_tooltip: Option<ChangeTooltip>,
 }
 
 /// Where an offset is after `range` was replaced by `new_len` bytes. Text
@@ -93,6 +92,11 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// Told when the pointer goes over a note or a note is clicked.
     pub fn on_gutter(&mut self, listener: impl Fn(&GutterEvent, &mut Window, &mut App) + 'static) {
         self.gutter.listener = Some(Rc::new(listener));
+    }
+
+    /// The tooltip over a change's mark, which a click opens.
+    pub fn set_change_tooltip(&mut self, tooltip: impl Fn(&mut Window, &mut App) -> AnyView + 'static) {
+        self.gutter.change_tooltip = Some(Rc::new(tooltip));
     }
 
     /// The row the last right press in the gutter was on, if it was there.
@@ -139,6 +143,27 @@ impl<M: InputModeKind> InputBaseState<M> {
             for offset in offsets.iter_mut() {
                 *offset = moved_offset(*offset, range, new_len);
             }
+        }
+    }
+
+    /// Whether a change's mark is on the row: a strip, or the bar of lines
+    /// gone before it.
+    pub(super) fn has_change_mark(&self, row: usize) -> bool {
+        self.line_marks.rows.contains_key(&row) || self.line_marks.gone_before.contains_key(&row)
+    }
+
+    /// How far left of the gutter's right edge the row's change mark takes
+    /// a click: all the room right of the line numbers, short of a fold
+    /// arrow where the row has one.
+    pub(super) fn change_reach(&self, row: usize) -> Pixels {
+        use super::element::{FOLD_ICON_HITBOX_WIDTH, FOLD_ICON_WIDTH, LINE_NUMBER_RIGHT_MARGIN};
+        if !self.mode.is_folding() {
+            LINE_NUMBER_RIGHT_MARGIN
+        } else if self.display_map.is_fold_candidate(row) {
+            // The arrow is centered in its column, which ends this margin short of the edge.
+            LINE_NUMBER_RIGHT_MARGIN + (FOLD_ICON_HITBOX_WIDTH - FOLD_ICON_WIDTH) / 2.
+        } else {
+            LINE_NUMBER_RIGHT_MARGIN + FOLD_ICON_HITBOX_WIDTH - px(2.)
         }
     }
 
@@ -191,8 +216,8 @@ impl<M: InputModeKind> InputBaseState<M> {
         }
         if let Some((row, _)) = at
             && let Some(layout) = self.last_layout.as_ref()
-            && position.x - self.input_bounds.origin.x >= layout.line_number_width - CHANGE_MARK_REACH
-            && (self.line_marks.rows.contains_key(&row) || self.line_marks.gone_before.contains_key(&row))
+            && position.x - self.input_bounds.origin.x >= layout.line_number_width - self.change_reach(row)
+            && self.has_change_mark(row)
             && let Some(listener) = self.gutter.listener.clone()
         {
             window.defer(cx, move |window, cx| listener(&GutterEvent::Change(row), window, cx));

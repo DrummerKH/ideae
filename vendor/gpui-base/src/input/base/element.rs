@@ -50,8 +50,8 @@ fn diagnostic_highlight_style(
 const BOTTOM_MARGIN_ROWS: usize = 3;
 pub(super) const RIGHT_MARGIN: Pixels = px(10.);
 pub(super) const LINE_NUMBER_RIGHT_MARGIN: Pixels = px(6.);
-const FOLD_ICON_WIDTH: Pixels = px(14.);
-const FOLD_ICON_HITBOX_WIDTH: Pixels = px(18.);
+pub(super) const FOLD_ICON_WIDTH: Pixels = px(14.);
+pub(super) const FOLD_ICON_HITBOX_WIDTH: Pixels = px(18.);
 const MAX_HIGHLIGHT_LINE_LENGTH: usize = 10_000;
 const MIN_LINE_NUMBER_DIGITS: usize = 3;
 const MAX_LINE_NUMBER_DIGITS: usize = 7;
@@ -1531,6 +1531,53 @@ impl<M: InputModeKind> TextElement<M> {
         icon_layout
     }
 
+    /// ideae patch: over each row's change mark, what takes the pointer
+    /// there: a hand and a tooltip. The click itself is the editor's
+    /// (`gutter_press_at`).
+    fn layout_change_targets(
+        &self,
+        origin_x: Pixels,
+        bounds: &Bounds<Pixels>,
+        last_layout: &LastLayout,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Vec<AnyElement> {
+        use gpui::StatefulInteractiveElement as _;
+        let (targets, tooltip) = {
+            let state = self.state.read(cx);
+            if state.gutter.listener.is_none() || (state.line_marks.rows.is_empty() && state.line_marks.gone_before.is_empty()) {
+                return Vec::new();
+            }
+            let mut offset_y = last_layout.visible_top;
+            let mut targets = Vec::new();
+            for (line, &buffer_line) in last_layout.lines.iter().zip(last_layout.visible_buffer_lines.iter()) {
+                let height = last_layout.line_height * line.wrapped_lines.len() as f32;
+                if state.has_change_mark(buffer_line) {
+                    targets.push((buffer_line, offset_y, height, state.change_reach(buffer_line)));
+                }
+                offset_y += height;
+            }
+            (targets, state.gutter.change_tooltip.clone())
+        };
+        targets
+            .into_iter()
+            .map(|(row, y, height, reach)| {
+                let target = gpui::div().id(("change-mark", row)).w(reach).h(height).cursor_pointer();
+                let mut target = match tooltip.clone() {
+                    Some(tooltip) => target.tooltip(move |window, cx| tooltip(window, cx)).into_any_element(),
+                    None => target.into_any_element(),
+                };
+                target.prepaint_as_root(
+                    point(origin_x + last_layout.line_number_width - reach, bounds.origin.y + y),
+                    size(reach, height).into(),
+                    window,
+                    cx,
+                );
+                target
+            })
+            .collect()
+    }
+
     /// Paint fold icons using prepaint hitboxes.
     ///
     /// This handles:
@@ -2568,6 +2615,8 @@ pub(super) struct PrepaintState {
     bounds: Bounds<Pixels>,
     /// Fold icon layout data
     fold_icon_layout: FoldIconLayout,
+    /// ideae patch: see `layout_change_targets`.
+    change_targets: Vec<AnyElement>,
     // Inline completion rendering data
     /// Shaped ghost lines to paint after cursor row (completion lines 2+)
     ghost_lines: Vec<ShapedLine>,
@@ -3324,6 +3373,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
             )));
         let fold_icon_layout =
             self.layout_fold_icons(original_x, &bounds, &last_layout, window, cx);
+        let change_targets = self.layout_change_targets(original_x, &bounds, &last_layout, window, cx);
         let hitbox = window.insert_hitbox(input_bounds, HitboxBehavior::Normal);
         self.request_reveal(
             input_bounds,
@@ -3356,6 +3406,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
             range_decoration_frames,
             indent_guides_path,
             fold_icon_layout,
+            change_targets,
             ghost_first_line,
             ghost_lines,
             ghost_lines_height,
@@ -3710,6 +3761,9 @@ impl<M: InputModeKind> Element for TextElement<M> {
             window,
             cx,
         );
+        for target in prepaint.change_targets.iter_mut() {
+            target.paint(window, cx);
+        }
 
         // ideae patch: the sticky lines, over the text and the gutter; a
         // click on one goes to its declaration.

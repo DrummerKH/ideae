@@ -179,7 +179,8 @@ impl TaskView {
         editor.update(cx, |state, _| {
             state.on_gutter(move |event, window, cx| {
                 let _ = weak.update(cx, |f, cx| f.on_gutter(event, window, cx));
-            })
+            });
+            state.set_change_tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Show the change").build(window, cx));
         });
         self.give_bookmarks(&path, &editor, cx);
         file.update(cx, |f, cx| {
