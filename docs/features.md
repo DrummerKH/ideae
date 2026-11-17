@@ -128,6 +128,17 @@ all: what is removed stays under `refs/ideae/variants` for two weeks.
 - Tree-sitter highlighting; go to definition, usages and implementations
   (with a language server, else a search-based fallback). A missing server
   can be installed from the editor header.
+- Language servers: gopls (Go), rust-analyzer, typescript-language-server
+  (TypeScript, JavaScript), intelephense (PHP), kotlin-lsp, basedpyright
+  (Python), clangd (C, C++), jdtls (Java), csharp-ls (C#), LuaLS, zls (Zig),
+  bash-language-server, the JSON, CSS and HTML servers of VS Code,
+  yaml-language-server, Taplo (TOML), Marksman (Markdown),
+  dockerfile-language-server, terraform-ls. ruby-lsp, sourcekit-lsp (Swift),
+  Dart's, elixir-ls and Metals (Scala) are used when on PATH: they come with
+  their language, or need it to install. A server on PATH wins over one ideae
+  installed; Settings → Language servers turns each off.
+- Types and parameter names from the server are shown in the code where it
+  has them (most of the above; intelephense only with a licence).
 - With a language server: completion as you type, problems underlined (F2
   steps through them), fixes (Alt+Enter), rename everywhere (Shift+F6),
   reformat (Ctrl+Alt+L, or on save), parameter info (Ctrl+P), names colored

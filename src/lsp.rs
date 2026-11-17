@@ -144,31 +144,152 @@ pub struct Server {
     pub args: &'static [&'static str],
 }
 
-/// A language server ideae can run: the program, its arguments, and the
-/// file extensions it serves with their LSP language ids. The one list:
-/// Settings shows what is here.
+/// A language server ideae can run: the program, its arguments, the file
+/// extensions it serves with their LSP language ids, files it serves by
+/// name, and what marks a project of its own. The one list: Settings shows
+/// what is here.
 pub struct ServerDef {
     pub program: &'static str,
     pub args: &'static [&'static str],
     pub languages: &'static [(&'static str, &'static str)],
+    /// Files it serves by their lowercase name, before any extension, with
+    /// their language ids; a `*` stands for any part of the name.
+    pub names: &'static [(&'static str, &'static str)],
+    /// Files in a project's top directory: see `project_root`.
+    pub markers: &'static [&'static str],
+}
+
+const fn server(
+    program: &'static str,
+    args: &'static [&'static str],
+    languages: &'static [(&'static str, &'static str)],
+    markers: &'static [&'static str],
+) -> ServerDef {
+    ServerDef { program, args, languages, names: &[], markers }
 }
 
 pub const SERVERS: &[ServerDef] = &[
-    ServerDef { program: "gopls", args: &[], languages: &[("go", "go")] },
-    ServerDef { program: "rust-analyzer", args: &[], languages: &[("rs", "rust")] },
+    server("gopls", &[], &[("go", "go")], &["go.work", "go.mod"]),
+    server("rust-analyzer", &[], &[("rs", "rust")], &["Cargo.toml"]),
+    server(
+        "typescript-language-server",
+        &["--stdio"],
+        &[
+            ("ts", "typescript"),
+            ("tsx", "typescriptreact"),
+            ("mts", "typescript"),
+            ("cts", "typescript"),
+            ("js", "javascript"),
+            ("jsx", "javascriptreact"),
+            ("mjs", "javascript"),
+            ("cjs", "javascript"),
+        ],
+        &["tsconfig.json", "jsconfig.json", "package.json"],
+    ),
+    server("intelephense", &["--stdio"], &[("php", "php")], &["composer.json"]),
+    server("kotlin-lsp", &["--stdio"], &[("kt", "kotlin"), ("kts", "kotlin")], &["settings.gradle.kts", "settings.gradle"]),
+    server(
+        "basedpyright-langserver",
+        &["--stdio"],
+        &[("py", "python"), ("pyi", "python")],
+        &["pyproject.toml", "pyrightconfig.json", "setup.py", "setup.cfg"],
+    ),
+    server(
+        "clangd",
+        &[],
+        &[
+            ("c", "c"),
+            ("h", "c"),
+            ("cpp", "cpp"),
+            ("cc", "cpp"),
+            ("cxx", "cpp"),
+            ("c++", "cpp"),
+            ("hpp", "cpp"),
+            ("hxx", "cpp"),
+            ("hh", "cpp"),
+            ("h++", "cpp"),
+            ("ipp", "cpp"),
+            ("tpp", "cpp"),
+            ("inl", "cpp"),
+            ("cu", "cuda-cpp"),
+            ("cuh", "cuda-cpp"),
+            ("mm", "objective-cpp"),
+        ],
+        &[".clangd", "compile_commands.json", "compile_flags.txt", "CMakeLists.txt", "meson.build"],
+    ),
+    server("jdtls", &[], &[("java", "java")], &["pom.xml", "settings.gradle.kts", "settings.gradle", "build.gradle.kts", "build.gradle"]),
+    server("csharp-ls", &[], &[("cs", "csharp"), ("csx", "csharp")], &[]),
     ServerDef {
-        program: "typescript-language-server",
-        args: &["--stdio"],
-        languages: &[("ts", "typescript"), ("tsx", "typescriptreact"), ("js", "javascript"), ("jsx", "javascriptreact")],
+        names: &[
+            ("gemfile", "ruby"),
+            ("rakefile", "ruby"),
+            ("podfile", "ruby"),
+            ("vagrantfile", "ruby"),
+            ("fastfile", "ruby"),
+            ("brewfile", "ruby"),
+            ("guardfile", "ruby"),
+        ],
+        ..server("ruby-lsp", &[], &[("rb", "ruby"), ("rake", "ruby"), ("gemspec", "ruby"), ("ru", "ruby"), ("podspec", "ruby")], &["Gemfile"])
     },
-    ServerDef { program: "intelephense", args: &["--stdio"], languages: &[("php", "php")] },
-    ServerDef { program: "kotlin-lsp", args: &["--stdio"], languages: &[("kt", "kotlin"), ("kts", "kotlin")] },
+    server("lua-language-server", &[], &[("lua", "lua")], &[".luarc.json", ".luarc.jsonc"]),
+    ServerDef {
+        names: &[
+            (".bashrc", "shellscript"),
+            (".bash_profile", "shellscript"),
+            (".bash_aliases", "shellscript"),
+            (".bash_logout", "shellscript"),
+            (".profile", "shellscript"),
+            (".envrc", "shellscript"),
+            ("pkgbuild", "shellscript"),
+            ("apkbuild", "shellscript"),
+        ],
+        ..server("bash-language-server", &["start"], &[("sh", "shellscript"), ("bash", "shellscript"), ("bats", "shellscript")], &[])
+    },
+    server("zls", &[], &[("zig", "zig"), ("zon", "zig")], &["build.zig"]),
+    server("sourcekit-lsp", &[], &[("swift", "swift")], &["Package.swift"]),
+    server("dart", &["language-server", "--protocol=lsp"], &[("dart", "dart")], &["pubspec.yaml"]),
+    server("elixir-ls", &[], &[("ex", "elixir"), ("exs", "elixir")], &["mix.exs"]),
+    server("metals", &[], &[("scala", "scala"), ("sc", "scala"), ("sbt", "scala")], &["build.sbt", "build.sc", "build.mill"]),
+    // Files that are JSON with comments, which plain JSON marks as errors.
+    ServerDef {
+        names: &[
+            ("tsconfig.json", "jsonc"),
+            ("tsconfig.*.json", "jsonc"),
+            ("jsconfig.json", "jsonc"),
+            ("jsconfig.*.json", "jsonc"),
+            (".eslintrc.json", "jsonc"),
+            ("devcontainer.json", "jsonc"),
+            (".devcontainer.json", "jsonc"),
+            ("settings.json", "jsonc"),
+            ("launch.json", "jsonc"),
+            ("tasks.json", "jsonc"),
+            ("extensions.json", "jsonc"),
+        ],
+        ..server("vscode-json-language-server", &["--stdio"], &[("json", "json"), ("jsonc", "jsonc")], &[])
+    },
+    server("vscode-css-language-server", &["--stdio"], &[("css", "css"), ("scss", "scss"), ("less", "less")], &[]),
+    server("vscode-html-language-server", &["--stdio"], &[("html", "html"), ("htm", "html")], &[]),
+    server("yaml-language-server", &["--stdio"], &[("yaml", "yaml"), ("yml", "yaml")], &[]),
+    server("taplo", &["lsp", "stdio"], &[("toml", "toml")], &[]),
+    server("marksman", &["server"], &[("md", "markdown"), ("markdown", "markdown")], &[".marksman.toml"]),
+    ServerDef {
+        names: &[("dockerfile", "dockerfile"), ("dockerfile.*", "dockerfile"), ("containerfile", "dockerfile"), ("containerfile.*", "dockerfile")],
+        ..server("docker-langserver", &["--stdio"], &[("dockerfile", "dockerfile"), ("containerfile", "dockerfile")], &[])
+    },
+    server("terraform-ls", &["serve"], &[("tf", "terraform"), ("tfvars", "terraform-vars")], &[]),
 ];
 
 impl ServerDef {
-    /// ".go", ".ts .tsx .js .jsx": what it is for, in Settings.
+    /// ".go", ".ts .tsx .js .jsx", ".sh .bash .bashrc": what it is for, in
+    /// Settings; names that have an extension of its own go without saying.
     pub fn extensions(&self) -> String {
-        self.languages.iter().map(|(ext, _)| format!(".{ext}")).collect::<Vec<_>>().join(" ")
+        let extensions = self.languages.iter().map(|(ext, _)| format!(".{ext}"));
+        let names = self
+            .names
+            .iter()
+            .filter(|(name, _)| !self.languages.iter().any(|(ext, _)| name.ends_with(&format!(".{ext}"))))
+            .map(|(name, _)| name.to_string());
+        extensions.chain(names).collect::<Vec<_>>().join(" ")
     }
 
     /// On PATH or installed by ideae.
@@ -184,6 +305,18 @@ fn extension_of(path: &Path) -> String {
 }
 
 fn known(path: &Path) -> Option<(&'static str, &'static str, &'static [&'static str])> {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_lowercase();
+    let name = template_of(&name);
+    let named = |pattern: &str| match pattern.split_once('*') {
+        Some((start, end)) => name.len() >= start.len() + end.len() && name.starts_with(start) && name.ends_with(end),
+        None => name == pattern,
+    };
+    let by_name = SERVERS.iter().find_map(|def| {
+        def.names.iter().find(|(pattern, _)| named(pattern)).map(|(_, language)| (*language, def.program, def.args))
+    });
+    if by_name.is_some() {
+        return by_name;
+    }
     let ext = extension_of(path);
     SERVERS.iter().find_map(|def| {
         def.languages.iter().find(|(e, _)| *e == ext).map(|(_, language)| (*language, def.program, def.args))
@@ -263,14 +396,7 @@ pub fn on_path(program: &str) -> bool {
 /// indexing it all again, gigabytes apiece. Projects side by side in a repo
 /// without a root marker still get one server each.
 pub fn project_root(program: &str, file: &Path, limit: &Path) -> PathBuf {
-    let markers: &[&str] = match program {
-        "gopls" => &["go.work", "go.mod"],
-        "rust-analyzer" => &["Cargo.toml"],
-        "typescript-language-server" => &["tsconfig.json", "package.json"],
-        "intelephense" => &["composer.json"],
-        "kotlin-lsp" => &["settings.gradle.kts", "settings.gradle"],
-        _ => &[],
-    };
+    let markers = SERVERS.iter().find(|def| def.program == program).map_or(&[][..], |def| def.markers);
     let mut found = None;
     let mut dir = file.parent();
     while let Some(d) = dir {
@@ -448,7 +574,7 @@ impl LspClient {
     /// call waits for it.
     pub fn spawn(program: &str, executable: &Path, args: &[&str], root: &Path, init_options: Value) -> Result<Arc<Self>> {
         let mut command = crate::procs::command(executable);
-        command.args(args).envs(server_env(program)).current_dir(root).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+        command.args(args).args(project_args(program, root)).envs(server_env(program)).current_dir(root).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
         // A group of its own: what it starts (cargo check, a proc-macro
         // server, tsserver) is ended with it, not left to notice.
         #[cfg(unix)]
@@ -472,9 +598,12 @@ impl LspClient {
         let reader_problems = problems.clone();
         let opened: Opened = Arc::default();
         let reader_opened = opened.clone();
+        let reader_settings = settings(program);
         thread::Builder::new()
             .name(format!("lsp-read-{program}"))
-            .spawn(move || read_loop(stdout, reader_out, reader_pending, reader_progress, reader_import, reader_problems, reader_opened))?;
+            .spawn(move || {
+                read_loop(stdout, reader_out, reader_pending, reader_progress, reader_import, reader_problems, reader_opened, reader_settings)
+            })?;
 
         let client = Arc::new(Self {
             out,
@@ -490,11 +619,12 @@ impl LspClient {
         });
 
         let init = client.clone();
+        let told = settings(program);
         let root = root.to_path_buf();
         thread::Builder::new()
             .name(format!("lsp-init-{program}"))
             .spawn(move || {
-                let result = init.initialize(&root, init_options).map_err(|e| e.to_string());
+                let result = init.initialize(&root, init_options, &told).map_err(|e| e.to_string());
                 if result.is_ok() {
                     let _ = init.out.send(Out::Ready);
                 }
@@ -505,7 +635,7 @@ impl LspClient {
         Ok(client)
     }
 
-    fn initialize(&self, root: &Path, init_options: Value) -> Result<()> {
+    fn initialize(&self, root: &Path, init_options: Value, settings: &Value) -> Result<()> {
         let uri = path_to_uri(root);
         let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let answer = self.request(
@@ -561,7 +691,12 @@ impl LspClient {
             }),
         )?;
         *self.capabilities.lock().unwrap() = answer["capabilities"].clone();
-        self.send(Out::Now(json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} })))
+        self.send(Out::Now(json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} })))?;
+        // For the servers that wait to be told rather than ask.
+        if settings.is_null() {
+            return Ok(());
+        }
+        self.send(Out::Now(json!({ "jsonrpc": "2.0", "method": "workspace/didChangeConfiguration", "params": { "settings": settings } })))
     }
 
     fn wait_ready(&self) -> Result<()> {
@@ -818,32 +953,7 @@ impl LspClient {
         Ok(serde_json::from_value::<Option<lsp_types::SemanticTokens>>(value)?.unwrap_or_default())
     }
 
-    /// What a server asks of its settings by `workspace/configuration`; null,
-/// and it takes its defaults.
-fn configuration(section: &str) -> Value {
-    match section {
-        // kotlin-lsp shows only the kinds of hints named here as on; with
-        // none it shows none.
-        "jetbrains.kotlin" => {
-            const ON: &[&str] = &[
-                "parameters",
-                "parameters.compiled",
-                "type.property",
-                "type.variable",
-                "type.function.return",
-                "type.function.parameter",
-                "lambda.return",
-                "lambda.receivers.parameters",
-                "value.ranges",
-                "value.kotlin.time",
-            ];
-            json!({ "hints": ON.iter().map(|kind| (kind.to_string(), Value::Bool(true))).collect::<serde_json::Map<_, _>>() })
-        }
-        _ => Value::Null,
-    }
-}
-
-/// textDocument/inlayHint: the types and parameter names the server
+    /// textDocument/inlayHint: the types and parameter names the server
     /// would show in a range; none from a server that has no hints.
     pub fn inlay_hints(&self, uri: &str, range: lsp_types::Range) -> Result<Vec<lsp_types::InlayHint>> {
         self.wait_ready()?;
@@ -1079,13 +1189,33 @@ fn write_message(stdin: &mut ChildStdin, message: &Value) -> Result<()> {
     Ok(())
 }
 
-fn read_loop(stdout: impl Read, out: mpsc::Sender<Out>, pending: Pending, progress: Progress, import: Import, problems: Problems, opened: Opened) {
-    read_messages(stdout, out, &pending, progress, import, problems, opened);
+#[allow(clippy::too_many_arguments)]
+fn read_loop(
+    stdout: impl Read,
+    out: mpsc::Sender<Out>,
+    pending: Pending,
+    progress: Progress,
+    import: Import,
+    problems: Problems,
+    opened: Opened,
+    settings: Value,
+) {
+    read_messages(stdout, out, &pending, progress, import, problems, opened, &settings);
     // The server is gone: what waits for its answer need not wait out its time.
     pending.lock().unwrap().clear();
 }
 
-fn read_messages(stdout: impl Read, out: mpsc::Sender<Out>, pending: &Pending, progress: Progress, import: Import, problems: Problems, opened: Opened) {
+#[allow(clippy::too_many_arguments)]
+fn read_messages(
+    stdout: impl Read,
+    out: mpsc::Sender<Out>,
+    pending: &Pending,
+    progress: Progress,
+    import: Import,
+    problems: Problems,
+    opened: Opened,
+    settings: &Value,
+) {
     let mut reader = BufReader::new(stdout);
     loop {
         let mut length = None;
@@ -1115,7 +1245,7 @@ fn read_messages(stdout: impl Read, out: mpsc::Sender<Out>, pending: &Pending, p
             (Some(id), Some(method)) => {
                 let result = if method == "workspace/configuration" {
                     let items = message["params"]["items"].as_array().map(Vec::as_slice).unwrap_or_default();
-                    Value::Array(items.iter().map(|item| LspClient::configuration(item["section"].as_str().unwrap_or_default())).collect())
+                    Value::Array(items.iter().map(|item| section(settings, item["section"].as_str().unwrap_or_default())).collect())
                 } else {
                     Value::Null
                 };
@@ -1194,6 +1324,129 @@ fn read_messages(stdout: impl Read, out: mpsc::Sender<Out>, pending: &Pending, p
     }
 }
 
+/// The settings a server is given, as an editor's settings file would
+/// hold them: asked for by `workspace/configuration` a section at a time,
+/// and told once after `initialized`, for those that only listen. Mostly
+/// hints, which several servers leave off unless asked.
+fn settings(program: &str) -> Value {
+    match program {
+        "gopls" => json!({ "gopls": init_options(program) }),
+        // kotlin-lsp shows only the kinds of hints named here as on; with
+        // none it shows none.
+        "kotlin-lsp" => {
+            const ON: &[&str] = &[
+                "parameters",
+                "parameters.compiled",
+                "type.property",
+                "type.variable",
+                "type.function.return",
+                "type.function.parameter",
+                "lambda.return",
+                "lambda.receivers.parameters",
+                "value.ranges",
+                "value.kotlin.time",
+            ];
+            let hints: serde_json::Map<_, _> = ON.iter().map(|kind| (kind.to_string(), Value::Bool(true))).collect();
+            json!({ "jetbrains": { "kotlin": { "hints": hints } } })
+        }
+        // Its own default, "recommended", underlines most of a project not
+        // written for it; a project's pyproject.toml still has the last word.
+        "basedpyright-langserver" => json!({ "basedpyright": { "analysis": { "typeCheckingMode": "standard" } } }),
+        "lua-language-server" => json!({ "Lua": { "hint": { "enable": true, "setType": true, "paramName": "All", "arrayIndex": "Disable" } } }),
+        "jdtls" => init_options(program)["settings"].clone(),
+        "metals" => json!({
+            "metals": {
+                "inlayHints": {
+                    "inferredTypes": { "enable": true },
+                    "implicitArguments": { "enable": true },
+                    "typeParameters": { "enable": true },
+                    "hintsInPatternMatch": { "enable": true },
+                },
+            },
+        }),
+        "yaml-language-server" => json!({ "yaml": { "schemaStore": { "enable": true }, "hover": true, "completion": true, "validate": true } }),
+        "vscode-json-language-server" => json!({ "json": { "validate": { "enable": true }, "schemas": json_schemas() } }),
+        "taplo" => json!({ "evenBetterToml": { "schema": { "enabled": true, "catalogs": [], "associations": toml_schemas() } } }),
+        _ => Value::Null,
+    }
+}
+
+/// One section of the settings, by its dotted name: `jetbrains.kotlin`.
+fn section(settings: &Value, name: &str) -> Value {
+    name.split('.').filter(|part| !part.is_empty()).fold(settings, |at, part| &at[part]).clone()
+}
+
+/// `initializationOptions` the server needs, wherever it was installed.
+pub fn init_options(program: &str) -> Value {
+    match program {
+        // Go to symbol finds functions and fields too: by itself it knows only types.
+        "rust-analyzer" => json!({ "workspace": { "symbol": { "search": { "kind": "all_symbols" } } } }),
+        "gopls" => json!({
+            "hints": {
+                "assignVariableTypes": true,
+                "compositeLiteralFields": true,
+                "constantValues": true,
+                "functionTypeParameters": true,
+                "parameterNames": true,
+                "rangeVariableTypes": true,
+            },
+        }),
+        "typescript-language-server" => json!({
+            "preferences": {
+                "includeInlayParameterNameHints": "all",
+                "includeInlayParameterNameHintsWhenArgumentMatchesName": false,
+                "includeInlayVariableTypeHints": true,
+                "includeInlayVariableTypeHintsWhenTypeMatchesName": false,
+                "includeInlayFunctionParameterTypeHints": true,
+                "includeInlayFunctionLikeReturnTypeHints": true,
+                "includeInlayPropertyDeclarationTypeHints": true,
+                "includeInlayEnumMemberValueHints": true,
+            },
+        }),
+        "jdtls" => json!({ "settings": { "java": { "inlayHints": { "parameterNames": { "enabled": "all" } } } } }),
+        "ruby-lsp" => json!({ "featuresConfiguration": { "inlayHint": { "enableAll": true } } }),
+        "vscode-json-language-server" | "vscode-css-language-server" | "vscode-html-language-server" => {
+            json!({ "provideFormatter": true })
+        }
+        _ => Value::Null,
+    }
+}
+
+/// The schemas of JSON files most projects have, which the server fetches
+/// from SchemaStore: what a key means, on hover, and a wrong one marked.
+fn json_schemas() -> Value {
+    const SCHEMAS: &[(&[&str], &str)] = &[
+        (&["package.json"], "package"),
+        (&["tsconfig.json", "tsconfig.*.json", "jsconfig.json"], "tsconfig"),
+        (&[".eslintrc", ".eslintrc.json"], "eslintrc"),
+        (&[".prettierrc", ".prettierrc.json"], "prettierrc"),
+        (&[".babelrc", "babel.config.json"], "babelrc"),
+        (&["renovate.json"], "renovate"),
+        (&["appsettings.json", "appsettings.*.json"], "appsettings"),
+    ];
+    let mut schemas: Vec<Value> = SCHEMAS
+        .iter()
+        .map(|(files, name)| json!({ "fileMatch": files, "url": format!("https://www.schemastore.org/{name}.json") }))
+        .collect();
+    schemas.push(json!({ "fileMatch": ["composer.json"], "url": "https://getcomposer.org/schema.json" }));
+    Value::Array(schemas)
+}
+
+/// The same for TOML. Taplo would find these in SchemaStore's catalog,
+/// but cannot read the catalog as it is now.
+fn toml_schemas() -> Value {
+    const SCHEMAS: &[(&str, &str)] = &[
+        (r"(^|/)Cargo\.toml$", "cargo"),
+        (r"(^|/)\.cargo/config(\.toml)?$", "cargo-config"),
+        (r"(^|/)pyproject\.toml$", "pyproject"),
+        (r"(^|/)\.?rustfmt\.toml$", "rustfmt"),
+        (r"(^|/)\.?ruff\.toml$", "ruff"),
+        (r"(^|/)uv\.toml$", "uv"),
+        (r"(^|/)\.?taplo\.toml$", "taplo"),
+    ];
+    SCHEMAS.iter().map(|(file, name)| (file.to_string(), json!(format!("https://www.schemastore.org/{name}.json")))).collect::<serde_json::Map<_, _>>().into()
+}
+
 /// What Gradle says went wrong, from its output: the lines between
 /// "* What went wrong:" and the next section.
 fn build_failure(log: &[String]) -> Option<String> {
@@ -1205,6 +1458,21 @@ fn build_failure(log: &[String]) -> Option<String> {
         .filter(|l| !l.is_empty())
         .collect();
     (!reason.is_empty()).then(|| reason.join(" "))
+}
+
+/// Arguments that depend on the project. jdtls keeps its index in a
+/// workspace of its own, by default one per directory *name*: two tasks'
+/// worktrees of one name would share it, and the second server fails on
+/// its lock. One per project path instead.
+fn project_args(program: &str, root: &Path) -> Vec<std::ffi::OsString> {
+    if program != "jdtls" {
+        return Vec::new();
+    }
+    use sha2::Digest as _;
+    let hash = sha2::Sha256::digest(root.to_string_lossy().as_bytes());
+    let name: String = hash.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    let data = crate::state::data_home().join("ideae").join("jdtls").join(name);
+    vec!["-data".into(), data.into_os_string()]
 }
 
 /// Variables a server needs that the user's environment does not give.
@@ -1584,9 +1852,278 @@ mod configuration_tests {
     /// kotlin-lsp shows a kind of hint only when it is named as on.
     #[test]
     fn kotlin_lsp_is_told_which_hints_to_show() {
-        let kotlin = LspClient::configuration("jetbrains.kotlin");
+        let kotlin = section(&settings("kotlin-lsp"), "jetbrains.kotlin");
         assert_eq!(kotlin["hints"]["type.variable"], Value::Bool(true));
         assert_eq!(kotlin["hints"]["parameters"], Value::Bool(true));
-        assert_eq!(LspClient::configuration("intelephense"), Value::Null);
+        assert_eq!(section(&settings("intelephense"), "intelephense"), Value::Null);
+    }
+
+    /// gopls asks for its settings after starting with them: the answer
+    /// must not take back the hints its options turned on.
+    #[test]
+    fn gopls_is_asked_what_it_started_with() {
+        let asked = section(&settings("gopls"), "gopls");
+        assert_eq!(asked, init_options("gopls"));
+        assert_eq!(asked["hints"]["parameterNames"], Value::Bool(true));
+        assert_eq!(section(&settings("lua-language-server"), "Lua.hint.enable"), Value::Bool(true));
+        assert_eq!(section(&settings("gopls"), "nothing.here"), Value::Null);
+    }
+
+    #[test]
+    fn files_find_their_server_by_extension_or_name() {
+        let program = |path: &str| known(Path::new(path)).map(|(language, program, _)| (language, program));
+        assert_eq!(program("/a/Dockerfile"), Some(("dockerfile", "docker-langserver")));
+        assert_eq!(program("/a/Dockerfile.dev"), Some(("dockerfile", "docker-langserver")));
+        assert_eq!(program("/a/app.dockerfile"), Some(("dockerfile", "docker-langserver")));
+        assert_eq!(program("/a/.bashrc"), Some(("shellscript", "bash-language-server")));
+        assert_eq!(program("/a/Gemfile"), Some(("ruby", "ruby-lsp")));
+        assert_eq!(program("/a/main.py"), Some(("python", "basedpyright-langserver")));
+        assert_eq!(program("/a/x.hpp"), Some(("cpp", "clangd")));
+        assert_eq!(program("/a/Cargo.toml"), Some(("toml", "taplo")));
+        assert_eq!(program("/a/dockerfile_test.go"), Some(("go", "gopls")));
+        assert_eq!(program("/a/Gemfile.lock"), None);
+        assert_eq!(program("/a/tsconfig.app.json"), Some(("jsonc", "vscode-json-language-server")));
+        assert_eq!(program("/a/tsconfig.ts"), Some(("typescript", "typescript-language-server")));
+        assert_eq!(program("/a/data.json"), Some(("json", "vscode-json-language-server")));
+        assert_eq!(program("/a/notes.txt"), None);
+    }
+
+    #[test]
+    fn every_extension_has_one_server() {
+        let mut seen = HashSet::new();
+        for def in SERVERS {
+            assert!(!def.languages.is_empty(), "{}", def.program);
+            for (ext, _) in def.languages {
+                assert!(seen.insert(*ext), ".{ext} twice");
+            }
+        }
+    }
+}
+
+/// Real servers, one project each: what the editor asks of every one, with
+/// the settings and options the app gives it. Each needs its server on PATH
+/// or installed under IDEAE_LSP_DIR (the lsp_install tests put it there
+/// when given one): `cargo test lsp::server_tests -- --ignored`.
+#[cfg(test)]
+mod server_tests {
+    use super::*;
+
+    struct Answers {
+        hover: String,
+        definition: Vec<lsp_types::LocationLink>,
+        hints: Vec<String>,
+    }
+
+    fn label(hint: &lsp_types::InlayHint) -> String {
+        match &hint.label {
+            lsp_types::InlayHintLabel::String(text) => text.clone(),
+            lsp_types::InlayHintLabel::LabelParts(parts) => parts.iter().map(|p| p.value.as_str()).collect(),
+        }
+    }
+
+    /// Writes `files`, opens the first and asks at the first `at` in it,
+    /// waiting out the server's indexing; hints too when they are expected.
+    fn ask(program: &str, files: &[(&str, &str)], at: &str, hints: bool) -> Answers {
+        let base = std::env::temp_dir().join(format!("ideae-server-{program}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for (name, text) in files {
+            let path = base.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let (name, text) = files[0];
+        let file = base.join(name);
+        let (language, _, args) = known(&file).unwrap();
+        let command = locate(program).unwrap_or_else(|| panic!("{program} is not installed"));
+        let root = project_root(program, &file, &base);
+        let options = crate::lsp_install::init_options(program, &command);
+        let client = LspClient::spawn(program, &command, args, &root, options).unwrap();
+        client.did_open(&file, language, text).unwrap();
+        let uri = path_to_uri(&file);
+        let (line, row) = text.lines().enumerate().find(|(_, l)| l.contains(at)).unwrap();
+        let pos = lsp_types::Position::new(line as u32, row.find(at).unwrap() as u32 + 1);
+        let started = std::time::Instant::now();
+        let waited = || started.elapsed() > Duration::from_secs(120);
+        let hover = loop {
+            let hover = client.hover(&uri, pos).ok().flatten().map(|h| format!("{:?}", h.contents)).unwrap_or_default();
+            // LuaLS answers with its progress until it has read the project.
+            if (!hover.is_empty() && !hover.contains("Workspace loading")) || waited() {
+                break hover;
+            }
+            thread::sleep(Duration::from_millis(500));
+        };
+        let definition = client.definition(&uri, pos).unwrap_or_default();
+        let whole = lsp_types::Range::new(lsp_types::Position::new(0, 0), lsp_types::Position::new(text.lines().count() as u32, 0));
+        let hints = loop {
+            let found: Vec<String> = client.inlay_hints(&uri, whole).unwrap_or_default().iter().map(label).collect();
+            if !found.is_empty() || !hints || waited() {
+                break found;
+            }
+            thread::sleep(Duration::from_millis(500));
+        };
+        eprintln!(
+            "{program} after {:?}\n  hover {hover:.300}\n  definition {:?}\n  hints {hints:?}",
+            started.elapsed(),
+            definition.first().map(|l| l.target_range)
+        );
+        drop(client);
+        let _ = std::fs::remove_dir_all(&base);
+        Answers { hover, definition, hints }
+    }
+
+    #[test]
+    #[ignore]
+    fn gopls_shows_types_and_parameter_names() {
+        let main = "package main\n\nfunc add(left, right int) int { return left + right }\n\nfunc main() {\n\tx := add(1, 2)\n\t_ = x\n}\n";
+        let answers = ask("gopls", &[("main.go", main), ("go.mod", "module example.com/m\n\ngo 1.21\n")], "add(1", true);
+        assert!(answers.hover.contains("func add"), "{}", answers.hover);
+        assert_eq!(answers.definition[0].target_selection_range.start.line, 2);
+        assert!(answers.hints.iter().any(|h| h.contains("left")) && answers.hints.iter().any(|h| h.contains("int")), "{:?}", answers.hints);
+    }
+
+    #[test]
+    #[ignore]
+    fn typescript_shows_types_and_parameter_names() {
+        let main = "function greet(name: string, times: number) {\n  return name.repeat(times)\n}\nconst x = greet(\"a\", 2)\n";
+        let answers = ask("typescript-language-server", &[("a.ts", main), ("package.json", "{}\n")], "greet(\"a", true);
+        assert!(answers.hover.contains("function greet"), "{}", answers.hover);
+        assert_eq!(answers.definition[0].target_selection_range.start.line, 0);
+        assert!(answers.hints.iter().any(|h| h.contains("name:")) && answers.hints.iter().any(|h| h.contains("string")), "{:?}", answers.hints);
+    }
+
+    /// Imports the Gradle build first: a minute or more, with network.
+    #[test]
+    #[ignore]
+    fn kotlin_lsp_shows_types_and_parameter_names() {
+        let main = "fun greet(name: String, times: Int): String = name.repeat(times)\n\nfun main() {\n    val word = greet(\"hi\", 3)\n    println(word)\n}\n";
+        let files = [
+            ("src/main/kotlin/Main.kt", main),
+            ("settings.gradle.kts", "rootProject.name = \"p\"\n"),
+            ("build.gradle.kts", "plugins { kotlin(\"jvm\") version \"2.1.0\" }\nrepositories { mavenCentral() }\n"),
+        ];
+        let answers = ask("kotlin-lsp", &files, "greet(\"hi", true);
+        assert!(answers.hover.contains("greet"), "{}", answers.hover);
+        assert_eq!(answers.definition[0].target_selection_range.start.line, 0);
+        assert!(answers.hints.iter().any(|h| h.contains("name")) && answers.hints.iter().any(|h| h.contains("String")), "{:?}", answers.hints);
+    }
+
+    #[test]
+    #[ignore]
+    fn basedpyright_shows_types_and_parameter_names() {
+        let main = "def greet(name: str, times: int):\n    return name * times\n\n\nx = greet(\"a\", 2)\n";
+        let answers = ask("basedpyright-langserver", &[("main.py", main), ("pyproject.toml", "[project]\nname = \"p\"\n")], "greet(\"a", true);
+        assert!(answers.hover.contains("def greet"), "{}", answers.hover);
+        assert_eq!(answers.definition[0].target_selection_range.start.line, 0);
+        assert!(answers.hints.iter().any(|h| h.contains("name")) && answers.hints.iter().any(|h| h.contains("str")), "{:?}", answers.hints);
+    }
+
+    #[test]
+    #[ignore]
+    fn clangd_shows_types_and_parameter_names() {
+        let main = "int add(int left, int right) { return left + right; }\nint main() {\n  auto x = add(1, 2);\n  return x;\n}\n";
+        let answers = ask("clangd", &[("main.cpp", main), ("compile_flags.txt", "-std=c++17\n")], "add(1", true);
+        assert!(answers.hover.contains("add"), "{}", answers.hover);
+        assert_eq!(answers.definition[0].target_selection_range.start.line, 0);
+        assert!(answers.hints.iter().any(|h| h.contains("left")) && answers.hints.iter().any(|h| h.contains("int")), "{:?}", answers.hints);
+    }
+
+    #[test]
+    #[ignore]
+    fn jdtls_shows_parameter_names() {
+        let main = "public class Main {\n    static int add(int left, int right) { return left + right; }\n\n    public static void main(String[] args) {\n        var x = add(1, 2);\n        System.out.println(x);\n    }\n}\n";
+        let answers = ask("jdtls", &[("src/Main.java", main)], "add(1", true);
+        assert!(answers.hover.contains("add"), "{}", answers.hover);
+        assert_eq!(answers.definition[0].target_selection_range.start.line, 1);
+        assert!(answers.hints.iter().any(|h| h.contains("left")), "{:?}", answers.hints);
+    }
+
+    #[test]
+    #[ignore]
+    fn csharp_ls_shows_parameter_names() {
+        let main = "class Program {\n    static int Add(int left, int right) => left + right;\n    static void Main() {\n        var x = Add(1, 2);\n        System.Console.WriteLine(x);\n    }\n}\n";
+        let project = "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    <OutputType>Exe</OutputType>\n    <TargetFramework>net10.0</TargetFramework>\n  </PropertyGroup>\n</Project>\n";
+        let answers = ask("csharp-ls", &[("Program.cs", main), ("p.csproj", project)], "Add(1", true);
+        assert!(answers.hover.contains("Add"), "{}", answers.hover);
+        assert_eq!(answers.definition[0].target_selection_range.start.line, 1);
+        assert!(answers.hints.iter().any(|h| h.contains("left")), "{:?}", answers.hints);
+    }
+
+    #[test]
+    #[ignore]
+    fn lua_language_server_shows_types_and_parameter_names() {
+        let main = "local function add(left, right)\n  return left + right\nend\n\nlocal x = add(1, 2)\nprint(x)\n";
+        let answers = ask("lua-language-server", &[("main.lua", main)], "add(1", true);
+        assert!(answers.hover.contains("add"), "{}", answers.hover);
+        assert_eq!(answers.definition[0].target_selection_range.start.line, 0);
+        assert!(answers.hints.iter().any(|h| h.contains("left")), "{:?}", answers.hints);
+    }
+
+    #[test]
+    #[ignore]
+    fn zls_shows_types_and_parameter_names() {
+        let main = "const std = @import(\"std\");\n\nfn add(left: i32, right: i32) i32 {\n    return left + right;\n}\n\npub fn main() void {\n    const x = add(1, 2);\n    std.debug.print(\"{}\\n\", .{x});\n}\n";
+        let answers = ask("zls", &[("main.zig", main)], "add(1", true);
+        assert!(answers.hover.contains("add"), "{}", answers.hover);
+        assert_eq!(answers.definition[0].target_selection_range.start.line, 2);
+        assert!(answers.hints.iter().any(|h| h.contains("left")) && answers.hints.iter().any(|h| h.contains("i32")), "{:?}", answers.hints);
+    }
+
+    #[test]
+    #[ignore]
+    fn bash_language_server_finds_functions() {
+        let main = "greet() {\n  echo hi\n}\n\ngreet world\n";
+        let answers = ask("bash-language-server", &[("main.sh", main)], "greet world", false);
+        assert_eq!(answers.definition[0].target_selection_range.start.line, 0);
+    }
+
+    #[test]
+    #[ignore]
+    fn the_extracted_servers_hover() {
+        let css = ask("vscode-css-language-server", &[("a.css", "a {\n  color: red;\n}\n")], "color", false);
+        assert!(css.hover.contains("color"), "{}", css.hover);
+        let html = ask("vscode-html-language-server", &[("a.html", "<html>\n<body>\n<div class=\"x\"></div>\n</body>\n</html>\n")], "div", false);
+        assert!(html.hover.contains("div"), "{}", html.hover);
+        // Its schema comes from SchemaStore: needs network.
+        let json = ask("vscode-json-language-server", &[("package.json", "{\n  \"name\": \"x\",\n  \"version\": \"1.0.0\"\n}\n")], "\"version", false);
+        assert!(json.hover.to_lowercase().contains("version"), "{}", json.hover);
+    }
+
+    #[test]
+    #[ignore]
+    fn yaml_language_server_knows_a_workflow() {
+        let workflow = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+        let answers = ask("yaml-language-server", &[(".github/workflows/ci.yml", workflow)], "runs-on", false);
+        assert!(!answers.hover.is_empty());
+    }
+
+    #[test]
+    #[ignore]
+    fn taplo_knows_cargo_toml() {
+        let manifest = "[package]\nname = \"x\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+        let answers = ask("taplo", &[("Cargo.toml", manifest)], "edition", false);
+        assert!(answers.hover.to_lowercase().contains("edition"), "{}", answers.hover);
+    }
+
+    #[test]
+    #[ignore]
+    fn marksman_follows_links() {
+        let doc = "# Title\n\nText.\n\n## Usage\n\nSee [usage](#usage).\n";
+        let answers = ask("marksman", &[("README.md", doc), (".marksman.toml", "")], "(#usage", false);
+        assert_eq!(answers.definition[0].target_range.start.line, 4);
+    }
+
+    #[test]
+    #[ignore]
+    fn docker_langserver_hovers() {
+        let answers = ask("docker-langserver", &[("Dockerfile", "FROM alpine:3\nRUN echo hi\n")], "RUN", false);
+        assert!(answers.hover.contains("RUN"), "{}", answers.hover);
+    }
+
+    #[test]
+    #[ignore]
+    fn terraform_ls_finds_variables() {
+        let main = "variable \"region\" {\n  default = \"x\"\n}\n\noutput \"where\" {\n  value = var.region\n}\n";
+        let answers = ask("terraform-ls", &[("main.tf", main)], "var.region", false);
+        assert_eq!(answers.definition[0].target_range.start.line, 0);
     }
 }

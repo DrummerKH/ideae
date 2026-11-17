@@ -167,7 +167,7 @@ impl TaskView {
             let message = format!("Installing {program} needs {tool} on PATH.");
             return window.push_notification(Notification::warning(message).title(format!("Install {program}")), cx);
         }
-        let description = format!("{}\n\nInto {}.", recipe.summary, crate::lsp_install::root().join(program).display());
+        let description = format!("{}\n\nInto {}.", recipe.summary, crate::lsp_install::root().join(crate::lsp_install::home(program)).display());
         let this = cx.weak_entity();
         window.open_alert_dialog(cx, move |dialog, _, _| {
             let this = this.clone();
@@ -216,13 +216,15 @@ impl TaskView {
         }
     }
 
-    /// Starts the newly installed server for the open files waiting for it.
+    /// Starts the newly installed server for the open files waiting for it,
+    /// or for another installed with it (JSON's with CSS's).
     pub(super) fn reattach_lsp(&mut self, program: &'static str, cx: &mut Context<Self>) {
+        use crate::lsp_install::home;
         let waiting: Vec<_> = self
             .tabs
             .iter()
             .filter_map(|tab| match &tab.kind {
-                TabKind::File(file) if file.read(cx).lsp_missing == Some(program) => Some(file.clone()),
+                TabKind::File(file) if file.read(cx).lsp_missing.is_some_and(|p| home(p) == home(program)) => Some(file.clone()),
                 _ => None,
             })
             .collect();
