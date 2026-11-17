@@ -352,6 +352,9 @@ pub struct TaskState {
     pub created: u64,
     /// When its agent's latest turn ended.
     pub done_at: u64,
+    /// When it was last looked at: in view in the active window.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub seen_at: u64,
     /// The commit a variant was made from: what its diff is counted against.
     pub base: String,
     /// How the command last run in every variant went in this one.
@@ -503,6 +506,10 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 pub fn now() -> u64 {

@@ -262,6 +262,7 @@ fn serve(shared: Shared, stream: UnixStream) {
             Frame::Msg(Msg::Shutdown) => shutdown(&shared),
             Frame::Msg(Msg::Upgrade { exe }) => handover::give(&shared, &exe),
             Frame::Msg(Msg::Hook(mut hook)) => {
+                hook.at = crate::state::now();
                 let mut s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 // A window that comes later hears only this one: the reminder
                 // after a turn, or the question after a tool call, keeps
@@ -476,7 +477,7 @@ fn event_of(hook: &Hook) -> crate::agent::HookEvent {
         said: hook.said.clone(),
         session: hook.session.clone(),
         guessed: false,
-        replayed: false,
+        replayed: None,
     }
 }
 
@@ -730,6 +731,7 @@ mod tests {
             file: None,
             session: None,
             said: Some("x".into()),
+            at: 0,
         };
         let (stop, tool) = (hook("Stop", None, None), hook("PreToolUse", None, Some("Running ls")));
         let idle = hook("Notification", Some("idle_prompt"), Some("Claude is waiting for your input"));

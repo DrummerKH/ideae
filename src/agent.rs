@@ -73,9 +73,10 @@ pub struct HookEvent {
     /// What the agent said ([`crate::said`]): a turn's last words, or what
     /// a tool call waits for.
     pub said: Option<String>,
-    /// The daemon's record of an earlier event, handed over on connect: it
-    /// sets the status but notifies nobody again.
-    pub replayed: bool,
+    /// The daemon's record of an earlier event, handed over on connect, with
+    /// when it heard it (0: not known): it sets the status but notifies
+    /// nobody again.
+    pub replayed: Option<u64>,
     /// The agent's id of the session it runs, when it says.
     pub session: Option<String>,
     /// Not reported but guessed from the agent's terminal.
@@ -327,7 +328,7 @@ fn parse_line(line: &str) -> Option<HookEvent> {
         kind: v["kind"].as_str().map(str::to_string),
         file: v["file"].as_str().map(str::to_string),
         said: v["said"].as_str().map(str::to_string),
-        replayed: false,
+        replayed: None,
         session: v["session"].as_str().map(str::to_string),
         guessed: false,
     })
@@ -446,6 +447,7 @@ pub fn run_hook(args: &[String]) {
             file: line["file"].as_str().map(str::to_string),
             said,
             session: line["session"].as_str().map(str::to_string),
+            at: 0,
         });
         return;
     }
@@ -457,7 +459,7 @@ mod tests {
     use super::*;
 
     fn note(message: &str, kind: Option<&str>) -> Option<AgentStatus> {
-        HookEvent { task: PathBuf::new(), event: "Notification".into(), message: Some(message.into()), kind: kind.map(Into::into), file: None, said: None, replayed: false, session: None, guessed: false }
+        HookEvent { task: PathBuf::new(), event: "Notification".into(), message: Some(message.into()), kind: kind.map(Into::into), file: None, said: None, replayed: None, session: None, guessed: false }
             .status()
     }
 
@@ -505,7 +507,7 @@ mod tests {
             kind: kind.map(Into::into),
             file: None,
             said: None,
-            replayed: false,
+            replayed: None,
             session: None,
             guessed: false,
         };

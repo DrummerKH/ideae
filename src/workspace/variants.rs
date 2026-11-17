@@ -445,9 +445,11 @@ impl Workspace {
         }
         if let Some(old) = self.active.take().and_then(|a| self.entry_mut(&a)) {
             old.left_view = Some(std::time::Instant::now());
+            old.seen_at = crate::state::now();
         }
         self.active_group = Some(group.to_string());
         for (pi, ti) in self.members(group) {
+            self.projects[pi].tasks[ti].seen_at = crate::state::now();
             if let Some(view) = &self.projects[pi].tasks[ti].view {
                 view.update(cx, |t, _| t.unseen = false);
             }
@@ -2167,7 +2169,7 @@ pub(crate) mod tests {
             cx.update_window(handle.into(), |_, window, cx| workspace.update(cx, |w, cx| act(w, window, cx))).unwrap();
             cx.run_until_parked();
         };
-        let hook = |task: &std::path::Path, event: &str| HookEvent { task: task.to_path_buf(), event: event.into(), message: None, kind: None, file: None, said: None, replayed: false, session: None, guessed: false };
+        let hook = |task: &std::path::Path, event: &str| HookEvent { task: task.to_path_buf(), event: event.into(), message: None, kind: None, file: None, said: None, replayed: None, session: None, guessed: false };
 
         step(cx, &mut |w, window, cx| w.create_task(0, "Fix login".into(), "Make the file.".into(), vec![String::new(), "With the smallest patch.".into()], Vec::new(), window, cx));
         let (group, paths) = workspace.update(cx, |w, _| {
@@ -2501,6 +2503,7 @@ pub(crate) mod tests {
                     left_active: Some(1),
                     ..Default::default()
                 },
+                seen_at: 100,
                 ..Default::default()
             },
             TaskState { path: other.clone(), branch: "other".into(), title: "Other".into(), open: true, ..Default::default() },
@@ -2538,6 +2541,17 @@ pub(crate) mod tests {
             assert_eq!(focused, [false, true], "the main checkout restored later, the task in view");
         })
         .unwrap();
+        // What the daemon heard before is told again on connect: new only
+        // when it came after the task was last looked at.
+        let hook = |event: &str, replayed: Option<u64>| crate::agent::HookEvent { task: repo.clone(), event: event.into(), message: None, kind: None, file: None, said: None, replayed, session: None, guessed: false };
+        let unseen_after = |cx: &mut TestAppContext, event: crate::agent::HookEvent| {
+            cx.update_window(handle.into(), |_, window, cx| workspace.update(cx, |w, cx| w.on_hook(event, window, cx))).unwrap();
+            workspace.update(cx, |w, cx| w.projects[0].tasks[0].view.as_ref().unwrap().read(cx).unseen)
+        };
+        assert!(!unseen_after(cx, hook("Stop", Some(90))), "a turn that ended before the last look");
+        unseen_after(cx, hook("UserPromptSubmit", None));
+        assert!(unseen_after(cx, hook("Stop", Some(200))), "one that ended after it");
+        workspace.update(cx, |w, cx| assert_eq!(w.snapshot(cx).projects[0].tasks[0].seen_at, 100, "the last look is kept"));
         workspace.update(cx, |w, cx| {
             for view in w.views() {
                 view.update(cx, |t, cx| t.shut_down(cx));

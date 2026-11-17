@@ -87,7 +87,7 @@ impl TaskView {
             message,
             file: None,
             said: None,
-            replayed: false,
+            replayed: None,
             session: None,
             guessed: true,
         }));

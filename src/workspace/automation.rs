@@ -856,7 +856,7 @@ mod tests {
             pid.unwrap()
         });
 
-        let hook = |event: &str| HookEvent { task: path.clone(), event: event.into(), message: None, kind: None, file: None, said: None, replayed: false, session: None, guessed: false };
+        let hook = |event: &str| HookEvent { task: path.clone(), event: event.into(), message: None, kind: None, file: None, said: None, replayed: None, session: None, guessed: false };
         let turn = |cx: &mut TestAppContext| {
             step(cx, &mut |w, window, cx| w.on_hook(hook("UserPromptSubmit"), window, cx));
             step(cx, &mut |w, window, cx| w.on_hook(hook("Stop"), window, cx));

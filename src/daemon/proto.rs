@@ -56,6 +56,14 @@ pub struct Hook {
     /// The agent's session id, when it says (newer `ideae --hook`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// When the daemon heard it, Unix seconds: a window that hears it again
+    /// on connect tells whether it came after the task was last looked at.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub at: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

@@ -61,6 +61,9 @@ pub struct TaskEntry {
     /// When its agent's latest turn ended. Not `last_active`, which a
     /// look at the task moves too.
     pub done_at: u64,
+    /// When it was last looked at: in view in the active window. What its
+    /// agent reported before stays out of Needs you after a restart.
+    pub seen_at: u64,
     /// The commit a variant was made from: what its diff is counted against.
     pub base: String,
     /// A worktree an agent made for itself (side.rs), not a task of the user's.
@@ -311,13 +314,13 @@ impl Workspace {
         if std::env::var_os("IDEAE_NO_DAEMON").is_none() {
             let live = hook_tx.clone();
             let to_event = |h: crate::daemon::proto::Hook, replayed: bool| agent::HookEvent {
+                replayed: replayed.then_some(h.at),
                 task: h.task.into(),
                 event: h.event,
                 message: h.message,
                 kind: h.kind,
                 file: h.file,
                 said: h.said,
-                replayed,
                 session: h.session,
                 guessed: false,
             };
@@ -354,6 +357,7 @@ impl Workspace {
             }),
             // Leaving the window saves edited files, as JetBrains IDEs do.
             cx.observe_window_activation(window, |this: &mut Self, window, cx| {
+                this.looked_at_in_view(window, cx);
                 if !window.is_window_active() {
                     for view in this.views() {
                         view.update(cx, |t, cx| t.autosave_all(cx));
@@ -758,6 +762,7 @@ impl Workspace {
                     prompt: t.prompt.clone(),
                     created: t.created,
                     done_at: t.done_at,
+                    seen_at: t.seen_at,
                     base: t.base.clone(),
                     side: None,
                     agent: t.agent.clone(),
@@ -872,6 +877,7 @@ impl Workspace {
                             prompt: t.prompt.clone(),
                             created: t.created,
                             done_at: t.done_at,
+                            seen_at: t.seen_at,
                             base: t.base.clone(),
                             check: self.checks.get(&t.path).filter(|run| run.is_over()).cloned(),
                             agent: t.agent.clone(),
@@ -969,6 +975,28 @@ impl Workspace {
         cx.notify();
     }
 
+    /// The window came to the front or left it: what is in view was looked at
+    /// until now, and on coming back is looked at again.
+    fn looked_at_in_view(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let now = state::now();
+        let looked: Vec<PathBuf> = match &self.active_group {
+            Some(group) => self.members(group).into_iter().map(|(pi, ti)| self.projects[pi].tasks[ti].path.clone()).collect(),
+            None => self.active.iter().cloned().collect(),
+        };
+        for path in looked {
+            let Some(entry) = self.entry_mut(&path) else { continue };
+            entry.seen_at = now;
+            if let Some(view) = entry.view.clone().filter(|_| window.is_window_active()) {
+                view.update(cx, |t, cx| {
+                    if t.unseen {
+                        t.unseen = false;
+                        cx.notify();
+                    }
+                });
+            }
+        }
+    }
+
     pub fn switch(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
         self.active_group = None;
         if self.active.as_deref() != Some(path) {
@@ -980,12 +1008,16 @@ impl Workspace {
             }
             if let Some(old) = self.active.clone().and_then(|a| self.entry_mut(&a)) {
                 old.left_view = Some(std::time::Instant::now());
+                if window.is_window_active() {
+                    old.seen_at = state::now();
+                }
             }
         }
         let Some(view) = self.load(path, window, cx) else { return };
         self.active = Some(path.to_path_buf());
         if let Some(entry) = self.entry_mut(path) {
             entry.last_active = state::now();
+            entry.seen_at = state::now();
         }
         view.update(cx, |t, cx| {
             t.unseen = false;
@@ -1885,10 +1917,15 @@ impl Workspace {
         let variant = variants::letter(entry.variant);
         // A group on its screen is in view with all its variants.
         let in_view = self.active.as_deref() == Some(event.task.as_path()) || (group.is_some() && self.active_group == group);
-        let seen = in_view && window.is_window_active();
+        let looked = in_view && window.is_window_active();
+        // Heard again after a restart: new only when it came after the last look.
+        let seen = looked || event.replayed.is_some_and(|at| at <= entry.seen_at);
         let was = view.read(cx).agent_status.clone();
         // The Notification about a question its PreToolUse told already: no second notice, the question kept.
         let status = if agent::asked_again(&was, &event) { was.clone() } else { status };
+        if looked {
+            self.projects[pi].tasks[ti].seen_at = state::now();
+        }
         // A turn's end, not the reminder a minute later or a session's start.
         let turn_over = status == agent::AgentStatus::Done && matches!(was, agent::AgentStatus::Working | agent::AgentStatus::NeedsInput(_));
         // A message that waited for this goes out now: the agent is not done yet.
@@ -1909,7 +1946,7 @@ impl Workspace {
                 cx.emit(TaskEvent::Changed);
                 cx.notify();
             }
-            if turn_over && !event.replayed {
+            if turn_over && event.replayed.is_none() {
                 t.deliver_queued(window, cx);
             }
             said != (t.agent_said.clone(), t.agent_asks.clone())
@@ -1926,7 +1963,7 @@ impl Workspace {
         if state::now().saturating_sub(*last) >= 60 || turn_over {
             *last = state::now();
         }
-        if turn_over && !event.replayed && !more_coming {
+        if turn_over && event.replayed.is_none() && !more_coming {
             self.after_turn(&event.task, window, cx);
         }
         if turn_over {
@@ -1935,17 +1972,17 @@ impl Workspace {
             self.refresh_usage(window, cx);
             if let Some(group) = &group {
                 self.refresh_touched(true, window, cx);
-                if !event.replayed && !more_coming && self.group_settled(group, cx) {
+                if event.replayed.is_none() && !more_coming && self.group_settled(group, cx) {
                     self.group_came_through(group, window, cx);
                 }
             }
         }
         // Out of sight while presenting: nothing is told now, all of it at the end.
         let hidden = !self.shows(pi, ti);
-        if hidden && status.is_attention() && status != was && !event.replayed {
+        if hidden && status.is_attention() && status != was && event.replayed.is_none() {
             self.hold_notice(&event.task);
         }
-        if status.is_attention() && !seen && !hidden && status != was && !event.replayed && state::settings().notifications {
+        if status.is_attention() && !seen && !hidden && status != was && event.replayed.is_none() && state::settings().notifications {
             let said = self.said_shown(&view, cx);
             let words = state::with_settings(|s| s.notify_said && s.show_said) && !self.is_presenting();
             let body = match (&status, &group) {
