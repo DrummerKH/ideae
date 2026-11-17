@@ -95,6 +95,10 @@ impl TaskView {
                     label = format!("{}: {}", tab.title, short_title(&tab.shown)).into();
                 }
                 if tab.title == "agent" {
+                    // Which agent, when there are several.
+                    if let Some(letter) = self.agent_letter() {
+                        label = format!("[{letter}] {label}").into();
+                    }
                     if let Some((glyph, _)) = status_glyph(&self.agent_status) {
                         label = format!("{glyph} {label}").into();
                     }
@@ -120,6 +124,7 @@ impl TaskView {
                 let dragged = DraggedTab { tab_id: tab.id, title: label.clone() };
                 let item = if tab.title == "agent" {
                     let root = self.root.clone();
+                    let who = self.session_ref();
                     let fill = self.context_fill;
                     let dialed = fill > 0. && crate::state::with_settings(|s| s.context_on_tab);
                     Tab::new().child(
@@ -128,7 +133,7 @@ impl TaskView {
                             .gap_1p5()
                             .child(label)
                             .when(dialed, |tab| tab.child(crate::sidebar::context_dial(fill, cx)))
-                            .tooltip(move |_, cx| cx.new(|cx| crate::usage::UsageTooltip::new(root.clone(), cx)).into()),
+                            .tooltip(move |_, cx| cx.new(|cx| crate::usage::UsageTooltip::new(root.clone(), who.clone(), cx)).into()),
                     )
                 } else {
                     Tab::new().label(label).when(tab.preview, |tab| tab.italic())

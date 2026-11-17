@@ -366,7 +366,7 @@ impl TaskView {
     }
 
     pub fn has_agent(&self) -> bool {
-        self.agent.is_some()
+        self.launch.is_some()
     }
 
     pub(super) fn show_run_panel(&mut self, cx: &mut Context<Self>) {

@@ -1,4 +1,6 @@
-//! Agent status from Claude Code hooks, without touching any Claude config.
+//! Agent status from the agents' own reports, without touching any of their
+//! config: Claude Code's hooks, Codex's `notify`, OpenCode's plugin events
+//! (agents/), all as Claude Code's hook events.
 //!
 //! The agent tab starts `claude --settings <file>`, where the file holds hooks
 //! that run `ideae --hook <Event>`. That subcommand forwards the event over a
@@ -67,6 +69,10 @@ pub struct HookEvent {
     /// The daemon's record of an earlier event, handed over on connect: it
     /// sets the status but notifies nobody again.
     pub replayed: bool,
+    /// The agent's id of the session it runs, when it says.
+    pub session: Option<String>,
+    /// Not reported but guessed from the agent's terminal.
+    pub guessed: bool,
 }
 
 impl HookEvent {
@@ -87,7 +93,7 @@ impl HookEvent {
             "Notification" if self.is_idle_reminder() => AgentStatus::Done,
             "Notification" if self.kind.as_deref() == Some("auth_success") => return None,
             "Notification" => AgentStatus::NeedsInput(
-                self.message.clone().unwrap_or_else(|| "Claude needs your input".into()),
+                self.message.clone().unwrap_or_else(|| "The agent needs your input".into()),
             ),
             "Stop" => AgentStatus::Done,
             "SessionEnd" => AgentStatus::Exited,
@@ -102,6 +108,8 @@ pub struct Bridge {
     pub socket: String,
     socket_file: Option<PathBuf>,
     pub settings: PathBuf,
+    /// OpenCode's plugin, next to the settings.
+    plugin: PathBuf,
 }
 
 #[cfg(unix)]
@@ -176,6 +184,7 @@ impl Bridge {
         } else {
             dir.join(format!("hooks-{pid}.json"))
         };
+        let plugin = settings.with_extension("opencode.js");
         let (socket, socket_file, incoming) = listen(&dir, pid)?;
 
         std::thread::Builder::new().name("hook-listener".into()).spawn(move || {
@@ -189,8 +198,13 @@ impl Bridge {
             }
         })?;
 
-        let bridge = Self { socket, socket_file, settings };
+        let bridge = Self { socket, socket_file, settings, plugin };
         bridge.write_settings()?;
+        let exe = std::env::current_exe().ok();
+        if let Some(exe) = &exe {
+            let _ = std::fs::write(&bridge.plugin, crate::agents::opencode::plugin_source(exe));
+        }
+        crate::agents::set_hooks(crate::agents::Hooks { claude_settings: Some(bridge.settings.clone()), exe, opencode_plugin: Some(bridge.plugin.clone()) });
         Ok(bridge)
     }
 
@@ -205,35 +219,6 @@ impl Bridge {
         }
         std::fs::write(&self.settings, serde_json::to_vec_pretty(&value)?)
     }
-
-    /// The shell command for the agent tab: continue the last conversation in
-    /// this worktree, or start one when there is none. On Windows the shell
-    /// is PowerShell, whose 5.1 has no `||`.
-    pub fn claude_command(&self, claude: &str) -> String {
-        let settings = shell_quote(&self.settings.display().to_string());
-        // The user's own choice of conversation stands.
-        let picks_conversation = claude
-            .split_whitespace()
-            .skip(1)
-            .any(|a| matches!(a, "-c" | "--continue" | "-r" | "--resume" | "--session-id") || a.starts_with("--resume=") || a.starts_with("--session-id="));
-        if picks_conversation {
-            return format!("{claude} --settings {settings}");
-        }
-        if cfg!(windows) {
-            format!("{claude} --settings {settings} --continue; if (-not $?) {{ {claude} --settings {settings} }}")
-        } else {
-            format!("{claude} --settings {settings} --continue || {claude} --settings {settings}")
-        }
-    }
-}
-
-/// Whether an agent command runs Claude Code (`claude`, a path to it, with
-/// arguments or not): it gets the hooks and continues its conversation.
-pub fn is_claude(command: &str) -> bool {
-    command.split_whitespace().next().and_then(|program| {
-        let name = Path::new(program).file_name()?.to_string_lossy().to_lowercase();
-        Some(matches!(name.trim_end_matches(".exe").trim_end_matches(".cmd"), "claude"))
-    }) == Some(true)
 }
 
 impl Drop for Bridge {
@@ -243,6 +228,7 @@ impl Drop for Bridge {
         }
         if cfg!(windows) {
             let _ = std::fs::remove_file(&self.settings);
+            let _ = std::fs::remove_file(&self.plugin);
         }
     }
 }
@@ -323,6 +309,8 @@ fn parse_line(line: &str) -> Option<HookEvent> {
         file: v["file"].as_str().map(str::to_string),
         said: v["said"].as_str().map(str::to_string),
         replayed: false,
+        session: v["session"].as_str().map(str::to_string),
+        guessed: false,
     })
 }
 
@@ -370,13 +358,25 @@ pub fn edited_file(payload: &Value) -> Option<String> {
     .map(str::to_string)
 }
 
-/// `ideae --hook <Event>`: run by Claude Code, forwards the event and exits.
-/// It must never block or fail the agent, so every error is swallowed.
-pub fn run_hook(event: &str) {
-    let mut input = String::new();
-    let _ = std::io::stdin().read_to_string(&mut input);
-    let payload: Value = serde_json::from_str(&input).unwrap_or(Value::Null);
-    let (Some(socket), Some(task)) = (std::env::var(SOCK_ENV).ok(), std::env::var(TASK_ENV).ok()) else {
+/// `ideae --hook <Event>`: run by Claude Code (the payload on stdin) or by
+/// OpenCode's plugin, as `ideae --hook Codex --task=… --sock=… <json>` by
+/// Codex's notify; forwards the event and exits. It must never block or
+/// fail the agent, so every error is swallowed.
+pub fn run_hook(args: &[String]) {
+    let event = args.first().map(String::as_str).unwrap_or_default();
+    let given = |name: &str| args.iter().find_map(|a| a.strip_prefix(&format!("--{name}="))).filter(|v| !v.is_empty()).map(str::to_string);
+    let (event, payload) = if event == "Codex" {
+        // Codex gives the JSON as the last argument, and only at a turn's end.
+        match args.last().and_then(|json| crate::agents::codex::notify_payload(json)) {
+            Some(payload) => ("Stop", payload),
+            None => return,
+        }
+    } else {
+        let mut input = String::new();
+        let _ = std::io::stdin().read_to_string(&mut input);
+        (event, serde_json::from_str(&input).unwrap_or(Value::Null))
+    };
+    let (Some(socket), Some(task)) = (given("sock").or_else(|| std::env::var(SOCK_ENV).ok()), given("task").or_else(|| std::env::var(TASK_ENV).ok())) else {
         return;
     };
     // Before a tool runs the message says what the agent is doing.
@@ -396,6 +396,7 @@ pub fn run_hook(event: &str) {
         "kind": payload["notification_type"].as_str(),
         "file": if event == "PreToolUse" { edited_file(&payload) } else { None },
         "said": said,
+        "session": payload["session_id"].as_str(),
     });
     #[cfg(unix)]
     if Path::new(&socket).file_name().is_some_and(|name| name.to_string_lossy().starts_with("daemon")) {
@@ -406,6 +407,7 @@ pub fn run_hook(event: &str) {
             kind: line["kind"].as_str().map(str::to_string),
             file: line["file"].as_str().map(str::to_string),
             said,
+            session: line["session"].as_str().map(str::to_string),
         });
         return;
     }
@@ -417,7 +419,7 @@ mod tests {
     use super::*;
 
     fn note(message: &str, kind: Option<&str>) -> Option<AgentStatus> {
-        HookEvent { task: PathBuf::new(), event: "Notification".into(), message: Some(message.into()), kind: kind.map(Into::into), file: None, said: None, replayed: false }
+        HookEvent { task: PathBuf::new(), event: "Notification".into(), message: Some(message.into()), kind: kind.map(Into::into), file: None, said: None, replayed: false, session: None, guessed: false }
             .status()
     }
 
@@ -428,9 +430,9 @@ mod tests {
             let _ = tx.send(event);
         })
         .unwrap();
-        send(&bridge.socket, r#"{"task":"/w/t","event":"Stop"}"#);
+        send(&bridge.socket, r#"{"task":"/w/t","event":"Stop","session":"u-1"}"#);
         let event = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert_eq!((event.task, event.event), (PathBuf::from("/w/t"), "Stop".to_string()));
+        assert_eq!((event.task, event.event, event.session.as_deref()), (PathBuf::from("/w/t"), "Stop".to_string(), Some("u-1")));
         #[cfg(windows)]
         {
             let (addr, _) = bridge.socket.split_once('/').unwrap();
@@ -449,22 +451,6 @@ mod tests {
         assert_eq!(a(json!({"tool_name":"Bash","tool_input":{"command":"x","description":"Build the app"}})).as_deref(), Some("Build the app"));
         assert_eq!(a(json!({"tool_name":"Grep","tool_input":{"pattern":"fn main"}})).as_deref(), Some("Searching \"fn main\""));
         assert_eq!(a(json!({"tool_name":"mcp__github__get_issue","tool_input":{}})).as_deref(), Some("Using github get_issue"));
-    }
-
-    #[test]
-    fn claude_commands() {
-        assert!(is_claude("claude"));
-        assert!(is_claude("claude --model opus"));
-        assert!(is_claude("/home/u/.local/bin/claude"));
-        assert!(!is_claude("aider"));
-        assert!(!is_claude(""));
-        let bridge = Bridge { socket: String::new(), socket_file: None, settings: PathBuf::from("/run/h.json") };
-        let with_args = bridge.claude_command("claude --model opus");
-        // `||` in sh, `if (-not $?)` in PowerShell: the start is the same.
-        assert!(with_args.starts_with("claude --model opus --settings '/run/h.json' --continue"), "{with_args}");
-        assert!(with_args.matches("claude --model opus --settings '/run/h.json'").count() == 2, "{with_args}");
-        assert_eq!(bridge.claude_command("claude --resume abc"), "claude --resume abc --settings '/run/h.json'");
-        std::mem::forget(bridge);
     }
 
     #[test]

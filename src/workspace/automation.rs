@@ -199,6 +199,9 @@ impl Workspace {
 
     /// The Run panel asks for the settings, or a setup or a check again.
     pub(super) fn on_task_event(&mut self, view: &Entity<TaskView>, event: &TaskEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if let TaskEvent::Heard(heard) = event {
+            return self.on_hook(heard.clone(), window, cx);
+        }
         let TaskEvent::Auto(ask) = event else {
             return cx.notify();
         };
@@ -834,7 +837,7 @@ mod tests {
             })
         };
 
-        step(cx, &mut |w, window, cx| w.create_task(0, "Fix login".into(), String::new(), vec![String::new()], window, cx));
+        step(cx, &mut |w, window, cx| w.create_task(0, "Fix login".into(), String::new(), vec![String::new()], Vec::new(), window, cx));
         let mut path = None;
         until(cx, "the worktree", &mut |cx| {
             path = workspace.update(cx, |w, _| w.projects[0].tasks.iter().find(|t| !t.main && t.busy.is_none() && t.view.is_some()).map(|t| t.path.clone()));
@@ -853,7 +856,7 @@ mod tests {
             pid.unwrap()
         });
 
-        let hook = |event: &str| HookEvent { task: path.clone(), event: event.into(), message: None, kind: None, file: None, said: None, replayed: false };
+        let hook = |event: &str| HookEvent { task: path.clone(), event: event.into(), message: None, kind: None, file: None, said: None, replayed: false, session: None, guessed: false };
         let turn = |cx: &mut TestAppContext| {
             step(cx, &mut |w, window, cx| w.on_hook(hook("UserPromptSubmit"), window, cx));
             step(cx, &mut |w, window, cx| w.on_hook(hook("Stop"), window, cx));

@@ -2,6 +2,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod agent;
+mod agents;
 mod browser;
 mod crash;
 mod build_watch;
@@ -129,9 +130,12 @@ impl Render for Workspace {
                                             .text_xs()
                                             .text_color(cx.theme().muted_foreground)
                                             .child(format!("tokens 24h {}", usage::tokens(self.tokens_of_the_day())))
-                                            .tooltip(|window, cx| {
-                                                gpui_kit::component::tooltip::Tooltip::new("What the agents of the tasks open here took in the last 24 hours: input not read from the cache, and output")
-                                                    .build(window, cx)
+                                            .tooltip({
+                                                let mut told = "What the agents of the tasks open here took in the last 24 hours: input not read from the cache, and output".to_string();
+                                                for (name, n) in self.tokens_by_agent() {
+                                                    told.push_str(&format!("\n{name}: {}", usage::tokens(n)));
+                                                }
+                                                move |window, cx| gpui_kit::component::tooltip::Tooltip::new(told.clone()).build(window, cx)
                                             }),
                                     )
                                 })
@@ -601,7 +605,7 @@ fn main() {
         return;
     }
     if argv.get(1).map(String::as_str) == Some("--hook") {
-        agent::run_hook(argv.get(2).map(String::as_str).unwrap_or_default());
+        agent::run_hook(argv.get(2..).unwrap_or_default());
         return;
     }
     if let Some(what) = argv.get(1).filter(|a| *a == "--install" || *a == "--uninstall") {

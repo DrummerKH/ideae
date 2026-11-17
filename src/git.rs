@@ -1191,9 +1191,16 @@ pub fn run(root: &Path, program: &str, args: &[&str]) -> Result<String, String> 
 }
 
 /// A commit message for what would be committed (the staged changes, or
-/// all of them), written by `claude -p` in the style of the latest commits.
+/// all of them), written by the agent for quick questions (`claude -p`…)
+/// in the style of the latest commits.
 pub fn suggest_message(root: &Path, staged_only: bool) -> Result<String, String> {
     use std::io::Write as _;
+    let Some(profile) = crate::state::with_settings(|s| s.quick_profile().cloned()) else {
+        return Err("No agent to write it: add one in Settings → Agents".into());
+    };
+    let Some(asked) = profile.adapter().one_shot(&profile, &crate::agents::Ask::Quick) else {
+        return Err(format!("{} cannot answer one question: choose another agent for quick questions in Settings → Agents", profile.name));
+    };
     const MAX_DIFF: usize = 60_000;
     let mut diff = if staged_only { git(root, &["diff", "--cached"]).unwrap_or_default() } else { working_patch(root) };
     if diff.trim().is_empty() {
@@ -1216,26 +1223,25 @@ pub fn suggest_message(root: &Path, staged_only: bool) -> Result<String, String>
          no code fences.\n\nRecent commits, separated by ---:\n{}\n\nThe diff:\n{diff}",
         examples.join("\n---\n")
     );
-    // Quick and on its own: no tools, no MCP servers, no session kept.
-    let mut child = crate::procs::command("claude")
+    let name = profile.name.clone();
+    let mut child = asked
+        .command()
         .current_dir(root)
-        .args(["-p", "--model", "haiku", "--tools", "", "--strict-mcp-config", "--no-session-persistence"])
-        .env_remove(crate::agent::SOCK_ENV)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| format!("claude: {e}"))?;
+        .map_err(|e| format!("{name}: {e}"))?;
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(prompt.as_bytes());
     }
-    let out = child.wait_with_output().map_err(|e| format!("claude: {e}"))?;
-    let text = String::from_utf8_lossy(&out.stdout).trim().trim_matches('`').trim().to_string();
+    let out = child.wait_with_output().map_err(|e| format!("{name}: {e}"))?;
+    let text = asked.read_answer(&String::from_utf8_lossy(&out.stdout)).0.trim_matches('`').trim().to_string();
     if out.status.success() && !text.is_empty() {
         Ok(text)
     } else {
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        Err(if err.is_empty() { "claude gave no message".into() } else { err })
+        Err(if err.is_empty() { format!("{name} gave no message") } else { err })
     }
 }
 

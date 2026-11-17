@@ -107,9 +107,9 @@ impl TaskView {
                             .label("✦ Write")
                             .disabled(busy || self.files.is_empty())
                             .tooltip(if staged > 0 {
-                                "Have Claude write the commit message for the staged changes, into the box"
+                                "Have the agent for quick questions write the commit message for the staged changes, into the box"
                             } else {
-                                "Have Claude write the commit message for all the changes, into the box"
+                                "Have the agent for quick questions write the commit message for all the changes, into the box"
                             })
                             .on_click(cx.listener(|this, _, window, cx| this.suggest_message(window, cx))),
                     ).when(self.can_amend(), |column| {

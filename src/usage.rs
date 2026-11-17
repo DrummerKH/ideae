@@ -1,5 +1,6 @@
-//! What a task's Claude Code session has used, from its transcript in
-//! `~/.claude/projects`: shown when the pointer rests on the agent's tab.
+//! What a task's agent session has used, from its transcript (Claude Code's
+//! in `~/.claude/projects`; others through their adapter): shown when the
+//! pointer rests on the agent's tab.
 
 use std::{
     collections::HashMap,
@@ -47,6 +48,8 @@ pub struct Usage {
     /// What the answers of the last day took: input not read from the
     /// cache, and output.
     pub recent: u64,
+    /// The model's context window, when the session says; else guessed.
+    pub window: u64,
 }
 
 impl Usage {
@@ -57,14 +60,22 @@ impl Usage {
 
     /// How full the context is, 0 to 1: of 200k tokens, or of a million
     /// once it holds more than the smaller window can.
+    pub fn window(&self) -> u64 {
+        match self.window {
+            0 if self.context > 200_000 || self.model.contains("[1m]") => 1_000_000,
+            0 => 200_000,
+            told => told,
+        }
+    }
+
     pub fn fill(&self) -> f32 {
-        let window = if self.context > 200_000 || self.model.contains("[1m]") { 1_000_000 } else { 200_000 };
+        let window = self.window();
         (self.context as f32 / window as f32).min(1.)
     }
 }
 
 /// Seconds since 1970 of a time as transcripts write it: `2026-11-15T19:45:55.123Z`.
-fn epoch(time: &str) -> Option<u64> {
+pub fn epoch(time: &str) -> Option<u64> {
     let number = |range: std::ops::Range<usize>| time.get(range)?.parse::<u64>().ok();
     let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
     let (hour, minute, second) = (number(11..13)?, number(14..16)?, number(17..19)?);
@@ -76,25 +87,20 @@ fn epoch(time: &str) -> Option<u64> {
     Some((days.checked_sub(719_468)?) * 86_400 + hour * 3600 + minute * 60 + second)
 }
 
-/// Claude Code keeps a project's sessions in a folder named after its path,
-/// every character but letters and digits made a dash.
-fn sessions_dir(root: &Path) -> Option<PathBuf> {
-    let config = std::env::var_os("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(|h| PathBuf::from(h).join(".claude")))?;
-    let name: String = root.to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
-    Some(config.join("projects").join(name))
-}
-
-/// The task's latest session: the transcript written to last.
-pub fn transcript(root: &Path) -> Option<PathBuf> {
-    std::fs::read_dir(sessions_dir(root)?)
-        .ok()?
-        .flatten()
-        .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
-        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
-        .max_by_key(|(at, _)| *at)
-        .map(|(_, path)| path)
+/// A time as transcripts write it, of seconds since 1970.
+#[cfg(test)]
+pub fn stamp(secs: u64) -> String {
+    let (days, rest) = (secs / 86_400, secs % 86_400);
+    // Civil from days (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let (era, doe) = (z / 146_097, z % 146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + u64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.000Z", rest / 3600, rest % 3600 / 60, rest % 60)
 }
 
 /// What was read of a transcript so far: a session only grows, so the next
@@ -208,19 +214,24 @@ pub fn tokens(n: u64) -> String {
 /// The tooltip: reads the transcript off the UI thread.
 pub struct UsageTooltip {
     usage: Option<Option<Usage>>,
+    /// The agent's name, and whether its adapter can tell.
+    agent: String,
+    tells: bool,
     _read: Task<()>,
 }
 
 impl UsageTooltip {
-    pub fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
+    pub fn new(root: PathBuf, who: Option<crate::agents::SessionRef>, cx: &mut Context<Self>) -> Self {
+        let agent = who.as_ref().map_or_else(|| "the agent".to_string(), |w| w.profile.name.clone());
+        let tells = who.as_ref().is_some_and(|w| w.profile.adapter().tells_usage());
         let read = cx.spawn(async move |this, cx| {
-            let usage = cx.background_spawn(async move { transcript(&root).and_then(|p| read(&p)) }).await;
+            let usage = cx.background_spawn(async move { who.and_then(|who| who.usage(&root)).map(|(_, usage)| usage) }).await;
             let _ = this.update(cx, |t, cx| {
                 t.usage = Some(usage);
                 cx.notify();
             });
         });
-        Self { usage: None, _read: read }
+        Self { usage: None, agent, tells, _read: read }
     }
 }
 
@@ -235,7 +246,8 @@ impl Render for UsageTooltip {
         };
         let body = match &self.usage {
             None => v_flex().child("Reading the session…"),
-            Some(None) => v_flex().child("No Claude Code session here yet."),
+            Some(None) if !self.tells => v_flex().child(format!("{} does not tell ideae what it used.", self.agent)),
+            Some(None) => v_flex().child(format!("No session of {} here yet.", self.agent)),
             Some(Some(u)) => v_flex()
                 .gap_0p5()
                 .child(row("Model", if u.model.is_empty() { "?".into() } else { u.model.clone() }))
@@ -259,9 +271,7 @@ impl Render for UsageTooltip {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
-    use super::{last_answer, read, sessions_dir};
+    use super::{last_answer, read};
 
     #[test]
     fn the_last_answer_is_the_agents_own_last_words() {
@@ -346,11 +356,5 @@ mod tests {
         std::fs::write(&path, answer("z", 1, 2, 3)).unwrap();
         assert_eq!(read(&path).unwrap().answers, 1);
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn sessions_dir_dashes_the_path() {
-        let dir = sessions_dir(Path::new("/ott/a.worktrees/b_c")).unwrap();
-        assert!(dir.ends_with("projects/-ott-a-worktrees-b-c"), "{dir:?}");
     }
 }

@@ -65,8 +65,17 @@ pub struct TaskEntry {
     pub base: String,
     /// A worktree an agent made for itself (side.rs), not a task of the user's.
     pub side: Option<side::Side>,
+    /// The agent chosen when it was made, by profile id; empty for its
+    /// project's or the default.
+    pub agent: String,
+    /// Its agents' sessions; the last is the one it runs.
+    pub sessions: Vec<state::AgentSession>,
+    /// Made this run and not started yet, or its latest session recorded
+    /// and not run: its agent starts a new session.
+    pub fresh: bool,
 }
 
+pub mod agents_ui;
 pub mod automation;
 pub mod present;
 pub mod side;
@@ -74,6 +83,13 @@ pub mod spaces;
 pub mod variants;
 
 impl TaskEntry {
+    /// The agent's latest session, to find its file by.
+    pub fn session_ref(&self) -> Option<crate::agents::SessionRef> {
+        let session = self.sessions.last()?;
+        let profile = state::with_settings(|s| s.profile(&session.profile).cloned())?;
+        Some(crate::agents::SessionRef { profile, id: session.id.clone() })
+    }
+
     pub fn label(&self) -> String {
         match (&self.title, self.side.as_ref().and_then(|s| s.about.as_ref())) {
             (title, _) if !title.is_empty() => title.clone(),
@@ -100,6 +116,8 @@ pub struct Project {
     /// in project_config, read from any thread.
     pub trusted: std::collections::BTreeMap<String, bool>,
     pub hints_off: std::collections::BTreeSet<String>,
+    /// The agent of its new tasks, by profile id; none for the default.
+    pub agent: Option<String>,
 }
 
 impl Project {
@@ -115,6 +133,7 @@ impl Project {
             check_auto: false,
             trusted: Default::default(),
             hints_off: Default::default(),
+            agent: None,
         }
     }
 }
@@ -132,7 +151,6 @@ pub struct Workspace {
     pub spaces: Vec<spaces::Space>,
     pub space: Option<String>,
     last_in_space: std::collections::HashMap<Option<String>, PathBuf>,
-    agent: Option<String>,
     /// The agent given on the command line, over Settings.
     agent_override: Option<Option<String>>,
     hook_socket: Option<String>,
@@ -270,9 +288,7 @@ impl Workspace {
         })
         .inspect_err(|e| eprintln!("agent hooks off: {e}"))
         .ok();
-        // Claude gets the hooks; any other agent command runs as given.
         let agent_override = agent;
-        let agent = Self::agent_command(&agent_override, bridge.as_ref());
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut hook_socket = bridge.as_ref().map(|b| b.socket.clone());
         // Terminals run in the daemon, which also takes the hooks. Without
@@ -288,6 +304,8 @@ impl Workspace {
                 file: h.file,
                 said: h.said,
                 replayed,
+                session: h.session,
+                guessed: false,
             };
             match crate::daemon::client::connect(move |h| {
                 let _ = live.send_blocking(to_event(h, false));
@@ -468,7 +486,6 @@ impl Workspace {
             spaces: saved.spaces.clone(),
             space: saved.space.clone().filter(|name| saved.spaces.iter().any(|s| &s.name == name)),
             last_in_space: Default::default(),
-            agent,
             agent_override,
             hook_socket,
             _bridge: bridge,
@@ -665,7 +682,9 @@ impl Workspace {
         if let (Ok(task), false) = (std::env::var("IDEAE_NEW_TASK"), this.projects.is_empty()) {
             let (title, prompt) = task.split_once('\n').unwrap_or((task.as_str(), ""));
             let variants = std::env::var("IDEAE_VARIANTS").ok().and_then(|n| n.parse::<usize>().ok()).unwrap_or(1).clamp(1, variants::MOST);
-            this.create_task(0, title.trim().to_string(), prompt.trim().to_string(), vec![String::new(); variants], window, cx);
+            // IDEAE_AGENTS="claude,codex": the agent of each, by profile id.
+            let agents = std::env::var("IDEAE_AGENTS").map(|a| a.split(',').map(|id| id.trim().to_string()).collect()).unwrap_or_default();
+            this.create_task(0, title.trim().to_string(), prompt.trim().to_string(), vec![String::new(); variants], agents, window, cx);
         }
         this
     }
@@ -679,6 +698,7 @@ impl Workspace {
             project.check_auto = p.check_auto;
             project.trusted = p.trusted.clone();
             project.hints_off = p.hints_off.iter().cloned().collect();
+            project.agent = p.agent.clone();
             crate::project_config::set_own(&p.path, p.own.clone());
             // What the judge said and how the checks went: paid for, kept.
             for (group, verdict) in &p.verdicts {
@@ -717,6 +737,9 @@ impl Workspace {
                     done_at: t.done_at,
                     base: t.base.clone(),
                     side: None,
+                    agent: t.agent.clone(),
+                    sessions: t.sessions.clone(),
+                    fresh: false,
                 })
                 .collect();
             self.projects.push(project);
@@ -792,6 +815,7 @@ impl Workspace {
                     own: crate::project_config::own(&p.path),
                     trusted: p.trusted.clone(),
                     hints_off: p.hints_off.iter().cloned().collect(),
+                    agent: p.agent.clone(),
                     verdicts: self
                         .judges
                         .iter()
@@ -824,6 +848,8 @@ impl Workspace {
                             done_at: t.done_at,
                             base: t.base.clone(),
                             check: self.checks.get(&t.path).filter(|run| run.is_over()).cloned(),
+                            agent: t.agent.clone(),
+                            sessions: t.sessions.clone(),
                         })
                         .collect(),
                 })
@@ -857,16 +883,6 @@ impl Workspace {
     fn load(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) -> Option<Entity<TaskView>> {
         self.restoring.retain(|p| p != path);
         let socket = self.hook_socket.clone();
-        let variant = self.find(path).is_some_and(|(pi, ti)| !self.projects[pi].tasks[ti].group.is_empty());
-        let side = self.find(path).is_some_and(|(pi, ti)| self.projects[pi].tasks[ti].side.is_some());
-        // An agent's own worktree gets none of its own: a shell, for looking.
-        let agent = if side {
-            None
-        } else if variant {
-            Self::agent_command_for(&self.agent_override, self._bridge.as_ref(), true)
-        } else {
-            self.agent.clone()
-        };
         let entry = self.entry_mut(path)?;
         if let Some(view) = &entry.view {
             return Some(view.clone());
@@ -874,6 +890,7 @@ impl Workspace {
         if entry.busy.is_some() {
             return None;
         }
+        let launch = self.launch_for(path);
         let slot = self.port_slot_for(path);
         if let Some((pi, _)) = self.find(path) {
             crate::project_config::register(path, &self.projects[pi].path);
@@ -882,7 +899,7 @@ impl Workspace {
         let (root, branch, session, pr) = (entry.path.clone(), entry.branch.clone(), entry.session.clone(), entry.pr.clone());
         let fill = self.usage.get(path).map_or(0., |(_, usage)| usage.fill());
         let view = cx.new(|cx| {
-            let mut t = TaskView::new(root, branch, agent, socket, slot, window, cx);
+            let mut t = TaskView::new(root, branch, launch, socket, slot, window, cx);
             t.context_fill = fill;
             // Servers start when the task comes into view (switch).
             t.lsp_asleep = true;
@@ -1485,24 +1502,28 @@ impl Workspace {
                 cx.new(|cx| InputState::new(window, cx).placeholder(format!("{}: {hint}", variants::letter(v))))
             })
             .collect();
-        // The title, the prompt and the variants' notes, when it can be made.
+        // The agent of each: the project's to start with.
+        let first_agent = self.project_agent(project);
+        let agents: Vec<Rc<RefCell<String>>> = (0..variants::MOST).map(|_| Rc::new(RefCell::new(first_agent.clone()))).collect();
+        // The title, the prompt, the variants' notes and agents, when it can be made.
         let filled_in = {
-            let (input, prompt, count, notes) = (input.clone(), prompt.clone(), count.clone(), notes.clone());
+            let (input, prompt, count, notes, agents) = (input.clone(), prompt.clone(), count.clone(), notes.clone(), agents.clone());
             move |cx: &App| {
                 let title = input.read(cx).value().trim().to_string();
                 let text = prompt.read(cx).value().trim().to_string();
                 let notes: Vec<String> = notes.iter().take(count.get()).map(|n| n.read(cx).value().trim().to_string()).collect();
+                let agents: Vec<String> = agents.iter().take(count.get()).map(|a| a.borrow().clone()).collect();
                 // Variants are sent their prompt: there has to be one.
-                (!title.is_empty() && (notes.len() < 2 || !text.is_empty())).then_some((title, text, notes))
+                (!title.is_empty() && (notes.len() < 2 || !text.is_empty())).then_some((title, text, notes, agents))
             }
         };
         let this = cx.weak_entity();
         let submit = {
             let (this, filled_in) = (this.clone(), filled_in.clone());
             move |window: &mut Window, cx: &mut App| {
-                let Some((title, text, notes)) = filled_in(cx) else { return };
+                let Some((title, text, notes, agents)) = filled_in(cx) else { return };
                 window.close_dialog(cx);
-                let _ = this.update(cx, |this, cx| this.create_task(project, title, text, notes, window, cx));
+                let _ = this.update(cx, |this, cx| this.create_task(project, title, text, notes, agents, window, cx));
             }
         };
         // Runs inside this entity's update, so it cannot go through `submit`.
@@ -1514,9 +1535,9 @@ impl Workspace {
                 if in_prompt && !*secondary {
                     return;
                 }
-                if let Some((title, text, notes)) = filled_in(cx) {
+                if let Some((title, text, notes, agents)) = filled_in(cx) {
                     window.close_dialog(cx);
-                    this.create_task(project, title, text, notes, window, cx);
+                    this.create_task(project, title, text, notes, agents, window, cx);
                 }
             }
         };
@@ -1577,9 +1598,10 @@ impl Workspace {
         let focused = std::rc::Rc::new(std::cell::Cell::new(false));
         window.open_dialog(cx, move |dialog, _, cx| {
             let (input, prompt, submit, focused) = (input.clone(), prompt.clone(), submit.clone(), focused.clone());
-            let (count, notes) = (count.clone(), notes.clone());
+            let (count, notes, agents) = (count.clone(), notes.clone(), agents.clone());
             let _ = &listening;
             let many = count.get();
+            let several = state::with_settings(|s| s.several_agents());
             let muted = cx.theme().muted_foreground;
             dialog
                 .title(format!("New task in {name}"))
@@ -1600,6 +1622,15 @@ impl Workspace {
                                     .child(branch_hint(&input.read(cx).value())),
                             )
                             .child(Textarea::new(&prompt))
+                            .when(several && many == 1, |form| {
+                                form.child(
+                                    h_flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .child(div().text_sm().child("Agent"))
+                                        .child(agents_ui::picker("new-task-agent", agents[0].clone())),
+                                )
+                            })
                             .child(
                                 h_flex()
                                     .gap_1()
@@ -1628,7 +1659,12 @@ impl Workspace {
                                     ("Refactor on the way", "Refactor what is in the way before making the change."),
                                     ("Question the premise", "First question whether the task is the right fix; say so if another is better, and do that."),
                                 ];
-                                form.children(notes.iter().take(many).map(|note| Input::new(note).small())).child(
+                                form.children(notes.iter().zip(&agents).take(many).enumerate().map(|(ix, (note, agent))| {
+                                    h_flex()
+                                        .gap_2()
+                                        .child(div().flex_1().child(Input::new(note).small()))
+                                        .when(several, |row| row.child(agents_ui::picker(("variant-agent", ix), agent.clone())))
+                                })).child(
                                     h_flex().gap_1().children(ways.into_iter().enumerate().map(|(ix, (name, text))| {
                                         let notes: Vec<Entity<InputState>> = notes.iter().take(many).cloned().collect();
                                         Button::new(("way", ix)).xsmall().ghost().label(name).tooltip(text).on_click(move |_, window, cx| {
@@ -1669,10 +1705,11 @@ impl Workspace {
     }
 
     /// `notes` has what each variant's agent alone is told: two or more
-    /// make as many variants of the task (variants.rs).
-    fn create_task(&mut self, project: usize, title: String, prompt: String, notes: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+    /// make as many variants of the task (variants.rs). `agents`: the
+    /// profile each runs; none given, the project's.
+    fn create_task(&mut self, project: usize, title: String, prompt: String, notes: Vec<String>, agents: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
         if notes.len() > 1 {
-            return self.create_variants(project, title, prompt, notes, window, cx);
+            return self.create_variants(project, title, prompt, notes, agents, window, cx);
         }
         let Some(p) = self.projects.get_mut(project) else { return };
         let branch = naming::branch_name(&title);
@@ -1687,6 +1724,8 @@ impl Workspace {
             busy: Some("creating…".into()),
             prompt: prompt.clone(),
             created: state::now(),
+            agent: agents.into_iter().next().unwrap_or_default(),
+            fresh: true,
             ..Default::default()
         });
         cx.notify();
@@ -1924,6 +1963,10 @@ impl Workspace {
     // ------------------------------------------------------------ hooks
 
     fn on_hook(&mut self, event: agent::HookEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Which session the agent runs: what a restart, or the next run, resumes.
+        if let Some(id) = event.session.as_deref().filter(|id| !id.is_empty()) {
+            self.learn_session(&event.task, id, cx);
+        }
         let Some(status) = event.status() else { return };
         let Some((pi, ti)) = self.find(&event.task) else { return };
         let entry = &self.projects[pi].tasks[ti];
@@ -1942,6 +1985,7 @@ impl Workspace {
         let heard = view.update(cx, |t, cx| {
             let said = (t.agent_said.clone(), t.agent_asks.clone());
             t.hear(&event, &status);
+            t.status_guessed = event.guessed;
             t.set_agent_status(status.clone(), seen, cx);
             let before = t.agent_shown();
             t.follow_agent(&event.event, event.file.as_deref());
@@ -2014,6 +2058,20 @@ impl Workspace {
         }
     }
 
+    /// The agent reported its session id: kept as the task's latest
+    /// session's, the one resumed. Claude Code's `/clear` starts another.
+    fn learn_session(&mut self, task: &Path, id: &str, cx: &mut Context<Self>) {
+        let Some(entry) = self.entry_mut(task) else { return };
+        let Some(session) = entry.sessions.last_mut() else { return };
+        if session.id.as_deref() == Some(id) {
+            return;
+        }
+        session.id = Some(id.to_string());
+        if let Some(view) = entry.view.clone() {
+            view.update(cx, |t, _| t.learned_session(id));
+        }
+    }
+
     /// What the agent of a task said, as far as it is to be shown: not
     /// while presenting, not when turned off. Whole, for a notification.
     pub fn said_shown(&self, view: &Entity<crate::task::TaskView>, cx: &App) -> Option<SharedString> {
@@ -2036,22 +2094,22 @@ impl Workspace {
         if std::mem::replace(&mut self.reading_usage, true) {
             return;
         }
-        let known: Vec<(PathBuf, Option<std::time::SystemTime>)> = self
+        let known: Vec<(PathBuf, crate::agents::SessionRef, Option<std::time::SystemTime>)> = self
             .projects
             .iter()
             .flat_map(|p| &p.tasks)
             .filter(|t| t.view.is_some())
-            .map(|t| (t.path.clone(), self.usage.get(&t.path).and_then(|(written, _)| *written)))
+            .filter_map(|t| Some((t.path.clone(), t.session_ref()?, self.usage.get(&t.path).and_then(|(written, _)| *written))))
             .collect();
         cx.spawn_in(window, async move |this, cx| {
             let read = cx
                 .background_spawn(async move {
                     known
                         .into_iter()
-                        .filter_map(|(path, before)| {
-                            let transcript = crate::usage::transcript(&path)?;
+                        .filter_map(|(path, who, before)| {
+                            let transcript = who.transcript(&path)?;
                             let written = std::fs::metadata(&transcript).and_then(|m| m.modified()).ok();
-                            (written != before).then(|| crate::usage::read(&transcript)).flatten().map(|usage| (path, written, usage))
+                            (written != before).then(|| who.profile.adapter().usage(&transcript)).flatten().map(|usage| (path, written, usage))
                         })
                         .collect::<Vec<_>>()
                 })
@@ -2104,6 +2162,23 @@ impl Workspace {
         self.usage.iter().filter(|(path, _)| self.find(path).is_none_or(|(pi, _)| self.in_space(pi))).map(|(_, (_, usage))| usage.recent).sum()
     }
 
+    /// The same by agent, with more than one: by profile name.
+    pub fn tokens_by_agent(&self) -> Vec<(String, u64)> {
+        let mut by: std::collections::BTreeMap<String, u64> = Default::default();
+        state::with_settings(|s| {
+            if !s.several_agents() {
+                return;
+            }
+            for (path, (_, usage)) in &self.usage {
+                let Some((pi, ti)) = self.find(path).filter(|(pi, _)| self.in_space(*pi)) else { continue };
+                let id = self.projects[pi].tasks[ti].sessions.last().map(|x| x.profile.clone()).unwrap_or_default();
+                let name = s.profile(&id).map_or_else(|| "Other".to_string(), |p| p.name.clone());
+                *by.entry(name).or_default() += usage.recent;
+            }
+        });
+        by.into_iter().filter(|(_, n)| *n > 0).collect()
+    }
+
     pub fn toggle_power_saving(&mut self, cx: &mut Context<Self>) {
         let on = !crate::lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed);
         crate::lsp::POWER_SAVING.store(on, std::sync::atomic::Ordering::Relaxed);
@@ -2125,28 +2200,47 @@ impl Workspace {
         .detach();
     }
 
-    /// The agent tab's command line: the command line's choice, else the
-    /// Settings one; Claude gets the hooks.
-    fn agent_command(over: &Option<Option<String>>, bridge: Option<&agent::Bridge>) -> Option<String> {
-        Self::agent_command_for(over, bridge, false)
-    }
-
-    /// `unasked`: Claude Code in its auto mode, unless the command picks a
-    /// mode itself. For the variants of a task: the same question in every
-    /// one of them is what nobody sits through.
-    fn agent_command_for(over: &Option<Option<String>>, bridge: Option<&agent::Bridge>, unasked: bool) -> Option<String> {
-        let cmd = match over {
-            Some(cmd) => cmd.clone(),
-            None => Some(state::settings().agent).filter(|a| !a.trim().is_empty()),
-        };
-        let cmd = cmd.map(|cmd| {
-            let picks_mode = cmd.contains("--permission-mode") || cmd.contains("--dangerously-skip-permissions");
-            if unasked && agent::is_claude(&cmd) && !picks_mode { format!("{} --permission-mode auto", cmd.trim()) } else { cmd }
-        });
-        match (cmd, bridge) {
-            (Some(cmd), Some(bridge)) if agent::is_claude(&cmd) => Some(bridge.claude_command(cmd.trim())),
-            (cmd, _) => cmd,
+    /// What starts the agent of a task, and its session recorded: a task
+    /// just made begins one (under an id the app chooses, when the agent
+    /// takes one); another resumes its latest, by id when known, else the
+    /// latest in its folder. The command line's agent goes over Settings;
+    /// an agent's own worktree gets none, a shell for looking.
+    fn launch_for(&mut self, path: &Path) -> Option<crate::agents::Launch> {
+        use crate::agents::{Launch, Start};
+        let (pi, ti) = self.find(path)?;
+        let project_agent = self.projects[pi].agent.clone();
+        let t = &mut self.projects[pi].tasks[ti];
+        if t.side.is_some() {
+            return None;
         }
+        // The variants of a task: the same question in every one of them is what nobody sits through.
+        let unasked = !t.group.is_empty();
+        let profile = match &self.agent_override {
+            Some(None) => return None,
+            Some(Some(command)) => crate::agents::Profile { id: String::new(), ..crate::agents::Profile::from_command(command) },
+            None => {
+                let settings = state::settings();
+                let last = t.sessions.last().map(|s| s.profile.clone()).unwrap_or_default();
+                crate::agents::resolve(&settings.agents, &[&last, &t.agent], project_agent.as_deref(), &settings.default_agent)?.clone()
+            }
+        };
+        let same = t.sessions.last().is_some_and(|s| s.profile == profile.id);
+        let start = if t.fresh && same {
+            // Recorded already and never run (Continue with another agent).
+            Start::New(t.sessions.last().and_then(|s| s.id.clone()))
+        } else if same {
+            crate::agents::start_of(t.sessions.last())
+        } else if !t.fresh && t.sessions.is_empty() {
+            // A task of before sessions were kept: as then, and its id is learned from the agent.
+            t.sessions.push(state::AgentSession { profile: profile.id.clone(), id: None, started: state::now() });
+            Start::Last
+        } else {
+            let id = profile.adapter().chooses_session_id().then(crate::agents::uuid);
+            t.sessions.push(state::AgentSession { profile: profile.id.clone(), id: id.clone(), started: state::now() });
+            Start::New(id)
+        };
+        t.fresh = false;
+        Some(Launch { profile, start, unasked })
     }
 
     /// New settings: they go to the state, and what they change now
@@ -2164,7 +2258,6 @@ impl Workspace {
                 view.update(cx, |t, cx| t.reload_gutters(cx));
             }
         }
-        self.agent = Self::agent_command(&self.agent_override, self._bridge.as_ref());
         if old.keys != new.keys {
             crate::keymap::rebind(&old, cx);
         }

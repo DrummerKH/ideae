@@ -37,13 +37,6 @@ fn switch(
 
 fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc<RefCell<Option<Subscription>>>) -> Vec<SettingPage> {
     let default = state::Settings::default();
-    let agent = {
-        let (read, write) = (draft.clone(), draft.clone());
-        SettingField::input(move |_| SharedString::from(read.borrow().agent.clone()), move |value: SharedString, _| {
-            write.borrow_mut().agent = value.to_string()
-        })
-        .default_value(default.agent.clone())
-    };
     let idle = {
         let (read, write) = (draft.clone(), draft.clone());
         SettingField::number_input(
@@ -194,25 +187,16 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
                         .description("Dragged as narrow as it goes, the sidebar is a rail of tasks to click. The whole of it opens over the task when the pointer rests on the rail this long."),
                 ),
         ),
-        SettingPage::new("Agent").default_open(true).group(
-            SettingGroup::new().title("Command")
-                .item(
-                    SettingItem::new("Agent command", agent)
-                        .description("Runs in each task's agent tab; empty for a plain shell. New tasks use it."),
-                )
-                .item(switch(
-                    draft,
-                    "Agents' language servers",
-                    "Claude Code's LSP plugins, a rust-analyzer and the like per agent: much memory for every agent that runs, for go-to-definition in what it reads. For agents started after Save.",
-                    |s| s.agent_lsp,
-                    |s, v| s.agent_lsp = v,
-                )),
-        ).group(
-            SettingGroup::new().title("Tokens")
-                .item(
-                    SettingItem::new("Tell me when a session has used", token_warn)
-                        .description("A notification, once for a session, when its agent has used this much: input not read from the cache, and output. The agent is not stopped."),
-                ),
+        agents_page(
+            draft,
+            switch(
+                draft,
+                "Agents' language servers",
+                "Claude Code's LSP plugins, a rust-analyzer and the like per agent: much memory for every agent that runs, for go-to-definition in what it reads. For agents started after Save.",
+                |s| s.agent_lsp,
+                |s, v| s.agent_lsp = v,
+            ),
+            token_warn,
         ),
         SettingPage::new("Editor").default_open(true).group(
             SettingGroup::new().title("Typing")
@@ -377,6 +361,198 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
 
 /// Where the shortcuts are among the pages.
 pub const KEYS_PAGE: usize = 5;
+#[cfg(test)]
+pub const AGENTS_PAGE: usize = 1;
+
+/// The Agents page: the profiles, the default, the one for quick questions.
+fn agents_page(draft: &Draft, lsp_switch: SettingItem, token_warn: SettingField<SharedString>) -> SettingPage {
+    let list = {
+        let draft = draft.clone();
+        SettingItem::render(move |_, _, cx| {
+            let muted = cx.theme().muted_foreground;
+            let d = draft.borrow();
+            let rows = d.agents.iter().enumerate().map(|(ix, p)| {
+                let default = p.id == d.default_agent;
+                let mut about = format!("{} · {}", p.kind.label(), if p.command.trim().is_empty() { p.kind.program() } else { p.command.trim() });
+                if !p.env.is_empty() {
+                    about.push_str(&format!(" · {}", p.env.keys().cloned().collect::<Vec<_>>().join(", ")));
+                }
+                let (edit, remove) = (draft.clone(), draft.clone());
+                h_flex()
+                    .id(SharedString::from(format!("agent-profile-{ix}")))
+                    .test_support()
+                    .gap_2()
+                    .py_1()
+                    .items_center()
+                    .child(div().w(px(18.)).text_xs().text_color(muted).child(p.letter()))
+                    .child(
+                        gpui_kit::component::v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().text_sm().child(if default { format!("{} (default)", p.name) } else { p.name.clone() }))
+                            .child(div().text_xs().text_color(muted).truncate().child(about))
+                            .when(!p.adapter().tried_live(), |s| s.child(div().text_xs().text_color(muted).child("Not tried live: its adapter follows the agent's source code."))),
+                    )
+                    .child(Button::new(SharedString::from(format!("agent-edit-{ix}"))).xsmall().ghost().label("Edit…").on_click(move |_, window, cx| profile_dialog(edit.clone(), Some(ix), window, cx)))
+                    .child(Button::new(SharedString::from(format!("agent-remove-{ix}"))).xsmall().ghost().label("Remove").on_click(move |_, window, _| {
+                        let mut d = remove.borrow_mut();
+                        if ix < d.agents.len() {
+                            d.agents.remove(ix);
+                            d.normalize();
+                        }
+                        window.refresh();
+                    }))
+            });
+            let add = draft.clone();
+            gpui_kit::component::v_flex()
+                .gap_1()
+                .children(rows)
+                .when(d.agents.is_empty(), |s| s.child(div().text_xs().text_color(muted).child("No agent: tasks open with a plain shell.")))
+                .child(h_flex().pt_1().child(Button::new("agent-add").small().outline().label("Add agent…").on_click(move |_, window, cx| profile_dialog(add.clone(), None, window, cx))))
+        })
+    };
+    let choices = |with_default: bool| -> Vec<(SharedString, SharedString)> {
+        let d = draft.borrow();
+        let mut options: Vec<(SharedString, SharedString)> = Vec::new();
+        if with_default {
+            options.push((SharedString::default(), SharedString::from("The default agent")));
+        }
+        options.extend(d.agents.iter().map(|p| (SharedString::from(p.id.clone()), SharedString::from(p.name.clone()))));
+        options
+    };
+    let default_agent = {
+        let (read, write) = (draft.clone(), draft.clone());
+        SettingField::dropdown(choices(false), move |_| read.borrow().default_agent.clone().into(), move |value: SharedString, _| {
+            let mut d = write.borrow_mut();
+            d.default_agent = value.to_string();
+            d.normalize();
+        })
+    };
+    let quick_agent = {
+        let (read, write) = (draft.clone(), draft.clone());
+        SettingField::dropdown(choices(true), move |_| read.borrow().quick_agent.clone().into(), move |value: SharedString, _| write.borrow_mut().quick_agent = value.to_string())
+    };
+    let several = draft.borrow().agents.len() > 1;
+    let mut choose = SettingGroup::new().title("Which one");
+    if !draft.borrow().agents.is_empty() {
+        choose = choose.item(SettingItem::new("Default agent", default_agent).description("New tasks run it, unless their project or the new-task dialog chooses another."));
+        choose = choose.item(
+            SettingItem::new("Agent for quick questions", quick_agent)
+                .description("Writes commit messages and judges variants: asked one question at a time, it answers and exits."),
+        );
+    }
+    SettingPage::new("Agents")
+        .default_open(true)
+        .description(if several {
+            "Each task runs one of these in its agent tab. A task's menu has Continue with another agent…; a project's menu chooses the agent of its new tasks."
+        } else {
+            "The agent each task runs in its agent tab. With more than one, a task can be given any of them when it is made, and carried on by another."
+        })
+        .group(SettingGroup::new().title("Profiles").item(list))
+        .group(choose)
+        .group(SettingGroup::new().title("Claude Code").item(lsp_switch))
+        .group(
+            SettingGroup::new().title("Tokens").item(
+                SettingItem::new("Tell me when a session has used", token_warn)
+                    .description("A notification, once for a session, when its agent has used this much: input not read from the cache, and output. The agent is not stopped."),
+            ),
+        )
+}
+
+/// What each kind of agent does with ideae, for the profile editor.
+fn kind_hint(kind: crate::agents::Kind) -> &'static str {
+    use crate::agents::Kind;
+    match kind {
+        Kind::Claude => "Reports through its hooks; each task resumes its own session by id. For a second account, set CLAUDE_CONFIG_DIR.",
+        Kind::Codex => "Not tried live: its adapter follows Codex's source. Reports the end of each turn through notify and its approvals as terminal notifications; resumes a task's session by id. For a second account, set CODEX_HOME.",
+        Kind::OpenCode => "Not tried live: its adapter follows OpenCode's source. Reports through a plugin ideae adds for the session (OPENCODE_CONFIG_CONTENT); resumes a task's session by id. Separate accounts: XDG_DATA_HOME.",
+        Kind::Generic => "Any program that runs in a terminal. What it does is guessed from its terminal: it works while it writes, and is done once quiet, or when it rings the bell.",
+    }
+}
+
+/// Adds a profile (`at` none) or edits one, in the draft.
+fn profile_dialog(draft: Draft, at: Option<usize>, window: &mut Window, cx: &mut App) {
+    use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
+    let editing = at.and_then(|ix| draft.borrow().agents.get(ix).cloned()).unwrap_or_else(|| crate::agents::Profile {
+        kind: crate::agents::Kind::Codex,
+        name: "Codex".into(),
+        command: "codex".into(),
+        ..Default::default()
+    });
+    let name = cx.new(|cx| InputState::new(window, cx).placeholder("Claude — work account"));
+    let command = cx.new(|cx| InputState::new(window, cx).placeholder("claude --model opus"));
+    let env = cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 6).placeholder("KEY=value, one a line: CLAUDE_CONFIG_DIR=~/.claude-work"));
+    name.update(cx, |i, cx| i.set_value(editing.name.clone(), window, cx));
+    command.update(cx, |i, cx| i.set_value(editing.command.clone(), window, cx));
+    env.update(cx, |i, cx| i.set_value(editing.env_text(), window, cx));
+    let kind = Rc::new(Cell::new(editing.kind));
+    window.open_dialog(cx, move |dialog, _, cx| {
+        let muted = cx.theme().muted_foreground;
+        let (name, command, env, kind, draft, editing) = (name.clone(), command.clone(), env.clone(), kind.clone(), draft.clone(), editing.clone());
+        let (save_name, save_command, save_env, save_kind) = (name.clone(), command.clone(), env.clone(), kind.clone());
+        let label = |text: &'static str| div().text_sm().w(px(110.)).flex_none().child(text);
+        dialog
+            .title(if at.is_some() { "Edit agent" } else { "Add agent" })
+            .w(px(620.))
+            .content(move |content, _, _| {
+                let current = kind.get();
+                content.child(
+                    gpui_kit::component::v_flex()
+                        .gap_2()
+                        .child(h_flex().gap_2().items_center().child(label("Kind")).children(crate::agents::Kind::ALL.into_iter().map(|k| {
+                            let (kind, command, name) = (kind.clone(), command.clone(), name.clone());
+                            Button::new(("agent-kind", k as usize)).xsmall().ghost().label(k.label()).selected(current == k).on_click(move |_, window, cx| {
+                                let before = kind.replace(k);
+                                // A command or name that was the old kind's own follows the new kind.
+                                if command.read(cx).value().trim() == before.program() {
+                                    command.update(cx, |i, cx| i.set_value(k.program(), window, cx));
+                                }
+                                if name.read(cx).value().trim().is_empty() || name.read(cx).value() == before.label() {
+                                    name.update(cx, |i, cx| i.set_value(if k == crate::agents::Kind::Generic { "" } else { k.label() }, window, cx));
+                                }
+                                window.refresh();
+                            })
+                        })))
+                        .child(div().text_xs().text_color(muted).child(kind_hint(current)))
+                        .child(h_flex().gap_2().items_center().child(label("Name")).child(div().flex_1().child(Input::new(&name))))
+                        .child(h_flex().gap_2().items_center().child(label("Command")).child(div().flex_1().child(Input::new(&command))))
+                        .child(div().text_xs().text_color(muted).child("The program and its flags, as typed in a shell: a model, a mode. ideae adds what starts or resumes a session and what reports to it."))
+                        .child(h_flex().gap_2().items_start().child(label("Environment")).child(div().flex_1().child(Textarea::new(&env))))
+                        .child(div().text_xs().text_color(muted).child("For the agent alone. Another account of the same agent is another profile with its own config folder here.")),
+                )
+            })
+            .footer(h_flex().justify_end().gap_2().child(Button::new("agent-cancel").ghost().label("Cancel").on_click(|_, window, cx| window.close_dialog(cx))).child(
+                Button::new("agent-save").primary().label("Save").on_click(move |_, window, cx| {
+                    let k = save_kind.get();
+                    let command = save_command.read(cx).value().trim().to_string();
+                    let command = if command.is_empty() { k.program().to_string() } else { command };
+                    if command.is_empty() {
+                        return;
+                    }
+                    let mut name = save_name.read(cx).value().trim().to_string();
+                    if name.is_empty() {
+                        name = command.split_whitespace().next().unwrap_or("Agent").to_string();
+                    }
+                    let env = crate::agents::Profile::parse_env(&save_env.read(cx).value());
+                    {
+                        let mut d = draft.borrow_mut();
+                        let id = match at {
+                            Some(_) if !editing.id.is_empty() => editing.id.clone(),
+                            _ => crate::agents::new_profile_id(&name, &d.agents),
+                        };
+                        let profile = crate::agents::Profile { id, name, kind: k, command, env };
+                        match at.filter(|ix| *ix < d.agents.len()) {
+                            Some(ix) => d.agents[ix] = profile,
+                            None => d.agents.push(profile),
+                        }
+                        d.normalize();
+                    }
+                    window.close_dialog(cx);
+                    window.refresh();
+                }),
+            ))
+    });
+}
 
 thread_local! {
     /// Which language servers are there, as found when the dialog asked first.
@@ -420,7 +596,7 @@ fn open(current: state::Settings, first: usize, window: &mut Window, cx: &mut Ap
             let (draft, save) = (draft.clone(), save.clone());
             move |window: &mut Window, cx: &mut App| {
                 let mut settings = draft.borrow().clone();
-                settings.agent = settings.agent.trim().to_string();
+                settings.normalize();
                 settings.lsp_idle_minutes = settings.lsp_idle_minutes.max(1);
                 save(settings, cx);
                 window.close_dialog(cx);
@@ -603,7 +779,7 @@ mod tests {
         let saved: Rc<RefCell<Option<state::Settings>>> = Rc::default();
         cx.update_window(handle, |_, window, cx| {
             let mut current = state::Settings::default();
-            current.agent = " mine ".into();
+            current.agents[0].command = "mine".into();
             let saved = saved.clone();
             open(current, 5, window, cx, move |settings, _| *saved.borrow_mut() = Some(settings));
             window.render_frame(cx);
@@ -615,6 +791,31 @@ mod tests {
             window.click("settings-save", cx);
         })
         .unwrap();
-        assert_eq!(saved.borrow().as_ref().map(|s| s.agent.as_str()), Some("mine"));
+        assert_eq!(saved.borrow().as_ref().map(|s| s.agent.as_str()), Some("mine"), "the older field follows the default profile");
+    }
+
+    /// The Agents page lists the profiles; one removed is gone on Save,
+    /// and the default moves to one still there.
+    #[gpui_kit::test]
+    fn agents_are_listed_and_removed(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = window(cx);
+        let saved: Rc<RefCell<Option<state::Settings>>> = Rc::default();
+        cx.update_window(handle, |_, window, cx| {
+            let mut current = state::Settings::default();
+            current.agents.push(crate::agents::Profile { id: "codex".into(), name: "Codex".into(), kind: crate::agents::Kind::Codex, command: "codex".into(), ..Default::default() });
+            let saved = saved.clone();
+            open(current, super::AGENTS_PAGE, window, cx, move |settings, _| *saved.borrow_mut() = Some(settings));
+            window.render_frame(cx);
+            assert!(window.try_find("agent-profile-1").is_some(), "both listed");
+            window.click("agent-remove-0", cx);
+            window.render_frame(cx);
+            window.click("settings-save", cx);
+        })
+        .unwrap();
+        let saved = saved.borrow();
+        let saved = saved.as_ref().unwrap();
+        assert_eq!(saved.agents.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["codex"]);
+        assert_eq!((saved.default_agent.as_str(), saved.agent.as_str()), ("codex", "codex"));
     }
 }

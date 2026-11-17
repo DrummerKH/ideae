@@ -8,6 +8,7 @@ cargo test
 cargo test -- --ignored \
   an_open_file \
   two_variants \
+  two_agents \
   the_tasks_of_the_last_run \
   a_window_that_does_not_read \
   a_task_is_set_up_checked_and_torn_down

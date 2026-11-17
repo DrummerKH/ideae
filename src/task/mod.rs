@@ -29,6 +29,7 @@ use notify::{RecursiveMode, Watcher as _};
 use crate::{git, history::HistoryView, lsp};
 use gpui_kit::component::notification::Notification;
 
+mod activity;
 mod agent_tab;
 mod lookups;
 mod branches;
@@ -257,6 +258,8 @@ pub enum TaskEvent {
     /// Something only the workspace does: the project's settings, or a
     /// setup or a check, which run as the project's trust allows.
     Auto(AutoAsk),
+    /// What the agent does, as guessed from its terminal (activity.rs).
+    Heard(crate::agent::HookEvent),
 }
 
 impl EventEmitter<TaskEvent> for TaskView {}
@@ -278,8 +281,13 @@ pub struct TaskView {
     agent_touched: Rc<HashSet<SharedString>>,
     /// The paths of `files`, for the tree's marks.
     changed_paths: Rc<HashSet<SharedString>>,
-    /// The command that starts the agent, for Restart.
-    agent: Option<String>,
+    /// What starts the agent, for Restart: its profile and session.
+    pub launch: Option<crate::agents::Launch>,
+    /// What tells, for an agent that reports no start of work, when it
+    /// works and when it went quiet (activity.rs).
+    activity: activity::Watch,
+    /// The status shown was guessed from the terminal, not reported.
+    pub status_guessed: bool,
     /// Text for the agent's prompt once it is ready to take it, and whether
     /// it is sent too.
     pending_prompt: Option<(String, bool)>,
@@ -445,7 +453,7 @@ impl TaskView {
     pub fn new(
         root: PathBuf,
         branch: String,
-        agent: Option<String>,
+        launch: Option<crate::agents::Launch>,
         hook_socket: Option<String>,
         port_slot: u32,
         window: &mut Window,
@@ -466,8 +474,12 @@ impl TaskView {
         let mut tabs = Vec::new();
         // The agent's terminal, or a shell when there is no agent; more shells
         // are a "+" away.
-        match &agent {
-            Some(agent) => tabs.push(Self::make_terminal(&root, hook_socket.as_ref(), "agent", 0, Some(agent.clone()), task_env.clone(), None, None, window, cx)),
+        match &launch {
+            Some(launch) => {
+                let mut env = task_env.clone();
+                env.extend(launch.env());
+                tabs.push(Self::make_terminal(&root, hook_socket.as_ref(), "agent", 0, Some(launch.command()), env, None, None, window, cx))
+            }
             None => tabs.push(Self::make_terminal(&root, hook_socket.as_ref(), "shell", 1, None, task_env.clone(), None, None, window, cx)),
         }
         // Changes and History open on demand: the Log button, a changed file,
@@ -624,7 +636,9 @@ impl TaskView {
             agent_editing: None,
             agent_touched: Rc::default(),
             changed_paths: Rc::default(),
-            agent: agent.clone(),
+            launch: launch.clone(),
+            activity: activity::Watch::default(),
+            status_guessed: false,
             pending_prompt: None,
             queued_message: None,
             recent: Vec::new(),
@@ -717,6 +731,7 @@ impl TaskView {
         let first = std::env::var("IDEAE_TAB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
         this.left_active = this.tabs.get(first).or(this.tabs.first()).map_or(0, |t| t.id);
         this.sync_visibility(cx);
+        this.watch_activity(cx);
         this
     }
 
@@ -823,11 +838,23 @@ impl TaskView {
             }
             TerminalEvent::TitleChanged | TerminalEvent::Bell => {
                 let title = state.read(cx).title().clone();
+                let mut of_agent = false;
                 if let Some(tab) = this.tabs.iter_mut().find(|t| matches!(&t.kind, TabKind::Terminal(v) if v.read(cx).state == *state)) {
                     tab.shown = title;
+                    of_agent = tab.title == "agent";
+                }
+                if of_agent && *event == TerminalEvent::Bell {
+                    this.agent_signal(None, cx);
                 }
                 cx.emit(TaskEvent::Changed);
                 cx.notify();
+            }
+            TerminalEvent::Notification { title, body } => {
+                let of_agent = this.tabs.iter().any(|t| t.title == "agent" && matches!(&t.kind, TabKind::Terminal(v) if v.read(cx).state == *state));
+                if of_agent {
+                    let words = if body.is_empty() { title.to_string() } else { body.to_string() };
+                    this.agent_signal(Some(&words), cx);
+                }
             }
             TerminalEvent::OpenPath(target) => {
                 let cwd = state.read(cx).cwd().map(|p| p.to_path_buf());

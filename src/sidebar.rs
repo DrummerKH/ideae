@@ -457,8 +457,12 @@ impl Workspace {
         let spaces: Vec<(String, String)> = self.spaces.iter().map(|s| (s.name.clone(), s.mark())).collect();
         let in_space = p.space.clone();
         let merged = p.tasks.iter().filter(|t| !t.main && t.pr.as_ref().is_some_and(|pr| pr.state == crate::pr::PrState::Merged)).count();
+        // Which agent its new tasks run, when there is a choice.
+        let profiles: Vec<(String, String)> = crate::state::with_settings(|s| if s.several_agents() { s.agents.iter().map(|a| (a.id.clone(), a.name.clone())).collect() } else { Vec::new() });
+        let project_agent = p.agent.clone();
         let menu = move |menu: PopupMenu, this: WeakEntity<Workspace>| {
             let (spaces, in_space) = (spaces.clone(), in_space.clone());
+            let (profiles, project_agent, agent_w) = (profiles.clone(), project_agent.clone(), this.clone());
             let settings = this.clone();
             let (a, b, c, d) = (this.clone(), this.clone(), this.clone(), this);
             menu.item(PopupMenuItem::new("Open main thread").on_click(move |_, window, cx| {
@@ -494,6 +498,22 @@ impl Workspace {
                     let _ = w.update(cx, |w, cx| w.set_project_space(pi, None, window, cx));
                 }))
                 .separator()
+            })
+            .map(|mut menu| {
+                if profiles.is_empty() {
+                    return menu;
+                }
+                let w = agent_w.clone();
+                menu = menu.item(PopupMenuItem::new("New tasks: the default agent").checked(project_agent.is_none()).on_click(move |_, _, cx| {
+                    let _ = w.update(cx, |w, cx| w.set_project_agent(pi, None, cx));
+                }));
+                for (id, name) in &profiles {
+                    let (to, w) = (id.clone(), agent_w.clone());
+                    menu = menu.item(PopupMenuItem::new(format!("New tasks: {name}")).checked(project_agent.as_ref() == Some(id)).on_click(move |_, _, cx| {
+                        let _ = w.update(cx, |w, cx| w.set_project_agent(pi, Some(to.clone()), cx));
+                    }));
+                }
+                menu.separator()
             })
         };
         let (menu_a, this_a) = (menu.clone(), this.clone());
@@ -679,6 +699,10 @@ impl Workspace {
         };
         let is_active = self.active.as_deref() == Some(path.as_path());
         let running = t.view.is_some();
+        // With more than one agent: which one it runs, as a letter.
+        let several = crate::state::with_settings(|s| s.several_agents());
+        let agent_mark = if several && t.side.is_none() { self.task_profile(&path, cx) } else { None };
+        let guessed = t.view.as_ref().is_some_and(|v| v.read(cx).status_guessed);
 
         let ((glyph, changes, unseen, needs), unpushed) = match &t.view {
             Some(view) => {
@@ -767,12 +791,14 @@ impl Workspace {
         let this = cx.weak_entity();
         let (starred, main) = (t.starred, t.main);
         let (grouped, ready) = (!t.group.is_empty(), t.busy.is_none());
+        let can_continue = several && t.side.is_none() && ready;
         let menu_path = path.clone();
         let branch = t.branch.clone();
         let menu = move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
             let (a, b, c, d) = (this.clone(), this.clone(), this.clone(), this.clone());
             let (pa, pb, pc, pd) = (menu_path.clone(), menu_path.clone(), menu_path.clone(), menu_path.clone());
             let (e, f, pe, pf) = (this.clone(), this.clone(), menu_path.clone(), menu_path.clone());
+            let (g, pg) = (this.clone(), menu_path.clone());
             let branch = branch.clone();
             // What it is called and how it is found; its variants; its end.
             menu.when(!main, |m| {
@@ -796,6 +822,11 @@ impl Workspace {
                             let _ = f.update(cx, |w, cx| w.keep_variant_dialog(&pf, window, cx));
                         }))
                     })
+            })
+            .when(can_continue, |m| {
+                m.when(main, |m| m.separator()).item(PopupMenuItem::new("Continue with another agent…").on_click(move |_, window, cx| {
+                    let _ = g.update(cx, |w, cx| w.continue_with_dialog(&pg, window, cx));
+                }))
             })
             .when(running || !main, |m| m.separator())
             .when(running, |m| {
@@ -847,6 +878,23 @@ impl Workspace {
                             .when(!running, |s| s.text_color(muted))
                             .child(label.clone()),
                     )
+                    .when_some(agent_mark.as_ref(), |s, profile| {
+                        let name = profile.name.clone();
+                        s.child(
+                            div()
+                                .id(SharedString::from(format!("agent-mark-{}", path.display())))
+                                .test_support()
+                                .flex_none()
+                                .text_size(px(10.))
+                                .px(px(3.))
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .text_color(muted)
+                                .child(profile.letter())
+                                .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(format!("Runs {name}")).build(window, cx)),
+                        )
+                    })
                     // How full the agent's context is, as a dial.
                     .when(dialed && fill > 0., |s| s.child(context_dial(fill, cx)))
                     .when(unpushed > 0, |s| {
@@ -991,8 +1039,17 @@ impl Workspace {
         // What the row leaves out, when the pointer rests on the task: its
         // branch, and what its agent has used.
         let mut told = format!("⎇ {whole_branch}");
+        if let Some(profile) = &agent_mark {
+            told.push_str(&format!("\nAgent: {}", profile.name));
+        }
+        if guessed {
+            told.push_str("\nIts status is guessed from its terminal: this agent does not report it.");
+        }
         if let Some((_, usage)) = self.usage.get(&path).filter(|(_, usage)| usage.context > 0) {
-            let window = if usage.context > 200_000 || usage.model.contains("[1m]") { "1M" } else { "200k" };
+            let window = match usage.window() {
+                1_000_000 => "1M".to_string(),
+                w => crate::usage::tokens(w),
+            };
             told.push_str(&format!(
                 "\nContext {:.0}% full: {} of {window} tokens\nThis session: {} tokens · last 24 hours: {}",
                 fill * 100.,

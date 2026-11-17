@@ -57,9 +57,20 @@ impl State {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(default)]
 pub struct Settings {
-    /// The agent tab's command; empty for a plain shell. `--agent` and
-    /// `--no-agent` on the command line win.
+    /// The default agent's command, as older versions read it: kept in step
+    /// with `agents`, of which it is the first when a state has none.
     pub agent: String,
+    /// The agents to choose from (agents/mod.rs); none, and tasks get a
+    /// plain shell. `--agent` and `--no-agent` on the command line win.
+    #[serde(default)]
+    pub agents: Vec<crate::agents::Profile>,
+    /// The one new tasks run, by its id.
+    #[serde(default)]
+    pub default_agent: String,
+    /// The one asked one-shot questions (commit messages, the variants'
+    /// judge); empty for the default.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub quick_agent: String,
     /// Language servers (program names) never started.
     pub lsp_off: Vec<String>,
     /// Minutes a task out of view keeps its language servers.
@@ -134,6 +145,9 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             agent: "claude".into(),
+            agents: vec![crate::agents::Profile::claude_code()],
+            default_agent: crate::agents::DEFAULT_ID.into(),
+            quick_agent: String::new(),
             lsp_off: Vec::new(),
             lsp_idle_minutes: 15,
             notifications: true,
@@ -169,6 +183,48 @@ impl Default for Settings {
     }
 }
 
+impl Settings {
+    /// A state of before profiles: its agent command becomes the one
+    /// profile, the default. After: the default named exists, and `agent`
+    /// is its command, for an older version reading the state.
+    pub fn normalize(&mut self) {
+        if self.agents.is_empty() && !self.agent.trim().is_empty() {
+            self.agents.push(crate::agents::Profile::from_command(&self.agent));
+        }
+        for at in 0..self.agents.len() {
+            if self.agents[at].id.is_empty() || self.agents[..at].iter().any(|p| p.id == self.agents[at].id) {
+                let name = self.agents[at].name.clone();
+                self.agents[at].id = crate::agents::new_profile_id(&name, &self.agents);
+            }
+        }
+        if !self.agents.iter().any(|p| p.id == self.default_agent) {
+            self.default_agent = self.agents.first().map(|p| p.id.clone()).unwrap_or_default();
+        }
+        if !self.quick_agent.is_empty() && !self.agents.iter().any(|p| p.id == self.quick_agent) {
+            self.quick_agent.clear();
+        }
+        self.agent = self.default_profile().map(|p| p.command.clone()).unwrap_or_default();
+    }
+
+    pub fn profile(&self, id: &str) -> Option<&crate::agents::Profile> {
+        self.agents.iter().find(|p| p.id == id)
+    }
+
+    pub fn default_profile(&self) -> Option<&crate::agents::Profile> {
+        self.profile(&self.default_agent).or_else(|| self.agents.first())
+    }
+
+    /// Who answers one-shot questions.
+    pub fn quick_profile(&self) -> Option<&crate::agents::Profile> {
+        self.profile(&self.quick_agent).or_else(|| self.default_profile())
+    }
+
+    /// More than one agent to choose from: marks and choices show.
+    pub fn several_agents(&self) -> bool {
+        self.agents.len() > 1
+    }
+}
+
 static SETTINGS: std::sync::RwLock<Option<Settings>> = std::sync::RwLock::new(None);
 
 /// The settings in force, readable from any thread.
@@ -197,7 +253,8 @@ pub fn init_settings(settings: &Settings) {
     }
 }
 
-pub fn set_settings(settings: Settings) {
+pub fn set_settings(mut settings: Settings) {
+    settings.normalize();
     *SETTINGS.write().unwrap() = Some(settings);
 }
 
@@ -242,6 +299,10 @@ pub struct ProjectState {
     /// Hints asked not to be shown again.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub hints_off: Vec<String>,
+    /// The agent its new tasks run, by profile id; none for the default.
+    /// Here and not in `.ideae.toml`: whose subscription runs is personal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq)]
@@ -275,6 +336,25 @@ pub struct TaskState {
     pub base: String,
     /// How the command last run in every variant went in this one.
     pub check: Option<crate::workspace::variants::Run>,
+    /// The agent chosen when it was made, by profile id.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub agent: String,
+    /// Its agents' sessions, the one it runs last.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<AgentSession>,
+}
+
+/// A session of an agent in a task.
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq, Debug)]
+#[serde(default)]
+pub struct AgentSession {
+    /// The profile it ran.
+    pub profile: String,
+    /// The agent's own id for it, once known: what is resumed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Unix seconds.
+    pub started: u64,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq)]
@@ -372,7 +452,10 @@ fn state_path() -> PathBuf {
 pub fn load() -> State {
     let path = state_path();
     match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+        Ok(bytes) => serde_json::from_slice::<State>(&bytes).map(|mut state| {
+            state.settings.normalize();
+            state
+        }).unwrap_or_else(|e| {
             // Keep the unreadable file for a look rather than overwrite it.
             eprintln!("state {}: {e}; starting empty", path.display());
             let _ = std::fs::rename(&path, path.with_extension("json.bad"));
@@ -398,6 +481,59 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 pub fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+#[cfg(test)]
+mod agents_tests {
+    use super::*;
+
+    #[test]
+    fn a_fresh_install_runs_claude_code() {
+        let s = Settings::default();
+        assert_eq!(s.agents, [crate::agents::Profile::claude_code()]);
+        assert_eq!((s.default_profile().map(|p| p.name.as_str()), s.quick_profile().map(|p| p.id.as_str())), (Some("Claude Code"), Some("claude")));
+        assert!(!s.several_agents());
+        let mut empty: State = serde_json::from_str("{}").unwrap();
+        empty.settings.normalize();
+        assert_eq!(empty.settings, Settings::default());
+    }
+
+    #[test]
+    fn the_agent_command_of_before_becomes_the_default_profile() {
+        let mut old: Settings = serde_json::from_str(r#"{"agent":"claude --model opus"}"#).unwrap();
+        old.normalize();
+        assert_eq!(old.agents.len(), 1);
+        assert_eq!((old.agents[0].kind, old.agents[0].command.as_str(), old.default_agent.as_str()), (crate::agents::Kind::Claude, "claude --model opus", "claude"));
+        let mut other: Settings = serde_json::from_str(r#"{"agent":"aider --yes"}"#).unwrap();
+        other.normalize();
+        assert_eq!((other.agents[0].kind, other.agents[0].name.as_str(), other.agent.as_str()), (crate::agents::Kind::Generic, "aider", "aider --yes"));
+        // A plain shell stays one.
+        let mut shell: Settings = serde_json::from_str(r#"{"agent":""}"#).unwrap();
+        shell.normalize();
+        assert!(shell.agents.is_empty() && shell.default_profile().is_none());
+    }
+
+    #[test]
+    fn profiles_and_sessions_are_kept() {
+        let mut s = Settings::default();
+        let codex = crate::agents::Profile { id: "codex".into(), name: "Codex".into(), kind: crate::agents::Kind::Codex, command: "codex".into(), ..Default::default() };
+        s.agents.push(codex);
+        s.default_agent = "codex".into();
+        s.quick_agent = "gone".into();
+        s.normalize();
+        assert_eq!((s.agent.as_str(), s.quick_agent.as_str()), ("codex", ""), "the older field follows the default; a missing quick one is the default");
+        let task = TaskState {
+            agent: "codex".into(),
+            sessions: vec![AgentSession { profile: "claude".into(), id: Some("u-1".into()), started: 5 }, AgentSession { profile: "codex".into(), id: None, started: 9 }],
+            ..Default::default()
+        };
+        let state = State { settings: s, projects: vec![ProjectState { agent: Some("codex".into()), tasks: vec![task], ..Default::default() }], ..Default::default() };
+        let back: State = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert!(back == state);
+        // What an older state has not: none of it.
+        let old: TaskState = serde_json::from_str(r#"{"path":"/w/t"}"#).unwrap();
+        assert!(old.sessions.is_empty() && old.agent.is_empty());
+    }
 }
 
 #[cfg(test)]

@@ -11,7 +11,8 @@ impl TaskView {
     /// Starts the agent again in its tab: typed into its shell, or in a new
     /// terminal when the shell is gone too.
     pub fn restart_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(command) = self.agent.clone() else { return };
+        let Some(launch) = self.launch.as_ref().map(|l| l.again()) else { return };
+        let command = launch.command();
         let Some(ix) = self.tabs.iter().position(|t| t.title == "agent" && matches!(t.kind, TabKind::Terminal(_))) else {
             return;
         };
@@ -20,7 +21,8 @@ impl TaskView {
         let state = view.read(cx).state.clone();
         if TermView::gone(state.read(cx)) {
             TermView::end(&view, cx);
-            let env = crate::services::task_env(&self.services, self.port_slot);
+            let mut env = crate::services::task_env(&self.services, self.port_slot);
+            env.extend(launch.env());
             let tab = Self::make_terminal(&self.root, self.hook_socket.as_ref(), "agent", 0, Some(command), env, None, None, window, cx);
             (self.tabs[ix].kind, self.tabs[ix].shown) = (tab.kind, tab.shown);
         } else {
@@ -28,10 +30,63 @@ impl TaskView {
             view.update(cx, |v, _| v.ran = false);
             state.update(cx, |s, cx| s.send_text(format!("{command}{enter}"), cx));
         }
+        self.launch = Some(launch);
         self.agent_status = crate::agent::AgentStatus::Unknown;
+        self.status_guessed = false;
         self.activate(ix, window, cx);
         cx.emit(TaskEvent::Changed);
         cx.notify();
+    }
+
+    /// Another agent in the agent's tab: the one running ends with its
+    /// terminal, the new one starts in a terminal of its own, with its
+    /// own environment.
+    pub fn switch_agent(&mut self, launch: crate::agents::Launch, window: &mut Window, cx: &mut Context<Self>) {
+        let mut env = crate::services::task_env(&self.services, self.port_slot);
+        env.extend(launch.env());
+        let tab = Self::make_terminal(&self.root, self.hook_socket.as_ref(), "agent", 0, Some(launch.command()), env, None, None, window, cx);
+        let ix = match self.tabs.iter().position(|t| t.title == "agent" && matches!(t.kind, TabKind::Terminal(_))) {
+            Some(ix) => {
+                if let TabKind::Terminal(old) = &self.tabs[ix].kind {
+                    TermView::end(old, cx);
+                }
+                (self.tabs[ix].kind, self.tabs[ix].shown) = (tab.kind, tab.shown);
+                ix
+            }
+            None => {
+                self.tabs.insert(0, tab);
+                0
+            }
+        };
+        self.launch = Some(launch);
+        self.agent_status = crate::agent::AgentStatus::Unknown;
+        self.status_guessed = false;
+        self.agent_said = None;
+        self.agent_asks = None;
+        self.queued_message = None;
+        self.watch_activity(cx);
+        self.activate(ix, window, cx);
+        cx.emit(TaskEvent::Changed);
+        cx.notify();
+    }
+
+    /// The agent said which session it runs: a restart resumes that one.
+    pub fn learned_session(&mut self, id: &str) {
+        if let Some(launch) = &mut self.launch {
+            launch.learned(id);
+        }
+    }
+
+    /// The session the agent runs, to find its file by.
+    pub fn session_ref(&self) -> Option<crate::agents::SessionRef> {
+        let launch = self.launch.as_ref()?;
+        Some(crate::agents::SessionRef { profile: launch.profile.clone(), id: launch.session_id() })
+    }
+
+    /// The agent's mark, when there are several to tell apart.
+    pub fn agent_letter(&self) -> Option<String> {
+        let launch = self.launch.as_ref()?;
+        crate::state::with_settings(|s| s.several_agents()).then(|| launch.profile.letter())
     }
 
     /// Puts `text` into the agent's prompt once the agent is up: Claude Code
@@ -40,13 +95,16 @@ impl TaskView {
     ///
     /// With `send` it is sent as well, not left for the user to finish.
     pub fn queue_prompt(&mut self, text: String, send: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.agent.is_none() {
+        if self.launch.is_none() {
             return;
         }
         self.pending_prompt = Some((text, send));
         cx.spawn_in(window, async move |this, cx| {
             let started = std::time::Instant::now();
             let mut running_since: Option<std::time::Instant> = None;
+            // When its output last grew: an agent that tells nothing is
+            // up once it has drawn its screen and gone quiet.
+            let (mut output, mut wrote_at) = (0u64, std::time::Instant::now());
             loop {
                 cx.background_executor().timer(Duration::from_millis(250)).await;
                 let ready = this.update(cx, |t, cx| {
@@ -54,26 +112,27 @@ impl TaskView {
                         return None;
                     }
                     let hooked = !matches!(t.agent_status, crate::agent::AgentStatus::Unknown);
-                    let running = t.tabs.iter().any(|tab| match &tab.kind {
-                        TabKind::Terminal(v) if tab.title == "agent" => {
-                            v.read(cx).state.read(cx).foreground().is_some_and(|p| !p.is_shell())
-                        }
-                        _ => false,
-                    });
-                    Some((hooked, running))
+                    let state = t.agent_terminal(cx)?;
+                    let state = state.read(cx);
+                    let running = state.foreground().is_some_and(|p| !p.is_shell());
+                    Some((hooked, running, state.output_seen()))
                 });
-                let Ok(Some((hooked, running))) = ready else { return };
+                let Ok(Some((hooked, running, seen))) = ready else { return };
+                if seen != output {
+                    (output, wrote_at) = (seen, std::time::Instant::now());
+                }
                 if running {
                     running_since.get_or_insert_with(std::time::Instant::now);
                 }
                 let waited = running_since.map_or(Duration::ZERO, |at| at.elapsed());
+                let settled = waited > Duration::from_millis(1500) && wrote_at.elapsed() > Duration::from_millis(1200);
                 // Its input box takes a moment after the hook.
                 // An agent that reports is waited for: until it says it
                 // is up it may be asking something (to trust the folder),
                 // and the prompt would go into that.
                 let patient = this.read_with(cx, |t, _| t.agent_reports()).unwrap_or(false);
                 if (hooked && waited > Duration::from_millis(500))
-                    || (!patient && (waited > Duration::from_secs(4) || started.elapsed() > Duration::from_secs(30)))
+                    || (!patient && (settled || waited > Duration::from_secs(8) || started.elapsed() > Duration::from_secs(30)))
                     || started.elapsed() > Duration::from_secs(1800)
                 {
                     break;
@@ -151,7 +210,15 @@ impl TaskView {
     /// Whether the agent is one that says when it is up: Claude Code,
     /// started with the hooks.
     pub(super) fn agent_reports(&self) -> bool {
-        self.agent.as_deref().is_some_and(|command| command.contains(" --settings "))
+        self.launch.as_ref().is_some_and(|l| l.profile.adapter().reports_ready() && crate::agents::hooks().is_some())
+    }
+
+    /// The agent tab's terminal.
+    pub(super) fn agent_terminal(&self, cx: &App) -> Option<Entity<TerminalState>> {
+        self.tabs.iter().find_map(|tab| match &tab.kind {
+            TabKind::Terminal(view) if tab.title == "agent" => Some(view.read(cx).state.clone()),
+            _ => None,
+        })
     }
 
     pub fn has_queued_message(&self) -> bool {

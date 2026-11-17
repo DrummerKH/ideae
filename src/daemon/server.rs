@@ -473,6 +473,8 @@ fn event_of(hook: &Hook) -> crate::agent::HookEvent {
         kind: hook.kind.clone(),
         file: hook.file.clone(),
         said: hook.said.clone(),
+        session: hook.session.clone(),
+        guessed: false,
         replayed: false,
     }
 }
@@ -724,6 +726,7 @@ mod tests {
             message: message.map(Into::into),
             kind: kind.map(Into::into),
             file: None,
+            session: None,
             said: Some("x".into()),
         };
         let (stop, tool) = (hook("Stop", None, None), hook("PreToolUse", None, Some("Running ls")));

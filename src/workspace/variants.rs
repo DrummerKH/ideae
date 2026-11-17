@@ -22,7 +22,7 @@ use gpui_kit::component::{
 use gpui_kit::{prelude::FluentBuilder as _, *};
 
 use super::{TaskEntry, Workspace};
-use crate::{agent::AgentStatus, git, naming, state, task, task::Told, usage};
+use crate::{agent::AgentStatus, git, naming, state, task, task::Told};
 
 /// More would be more to read than it is worth.
 pub const MOST: usize = 4;
@@ -78,15 +78,16 @@ pub struct VariantInfo {
 
 /// `before` is what was read last: a transcript not written to since is
 /// not read again, long as it may be.
-fn read_info(path: &Path, base: &str, before: Option<VariantInfo>) -> VariantInfo {
+fn read_info(path: &Path, base: &str, who: Option<&crate::agents::SessionRef>, before: Option<VariantInfo>) -> VariantInfo {
     let (files, additions, deletions) = git::change_size(path, Some(base)).unwrap_or_default();
-    let transcript = usage::transcript(path);
+    let transcript = who.and_then(|who| who.transcript(path));
     let written = transcript.as_deref().and_then(|t| std::fs::metadata(t).and_then(|m| m.modified()).ok());
     if let Some(before) = before.filter(|b| written.is_some() && b.written == written) {
         return VariantInfo { files, additions, deletions, ..before };
     }
-    let used = transcript.as_deref().and_then(usage::read).unwrap_or_default();
-    let answer = transcript.as_deref().and_then(usage::last_answer).unwrap_or_default();
+    let adapter = who.map(|who| who.profile.adapter());
+    let used = transcript.as_deref().zip(adapter).and_then(|(t, a)| a.usage(t)).unwrap_or_default();
+    let answer = transcript.as_deref().zip(adapter).and_then(|(t, a)| a.last_answer(t)).unwrap_or_default();
     VariantInfo { files, additions, deletions, tokens: used.input + used.output, answer, written }
 }
 
@@ -284,42 +285,9 @@ fn tail(text: &str, lines: usize) -> String {
     all[all.len().saturating_sub(lines)..].join("\n")
 }
 
-/// Whether the agent command is Claude Code, which can answer once and exit.
 /// The worktrees whose branch is pushed.
 fn pushed_of(paths: &[PathBuf]) -> std::collections::HashSet<PathBuf> {
     paths.iter().filter(|path| git::has_upstream(path)).cloned().collect()
-}
-
-fn judge_can(agent: &str) -> bool {
-    agent.split_whitespace().next().is_some_and(|program| Path::new(program).file_stem().is_some_and(|name| name == "claude"))
-}
-
-/// Claude Code, to read the task from its input and answer once. Of the
-/// agent command only the program and its model are taken: what lets the
-/// agent act without asking, or go on with an earlier talk, is not for a
-/// judge. It has no tool but reading, in the folders named, and leaves no
-/// session behind.
-fn judge_command(agent: &str, folders: &[PathBuf]) -> String {
-    let quote = |text: &str| if cfg!(windows) { format!("\"{text}\"") } else { format!("'{}'", text.replace('\'', r"'\''")) };
-    let words: Vec<&str> = agent.split_whitespace().collect();
-    // As JSON: with the answer comes what it took.
-    let mut line = format!("{} -p --no-session-persistence --output-format json --tools {}", quote(words.first().copied().unwrap_or("claude")), quote("Read,Grep,Glob"));
-    if let Some(model) = words.iter().position(|w| *w == "--model").and_then(|at| words.get(at + 1)) {
-        line.push_str(&format!(" --model {}", quote(model)));
-    }
-    for folder in folders {
-        line.push_str(&format!(" --add-dir {}", quote(&folder.to_string_lossy())));
-    }
-    line
-}
-
-/// The judge's answer and the tokens it took, of what `claude -p
-/// --output-format json` prints; what is no such thing is the answer itself.
-fn judge_answer(printed: &str) -> (String, u64) {
-    let Ok(told) = serde_json::from_str::<serde_json::Value>(printed.trim()) else { return (printed.trim().to_string(), 0) };
-    let Some(answer) = told["result"].as_str() else { return (printed.trim().to_string(), 0) };
-    let used = |key: &str| told["usage"][key].as_u64().unwrap_or(0);
-    (answer.trim().to_string(), used("input_tokens") + used("cache_creation_input_tokens") + used("output_tokens"))
 }
 
 /// The letter after the judge's `KEEP:`, when it names one.
@@ -350,6 +318,8 @@ struct Judged {
     check: Option<(String, String, String)>,
     /// Where its site is served, when it is.
     site: Option<String>,
+    /// Its agent's session, for what it says it did.
+    who: Option<crate::agents::SessionRef>,
 }
 
 /// What the judge reads first: the task, and for every variant where its
@@ -383,7 +353,7 @@ fn judge_brief(task: &str, variants: &[Judged], folder: &Path) -> String {
                 brief.push_str(&format!("Its site as a browser shows it, at {site}, is pictured in {}: read the picture.\n", picture.display()));
             }
         }
-        let said: String = read_info(&v.path, &v.base, None).answer.trim().chars().take(2500).collect();
+        let said: String = read_info(&v.path, &v.base, v.who.as_ref(), None).answer.trim().chars().take(2500).collect();
         if !said.is_empty() {
             brief.push_str(&format!("Its agent's own account, to check against the diff, not to trust:\n<account>\n{said}\n</account>\n"));
         }
@@ -517,17 +487,17 @@ impl Workspace {
     /// A task in several variants: `notes` has what each agent alone is
     /// told. The prompt is sent, not left to finish: nobody visits four
     /// terminals to press Enter.
-    pub(super) fn create_variants(&mut self, project: usize, title: String, prompt: String, notes: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn create_variants(&mut self, project: usize, title: String, prompt: String, notes: Vec<String>, agents: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(repo) = self.projects.get(project).map(|p| p.path.clone()) else { return };
         cx.spawn_in(window, async move |this, cx| {
             let job_repo = repo.clone();
             let taken = cx.background_spawn(async move { git::TakenNames::read(&job_repo) }).await;
-            let _ = this.update_in(cx, |this, window, cx| this.create_variants_named(repo, &taken, title, prompt, notes, window, cx));
+            let _ = this.update_in(cx, |this, window, cx| this.create_variants_named(repo, &taken, title, prompt, notes, agents, window, cx));
         })
         .detach();
     }
 
-    fn create_variants_named(&mut self, repo: PathBuf, taken: &git::TakenNames, title: String, prompt: String, notes: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+    fn create_variants_named(&mut self, repo: PathBuf, taken: &git::TakenNames, title: String, prompt: String, notes: Vec<String>, agents: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(project) = self.projects.iter().position(|p| p.path == repo) else { return };
         // A name nothing has yet: a ticket's title gives the same branch each time.
         let wanted = naming::branch_name(&title);
@@ -548,9 +518,11 @@ impl Workspace {
                 busy: Some("creating…".into()),
                 group: group.clone(),
                 variant,
+                agent: agents.get(variant as usize - 1).cloned().unwrap_or_default(),
                 note,
                 prompt: prompt.clone(),
                 created,
+                fresh: true,
                 ..Default::default()
             });
         }
@@ -634,11 +606,15 @@ impl Workspace {
         let prompt = cx.new(|cx| TextareaState::new(window, cx).auto_grow(4, 14).placeholder("What the agent is to do: sent to it as it is"));
         prompt.update(cx, |p, cx| p.set_value(stored, window, cx));
         let note = cx.new(|cx| InputState::new(window, cx).placeholder("For this one alone, optional: \"the smallest patch that works\""));
+        let pi = self.find(path).map_or(0, |(pi, _)| pi);
+        let agent = std::rc::Rc::new(std::cell::RefCell::new(self.project_agent(pi)));
         let this = cx.weak_entity();
         let path = path.to_path_buf();
         let focused = std::rc::Rc::new(std::cell::Cell::new(false));
         window.open_dialog(cx, move |dialog, _, cx| {
-            let (prompt, note, this, path, focused) = (prompt.clone(), note.clone(), this.clone(), path.clone(), focused.clone());
+            let (prompt, note, this, path, focused, agent) = (prompt.clone(), note.clone(), this.clone(), path.clone(), focused.clone(), agent.clone());
+            let several = state::with_settings(|s| s.several_agents());
+            let chosen = agent.clone();
             let muted = cx.theme().muted_foreground;
             let (create_prompt, create_note) = (prompt.clone(), note.clone());
             dialog
@@ -650,7 +626,9 @@ impl Workspace {
                         window.defer(cx, move |window, cx| note.read(cx).focus_handle(cx).focus(window, cx));
                     }
                     content.child(
-                        v_flex().gap_2().child(Textarea::new(&prompt)).child(Input::new(&note)).child(
+                        v_flex().gap_2().child(Textarea::new(&prompt)).child(
+                            h_flex().gap_2().child(div().flex_1().child(Input::new(&note))).when(several, |row| row.child(super::agents_ui::picker("another-variant-agent", agent.clone()))),
+                        ).child(
                             div()
                                 .text_xs()
                                 .text_color(muted)
@@ -664,23 +642,24 @@ impl Workspace {
                         return;
                     }
                     let note = create_note.read(cx).value().trim().to_string();
+                    let agent = chosen.borrow().clone();
                     window.close_dialog(cx);
-                    let _ = this.update(cx, |this, cx| this.add_variant(&path, text, note, window, cx));
+                    let _ = this.update(cx, |this, cx| this.add_variant(&path, text, note, agent, window, cx));
                 })))
         });
     }
 
-    fn add_variant(&mut self, like: &Path, prompt: String, note: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn add_variant(&mut self, like: &Path, prompt: String, note: String, agent: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some((pi, _)) = self.find(like) else { return };
         let (repo, like) = (self.projects[pi].path.clone(), like.to_path_buf());
         cx.spawn_in(window, async move |this, cx| {
             let taken = cx.background_spawn(async move { git::TakenNames::read(&repo) }).await;
-            let _ = this.update_in(cx, |this, window, cx| this.add_variant_named(&like, &taken, prompt, note, window, cx));
+            let _ = this.update_in(cx, |this, window, cx| this.add_variant_named(&like, &taken, prompt, note, agent, window, cx));
         })
         .detach();
     }
 
-    fn add_variant_named(&mut self, like: &Path, taken_names: &git::TakenNames, prompt: String, note: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn add_variant_named(&mut self, like: &Path, taken_names: &git::TakenNames, prompt: String, note: String, agent: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some((pi, ti)) = self.find(like) else { return };
         let repo = self.projects[pi].path.clone();
         let source = &mut self.projects[pi].tasks[ti];
@@ -718,6 +697,8 @@ impl Workspace {
                 note,
                 prompt,
                 created,
+                agent,
+                fresh: true,
                 ..Default::default()
             },
         );
@@ -1170,14 +1151,20 @@ impl Workspace {
         let members = self.members(group);
         let Some(&(pi, first)) = members.first() else { return };
         self.stale_verdicts.remove(group);
-        let agent = state::settings().agent;
-        if !judge_can(&agent) {
+        // The agent for quick questions, asked once: it has no tool but
+        // reading, in the folders named, and leaves no session behind.
+        let quick = state::with_settings(|s| s.quick_profile().cloned());
+        if quick.as_ref().and_then(|p| p.adapter().one_shot(p, &crate::agents::Ask::Read(Vec::new()))).is_none() {
             let mut run = Run::new("", RunState::Failed(0));
-            run.output = "The judge is Claude Code, and the agent command in Settings starts another program.".into();
+            run.output = match &quick {
+                Some(p) => format!("{} cannot be asked one question and answer it: choose another agent for quick questions in Settings → Agents.", p.name),
+                None => "No agent to judge with: add one in Settings → Agents.".into(),
+            };
             self.judges.insert(group.to_string(), run);
             self.notify_ready(group, window);
             return cx.notify();
         }
+        let judge = move |folders: Vec<PathBuf>| quick.as_ref().and_then(|p| p.adapter().one_shot(p, &crate::agents::Ask::Read(folders)));
         let head = &self.projects[pi].tasks[first];
         let task = if head.prompt.trim().is_empty() { head.label() } else { head.prompt.clone() };
         let variants: Vec<Judged> = members
@@ -1195,6 +1182,7 @@ impl Workspace {
                     .filter(|run| matches!(run.state, RunState::Passed | RunState::Failed(_)))
                     .map(|run| (run.what.clone(), run.outcome(), run.log.clone())),
                 site: t.view.as_ref().filter(|v| !v.read(cx).running_services(cx).is_empty()).and_then(|v| v.read(cx).site()),
+                who: t.session_ref(),
             })
             .collect();
         // What the verdicts before this one took stays counted.
@@ -1211,11 +1199,13 @@ impl Workspace {
                     let folder = std::env::temp_dir().join(format!("ideae-judge-{}-{}", std::process::id(), JUDGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
                     let _ = std::fs::remove_dir_all(&folder);
                     if let Err(e) = std::fs::create_dir_all(&folder) {
-                        return (RunState::Failed(-1), 0., e.to_string(), Vec::new());
+                        return (RunState::Failed(-1), 0., (e.to_string(), 0), Vec::new());
                     }
                     let brief = judge_brief(&task, &variants, &folder);
                     let folders: Vec<PathBuf> = std::iter::once(folder.clone()).chain(variants.iter().map(|v| v.path.clone())).collect();
-                    let mut shell = shell(&judge_command(&agent, &folders));
+                    let Some(asked) = judge(folders) else { return (RunState::Failed(-1), 0., (String::new(), 0), Vec::new()) };
+                    let mut shell = shell(&asked.line());
+                    shell.envs(asked.env.iter().map(|(k, v)| (k, v)));
                     shell.current_dir(&folder);
                     tag(&mut shell, &folder, socket.as_deref());
                     let (state, seconds, output) = run_captured(shell, Some(brief), &run_slot);
@@ -1232,7 +1222,7 @@ impl Workspace {
                         }
                     }
                     let _ = std::fs::remove_dir_all(&folder);
-                    (state, seconds, output, pictures)
+                    (state, seconds, asked.read_answer(&output), pictures)
                 }))
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -1240,7 +1230,7 @@ impl Workspace {
                 if this.judging.get(&job_group).is_some_and(|(slot, _)| Arc::ptr_eq(slot, &job_slot)) {
                     this.judging.remove(&job_group);
                     if let Some(run) = this.judges.get_mut(&job_group) {
-                        let (answer, took) = judge_answer(&output);
+                        let (answer, took) = output;
                         (run.state, run.seconds, run.output) = (state, seconds, answer);
                         (run.tokens, run.asked) = (run.tokens + took, run.asked + u32::from(state != RunState::Stopped));
                     }
@@ -1294,20 +1284,20 @@ impl Workspace {
             self.read_variants_again = true;
             return;
         }
-        let paths: Vec<(PathBuf, String, Option<VariantInfo>)> = self
+        let paths: Vec<(PathBuf, String, Option<crate::agents::SessionRef>, Option<VariantInfo>)> = self
             .members(&group)
             .into_iter()
             .map(|(pi, ti)| &self.projects[pi].tasks[ti])
             .filter(|t| t.busy.is_none())
-            .map(|t| (t.path.clone(), t.base.clone(), self.variant_info.get(&t.path).cloned()))
+            .map(|t| (t.path.clone(), t.base.clone(), t.session_ref(), self.variant_info.get(&t.path).cloned()))
             .collect();
         cx.spawn_in(window, async move |this, cx| {
             let found = cx
                 .background_spawn(async move {
                     paths
                         .into_iter()
-                        .map(|(path, base, before)| {
-                            let info = read_info(&path, &base, before);
+                        .map(|(path, base, who, before)| {
+                            let info = read_info(&path, &base, who.as_ref(), before);
                             (path, info)
                         })
                         .collect::<Vec<_>>()
@@ -1932,7 +1922,7 @@ impl Workspace {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{branch_for, full_prompt, judge_can, judge_command, judge_pick, letter, span, tokens};
+    use super::{branch_for, full_prompt, judge_pick, letter, span, tokens};
     #[cfg(unix)]
     use super::{Judged, RunSlot, RunState, end_run, judge_brief, run_captured, shell, tail};
     use gpui_kit::test::TestWindowExt as _;
@@ -2056,25 +2046,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn variants_run_unasked_unless_the_command_says_how() {
-        let command = |agent: &str| Workspace::agent_command_for(&Some(Some(agent.to_string())), None, true);
-        assert_eq!(command("claude --model opus").as_deref(), Some("claude --model opus --permission-mode auto"));
-        assert_eq!(command("claude --permission-mode plan").as_deref(), Some("claude --permission-mode plan"));
-        assert_eq!(command("codex").as_deref(), Some("codex"), "another agent is started as it is");
-        assert_eq!(Workspace::agent_command_for(&Some(Some("claude".into())), None, false).as_deref(), Some("claude"), "a task on its own as before");
-    }
-
-    #[test]
-    fn the_judge_is_claude_asked_once_and_can_only_read() {
-        assert!(judge_can("claude") && judge_can("/usr/local/bin/claude --model opus") && !judge_can("codex") && !judge_can(""));
-        // Of the agent command, the program and the model: not what lets it act unasked or go on with a talk.
-        let line = judge_command("claude --continue --model opus --permission-mode bypass", &["/w/fix a".into()]);
-        if cfg!(unix) {
-            assert_eq!(line, "'claude' -p --no-session-persistence --output-format json --tools 'Read,Grep,Glob' --model 'opus' --add-dir '/w/fix a'");
-        }
+    fn the_judge_picks_by_its_last_line() {
         let printed = r#"{"type":"result","result":"B is the one.\n\nKEEP: B\n","usage":{"input_tokens":1200,"cache_creation_input_tokens":300,"cache_read_input_tokens":9000,"output_tokens":80}}"#;
-        assert_eq!(super::judge_answer(printed), ("B is the one.\n\nKEEP: B".to_string(), 1580), "the answer, and what it took: not what was read from the cache again");
-        assert_eq!(super::judge_answer("Plain words.\n"), ("Plain words.".to_string(), 0), "an agent that prints no JSON");
+        assert_eq!(crate::agents::claude::json_answer(printed), ("B is the one.\n\nKEEP: B".to_string(), 1580), "the answer, and what it took: not what was read from the cache again");
+        assert_eq!(crate::agents::claude::json_answer("Plain words.\n"), ("Plain words.".to_string(), 0), "an agent that prints no JSON");
         assert_eq!(judge_pick("**KEEP: C**").as_deref(), Some("C"));
         assert_eq!(super::without_keep("B is the one.\n\nKEEP: B\n"), "B is the one.");
         assert_eq!(super::without_keep("No verdict."), "No verdict.");
@@ -2100,6 +2075,7 @@ pub(crate) mod tests {
             note: "the smallest patch".into(),
             check: Some(("make test".into(), "failed with exit 1 after 2.0 s".into(), "test login ... FAILED".into())),
             site: None,
+            who: None,
         };
         let brief = judge_brief("Fix the login.", &[variant], &dir.join("out"));
         for part in ["<task>\nFix the login.\n</task>", "Variant B", "the smallest patch", "`make test` failed with exit 1", "test login ... FAILED", "KEEP: A"] {
@@ -2175,7 +2151,7 @@ pub(crate) mod tests {
         let project = ProjectState { path: repo.clone(), check: "test -f made.txt".into(), check_auto: true, ..Default::default() };
         let saved = State { projects: vec![project], ..Default::default() };
         std::fs::write(dir.join("state.json"), serde_json::to_string(&saved).unwrap()).unwrap();
-        crate::state::set_settings(crate::state::Settings { agent: judge.display().to_string(), notifications: false, pr_status: false, ..Default::default() });
+        crate::state::set_settings(crate::state::Settings { agent: judge.display().to_string(), agents: Vec::new(), notifications: false, pr_status: false, ..Default::default() });
         cx.update(|cx| {
             gpui_kit::init(cx);
             gpui_cn::init(cx);
@@ -2191,9 +2167,9 @@ pub(crate) mod tests {
             cx.update_window(handle.into(), |_, window, cx| workspace.update(cx, |w, cx| act(w, window, cx))).unwrap();
             cx.run_until_parked();
         };
-        let hook = |task: &std::path::Path, event: &str| HookEvent { task: task.to_path_buf(), event: event.into(), message: None, kind: None, file: None, said: None, replayed: false };
+        let hook = |task: &std::path::Path, event: &str| HookEvent { task: task.to_path_buf(), event: event.into(), message: None, kind: None, file: None, said: None, replayed: false, session: None, guessed: false };
 
-        step(cx, &mut |w, window, cx| w.create_task(0, "Fix login".into(), "Make the file.".into(), vec![String::new(), "With the smallest patch.".into()], window, cx));
+        step(cx, &mut |w, window, cx| w.create_task(0, "Fix login".into(), "Make the file.".into(), vec![String::new(), "With the smallest patch.".into()], Vec::new(), window, cx));
         let (group, paths) = workspace.update(cx, |w, _| {
             let tasks = &w.projects[0].tasks;
             assert_eq!(tasks.len(), 2, "two variants");
@@ -2468,7 +2444,7 @@ pub(crate) mod tests {
 
         // One more try at it: the kept one becomes A again, and the new one
         // gets a letter whose directory is free (B's is the kept one's).
-        step(cx, &mut |w, window, cx| w.add_variant(&paths[1], "Make the file.".into(), "Another way.".into(), window, cx));
+        step(cx, &mut |w, window, cx| w.add_variant(&paths[1], "Make the file.".into(), "Another way.".into(), String::new(), window, cx));
         let third = workspace.update(cx, |w, _| {
             let tasks = &w.projects[0].tasks;
             assert_eq!(tasks.len(), 2, "the kept one and the new one");
