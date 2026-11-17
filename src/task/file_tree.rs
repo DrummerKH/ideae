@@ -4,6 +4,7 @@
 //! read from disk when it is opened.
 
 use super::*;
+use gpui_kit::component::menu::PopupMenu;
 
 /// What the color of a name in the tree tells.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,11 +112,12 @@ fn filler(folder: &str, what: &str) -> TreeItem {
 /// Nests sorted relative paths into tree items. Folder ids end in `/`, and
 /// the folders in `expanded` stay open across rebuilds. The ignored folders
 /// show what `listed` has of them; those open and not read yet are returned
-/// to be read.
+/// to be read. `made`: folders git does not list, for having nothing in them.
 pub(super) fn build_tree(
     files: &[String],
     gone: &HashSet<String>,
     ignored: &[String],
+    made: &[String],
     listed: &HashMap<SharedString, Listing>,
     expanded: &HashSet<SharedString>,
 ) -> (Vec<TreeItem>, Vec<SharedString>) {
@@ -144,6 +146,12 @@ pub(super) fn build_tree(
     };
     // Deleted and not staged so, git lists it still: not on disk, not in the tree.
     files.iter().filter(|file| !gone.contains(*file)).chain(ignored).for_each(&mut add);
+    for folder in made {
+        let mut node = &mut root;
+        for part in folder.split('/').filter(|part| !part.is_empty()) {
+            node = node.dirs.entry(part.to_string()).or_default();
+        }
+    }
 
     fn from_disk(id: &SharedString, listed: &HashMap<SharedString, Listing>, expanded: &HashSet<SharedString>, unread: &mut Vec<SharedString>) -> Vec<TreeItem> {
         let Some(entries) = listed.get(id) else {
@@ -296,7 +304,7 @@ impl TaskView {
         if self.tree_stale && shown {
             self.tree_stale = false;
             let ignored: &[String] = if self.tree_hides_ignored { &[] } else { &self.tree_ignored };
-            let (items, unread) = build_tree(&self.tree_files, &self.tree_gone, ignored, &self.ignored_listed, &self.expanded);
+            let (items, unread) = build_tree(&self.tree_files, &self.tree_gone, ignored, &self.made_folders, &self.ignored_listed, &self.expanded);
             self.tree.update(cx, |t, cx| t.set_items(items, cx));
             for id in unread {
                 self.list_ignored(id, cx);
@@ -316,6 +324,7 @@ impl TaskView {
         let ignored = if self.tree_hides_ignored { Rc::default() } else { self.tree_ignored.clone() };
         let touched = self.agent_touched.clone();
         let editing = self.agent_editing.clone();
+        let (menu_view, menu_root) = (view.clone(), root.clone());
         div().flex_1().min_h_0().child(
             tree(&self.tree, move |ix, entry, selected, _, cx| {
                 let item = entry.item();
@@ -365,14 +374,474 @@ impl TaskView {
                     let _ = view.update(cx, |t, cx| t.open_file_as(path, 0, 0, how, window, cx));
                 })
             })
+            .context_menu(move |_, entry, menu, _, _| {
+                let id = entry.item().id.clone();
+                if id.ends_with('\0') {
+                    return menu;
+                }
+                TaskView::tree_menu(menu_view.clone(), menu_root.clone(), id, menu)
+            })
             .size_full(),
         )
+        .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+            if event.keystroke.key == "f2" && !event.keystroke.modifiers.modified() {
+                cx.stop_propagation();
+                this.rename_selected(window, cx);
+            }
+        }))
+    }
+}
+
+/// The folder of a tree row, relative and without the slash: the folder
+/// itself, or the one the file is in; "" at the top.
+fn folder_of(id: &str) -> &str {
+    match id.strip_suffix('/') {
+        Some(folder) => folder,
+        None => id.rsplit_once('/').map_or("", |(folder, _)| folder),
+    }
+}
+
+/// Whether `name` names a file or folder, or for a new one a path under
+/// where it goes (`with_folders`): nothing that leads out of it.
+fn name_ok(name: &str, with_folders: bool) -> Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("Give it a name");
+    }
+    if name.contains('\\') || (!with_folders && name.contains('/')) {
+        return Err("A name has no slash in it");
+    }
+    if name.split('/').any(|part| part.is_empty() || part == "." || part == "..") {
+        return Err("Not a name a file can have here");
+    }
+    Ok(())
+}
+
+/// `old` moved to `new`, and `path` was it or in it: where it is now.
+fn moved(path: &std::path::Path, old: &std::path::Path, new: &std::path::Path) -> Option<PathBuf> {
+    path.strip_prefix(old).ok().map(|rest| if rest.as_os_str().is_empty() { new.to_path_buf() } else { new.join(rest) })
+}
+
+/// What a name dialog does with the name, off the UI thread: the path it
+/// made, or why not.
+type NameJob = Arc<dyn Fn(&str) -> Result<PathBuf, String> + Send + Sync>;
+/// What is done after, on the UI thread, with that path.
+type MadeIt = Rc<dyn Fn(&mut TaskView, PathBuf, &mut Window, &mut Context<TaskView>)>;
+
+/// Shows `path` in the system's file manager: the folder, or the folder
+/// of the file (on Windows and macOS with the file picked).
+fn reveal(path: PathBuf, folder: bool, cx: &mut App) {
+    cx.background_spawn(crate::procs::on_thread(move || {
+        #[cfg(target_os = "macos")]
+        let mut command = {
+            let _ = folder;
+            let mut command = crate::procs::command("open");
+            command.arg("-R").arg(&path);
+            command
+        };
+        #[cfg(windows)]
+        let mut command = {
+            let _ = folder;
+            let mut command = crate::procs::command("explorer");
+            command.arg(format!("/select,{}", path.display()));
+            command
+        };
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let mut command = {
+            let mut command = crate::procs::command("xdg-open");
+            command.arg(if folder { path.as_path() } else { path.parent().unwrap_or(&path) });
+            command
+        };
+        let _ = command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    }))
+    .detach();
+}
+
+impl TaskView {
+    /// The Files panel's menu of a row: `id` as the tree has it.
+    pub(super) fn tree_menu(view: WeakEntity<Self>, root: PathBuf, id: SharedString, menu: PopupMenu) -> PopupMenu {
+        use gpui_kit::component::menu::PopupMenuItem;
+        let folder = id.ends_with('/');
+        let relative = id.trim_end_matches('/').to_string();
+        let absolute = root.join(&relative);
+        let at = |run: fn(&mut TaskView, SharedString, &mut Window, &mut Context<TaskView>)| {
+            let (view, id) = (view.clone(), id.clone());
+            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                let _ = view.update(cx, |task, cx| run(task, id.clone(), window, cx));
+            }
+        };
+        let (shown, copied, copied_relative) = (absolute.clone(), absolute.to_string_lossy().into_owned(), relative.clone());
+        let here = if folder { absolute.clone() } else { absolute.parent().map_or(root.clone(), PathBuf::from) };
+        let terminal_view = view.clone();
+        menu.item(PopupMenuItem::new("New file…").on_click(at(|task, id, window, cx| task.new_entry_dialog(folder_of(&id).to_string(), false, window, cx))))
+            .item(PopupMenuItem::new("New folder…").on_click(at(|task, id, window, cx| task.new_entry_dialog(folder_of(&id).to_string(), true, window, cx))))
+            .separator()
+            .item(PopupMenuItem::new("Rename…").on_click(at(|task, id, window, cx| task.rename_entry_dialog(id, window, cx))))
+            .item(PopupMenuItem::new("Delete").on_click(at(|task, id, window, cx| task.delete_entry(id, window, cx))))
+            .separator()
+            .item(PopupMenuItem::new("Copy path").on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()))))
+            .item(PopupMenuItem::new("Copy relative path").on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copied_relative.clone()))))
+            .separator()
+            .item(PopupMenuItem::new("Reveal in file manager").on_click(move |_, _, cx| reveal(shown.clone(), folder, cx)))
+            .item(PopupMenuItem::new("Open terminal here").on_click(move |_, window, cx| {
+                let here = here.clone();
+                let _ = terminal_view.update(cx, |task, cx| task.new_terminal_in(here, window, cx));
+            }))
+            .when(!folder, |menu| {
+                menu.item(PopupMenuItem::new("Compare with…").on_click(at(|task, id, window, cx| task.compare_with_dialog(Some(id.to_string()), window, cx))))
+            })
+    }
+
+    /// F2 in the tree: the row it is on.
+    pub(super) fn rename_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.tree.read(cx).selected_item().map(|item| item.id.clone()) else { return };
+        if !id.ends_with('\0') {
+            self.rename_entry_dialog(id, window, cx);
+        }
+    }
+
+    /// Asks for a name, and runs `job` with it off the UI thread; done, the
+    /// dialog closes and `made` gets the path, else it tells why.
+    #[allow(clippy::too_many_arguments)]
+    fn name_dialog(&mut self, title: String, value: String, hint: String, ok: &'static str, with_folders: bool, job: NameJob, made: MadeIt, window: &mut Window, cx: &mut Context<Self>) {
+        let input = cx.new(|cx| gpui_kit::component::input::InputState::new(window, cx));
+        // The name without its extension, ready to be typed over.
+        let stem = value.rfind('.').filter(|&dot| dot > 0).unwrap_or(value.len());
+        input.update(cx, |i, cx| {
+            i.set_value(value.clone(), window, cx);
+            i.set_selected_range(0..stem, cx);
+        });
+        let said: Rc<std::cell::RefCell<Option<String>>> = Rc::default();
+        let apply = {
+            let (input, said) = (input.clone(), said.clone());
+            Rc::new(move |_: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+                let name = input.read(cx).value().trim().to_string();
+                if let Err(why) = name_ok(&name, with_folders) {
+                    *said.borrow_mut() = Some(why.to_string());
+                    return window.refresh();
+                }
+                let (job, made, said) = (job.clone(), made.clone(), said.clone());
+                cx.spawn_in(window, async move |this, cx| {
+                    let result = cx.background_spawn(async move { job(&name) }).await;
+                    let _ = this.update_in(cx, |this, window, cx| match result {
+                        Ok(path) => {
+                            window.close_dialog(cx);
+                            made(this, path, window, cx);
+                        }
+                        Err(why) => {
+                            *said.borrow_mut() = Some(why);
+                            window.refresh();
+                        }
+                    });
+                })
+                .detach();
+            })
+        };
+        let on_enter = apply.clone();
+        // Kept by the dialog and gone with it.
+        let listening = Rc::new(cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, window, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                on_enter(this, window, cx);
+            }
+        }));
+        let this = cx.weak_entity();
+        let focused = Rc::new(std::cell::Cell::new(false));
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (input, focused, this, apply, said, hint) = (input.clone(), focused.clone(), this.clone(), apply.clone(), said.clone(), hint.clone());
+            let _ = &listening;
+            dialog
+                .title(title.clone())
+                .w(px(460.))
+                .content(move |content, window, cx| {
+                    if !focused.replace(true) {
+                        let input = input.clone();
+                        window.defer(cx, move |window, cx| input.read(cx).focus_handle(cx).focus(window, cx));
+                    }
+                    content.child(
+                        v_flex()
+                            .gap_1()
+                            .child(gpui_kit::component::input::Input::new(&input))
+                            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(hint.clone()))
+                            .children(said.borrow().clone().map(|why| div().text_xs().text_color(gpui_kit::red()).child(why))),
+                    )
+                })
+                .footer(h_flex().justify_end().child(Button::new("name-ok").primary().label(ok).on_click(move |_, window, cx| {
+                    let apply = apply.clone();
+                    let _ = this.update(cx, |task, cx| apply(task, window, cx));
+                })))
+        });
+    }
+
+    /// New file… or New folder… in `folder` (relative, "" at the top).
+    pub(super) fn new_entry_dialog(&mut self, folder: String, dir: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let base = self.root.join(&folder);
+        let shown = if folder.is_empty() { "the top folder".to_string() } else { format!("{folder}/") };
+        let job: NameJob = Arc::new(move |name| {
+            let path = base.join(name);
+            if path.symlink_metadata().is_ok() {
+                return Err(format!("{name} is there already"));
+            }
+            if dir {
+                std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
+            } else {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(|e| e.to_string())?;
+            }
+            Ok(path)
+        });
+        let made: MadeIt = Rc::new(move |task, path, window, cx| task.made_entry(path, dir, window, cx));
+        let (title, ok) = if dir { ("New folder", "Create") } else { ("New file", "Create") };
+        self.name_dialog(title.into(), String::new(), format!("In {shown}; a name with / makes the folders on the way"), ok, true, job, made, window, cx);
+    }
+
+    /// A file or folder made from the tree: shown there, a file opened.
+    fn made_entry(&mut self, path: PathBuf, dir: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Ok(relative) = path.strip_prefix(&self.root).map(|p| p.to_string_lossy().replace('\\', "/")) else { return };
+        // Every folder on the way is opened, so that it is seen.
+        for (slash, _) in relative.match_indices('/') {
+            self.expanded.insert(format!("{}/", &relative[..slash]).into());
+        }
+        if dir {
+            self.expanded.insert(format!("{relative}/").into());
+            let mut made = (*self.made_folders).clone();
+            made.push(relative.clone());
+            self.made_folders = Rc::new(made);
+        }
+        let parent = format!("{}/", folder_of(&relative));
+        if self.in_ignored(&parent) {
+            self.list_ignored(parent.into(), cx);
+        }
+        self.tree_stale = true;
+        self.fill_tree(cx);
+        let _ = self.refresh_tx.try_send(());
+        if !dir {
+            self.open_file_as(path, 0, 0, OpenAs::Kept, window, cx);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn rename_entry_dialog(&mut self, id: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+        let relative = id.trim_end_matches('/').to_string();
+        let from = self.root.join(&relative);
+        let name = relative.rsplit('/').next().unwrap_or(&relative).to_string();
+        let job_from = from.clone();
+        let job: NameJob = Arc::new(move |name| {
+            let to = job_from.with_file_name(name);
+            if to == job_from {
+                return Ok(to);
+            }
+            // Another file of that name, not this one with its case changed.
+            let same = |a: &std::path::Path, b: &std::path::Path| std::fs::canonicalize(a).ok().is_some_and(|a| std::fs::canonicalize(b).ok() == Some(a));
+            if to.symlink_metadata().is_ok() && !same(&job_from, &to) {
+                return Err(format!("{name} is there already"));
+            }
+            std::fs::rename(&job_from, &to).map_err(|e| e.to_string())?;
+            Ok(to)
+        });
+        let made: MadeIt = Rc::new(move |task, to, window, cx| task.renamed(from.clone(), to, window, cx));
+        let hint = if id.ends_with('/') { "The tabs open on what is in it follow it, with what is not saved" } else { "A tab open on it follows it, with what is not saved" };
+        self.name_dialog(format!("Rename {name}"), name, hint.to_string(), "Rename", false, job, made, window, cx);
+    }
+
+    /// After a rename: open tabs of it, or in it, follow, as does the tree.
+    fn renamed(&mut self, from: PathBuf, to: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let title = |path: &std::path::Path| SharedString::from(path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+        for ix in 0..self.tabs.len() {
+            match &self.tabs[ix].kind {
+                TabKind::File(file) => {
+                    let Some(new) = moved(&file.read(cx).path, &from, &to) else { continue };
+                    let file = file.clone();
+                    let (old, client, editor) = {
+                        let f = file.read(cx);
+                        (f.path.clone(), f.lsp_client.clone(), f.editor.clone())
+                    };
+                    // The server knows the text by its old name: told it is closed, and given it under the new one.
+                    if let Some(client) = client {
+                        cx.background_spawn(crate::procs::on_thread(move || {
+                            let _ = client.did_close(&old);
+                        }))
+                        .detach();
+                    }
+                    file.update(cx, |f, cx| {
+                        f.path = new.clone();
+                        cx.notify();
+                    });
+                    self.tabs[ix].title = title(&new);
+                    let content = editor.read(cx).value().to_string();
+                    self.attach_lsp(&new, content, &editor, &file, cx);
+                }
+                TabKind::Binary(binary) => {
+                    let Some(new) = moved(&binary.read(cx).path, &from, &to) else { continue };
+                    binary.update(cx, |b, _| b.path = new.clone());
+                    self.tabs[ix].title = title(&new);
+                }
+                _ => {}
+            }
+        }
+        let (Ok(old), Ok(new)) = (from.strip_prefix(&self.root), to.strip_prefix(&self.root)) else { return };
+        let (old, new) = (old.to_string_lossy().replace('\\', "/"), new.to_string_lossy().replace('\\', "/"));
+        let follow = |path: &str| -> Option<String> {
+            if path == old {
+                Some(new.clone())
+            } else {
+                path.strip_prefix(&format!("{old}/")).map(|rest| format!("{new}/{rest}"))
+            }
+        };
+        self.expanded = self.expanded.iter().map(|id| follow(id.trim_end_matches('/')).map_or(id.clone(), |moved| format!("{moved}/").into())).collect();
+        self.made_folders = Rc::new(self.made_folders.iter().map(|folder| follow(folder).unwrap_or_else(|| folder.clone())).collect());
+        self.tree_stale = true;
+        self.fill_tree(cx);
+        let _ = self.refresh_tx.try_send(());
+        let _ = window;
+        cx.notify();
+    }
+
+    /// Delete: to the trash, with Undo; a folder is asked about first. With
+    /// no trash to go to, asked, and deleted for good.
+    pub(super) fn delete_entry(&mut self, id: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+        let folder = id.ends_with('/');
+        let relative = id.trim_end_matches('/').to_string();
+        let path = self.root.join(&relative);
+        if cfg!(windows) {
+            return self.delete_for_good_dialog(path, folder, None, window, cx);
+        }
+        if !folder {
+            return self.trash_entry(path, folder, window, cx);
+        }
+        let this = cx.weak_entity();
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            let (this, path) = (this.clone(), path.clone());
+            dialog
+                .confirm()
+                .title(format!("Move {relative}/ to the trash?"))
+                .description("The folder and all that is in it. Undo brings it back.")
+                .ok_text("Move to trash")
+                .on_ok(move |_, window, cx| {
+                    let path = path.clone();
+                    let _ = this.update(cx, |task, cx| task.trash_entry(path, true, window, cx));
+                    true
+                })
+        });
+    }
+
+    fn trash_entry(&mut self, path: PathBuf, folder: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // What is open of it is saved first, so that Undo brings back the last of it.
+        self.save_all_now(cx);
+        let job_path = path.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx.background_spawn(crate::procs::on_thread(move || crate::trash::trash(&job_path))).await;
+            let _ = this.update_in(cx, |task, window, cx| {
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                match result {
+                    Ok(trashed) => {
+                        task.deleted(&path, window, cx);
+                        let view = cx.weak_entity();
+                        let mut note = Notification::info(format!("Moved {name} to the trash"));
+                        if let Some(trashed) = trashed {
+                            note = note
+                                .action(move |_, _, cx| {
+                                    let (view, trashed, me) = (view.clone(), trashed.clone(), cx.entity().downgrade());
+                                    Button::new("undo-trash").xsmall().outline().label("Undo").on_click(move |_, window, cx| {
+                                        let trashed = trashed.clone();
+                                        let _ = view.update(cx, |task, cx| task.untrash(trashed, window, cx));
+                                        let _ = me.update(cx, |note, cx| note.dismiss(window, cx));
+                                    })
+                                })
+                                .autohide(true);
+                        }
+                        window.push_notification(note, cx);
+                    }
+                    Err(why) => task.delete_for_good_dialog(path, folder, Some(why), window, cx),
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn untrash(&mut self, trashed: crate::trash::Trashed, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx.background_spawn(async move { crate::trash::restore(&trashed) }).await;
+            let _ = this.update_in(cx, |task, window, cx| {
+                if let Err(why) = result {
+                    window.push_notification(Notification::error(format!("Not brought back: {why}")), cx);
+                }
+                let _ = task.refresh_tx.try_send(());
+            });
+        })
+        .detach();
+    }
+
+    fn delete_for_good_dialog(&mut self, path: PathBuf, folder: bool, why: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let this = cx.weak_entity();
+        let name = path.strip_prefix(&self.root).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        let shown = if folder { format!("{name}/") } else { name };
+        let description = match why {
+            Some(why) => format!("It cannot go to the trash ({why}). Deleted, it is gone for good."),
+            None if folder => "The folder and all that is in it are gone for good.".to_string(),
+            None => "It is gone for good.".to_string(),
+        };
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            let (this, path) = (this.clone(), path.clone());
+            dialog
+                .confirm()
+                .title(format!("Delete {shown}?"))
+                .description(description.clone())
+                .ok_text("Delete")
+                .ok_variant(gpui_kit::component::button::ButtonVariant::Danger)
+                .on_ok(move |_, window, cx| {
+                    let path = path.clone();
+                    let _ = this.update(cx, |_, cx| {
+                        let job_path = path.clone();
+                        cx.spawn_in(window, async move |this, cx| {
+                            let result = cx
+                                .background_spawn(async move { if folder { std::fs::remove_dir_all(&job_path) } else { std::fs::remove_file(&job_path) } })
+                                .await;
+                            let _ = this.update_in(cx, |task, window, cx| match result {
+                                Ok(()) => task.deleted(&path, window, cx),
+                                Err(e) => window.push_notification(Notification::error(format!("Not deleted: {e}")), cx),
+                            });
+                        })
+                        .detach();
+                    });
+                    true
+                })
+        });
+    }
+
+    /// After a delete: the tabs of it close, unless they hold what is not saved.
+    fn deleted(&mut self, path: &std::path::Path, window: &mut Window, cx: &mut Context<Self>) {
+        let gone: Vec<usize> = self
+            .tabs
+            .iter()
+            .filter(|t| match &t.kind {
+                TabKind::File(f) => f.read(cx).path.starts_with(path) && !f.read(cx).dirty,
+                TabKind::Binary(b) => b.read(cx).path.starts_with(path),
+                _ => false,
+            })
+            .map(|t| t.id)
+            .collect();
+        for id in gone {
+            if let Some(ix) = self.ix_of(id) {
+                self.remove_tab(ix, window, cx);
+            }
+        }
+        if let Ok(relative) = path.strip_prefix(&self.root).map(|p| p.to_string_lossy().replace('\\', "/")) {
+            let under = format!("{relative}/");
+            if self.made_folders.iter().any(|f| *f == relative || f.starts_with(&under)) {
+                self.made_folders = Rc::new(self.made_folders.iter().filter(|f| **f != relative && !f.starts_with(&under)).cloned().collect());
+                self.tree_stale = true;
+                self.fill_tree(cx);
+            }
+        }
+        let _ = self.refresh_tx.try_send(());
+        cx.notify();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Listing, Mark, build_tree, git, tree_marks};
+    use super::{Listing, Mark, build_tree, folder_of, git, moved, name_ok, tree_marks};
     use gpui_kit::{SharedString, component::tree::TreeItem};
     use std::{
         collections::{HashMap, HashSet},
@@ -409,23 +878,51 @@ mod tests {
         let ids = |items: &[TreeItem]| items.iter().map(|i| i.id.to_string()).collect::<Vec<_>>();
         let mut expanded = HashSet::new();
         let gone: HashSet<String> = ["src/main.rs".to_string()].into();
-        let (items, _) = build_tree(&files, &gone, &ignored, &HashMap::new(), &expanded);
+        let (items, _) = build_tree(&files, &gone, &ignored, &[], &HashMap::new(), &expanded);
         assert_eq!(ids(&items), ["target/", "web/", ".env"], "a deleted file is not in the tree");
         let none = HashSet::new();
-        let (items, unread) = build_tree(&files, &none, &ignored, &HashMap::new(), &expanded);
+        let (items, unread) = build_tree(&files, &none, &ignored, &[], &HashMap::new(), &expanded);
         assert_eq!(ids(&items), ["src/", "target/", "web/", ".env"]);
         assert_eq!(ids(&items[1].children), ["target/\0"], "not read yet");
         assert!(unread.is_empty(), "nothing open");
         assert_eq!(ids(&items[2].children), ["web/node_modules/", "web/app.js"]);
 
         expanded.insert(SharedString::from("target/"));
-        let (_, unread) = build_tree(&files, &none, &ignored, &HashMap::new(), &expanded);
+        let (_, unread) = build_tree(&files, &none, &ignored, &[], &HashMap::new(), &expanded);
         assert_eq!(unread, [SharedString::from("target/")]);
 
         let listed: HashMap<SharedString, Listing> = [(SharedString::from("target/"), Rc::new(vec![("debug".into(), true), ("x.log".into(), false)]))].into();
-        let (items, unread) = build_tree(&files, &none, &ignored, &listed, &expanded);
+        let (items, unread) = build_tree(&files, &none, &ignored, &[], &listed, &expanded);
         assert!(unread.is_empty());
         assert_eq!(ids(&items[1].children), ["target/debug/", "target/x.log"]);
         assert_eq!(ids(&items[1].children[0].children), ["target/debug/\0"]);
+    }
+
+    #[test]
+    fn names_and_where_they_go() {
+        assert_eq!(folder_of("src/task/"), "src/task");
+        assert_eq!(folder_of("src/main.rs"), "src");
+        assert_eq!(folder_of("README.md"), "");
+        assert!(name_ok("a.rs", false).is_ok());
+        assert!(name_ok("deep/a.rs", true).is_ok());
+        assert!(name_ok("deep/a.rs", false).is_err());
+        for bad in ["", "..", "../x", "a//b", "/etc/x", "a\\b", "a/"] {
+            assert!(name_ok(bad, true).is_err(), "{bad:?}");
+        }
+        let p = std::path::Path::new;
+        assert_eq!(moved(p("/r/a/b.rs"), p("/r/a"), p("/r/c")), Some(p("/r/c/b.rs").to_path_buf()));
+        assert_eq!(moved(p("/r/a"), p("/r/a"), p("/r/c")), Some(p("/r/c").to_path_buf()));
+        assert_eq!(moved(p("/r/ab.rs"), p("/r/a"), p("/r/c")), None);
+    }
+
+    #[test]
+    fn folders_made_empty_are_in_the_tree() {
+        let files: Vec<String> = ["src/main.rs"].map(String::from).to_vec();
+        let made: Vec<String> = ["docs/notes".to_string(), "src/new".to_string()].to_vec();
+        let ids = |items: &[TreeItem]| items.iter().map(|i| i.id.to_string()).collect::<Vec<_>>();
+        let (items, _) = build_tree(&files, &HashSet::new(), &[], &made, &HashMap::new(), &HashSet::new());
+        assert_eq!(ids(&items), ["docs/", "src/"]);
+        assert_eq!(ids(&items[0].children), ["docs/notes/"]);
+        assert_eq!(ids(&items[1].children), ["src/new/", "src/main.rs"]);
     }
 }

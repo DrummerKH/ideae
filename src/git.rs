@@ -441,6 +441,9 @@ pub struct BranchInfo {
     pub behind_base: u32,
     pub last_hash: String,
     pub last_subject: String,
+    /// The last commit is on the remote already: amending it would rewrite
+    /// what others may have.
+    pub head_pushed: bool,
     /// The files a pull would leave in conflict, with what is committed
     /// here or only written; empty when none, or when it cannot be told.
     pub pull_conflicts: Vec<String>,
@@ -800,6 +803,7 @@ pub fn refresh(root: &Path, picked: Option<String>, light: bool, known: &mut Kno
         info.base = base;
     }
     (info.last_hash, info.last_subject) = (history.last_hash, history.last_subject);
+    info.head_pushed = head_pushed(info.upstream.is_some(), info.ahead, info.base.is_some(), history.ahead_of_base);
 
     // The patches are of what the status tells, the files it names as they
     // are on disk, and where the branch forked: the same of all three, the
@@ -1241,11 +1245,160 @@ pub fn unstage(root: &Path, paths: &[String]) -> Result<String, String> {
 /// Commits what is staged; with nothing staged, everything (`git add -A`
 /// first). Asked of git here: what the window last read may be from before
 /// a change was staged.
-pub fn commit(root: &Path, message: &str) -> Result<String, String> {
+pub fn commit(root: &Path, message: &str, amend: bool) -> Result<String, String> {
     if git(root, &["diff", "--cached", "--name-only"]).is_some_and(|staged| staged.trim().is_empty()) {
         run(root, "git", &["add", "-A"])?;
     }
-    run(root, "git", &["commit", "-m", message])
+    if amend {
+        run(root, "git", &["commit", "--amend", "-m", message])
+    } else {
+        run(root, "git", &["commit", "-m", message])
+    }
+}
+
+/// Whether the last commit is on the remote: in the upstream (nothing
+/// ahead of it), or, for a branch not published, in the branch work starts
+/// from. With neither it is nowhere but here.
+pub fn head_pushed(has_upstream: bool, ahead: u32, has_base: bool, ahead_of_base: u32) -> bool {
+    if has_upstream {
+        ahead == 0
+    } else {
+        has_base && ahead_of_base == 0
+    }
+}
+
+/// The whole message of the last commit.
+pub fn last_message(root: &Path) -> Option<String> {
+    git(root, &["log", "-1", "--format=%B"]).map(|m| m.trim_end().to_string())
+}
+
+/// A push the remote turned down because it has commits this branch has
+/// not, as git words it; not one that failed for any other reason.
+pub fn push_refused(error: &str) -> bool {
+    error.lines().any(|line| {
+        let line = line.trim();
+        (line.starts_with("! [rejected]") && ["(non-fast-forward)", "(fetch first)", "(stale info)"].iter().any(|why| line.ends_with(why)))
+            || line.starts_with("Updates were rejected because the tip of your current branch is behind")
+            || line.starts_with("Updates were rejected because the remote contains work")
+    })
+}
+
+/// Where a branch pushes: the remote, and the branch there.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PushTarget {
+    pub remote: String,
+    pub branch: String,
+}
+
+impl PushTarget {
+    /// `origin/feature`.
+    pub fn tracking(&self) -> String {
+        format!("{}/{}", self.remote, self.branch)
+    }
+}
+
+/// The branch's upstream, or `origin/<branch>` where a first push would go.
+pub fn push_target(root: &Path) -> Option<PushTarget> {
+    let head = git(root, &["symbolic-ref", "--short", "HEAD"])?.trim().to_string();
+    let config = |key: &str| git(root, &["config", "--get", &format!("branch.{head}.{key}")]).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    match (config("remote"), config("merge")) {
+        (Some(remote), Some(merge)) if remote != "." => Some(PushTarget { remote, branch: merge.strip_prefix("refs/heads/").unwrap_or(&merge).to_string() }),
+        _ => Some(PushTarget { remote: "origin".into(), branch: head }),
+    }
+}
+
+/// A push turned down: what the remote has that is not here.
+#[derive(Clone, Debug)]
+pub struct Diverged {
+    pub target: PushTarget,
+    /// The commit the remote branch is at, as fetched just now: an
+    /// overwrite replaces that one and no other.
+    pub remote_hash: String,
+    /// The remote's commits not here, as "abc1234 subject (author)".
+    pub theirs: Vec<String>,
+    /// Why it is not to be overwritten, when it is not.
+    pub keep: Option<String>,
+}
+
+/// Whether a branch is one not to overwrite: the repository's default
+/// one, or one others have pushed to (`authors` of the commits that would
+/// go; `me` the user's email).
+pub fn keep_reason(branch: &str, default: Option<&str>, authors: &[(String, String)], me: Option<&str>) -> Option<String> {
+    if default == Some(branch) || ["main", "master"].contains(&branch) {
+        return Some(format!("{branch} is the repository's main branch"));
+    }
+    let others: std::collections::BTreeSet<&str> = authors.iter().filter(|(_, email)| me.is_none_or(|me| !email.eq_ignore_ascii_case(me))).map(|(name, _)| name.as_str()).collect();
+    if !others.is_empty() {
+        return Some(format!("the remote has commits by {}", others.into_iter().collect::<Vec<_>>().join(", ")));
+    }
+    None
+}
+
+/// Fetches the branch a push was turned down by, and tells what it has.
+pub fn diverged(root: &Path) -> Result<Diverged, String> {
+    let target = push_target(root).ok_or("not on a branch")?;
+    let _ = fetch_quietly(root, &["fetch", "--quiet", "--no-auto-maintenance", &target.remote, &target.branch]);
+    let tracking = target.tracking();
+    let remote_hash = git(root, &["rev-parse", "--verify", "-q", &format!("refs/remotes/{tracking}")]).map(|h| h.trim().to_string()).filter(|h| !h.is_empty()).ok_or_else(|| format!("{tracking} could not be read"))?;
+    let log = git(root, &["log", "--format=%h %s%x1f%an%x1f%ae", &format!("HEAD..{remote_hash}")]).unwrap_or_default();
+    let mut theirs = Vec::new();
+    let mut authors = Vec::new();
+    for line in log.lines() {
+        let mut parts = line.split('\x1f');
+        let (what, name, email) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default(), parts.next().unwrap_or_default());
+        theirs.push(format!("{what} ({name})"));
+        authors.push((name.to_string(), email.to_string()));
+    }
+    let me = git(root, &["config", "user.email"]).map(|m| m.trim().to_string());
+    let keep = keep_reason(&target.branch, remote_default(root).as_deref(), &authors, me.as_deref());
+    Ok(Diverged { target, remote_hash, theirs, keep })
+}
+
+/// Pushes; a push turned down for what the remote has comes back as what
+/// it has, to be pulled first or overwritten.
+pub fn push_or_tell(root: &Path, has_upstream: bool) -> Result<String, Result<Diverged, String>> {
+    match push(root, has_upstream) {
+        Ok(out) => Ok(out),
+        Err(error) if push_refused(&error) => Err(diverged(root).map_err(|why| format!("{}: {why}", first_line(&error)))),
+        Err(error) => Err(Err(error)),
+    }
+}
+
+fn first_line(text: &str) -> &str {
+    text.lines().find(|line| !line.trim().is_empty()).unwrap_or_default()
+}
+
+/// Brings in what the remote branch has (a rebase of the commits here onto
+/// it, as `git pull --rebase` does), then pushes. A conflict undoes the
+/// rebase: the branch is as it was, and the files that conflict are told.
+pub fn pull_and_push(root: &Path, has_upstream: bool) -> Result<String, RebaseError> {
+    let target = push_target(root).ok_or_else(|| RebaseError::Failed("not on a branch".into()))?;
+    run(root, "git", &["fetch", &target.remote, &target.branch]).map_err(|e| RebaseError::Failed(first_line(&e).to_string()))?;
+    let theirs = target.tracking();
+    if let Some(files) = merge_conflicts(root, None, &theirs).filter(|files| !files.is_empty()) {
+        return Err(RebaseError::Conflicts(files));
+    }
+    if let Err(e) = run(root, "git", &["rebase", "--autostash", &theirs]) {
+        let conflicts: Vec<String> = git(root, &["diff", "--name-only", "--diff-filter=U"]).unwrap_or_default().lines().map(str::to_string).collect();
+        let _ = run(root, "git", &["rebase", "--abort"]);
+        return Err(if conflicts.is_empty() { RebaseError::Failed(first_line(&e).to_string()) } else { RebaseError::Conflicts(conflicts) });
+    }
+    push(root, has_upstream).map_err(|e| RebaseError::Failed(first_line(&e).to_string()))?;
+    Ok(format!("Rebased onto {theirs} and pushed"))
+}
+
+/// Pushes over what the remote branch has, as long as it is still at the
+/// commit that was shown (`--force-with-lease` with it): never a bare
+/// `--force`.
+pub fn push_overwrite(root: &Path, diverged: &Diverged) -> Result<String, String> {
+    let Diverged { target, remote_hash, keep, .. } = diverged;
+    if let Some(why) = keep {
+        return Err(format!("not overwritten: {why}"));
+    }
+    let lease = format!("--force-with-lease=refs/heads/{}:{remote_hash}", target.branch);
+    let refspec = format!("HEAD:refs/heads/{}", target.branch);
+    run(root, "git", &["push", "--set-upstream", &lease, &target.remote, &refspec])?;
+    Ok(format!("Overwrote {}", target.tracking()))
 }
 
 /// Pushes, setting the upstream on the first push of a branch.
@@ -2888,5 +3041,140 @@ mod edge_tests {
         assert_eq!(out(&dir, &format!("git show {made}:f.txt")), "one\ntwo\n");
         assert!(out(&dir, "git stash list").is_empty() && out(&dir, "git status --short").contains("A  staged.txt"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod push_tests {
+    use super::{RebaseError, head_pushed, keep_reason, pull_and_push, push, push_or_tell, push_overwrite, push_refused, run};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn pushed_is_on_the_upstream_or_the_base() {
+        assert!(head_pushed(true, 0, true, 3), "in the upstream");
+        assert!(!head_pushed(true, 1, true, 0), "a commit not pushed");
+        assert!(!head_pushed(false, 0, true, 2), "never published");
+        assert!(head_pushed(false, 0, true, 0), "a new branch at its base: that commit is the base's");
+        assert!(!head_pushed(false, 0, false, 0), "no remote at all");
+    }
+
+    #[test]
+    fn refusals_told_from_other_failures() {
+        let behind = "To ../remote.git\n ! [rejected]        feature -> feature (non-fast-forward)\nerror: failed to push some refs to '../remote.git'\nhint: Updates were rejected because the tip of your current branch is behind";
+        let fetch_first = "To ../remote.git\n ! [rejected]        main -> main (fetch first)\nerror: failed to push some refs";
+        let stale = " ! [rejected]        feature -> feature (stale info)\nerror: failed to push some refs";
+        assert!(push_refused(behind) && push_refused(fetch_first) && push_refused(stale));
+        let hook = " ! [remote rejected] feature -> feature (pre-receive hook declined)\nerror: failed to push some refs";
+        let auth = "fatal: Authentication failed for 'https://example.com/repo.git/'";
+        let protected = " ! [remote rejected] main -> main (protected branch hook declined)";
+        assert!(!push_refused(hook) && !push_refused(auth) && !push_refused(protected));
+    }
+
+    #[test]
+    fn what_is_not_overwritten() {
+        let mine = [("Me".to_string(), "me@example.com".to_string())];
+        let theirs = [("Me".to_string(), "ME@example.com".to_string()), ("Other".to_string(), "other@example.com".to_string())];
+        assert!(keep_reason("main", Some("develop"), &mine, Some("me@example.com")).is_some());
+        assert!(keep_reason("develop", Some("develop"), &mine, Some("me@example.com")).is_some());
+        assert_eq!(keep_reason("feature", Some("main"), &mine, Some("me@example.com")), None);
+        assert_eq!(keep_reason("feature", Some("main"), &theirs, Some("me@example.com")).as_deref(), Some("the remote has commits by Other"));
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        run(dir, "git", args).unwrap_or_else(|e| panic!("git {args:?}: {e}"))
+    }
+
+    fn commit(dir: &Path, file: &str, text: &str, who: &str) {
+        std::fs::write(dir.join(file), text).unwrap();
+        git(dir, &["add", file]);
+        git(dir, &["-c", &format!("user.name={who}"), "-c", &format!("user.email={who}@example.com"), "commit", "-qm", &format!("{file} by {who}")]);
+    }
+
+    /// A remote, a clone of it here and one elsewhere, both on `feature`.
+    fn two_clones(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let top = std::env::temp_dir().join(format!("ideae-push-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&top);
+        std::fs::create_dir_all(&top).unwrap();
+        let (here, there) = (top.join("here"), top.join("there"));
+        git(&top, &["init", "-q", "--bare", "-b", "main", "remote.git"]);
+        git(&top, &["clone", "-q", "remote.git", "here"]);
+        git(&here, &["config", "user.email", "me@example.com"]);
+        git(&here, &["config", "user.name", "me"]);
+        git(&here, &["config", "core.autocrlf", "false"]);
+        git(&here, &["checkout", "-qb", "main"]);
+        commit(&here, "a.txt", "one\n", "me");
+        git(&here, &["push", "-q", "-u", "origin", "main"]);
+        git(&here, &["checkout", "-qb", "feature"]);
+        commit(&here, "b.txt", "mine\n", "me");
+        git(&here, &["push", "-q", "-u", "origin", "feature"]);
+        git(&top, &["clone", "-q", "-b", "feature", "remote.git", "there"]);
+        git(&there, &["config", "core.autocrlf", "false"]);
+        (top, here, there)
+    }
+
+    #[test]
+    fn a_refused_push_is_pulled_and_pushed() {
+        let (top, here, there) = two_clones("pull");
+        commit(&there, "c.txt", "theirs\n", "other");
+        git(&there, &["push", "-q"]);
+        commit(&here, "d.txt", "more\n", "me");
+        let Err(Ok(told)) = push_or_tell(&here, true) else { panic!("not told as diverged") };
+        assert_eq!(told.target.tracking(), "origin/feature");
+        assert_eq!(told.theirs.len(), 1);
+        assert_eq!(told.keep.as_deref(), Some("the remote has commits by other"));
+        assert!(push_overwrite(&here, &told).is_err(), "others' commits are not overwritten");
+        pull_and_push(&here, true).unwrap();
+        assert_eq!(git(&here, &["rev-parse", "HEAD"]), git(&here, &["rev-parse", "origin/feature"]));
+        assert!(here.join("c.txt").exists());
+        std::fs::remove_dir_all(&top).unwrap();
+    }
+
+    #[test]
+    fn a_conflict_leaves_the_branch_as_it_was() {
+        let (top, here, there) = two_clones("conflict");
+        commit(&there, "b.txt", "theirs\n", "me");
+        git(&there, &["push", "-q"]);
+        commit(&here, "b.txt", "mine again\n", "me");
+        let before = git(&here, &["rev-parse", "HEAD"]);
+        assert!(push(&here, true).is_err());
+        match pull_and_push(&here, true) {
+            Err(RebaseError::Conflicts(files)) => assert_eq!(files, ["b.txt"]),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(git(&here, &["rev-parse", "HEAD"]), before);
+        assert!(!here.join(".git/rebase-merge").exists() && !here.join(".git/rebase-apply").exists());
+        std::fs::remove_dir_all(&top).unwrap();
+    }
+
+    #[test]
+    fn a_rebased_branch_of_ones_own_is_overwritten_with_a_lease() {
+        let (top, here, there) = two_clones("overwrite");
+        // Pushed from elsewhere by the same person, then this branch rewritten.
+        commit(&there, "c.txt", "old try\n", "me");
+        git(&there, &["push", "-q"]);
+        git(&here, &["commit", "-q", "--amend", "-m", "b.txt, reworded"]);
+        let Err(Ok(told)) = push_or_tell(&here, true) else { panic!("not told as diverged") };
+        assert_eq!(told.keep, None);
+        // The remote moves after it was shown: the lease keeps it.
+        commit(&there, "e.txt", "later\n", "me");
+        git(&there, &["push", "-q"]);
+        assert!(push_overwrite(&here, &told).is_err(), "moved since it was shown");
+        let Err(Ok(told)) = push_or_tell(&here, true) else { panic!("not told as diverged") };
+        push_overwrite(&here, &told).unwrap();
+        assert_eq!(git(&here, &["rev-parse", "HEAD"]), git(&top.join("remote.git"), &["rev-parse", "feature"]));
+        std::fs::remove_dir_all(&top).unwrap();
+    }
+
+    #[test]
+    fn the_main_branch_is_not_overwritten() {
+        let (top, here, there) = two_clones("main");
+        git(&there, &["checkout", "-q", "main"]);
+        commit(&there, "c.txt", "theirs\n", "me");
+        git(&there, &["push", "-q"]);
+        git(&here, &["checkout", "-q", "main"]);
+        commit(&here, "d.txt", "mine\n", "me");
+        let Err(Ok(told)) = push_or_tell(&here, true) else { panic!("not told as diverged") };
+        assert!(told.keep.as_deref().is_some_and(|why| why.contains("main branch")));
+        std::fs::remove_dir_all(&top).unwrap();
     }
 }

@@ -34,6 +34,7 @@ mod sidebar;
 mod sysmon;
 mod state;
 mod task;
+mod trash;
 mod theme;
 mod update;
 mod usage;

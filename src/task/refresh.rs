@@ -182,6 +182,10 @@ impl TaskView {
             }
         }
         self.branch_info = info;
+        // Pushed meanwhile: what is pushed is not amended.
+        if !self.can_amend() {
+            self.amend = None;
+        }
         cx.emit(TaskEvent::Changed);
         cx.notify();
     }

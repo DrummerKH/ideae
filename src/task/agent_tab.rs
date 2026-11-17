@@ -21,7 +21,7 @@ impl TaskView {
         if TermView::gone(state.read(cx)) {
             TermView::end(&view, cx);
             let env = crate::services::task_env(&self.services, self.port_slot);
-            let tab = Self::make_terminal(&self.root, self.hook_socket.as_ref(), "agent", 0, Some(command), env, None, window, cx);
+            let tab = Self::make_terminal(&self.root, self.hook_socket.as_ref(), "agent", 0, Some(command), env, None, None, window, cx);
             (self.tabs[ix].kind, self.tabs[ix].shown) = (tab.kind, tab.shown);
         } else {
             let enter = if cfg!(windows) { "\r" } else { "\n" };

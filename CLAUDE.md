@@ -45,6 +45,7 @@ src/stalls.rs      debug aid: tells when the UI thread was held (debug builds, `
 src/git.rs         git CLI wrappers, worktrees
 src/lsp.rs         language server client
 src/lsp_install.rs language servers installed on request, ~/.local/share/ideae/lsp
+src/trash.rs       files to the system's trash and back (Undo of Delete in the Files panel)
 src/procs.rs       starting helper programs (no console on Windows), ending child sessions on quit
 src/daemon/        terminals in a daemon (`ideae --daemon`, unix): they outlive the window (×, Restart); Exit/Ctrl+Q ends them;
                    a window of another build makes the daemon hand its ptys to a new one (SCM_RIGHTS), agents keep running

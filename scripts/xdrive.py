@@ -37,7 +37,7 @@ for step in sys.argv[1:]:
             xt.XTestFakeKeyEvent(dp, kc, True, ctypes.c_ulong(0)); x11.XFlush(dp); time.sleep(0.02)
             xt.XTestFakeKeyEvent(dp, kc, False, ctypes.c_ulong(0)); x11.XFlush(dp); time.sleep(0.02)
     elif op == "key":
-        sym = {"escape": 0xff1b, "tab": 0xff09, "backspace": 0xff08, "f12": 0xffc9, "pageup": 0xff55, "pagedown": 0xff56, "down": 0xff54, "up": 0xff52, "right": 0xff53, "left": 0xff51, "return": 0xff0d}[arg]
+        sym = {"escape": 0xff1b, "f2": 0xffbf, "tab": 0xff09, "backspace": 0xff08, "f12": 0xffc9, "pageup": 0xff55, "pagedown": 0xff56, "down": 0xff54, "up": 0xff52, "right": 0xff53, "left": 0xff51, "return": 0xff0d}[arg]
         kc = x11.XKeysymToKeycode(dp, ctypes.c_ulong(sym))
         xt.XTestFakeKeyEvent(dp, kc, True, ctypes.c_ulong(0)); x11.XFlush(dp); time.sleep(0.02)
         xt.XTestFakeKeyEvent(dp, kc, False, ctypes.c_ulong(0))

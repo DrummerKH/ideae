@@ -27,6 +27,7 @@ impl TaskView {
         let staged = self.staged_paths().len();
         let b = &self.branch_info;
         let busy = self.busy.is_some();
+        let amend = self.amend.is_some();
         let (push_label, push_tip) = if !b.has_origin {
             ("Push".to_string(), "No remote named origin")
         } else if b.upstream.is_none() {
@@ -98,7 +99,8 @@ impl TaskView {
                     .gap_1()
                     .items_start()
                     .child(div().flex_1().min_w_0().child(gpui_kit::component::input::Textarea::new(&self.commit_input).small()))
-                    .child(
+                    // Under Write, where the buttons below have no room for it.
+                    .child(v_flex().flex_none().items_start().gap_1().child(
                         Button::new("suggest-message")
                             .small()
                             .ghost()
@@ -110,7 +112,20 @@ impl TaskView {
                                 "Have Claude write the commit message for all the changes, into the box"
                             })
                             .on_click(cx.listener(|this, _, window, cx| this.suggest_message(window, cx))),
-                    ),
+                    ).when(self.can_amend(), |column| {
+                        let view = cx.weak_entity();
+                        column.child(
+                            gpui_kit::component::checkbox::Checkbox::new("amend")
+                                .small()
+                                .label("Amend")
+                                .checked(amend)
+                                .disabled(busy)
+                                .tooltip("Fold this commit into the last one, which is not pushed yet")
+                                .on_click(move |_, window, cx| {
+                                    let _ = view.update(cx, |this, cx| this.toggle_amend(window, cx));
+                                }),
+                        )
+                    })),
             )
             .child(
                 h_flex()
@@ -119,8 +134,19 @@ impl TaskView {
                         Button::new("commit")
                             .small()
                             .outline()
-                            .disabled(busy || self.files.is_empty())
-                            .label(if staged > 0 { format!("Commit {staged}") } else { "Commit all".to_string() })
+                            .disabled(busy || (self.files.is_empty() && !amend))
+                            .label(match (amend, staged) {
+                                (true, _) => "Amend".to_string(),
+                                (false, 0) => "Commit all".to_string(),
+                                (false, staged) => format!("Commit {staged}"),
+                            })
+                            .when(amend, |button| {
+                                button.tooltip(if staged > 0 {
+                                    "Replace the last commit: its changes, the staged ones and the message in the box"
+                                } else {
+                                    "Replace the last commit: its changes, all the changes here and the message in the box"
+                                })
+                            })
                             .on_click(cx.listener(|this, _, window, cx| this.commit(window, cx))),
                     )
                     .child(
@@ -142,10 +168,7 @@ impl TaskView {
                             .disabled(busy || !can_push)
                             .label(push_label)
                             .tooltip(push_tip)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                let upstream = this.branch_info.upstream.is_some();
-                                this.run_action("Push", move |root| git::push(&root, upstream), false, window, cx)
-                            })),
+                            .on_click(cx.listener(|this, _, window, cx| this.push(window, cx))),
                     )
                     .child(
                         Button::new("pr")
@@ -689,6 +712,39 @@ impl TaskView {
         .detach();
     }
 
+    /// The last commit is here alone: amending it rewrites nothing anyone has.
+    pub(super) fn can_amend(&self) -> bool {
+        !self.branch_info.head_pushed && !self.branch_info.last_hash.is_empty()
+    }
+
+    /// Amend on puts the last commit's message in an empty box; off, takes
+    /// it out again if it is still as put.
+    pub(super) fn toggle_amend(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(filled) = self.amend.take() {
+            if !filled.is_empty() && self.commit_input.read(cx).value().trim() == filled.trim() {
+                self.commit_input.update(cx, |input, cx| input.set_value("", window, cx));
+            }
+            return cx.notify();
+        }
+        self.amend = Some(String::new());
+        cx.notify();
+        if !self.commit_input.read(cx).value().trim().is_empty() {
+            return;
+        }
+        let root = self.root.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let message = cx.background_spawn(async move { git::last_message(&root) }).await.unwrap_or_default();
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.amend.as_ref().is_some_and(String::is_empty) && this.commit_input.read(cx).value().trim().is_empty() {
+                    this.commit_input.update(cx, |input, cx| input.set_value(message.clone(), window, cx));
+                    this.amend = Some(message);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     pub(super) fn commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let message = self.commit_input.read(cx).value().trim().to_string();
         if message.is_empty() {
@@ -701,7 +757,129 @@ impl TaskView {
             cx.notify();
             return;
         }
-        self.run_action("Commit", move |root| git::commit(&root, &message), false, window, cx);
+        let amend = self.amend.is_some() && self.can_amend();
+        self.run_action(if amend { "Amend" } else { "Commit" }, move |root| git::commit(&root, &message, amend), false, window, cx);
+    }
+
+    /// Pushes; turned down for commits the remote has, asks whether to
+    /// pull them first or overwrite them.
+    pub(super) fn push(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy.is_some() {
+            return;
+        }
+        self.busy = Some("Push");
+        self.action = None;
+        self.discard_undo = None;
+        cx.notify();
+        let (root, upstream) = (self.root.clone(), self.branch_info.upstream.is_some());
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx.background_spawn(crate::procs::on_thread(move || git::push_or_tell(&root, upstream))).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.busy = None;
+                match result {
+                    Ok(out) => this.action = Some((true, out.lines().next().filter(|l| !l.is_empty()).unwrap_or("Push: done").to_string())),
+                    Err(Ok(diverged)) => {
+                        this.action = Some((false, format!("Push: {} has commits this branch has not", diverged.target.tracking())));
+                        this.diverged_dialog(diverged, window, cx);
+                    }
+                    Err(Err(error)) => this.action = Some((false, format!("Push: {error}"))),
+                }
+                let _ = this.refresh_tx.try_send(());
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// A push turned down: pull and push again, or, for a branch of one's
+    /// own, overwrite what the remote has.
+    fn diverged_dialog(&mut self, diverged: git::Diverged, window: &mut Window, cx: &mut Context<Self>) {
+        let this = cx.weak_entity();
+        let pull = {
+            let this = this.clone();
+            move |window: &mut Window, cx: &mut App| {
+                let _ = this.update(cx, |task, cx| {
+                    let upstream = task.branch_info.upstream.is_some();
+                    let asked = "Pull the remote branch into this one with a rebase (`git pull --rebase`), then push.".to_string();
+                    task.run_or_ask_agent("Pull and push", move |root| git::pull_and_push(&root, upstream), asked, window, cx)
+                });
+            }
+        };
+        let theirs = diverged.theirs.len();
+        let tracking = diverged.target.tracking();
+        let said = format!(
+            "{tracking} has {theirs} commit{} this branch has not: someone pushed to it, or this branch was rebased since it was pushed.",
+            if theirs == 1 { "" } else { "s" }
+        );
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let (pull, ok_pull, this, diverged) = (pull.clone(), pull.clone(), this.clone(), diverged.clone());
+            let muted = cx.theme().muted_foreground;
+            let listed: Vec<String> = diverged.theirs.iter().take(6).cloned().chain((diverged.theirs.len() > 6).then(|| format!("and {} more", diverged.theirs.len() - 6))).collect();
+            let keep = diverged.keep.clone();
+            let footer = h_flex()
+                .w_full()
+                .gap_2()
+                .justify_end()
+                .when(keep.is_none(), |row| {
+                    let (this, diverged) = (this.clone(), diverged.clone());
+                    row.child(Button::new("push-overwrite").small().ghost().label("Overwrite…").tooltip("Replace the remote branch with this one").on_click(move |_, window, cx| {
+                        window.close_dialog(cx);
+                        let diverged = diverged.clone();
+                        let _ = this.update(cx, |task, cx| task.overwrite_dialog(diverged, window, cx));
+                    }))
+                })
+                .child(Button::new("push-cancel").small().ghost().label("Cancel").on_click(|_, window, cx| window.close_dialog(cx)))
+                .child(Button::new("push-pull").small().primary().label("Pull and push").on_click(move |_, window, cx| {
+                    window.close_dialog(cx);
+                    pull(window, cx);
+                }));
+            dialog
+                .title("Push turned down")
+                .w(px(520.))
+                .content({
+                    let said = said.clone();
+                    move |content, _, _| {
+                        content
+                            .child(div().text_sm().child(said.clone()))
+                            .child(v_flex().pt_2().gap_0p5().text_xs().text_color(muted).children(listed.iter().map(|line| div().truncate().child(line.clone()))))
+                            .child(div().pt_2().text_xs().text_color(muted).child(match &keep {
+                                Some(why) => format!("Pull and push rebases this branch's commits onto them. It is not overwritten: {why}."),
+                                None => "Pull and push rebases this branch's commits onto them; a conflict stops it and changes nothing.".to_string(),
+                            }))
+                    }
+                })
+                .on_ok(move |_, window, cx| {
+                    ok_pull(window, cx);
+                    true
+                })
+                .footer(footer)
+        });
+    }
+
+    /// Asked once more, naming what goes.
+    fn overwrite_dialog(&mut self, diverged: git::Diverged, window: &mut Window, cx: &mut Context<Self>) {
+        let this = cx.weak_entity();
+        let tracking = diverged.target.tracking();
+        let theirs = diverged.theirs.len();
+        let listed = diverged.theirs.iter().take(6).cloned().collect::<Vec<_>>().join("\n");
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            let (this, diverged) = (this.clone(), diverged.clone());
+            dialog
+                .confirm()
+                .title(format!("Overwrite {tracking}?"))
+                .description(format!(
+                    "{} on {tracking} that {} not here will be lost:\n{listed}\n\nIf the remote branch moves again before this push, nothing is overwritten.",
+                    if theirs == 1 { "The commit".to_string() } else { format!("The {theirs} commits") },
+                    if theirs == 1 { "is" } else { "are" }
+                ))
+                .ok_text("Overwrite")
+                .ok_variant(gpui_kit::component::button::ButtonVariant::Danger)
+                .on_ok(move |_, window, cx| {
+                    let diverged = diverged.clone();
+                    let _ = this.update(cx, |task, cx| task.run_action("Overwrite", move |root| git::push_overwrite(&root, &diverged), false, window, cx));
+                    true
+                })
+        });
     }
 
     /// Runs a git/gh job off the UI thread, shows its outcome under the
@@ -844,8 +1022,9 @@ impl TaskView {
                         if open_url {
                             cx.open_url(&out);
                         }
-                        if label == "Commit" {
+                        if label == "Commit" || label == "Amend" {
                             this.commit_input.update(cx, |input, cx| input.set_value("", window, cx));
+                            this.amend = None;
                         }
                         let summary = out.lines().next().unwrap_or_default().to_string();
                         this.action = Some((true, if summary.is_empty() { format!("{label}: done") } else { summary }));

@@ -4,7 +4,7 @@
 #   scripts/drive.sh LOG STARTUP_SECS "steps..." -- [app args...]
 #
 # Steps (scripts/xdrive.py): move:X,Y click[:BUTTON] rclick press release wheel:up|down
-# down:ctrl up:ctrl type:text key:return wait:SECS shot:FILE.png
+# down:ctrl up:ctrl type:text key:return|f2|... wait:SECS shot:FILE.png
 #
 # The app gets no D-Bus session, so it cannot touch the real desktop (dash
 # favorites, notifications). Point IDEAE_STATE at a scratch file to keep the

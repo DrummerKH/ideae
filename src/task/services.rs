@@ -39,6 +39,7 @@ impl TaskView {
             Some(command),
             env,
             Some((name.to_string(), cwd)),
+            None,
             window,
             cx,
         );

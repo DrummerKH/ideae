@@ -376,6 +376,8 @@ pub struct TaskView {
     tree_gone: Rc<HashSet<String>>,
     /// Presenting with ignored files hidden: none in the tree.
     tree_hides_ignored: bool,
+    /// Folders made from the tree that git does not list yet, being empty.
+    made_folders: Rc<Vec<String>>,
     /// The files of the diff folded for being viewed, with the version of
     /// them that was; none for one unfolded when it changed after.
     folded_viewed: HashMap<String, Option<u64>>,
@@ -386,6 +388,9 @@ pub struct TaskView {
     pub lsp_asleep: bool,
     file_states: HashMap<String, git::FileState>,
     commit_input: Entity<gpui_kit::component::input::TextareaState>,
+    /// The next commit replaces the last one, which is not pushed; with the
+    /// message put in the box for it, if one was.
+    amend: Option<String>,
     /// The git/gh action running, and the outcome of the last one.
     busy: Option<&'static str>,
     /// The file the last Discard threw away, for Undo.
@@ -445,8 +450,8 @@ impl TaskView {
         // The agent's terminal, or a shell when there is no agent; more shells
         // are a "+" away.
         match &agent {
-            Some(agent) => tabs.push(Self::make_terminal(&root, hook_socket.as_ref(), "agent", 0, Some(agent.clone()), task_env.clone(), None, window, cx)),
-            None => tabs.push(Self::make_terminal(&root, hook_socket.as_ref(), "shell", 1, None, task_env.clone(), None, window, cx)),
+            Some(agent) => tabs.push(Self::make_terminal(&root, hook_socket.as_ref(), "agent", 0, Some(agent.clone()), task_env.clone(), None, None, window, cx)),
+            None => tabs.push(Self::make_terminal(&root, hook_socket.as_ref(), "shell", 1, None, task_env.clone(), None, None, window, cx)),
         }
         // Changes and History open on demand: the Log button, a changed file,
         // Ctrl+2/3.
@@ -661,11 +666,13 @@ impl TaskView {
             ignored_reading: HashSet::new(),
             tree_gone: Rc::default(),
             tree_hides_ignored: false,
+            made_folders: Rc::default(),
             folded_viewed: HashMap::new(),
             folded_changes: HashSet::new(),
             lsp_asleep: false,
             file_states: HashMap::new(),
             commit_input,
+            amend: None,
             busy: None,
             discard_undo: None,
             action: None,
@@ -698,6 +705,7 @@ impl TaskView {
         input: Option<String>,
         extra_env: Vec<(String, String)>,
         service: Option<(String, PathBuf)>,
+        cwd: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> TabItem {
@@ -716,7 +724,7 @@ impl TaskView {
         } else {
             "terminal"
         };
-        let cwd = service.as_ref().map_or_else(|| root.clone(), |(_, cwd)| cwd.clone());
+        let cwd = service.as_ref().map(|(_, cwd)| cwd.clone()).or(cwd).unwrap_or_else(|| root.clone());
         env.push((crate::agent::ROLE_ENV.into(), role.into()));
         // Enter is a carriage return; PowerShell's line editor takes a bare
         // newline for a line break inside the command and waits for more.
@@ -1136,6 +1144,14 @@ impl TaskView {
         self.activate(at, window, cx);
     }
 
+    /// A shell in `dir`, in a new tab shown in the pane worked in.
+    pub(super) fn new_terminal_in(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.terminal_seq += 1;
+        let at = self.terminal_tab_in(self.terminal_seq, Some(dir), window, cx);
+        self.tabs[at].right = self.focus_right && self.is_split();
+        self.activate(at, window, cx);
+    }
+
     /// Adds a shell tab after the last terminal and returns its index.
     fn new_terminal_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) -> usize {
         self.terminal_seq += 1;
@@ -1144,9 +1160,13 @@ impl TaskView {
 
     /// A shell tab numbered `seq`: a restored one gets its old session back.
     fn terminal_tab(&mut self, seq: usize, window: &mut Window, cx: &mut Context<Self>) -> usize {
+        self.terminal_tab_in(seq, None, window, cx)
+    }
+
+    fn terminal_tab_in(&mut self, seq: usize, cwd: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> usize {
         self.terminal_seq = self.terminal_seq.max(seq);
         let env = crate::services::task_env(&self.services, self.port_slot);
-        let tab = Self::make_terminal(&self.root, self.hook_socket.as_ref(), &format!("shell {seq}"), seq, None, env, None, window, cx);
+        let tab = Self::make_terminal(&self.root, self.hook_socket.as_ref(), &format!("shell {seq}"), seq, None, env, None, cwd, window, cx);
         // After the last terminal, so terminals stay together left of the views.
         let at = self.tabs.iter().rposition(|t| matches!(t.kind, TabKind::Terminal(_))).map_or(0, |ix| ix + 1);
         self.tabs.insert(at, tab);
