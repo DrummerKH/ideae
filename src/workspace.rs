@@ -1381,16 +1381,6 @@ impl Workspace {
     }
 
     /// Opens the project's own worktree as a task, adding it to the list.
-    /// A paused main thread out of the list; Open main thread brings it back.
-    pub fn remove_main(&mut self, path: &Path, cx: &mut Context<Self>) {
-        let Some((pi, ti)) = self.find(path) else { return };
-        if self.projects[pi].tasks[ti].main && self.projects[pi].tasks[ti].view.is_none() {
-            self.projects[pi].tasks.remove(ti);
-            self.save(cx);
-            cx.notify();
-        }
-    }
-
     pub fn open_main(&mut self, project: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(p) = self.projects.get_mut(project) else { return };
         if !p.tasks.iter().any(|t| t.main) {
@@ -1866,6 +1856,10 @@ impl Workspace {
                                 ..Default::default()
                             }),
                         }
+                    }
+                    // Every project has its main thread, paused until opened.
+                    if !p.tasks.iter().any(|t| t.main) {
+                        p.tasks.insert(0, TaskEntry { path: p.path.clone(), main: true, ..Default::default() });
                     }
                     if let Some(main) = p.tasks.iter_mut().find(|t| t.main) {
                         main.branch = worktrees[0].branch.clone();

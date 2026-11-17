@@ -810,7 +810,6 @@ impl Workspace {
             let (pa, pb, pc, pd) = (menu_path.clone(), menu_path.clone(), menu_path.clone(), menu_path.clone());
             let (e, f, pe, pf) = (this.clone(), this.clone(), menu_path.clone(), menu_path.clone());
             let (g, pg) = (this.clone(), menu_path.clone());
-            let (h, ph) = (this.clone(), menu_path.clone());
             let branch = branch.clone();
             // What it is called and how it is found; its variants; its end.
             menu.when(!main, |m| {
@@ -840,18 +839,12 @@ impl Workspace {
                     let _ = g.update(cx, |w, cx| w.continue_with_dialog(&pg, window, cx));
                 }))
             })
-            .when(running || ready, |m| m.separator())
+            .when(running || (!main && ready), |m| m.separator())
             // Pause stops what runs and keeps the task; Archive is the end
             // of one, which a restore takes up again.
             .when(running, |m| {
                 m.item(PopupMenuItem::new("Pause").on_click(move |_, window, cx| {
                     let _ = b.update(cx, |w, cx| w.close_task(&pb, window, cx));
-                }))
-            })
-            .when(main && !running, |m| {
-                let (h, ph) = (h.clone(), ph.clone());
-                m.item(PopupMenuItem::new("Remove from the list").on_click(move |_, _, cx| {
-                    let _ = h.update(cx, |w, cx| w.remove_main(&ph, cx));
                 }))
             })
             .when(!main && ready, |m| {
