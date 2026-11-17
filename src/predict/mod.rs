@@ -88,6 +88,17 @@ pub fn settings_changed(old: &crate::state::Settings, new: &crate::state::Settin
     }
 }
 
+/// Saving power: the model leaves the GPU and memory; it starts again at
+/// the first prediction asked after.
+pub fn power_saving(on: bool, cx: &mut App) {
+    if !on {
+        return;
+    }
+    init(cx);
+    cx.global_mut::<Ui>().asked = false;
+    server::stop();
+}
+
 pub fn quit() {
     server::quit();
 }
@@ -154,6 +165,9 @@ impl CompletionProvider for Provider {
             }
             Some(false) => return none(),
             Some(true) => {}
+        }
+        if crate::lsp::POWER_SAVING.load(Ordering::Relaxed) {
+            return none();
         }
         let Some((port, format, gpu)) = server::ready() else {
             init(cx);

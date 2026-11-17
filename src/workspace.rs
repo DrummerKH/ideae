@@ -2147,6 +2147,7 @@ impl Workspace {
         for view in self.views() {
             view.update(cx, |t, cx| t.set_language_servers(!on, cx));
         }
+        crate::predict::power_saving(on, cx);
         cx.notify();
     }
 
