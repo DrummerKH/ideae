@@ -74,7 +74,12 @@ pub mod variants;
 
 impl TaskEntry {
     pub fn label(&self) -> String {
-        if self.title.is_empty() { self.branch.clone() } else { self.title.clone() }
+        match (&self.title, self.side.as_ref().and_then(|s| s.about.as_ref())) {
+            (title, _) if !title.is_empty() => title.clone(),
+            // A subagent's branch is named after its id: what it was asked says more.
+            (_, Some(about)) => about.clone(),
+            _ => self.branch.clone(),
+        }
     }
 }
 
@@ -1774,7 +1779,8 @@ impl Workspace {
                                     let from = parent.as_ref().unwrap_or(&all[0]);
                                     let base = worktrees.iter().find(|o| &o.path == from).map(|o| o.branch.clone()).unwrap_or_default();
                                     let (ahead, dirty) = git::work_beyond(&w.path, &base);
-                                    Some((w.path.clone(), side::Side { parent, ahead, dirty }))
+                                    let about = side::about(&w.path, from);
+                                    Some((w.path.clone(), side::Side { parent, ahead, dirty, about }))
                                 })
                                 .collect();
                             (worktrees, sides, r)

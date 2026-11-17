@@ -2020,6 +2020,8 @@ pub struct BranchRow {
     pub changed: Vec<String>,
     /// That worktree is one an agent made for itself (a Claude Code subagent's).
     pub agent: bool,
+    /// What that agent was asked to do, when it can be told.
+    pub about: Option<String>,
 }
 
 pub fn branch_rows(root: &Path) -> Vec<BranchRow> {
@@ -2064,6 +2066,10 @@ pub fn branch_rows(root: &Path) -> Vec<BranchRow> {
                 ahead: ahead.get(full).copied(),
                 changed: held.as_deref().map(changed).unwrap_or_default(),
                 agent: held.as_deref().is_some_and(|path| crate::workspace::side::made_by_agent(path, &paths).is_some()),
+                about: held.as_deref().and_then(|path| {
+                    let from = crate::workspace::side::made_by_agent(path, &paths)?;
+                    crate::workspace::side::about(path, from.as_deref().or(paths.first().map(PathBuf::as_path))?)
+                }),
                 held,
                 when: parts.next()?.to_string(),
                 subject: parts.next().unwrap_or_default().to_string(),

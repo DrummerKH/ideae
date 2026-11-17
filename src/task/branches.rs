@@ -220,7 +220,9 @@ impl TaskView {
 /// agent works in it: then what it changes is told.
 fn branch_detail(row: &git::BranchRow, here: &str) -> String {
     let mut what = Vec::new();
-    if row.agent {
+    if let Some(about) = row.about.as_ref().filter(|_| row.agent) {
+        what.push(format!("subagent: {about}"));
+    } else if row.agent {
         what.push("subagent".to_string());
     } else if row.name == here {
         what.push("this task".into());

@@ -15,6 +15,8 @@ pub struct Side {
     pub ahead: u32,
     /// Changes not committed.
     pub dirty: bool,
+    /// What it was made for, as the agent that made it was asked.
+    pub about: Option<String>,
 }
 
 /// Whether `path`, a worktree of the repository whose worktrees are `all`
@@ -35,6 +37,32 @@ pub fn made_by_agent(path: &Path, all: &[PathBuf]) -> Option<Option<PathBuf>> {
     temporary(path).then_some(None)
 }
 
+/// What a Claude Code subagent's worktree (`.claude/worktrees/agent-<id>`)
+/// is for: the description it was started with, which Claude Code keeps
+/// next to the subagent's transcript, under the projects folder of the
+/// session that started it (`from`, the worktree that session ran in).
+pub fn about(path: &Path, from: &Path) -> Option<String> {
+    let id = path.file_name()?.to_str()?.strip_prefix("agent-")?;
+    let config = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude")))?;
+    let project = config.join("projects").join(project_dir(from));
+    let file = format!("agent-{id}.meta.json");
+    // A session folder each; the subagent's is in the one that started it.
+    let meta = std::fs::read_dir(&project).ok()?.flatten().map(|session| session.path().join("subagents").join(&file)).find(|meta| meta.is_file())?;
+    described(&std::fs::read_to_string(meta).ok()?)
+}
+
+/// Claude Code's folder name for a working directory: each character that
+/// is not a letter or a digit becomes a dash.
+fn project_dir(path: &Path) -> String {
+    path.to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
+}
+
+fn described(meta: &str) -> Option<String> {
+    let meta: serde_json::Value = serde_json::from_str(meta).ok()?;
+    let description = meta["description"].as_str().map(str::trim).filter(|d| !d.is_empty())?;
+    Some(description.chars().take(120).collect())
+}
+
 /// Under the system's temporary or cache folders, or Claude Code's own.
 fn temporary(path: &Path) -> bool {
     let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -51,7 +79,7 @@ fn temporary(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::made_by_agent;
+    use super::{described, made_by_agent, project_dir};
     use std::path::PathBuf;
 
     #[test]
@@ -67,5 +95,14 @@ mod tests {
         let in_tmp = [std::env::temp_dir().join("r"), std::env::temp_dir().join("r.worktrees/DEV-2_y")];
         assert_eq!(made_by_agent(&in_tmp[1], &in_tmp), None);
         assert_eq!(made_by_agent(&p("/elsewhere/.claude/worktrees/agent-3"), &all), Some(None));
+    }
+
+    #[test]
+    fn a_subagent_tells_what_it_is_for() {
+        assert_eq!(project_dir(std::path::Path::new("/w/my.repo_x")), "-w-my-repo-x");
+        let meta = r#"{"agentType":"general-purpose","worktreePath":"/w/repo/.claude/worktrees/agent-1","description":"Fix the login form","name":"login"}"#;
+        assert_eq!(described(meta).as_deref(), Some("Fix the login form"));
+        assert_eq!(described(r#"{"description":"  "}"#), None);
+        assert_eq!(described("not json"), None);
     }
 }
