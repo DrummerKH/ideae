@@ -7,7 +7,7 @@ use gpui_kit::component::{
     ActiveTheme as _, IndexPath, Selectable as _, Sizable as _, WindowExt as _,
     button::ButtonVariants as _,
     command::{Command, CommandGroup, CommandItem, CommandState},
-    h_flex, v_flex,
+    h_flex,
 };
 use gpui_kit::*;
 
@@ -76,6 +76,10 @@ pub struct Finder {
     mask: Option<Entity<gpui_kit::component::input::InputState>>,
     symbols: Option<SymbolSource>,
     picked: Option<(String, Picked)>,
+    /// Find in files: a search under way, and what the last one found, told
+    /// under the list.
+    searching: bool,
+    told: SharedString,
 }
 
 thread_local! {
@@ -187,6 +191,8 @@ impl Finder {
             mask: None,
             symbols,
             picked: None,
+            searching: false,
+            told: SharedString::default(),
         });
         if kind == FinderKind::Pick {
             let picked = PICK.with(|pick| pick.borrow_mut().take());
@@ -236,9 +242,18 @@ impl Finder {
                         FinderKind::Symbols => "Go to class, function, type…".to_string(),
                         FinderKind::Pick => pick_title,
                     })
-                    .min_h(px(420.))
+                    // The list's height follows what it holds, up to this.
                     .max_h(px(420.));
-                if kind == FinderKind::Places {
+                if kind == FinderKind::Grep {
+                    // A group a file: its path once, its lines under it.
+                    let mut rest = &hits[..];
+                    for &count in shown.iter() {
+                        let (these, after) = rest.split_at(count.min(rest.len()));
+                        rest = after;
+                        let Some(first) = these.first() else { continue };
+                        palette = palette.group(CommandGroup::new().label(first.path.clone()).items(these.iter().map(|hit| item(hit, kind))));
+                    }
+                } else if kind == FinderKind::Places {
                     let sections = finder.read(cx).sections.clone();
                     let mut rest = &hits[..];
                     for ((heading, all), &count) in sections.iter().zip(shown.iter()) {
@@ -258,14 +273,11 @@ impl Finder {
                 let query_owner = finder.clone();
                 let confirm_owner = finder.clone();
                 if kind == FinderKind::Grep {
-                    // A height, not just a minimum: with an empty list the
-                    // minimum let the options row hang below the dialog, where
-                    // a click went to the backdrop and closed it.
-                    palette = palette.h(px(488.));
                     let options = finder.clone();
                     palette = palette.footer(move |_, _, cx| {
                         let f = options.read(cx);
                         let (regex, mask) = (f.regex, f.mask.clone());
+                        let told = if f.searching { SharedString::from("Searching…") } else { f.told.clone() };
                         let toggle = options.clone();
                         h_flex()
                             .gap_2()
@@ -287,7 +299,7 @@ impl Finder {
                                     }),
                             )
                             .children(mask.map(|m| div().w(px(240.)).child(gpui_kit::component::input::Input::new(&m).small())))
-                            .child(div().flex_1())
+                            .child(div().flex_1().min_w_0().truncate().text_right().child(told))
                             .child(
                                 gpui_kit::component::button::Button::new("grep-regex")
                                     .xsmall()
@@ -366,9 +378,11 @@ impl Finder {
                 if query.len() < 2 {
                     // The search for what was typed before must not land after this.
                     self._search = Task::ready(());
+                    self.searching = false;
                     self.set_hits(Vec::new(), cx);
                     return;
                 }
+                self.searching = true;
                 let root = self.root.clone();
                 let regex = self.regex;
                 let mask = self.mask.as_ref().map(|m| m.read(cx).value().to_string()).unwrap_or_default();
@@ -386,6 +400,30 @@ impl Finder {
     }
 
     fn set_hits(&mut self, hits: Vec<Hit>, cx: &mut Context<Self>) {
+        if self.kind == FinderKind::Grep {
+            self.searching = false;
+            // The hits come sorted by path: a run of them is a file.
+            let mut shown: Vec<usize> = Vec::new();
+            for (ix, hit) in hits.iter().enumerate() {
+                match ix.checked_sub(1).map(|p| &hits[p]) {
+                    Some(prev) if prev.path == hit.path => *shown.last_mut().unwrap() += 1,
+                    _ => shown.push(1),
+                }
+            }
+            let matches: usize = hits.iter().map(|h| h.ranges.len().max(1)).sum();
+            let mut told = match (matches, shown.len()) {
+                // The list says so itself.
+                (0, _) => String::new(),
+                (1, _) => "1 match".to_string(),
+                (n, 1) => format!("{n} matches in 1 file"),
+                (n, f) => format!("{n} matches in {f} files"),
+            };
+            if hits.len() >= GREP_LIMIT {
+                told = format!("{told}, the first {GREP_LIMIT} lines");
+            }
+            self.told = told.into();
+            self.shown = Rc::new(shown);
+        }
         self.hits = Rc::new(hits);
         cx.notify();
         // The dialog content reads the hits when the window redraws.
@@ -394,7 +432,7 @@ impl Finder {
 
     fn confirm(&mut self, index: IndexPath, window: &mut Window, cx: &mut Context<Self>) {
         let row = match self.kind {
-            FinderKind::Places => self.shown.iter().take(index.section).sum::<usize>() + index.row,
+            FinderKind::Places | FinderKind::Grep => self.shown.iter().take(index.section).sum::<usize>() + index.row,
             _ => index.row,
         };
         let Some(hit) = self.hits.get(row).cloned() else { return };
@@ -461,13 +499,19 @@ fn item(hit: &Hit, kind: FinderKind) -> CommandItem {
             FinderKind::Files => h_flex()
                 .gap_2()
                 .min_w_0()
+                .child(crate::file_icons::icon(crate::file_icons::file(&name), cx))
                 .child(div().flex_none().child(name))
                 .child(div().truncate().text_xs().text_color(cx.theme().muted_foreground).child(dir))
                 .into_any_element(),
-            FinderKind::Grep | FinderKind::Places => v_flex()
+            // A line each: the code, and where it is (its file heads the group in Find in files).
+            FinderKind::Grep | FinderKind::Places => h_flex()
+                .gap_3()
                 .min_w_0()
+                .flex_1()
                 .child(
                     div()
+                        .flex_1()
+                        .min_w_0()
                         .truncate()
                         .font_family(cx.theme().mono_font_family.clone())
                         .text_sm()
@@ -475,10 +519,12 @@ fn item(hit: &Hit, kind: FinderKind) -> CommandItem {
                 )
                 .child(
                     div()
+                        .flex_shrink(1.)
+                        .max_w(px(260.))
                         .truncate()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
-                        .child(format!("{}:{}", hit.path, hit.line)),
+                        .child(if kind == FinderKind::Grep { format!(":{}", hit.line) } else { format!("{}:{}", hit.path, hit.line) }),
                 )
                 .into_any_element(),
         }

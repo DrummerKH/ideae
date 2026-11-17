@@ -3,7 +3,9 @@ use std::{path::PathBuf, rc::Rc};
 use gpui_kit::component::{
     ActiveTheme as _, Selectable as _, Sizable as _, StyledExt as _,
     button::{Button, ButtonVariants as _},
-    input::{Input, InputEvent, InputState},
+    checkbox::Checkbox,
+    input::{Input, InputEvent, InputState, MoveDown, MoveUp},
+    popover::Popover,
     diff::{Diff, DiffFile, DiffMode, DiffState},
     h_flex,
     list::ListItem,
@@ -43,6 +45,11 @@ struct Graph {
     /// Prefixes the remote has many branches under (`tenant/*`), not hidden:
     /// offered to hide.
     families: Vec<(String, usize)>,
+    /// The commits the typed words find, by their index in the list: found
+    /// among those read, as git's own search would break the lanes.
+    found: Option<Rc<Vec<usize>>>,
+    /// Which of them was gone to last.
+    at: usize,
 }
 
 /// Branches under one prefix that make it worth offering to hide them.
@@ -69,6 +76,8 @@ pub struct HistoryView {
     rev: String,
     typed: String,
     filter: Option<Entity<InputState>>,
+    /// Whether the field's hint is the graph's, which searches rather than narrows.
+    hint_graph: bool,
     _typing: Task<()>,
     _load: Task<()>,
     _show: Task<()>,
@@ -87,6 +96,9 @@ pub struct HistoryView {
     containing_open: bool,
     _containing: Task<()>,
 }
+
+/// What the field over the list takes, outside the graph.
+const HINT: &str = "words  @author  file:path";
 
 /// Lines of a long message shown before "Show all".
 const BODY_LINES: usize = 4;
@@ -115,6 +127,7 @@ impl HistoryView {
             rev: String::new(),
             typed: String::new(),
             filter: None,
+            hint_graph: false,
             _typing: Task::ready(()),
             _load: Task::ready(()),
             _show: Task::ready(()),
@@ -267,7 +280,7 @@ impl HistoryView {
             return Some(input.clone());
         }
         let shown = graph.filter.hide.join(", ");
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("hide branches: tenant/*, dependabot/*").default_value(shown));
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("tenant/*, dependabot/*").default_value(shown));
         cx.subscribe(&input, |this, input, event: &InputEvent, cx| {
             if !matches!(event, InputEvent::Change) {
                 return;
@@ -304,6 +317,9 @@ impl HistoryView {
         self.selected = None;
         if let Some(ix) = ix {
             self.select(ix, cx);
+        }
+        if self.graph.is_some() {
+            self.find_in_graph(cx);
         }
         cx.notify();
     }
@@ -421,8 +437,12 @@ impl HistoryView {
         if let Some(input) = &self.filter {
             return input.clone();
         }
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("words  @author  file:path"));
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder(HINT));
         cx.subscribe(&input, |this, input, event: &InputEvent, cx| {
+            if let InputEvent::PressEnter { shift, .. } = event {
+                this.step_found(if *shift { -1 } else { 1 }, cx);
+                return;
+            }
             if !matches!(event, InputEvent::Change) {
                 return;
             }
@@ -434,7 +454,15 @@ impl HistoryView {
                 cx.background_executor().timer(std::time::Duration::from_millis(250)).await;
                 let _ = this.update(cx, |this, cx| {
                     this.typed = typed;
-                    this.stale = true;
+                    // The graph's lanes are laid out for every commit: it is searched, not narrowed.
+                    if this.graph.is_some() {
+                        this.find_in_graph(cx);
+                        if let Some(&first) = this.graph.as_ref().and_then(|g| g.found.as_ref()).and_then(|f| f.first()) {
+                            this.jump_to(first, cx);
+                        }
+                    } else {
+                        this.stale = true;
+                    }
                     cx.notify();
                 });
             });
@@ -444,11 +472,52 @@ impl HistoryView {
         input
     }
 
+    /// The commits of the graph the typed words and `@author` find, in its
+    /// subject, branches and tags, or as the start of its hash.
+    fn find_in_graph(&mut self, cx: &mut Context<Self>) {
+        let Some(graph) = self.graph.as_mut() else { return };
+        let query = git::HistoryQuery::typed("", &self.typed);
+        if query.text.is_empty() && query.author.is_empty() {
+            graph.found = None;
+            cx.notify();
+            return;
+        }
+        let words: Vec<String> = query.text.to_lowercase().split_whitespace().map(str::to_string).collect();
+        let author = query.author.to_lowercase();
+        let found: Vec<usize> = self
+            .commits
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                if !author.is_empty() && !c.author.to_lowercase().contains(&author) {
+                    return false;
+                }
+                let (subject, refs) = (c.subject.to_lowercase(), c.refs.to_lowercase());
+                words.iter().all(|w| subject.contains(w.as_str()) || refs.contains(w.as_str()) || c.hash.starts_with(w.as_str()))
+            })
+            .map(|(ix, _)| ix)
+            .collect();
+        graph.at = self.selected.and_then(|s| found.iter().position(|&ix| ix == s)).unwrap_or(0);
+        graph.found = Some(Rc::new(found));
+        cx.notify();
+    }
+
+    /// The next or previous commit found in the graph, round the ends.
+    fn step_found(&mut self, by: isize, cx: &mut Context<Self>) {
+        let Some(graph) = self.graph.as_mut() else { return };
+        let Some(found) = graph.found.clone().filter(|f| !f.is_empty()) else { return };
+        let len = found.len() as isize;
+        graph.at = (graph.at as isize + by).rem_euclid(len) as usize;
+        let to = found[graph.at];
+        self.jump_to(to, cx);
+    }
+
     fn render_list(&self, filter: Entity<InputState>, hide: Option<Entity<InputState>>, cx: &mut Context<Self>) -> impl IntoElement {
         let commits = self.commits.clone();
         let selected = self.selected;
         let owner = cx.weak_entity();
         let graph = self.graph.as_ref().map(|g| (g.rows.clone(), g.lanes, g.filter.own_only));
+        let found = self.graph.as_ref().and_then(|g| g.found.clone());
         let palette = palette(cx);
         v_flex()
             .map(|list| match graph {
@@ -483,19 +552,35 @@ impl HistoryView {
                             )
                             .map(|row| match (&graph, hide) {
                                 (Some((_, _, own_only)), Some(hide)) => {
-                                    let own_only = *own_only;
-                                    row.child(div().flex_1().min_w_0().child(Input::new(&hide).xsmall())).child(
-                                        Button::new("graph-own")
-                                            .xsmall()
-                                            .ghost()
-                                            .label("with own commits")
-                                            .selected(own_only)
-                                            .tooltip("Only branches with commits of their own, not merges alone (a bot merging production into them)")
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                let Some(hide) = this.graph.as_ref().map(|g| g.filter.hide.clone()) else { return };
-                                                this.set_graph_filter(git::GraphFilter { hide, own_only: !own_only }, cx);
-                                            })),
+                                    let found = self.graph.as_ref().and_then(|g| g.found.clone().map(|f| (g.at, f)));
+                                    row.child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            // Up and down in the field go from one commit found to the next.
+                                            .capture_action(cx.listener(|this, _: &MoveUp, _, cx| {
+                                                cx.stop_propagation();
+                                                this.step_found(-1, cx);
+                                            }))
+                                            .capture_action(cx.listener(|this, _: &MoveDown, _, cx| {
+                                                cx.stop_propagation();
+                                                this.step_found(1, cx);
+                                            }))
+                                            .child(Input::new(&filter).xsmall()),
                                     )
+                                    .when_some(found, |row, (at, found)| {
+                                        let told = match found.len() {
+                                            0 => "no matches".to_string(),
+                                            n if found.get(at).is_some_and(|&ix| selected == Some(ix)) => format!("{} of {n}", at + 1),
+                                            1 => "1 match".to_string(),
+                                            n => format!("{n} matches"),
+                                        };
+                                        row.child(div().flex_none().px_1().child(told)).when(found.len() > 1, |row| {
+                                            row.child(Button::new("found-previous").xsmall().ghost().label("↑").tooltip("The previous one found (Shift+Enter, Up)").on_click(cx.listener(|this, _, _, cx| this.step_found(-1, cx))))
+                                                .child(Button::new("found-next").xsmall().ghost().label("↓").tooltip("The next one found (Enter, Down)").on_click(cx.listener(|this, _, _, cx| this.step_found(1, cx))))
+                                        })
+                                    })
+                                    .child(self.graph_options(hide, *own_only, cx))
                                 }
                                 _ => row
                                     .child(
@@ -514,7 +599,7 @@ impl HistoryView {
                             .gap_2()
                             .pb_1()
                             .child(format!("{count} branches under {}", prefix.trim_end_matches('*')))
-                            .child(Button::new("hide-family").xsmall().ghost().label("Hide").tooltip("Leave them out of the graph; the pattern goes in the field above").on_click(cx.listener(
+                            .child(Button::new("hide-family").xsmall().ghost().label("Hide").tooltip("Leave them out of the graph; the pattern goes into Filter ▾").on_click(cx.listener(
                                 move |this, _, window, cx| this.hide_family(prefix.clone(), window, cx),
                             )))
                     }))
@@ -559,7 +644,8 @@ impl HistoryView {
                                             let rows_away = to.abs_diff(*i);
                                             Some((to + offset, SharedString::from(format!("Goes on {rows_away} rows {way}, to {} {}. Click to go there.", target.short, target.subject))))
                                         });
-                                        return graph_row(ix, commit, row, *lanes, palette, selected == Some(ix), jump, owner, cx);
+                                        let dim = found.as_ref().is_some_and(|f| f.binary_search(&ix).is_err());
+                                        return graph_row(ix, commit, row, *lanes, palette, selected == Some(ix), dim, jump, owner, cx);
                                     }
                                     ListItem::new(ix)
                                         .selected(selected == Some(ix))
@@ -576,19 +662,9 @@ impl HistoryView {
                                                         .gap_1p5()
                                                         .min_w_0()
                                                         // A merge has seldom anything to read: dimmer.
-                                                        .child(div().text_sm().min_w_0().truncate().when(commit.merge, |s| s.text_color(cx.theme().muted_foreground)).child(commit.subject.clone()))
-                                                        // The branches and tags at this commit.
-                                                        .children(commit.refs.split(", ").filter(|name| !name.is_empty()).take(3).map(|name| {
-                                                            let tag = name.starts_with("tag: ");
-                                                            div()
-                                                                .flex_none()
-                                                                .px_1()
-                                                                .rounded_sm()
-                                                                .text_xs()
-                                                                .bg(cx.theme().accent)
-                                                                .text_color(if tag { gpui_kit::yellow() } else { cx.theme().primary })
-                                                                .child(name.trim_start_matches("tag: ").to_string())
-                                                        })),
+                                                        .child(div().flex_1().text_sm().min_w_0().truncate().when(commit.merge, |s| s.text_color(cx.theme().muted_foreground)).child(commit.subject.clone()))
+                                                        // The branches and tags at this commit, after its subject: one, and how many more.
+                                                        .children(ref_badges(ix, commit, cx)),
                                                 )
                                                 .child(
                                                     h_flex()
@@ -620,6 +696,41 @@ impl HistoryView {
 }
 
 impl HistoryView {
+    /// "Filter ▾" beside the graph's search: which branches it leaves out.
+    fn graph_options(&self, hide: Entity<InputState>, own_only: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let hidden = self.graph.as_ref().map_or(0, |g| g.filter.hide.len());
+        let owner = cx.weak_entity();
+        let label = match (hidden, own_only) {
+            (0, false) => "Filter ▾".to_string(),
+            (n, own) => format!("Filter · {} ▾", n + own as usize),
+        };
+        Popover::new("graph-options")
+            .anchor(Anchor::TopRight)
+            .trigger(Button::new("graph-options-button").xsmall().ghost().label(label).selected(hidden > 0 || own_only).tooltip("Which branches the graph leaves out"))
+            .content(move |_, _, cx| {
+                let own_only = owner.upgrade().and_then(|h| h.read(cx).graph.as_ref().map(|g| g.filter.own_only)).unwrap_or(false);
+                let owner = owner.clone();
+                v_flex()
+                    .w(px(340.))
+                    .gap_2()
+                    .text_xs()
+                    .child(div().text_color(cx.theme().muted_foreground).child("Hide branches, by pattern"))
+                    .child(Input::new(&hide).xsmall())
+                    .child(
+                        Checkbox::new("graph-own")
+                            .label("Only branches with commits of their own")
+                            .checked(own_only)
+                            .tooltip("Leaves out branches that only merge others in (a bot merging production into them)")
+                            .on_click(move |&on, _, cx| {
+                                let _ = owner.update(cx, |this, cx| {
+                                    let Some(hide) = this.graph.as_ref().map(|g| g.filter.hide.clone()) else { return };
+                                    this.set_graph_filter(git::GraphFilter { hide, own_only: on }, cx);
+                                });
+                            }),
+                    )
+            })
+    }
+
     /// The message past its subject: the first lines, and all of them on
     /// asking, scrolled within a part of the height.
     /// "In main, origin/main", or the first few of many and the rest on a click.
@@ -697,6 +808,11 @@ impl Render for HistoryView {
             self.load(cx);
         }
         let filter = self.filter_input(window, cx);
+        if self.hint_graph != self.graph.is_some() {
+            self.hint_graph = self.graph.is_some();
+            let hint = if self.hint_graph { "find: words  @author  hash" } else { HINT };
+            filter.update(cx, |input, cx| input.set_placeholder(hint, window, cx));
+        }
         let hide = self.hide_input(window, cx);
         if self.graph.is_some() {
             self.check_refs(cx);
@@ -723,18 +839,13 @@ impl Render for HistoryView {
                                 .child(div().font_semibold().child(c.subject.clone()))
                                 .children(self.render_body(&c.hash, window, cx))
                                 .children(self.render_containing(&c.hash, cx))
+                                .child(div().min_w_0().truncate().text_xs().text_color(cx.theme().muted_foreground).child(format!("{} · {} · {}", c.short, c.author, c.date)))
+                                // A narrow pane puts the buttons on more lines rather than cut their labels.
                                 .child(
                                     h_flex()
-                                        .gap_2()
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .truncate()
-                                                .text_xs()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(format!("{} · {} · {}", c.short, c.author, c.date)),
-                                        )
+                                        .flex_wrap()
+                                        .gap_x_1()
+                                        .ml(px(-6.))
                                         .children([("commit-pick", "Cherry-pick", "Take this commit into the task's branch", 0), ("commit-revert", "Revert", "Commit the opposite of this commit", 1), ("commit-task", "New task from here", "A task in a worktree of its own, starting at this commit", 2)].map(
                                             |(id, label, tip, what)| {
                                                 let (task, hash) = (self.task.clone(), c.hash.clone());
@@ -807,18 +918,21 @@ fn graph_row(
     lanes: usize,
     palette: [Hsla; 9],
     selected: bool,
+    // Not among those searched for: faint, the lanes as they are.
+    dim: bool,
     jump: Option<(usize, SharedString)>,
     owner: WeakEntity<HistoryView>,
     cx: &App,
 ) -> AnyElement {
     // A merge has seldom anything to read: its whole row is dimmer.
     let muted = cx.theme().muted_foreground;
-    let text = if commit.merge { muted } else { cx.theme().foreground };
+    let text = match (dim, commit.merge) {
+        (true, _) => muted.opacity(0.5),
+        (false, true) => muted,
+        (false, false) => cx.theme().foreground,
+    };
     let color = row.as_ref().map_or(palette[8], |(rows, i)| lane_color(&palette, rows[*i].at, rows[*i].color));
-    // One's own branches first: shorter, and the ones looked for.
-    let refs: Vec<&str> = commit.refs.split(", ").filter(|name| !name.is_empty()).collect();
-    let first = refs.iter().find(|r| !r.contains('/') && !r.starts_with("tag: ")).or(refs.first()).map(|r| r.to_string());
-    let more = refs.len().saturating_sub(1);
+    let (first, more) = first_ref(&commit.refs).map_or((None, 0), |(name, more)| (Some(name.to_string()), more));
     ListItem::new(ix)
         .selected(selected)
         .h(GRAPH_ROW)
@@ -836,7 +950,7 @@ fn graph_row(
                     h_flex()
                         .id(("graph-refs", ix))
                         .when(more > 0, |refs| {
-                            let all: SharedString = commit.refs.split(", ").map(|r| r.trim_start_matches("tag: ").to_string()).collect::<Vec<_>>().join("\n").into();
+                            let all = all_refs(&commit.refs);
                             refs.tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(all.clone()).build(window, cx))
                         })
                         .w(px(130.))
@@ -889,6 +1003,48 @@ fn graph_row(
             let _ = owner.update(cx, |this, cx| this.select(ix, cx));
         })
         .into_any_element()
+}
+
+/// The branch or tag a row shows of those at a commit: one's own branches
+/// first, as shorter and the ones looked for. With how many more there are.
+fn first_ref(refs: &str) -> Option<(&str, usize)> {
+    let all: Vec<&str> = refs.split(", ").filter(|name| !name.is_empty()).collect();
+    let first = all.iter().find(|r| !r.contains('/') && !r.starts_with("tag: ")).or(all.first())?;
+    Some((first, all.len() - 1))
+}
+
+/// Every branch and tag at a commit, a line each: the tooltip of its "+N".
+fn all_refs(refs: &str) -> SharedString {
+    refs.split(", ").map(|r| r.trim_start_matches("tag: ")).collect::<Vec<_>>().join("\n").into()
+}
+
+/// The list's badge for the branches and tags at a commit: the first, cut
+/// short when long, "+N" for the rest, and all of them on hover.
+fn ref_badges(ix: usize, commit: &git::Commit, cx: &App) -> Option<AnyElement> {
+    let (name, more) = first_ref(&commit.refs)?;
+    let tag = name.starts_with("tag: ");
+    let all = all_refs(&commit.refs);
+    Some(
+        h_flex()
+            .id(("history-refs", ix))
+            .flex_none()
+            .max_w(px(150.))
+            .gap_1()
+            .text_xs()
+            .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(all.clone()).build(window, cx))
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .px_1()
+                    .rounded_sm()
+                    .bg(cx.theme().accent)
+                    .text_color(if tag { gpui_kit::yellow() } else { cx.theme().primary })
+                    .child(name.trim_start_matches("tag: ").to_string()),
+            )
+            .when(more > 0, |refs| refs.child(div().flex_none().text_color(cx.theme().muted_foreground).child(format!("+{more}"))))
+            .into_any_element(),
+    )
 }
 
 fn lane_color(palette: &[Hsla; 9], lane: usize, color: usize) -> Hsla {

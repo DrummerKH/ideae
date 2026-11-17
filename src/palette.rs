@@ -118,7 +118,7 @@ fn open(placeholder: &str, entries: Vec<Entry>, recent: Option<(Recent, Run)>, w
                 .bordered(false)
                 .filterable(false)
                 .placeholder(placeholder.clone())
-                .min_h(px(360.))
+                // The list's height follows what it holds, up to this.
                 .max_h(px(360.))
                 .items(items);
             if let Some(tab_shown) = tab_shown {
