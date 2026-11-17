@@ -532,8 +532,8 @@ impl TextWrapper {
 
     /// ideae patch: replaces the inlays of `key` in `range` (or all of
     /// them) and wraps again the lines whose inlays changed. Inlays off the
-    /// text, inside a character or without text are dropped. Returns
-    /// whether anything changed.
+    /// text, inside a character, without text or of more than one line are
+    /// dropped. Returns whether anything changed.
     pub(crate) fn set_inlays(
         &mut self,
         key: &gpui::SharedString,
@@ -546,6 +546,7 @@ impl TextWrapper {
             inlay.offset <= len
                 && self.text.clip_offset(inlay.offset, Bias::Left) == inlay.offset
                 && !inlay.text.is_empty()
+                && !inlay.text.contains(['\n', '\r'])
         });
         let changed = self.inlays.set(key, range, inlays);
         if changed.is_empty() {
