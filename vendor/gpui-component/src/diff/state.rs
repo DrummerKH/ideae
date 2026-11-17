@@ -223,6 +223,9 @@ pub struct DiffState {
     selection: TextSelectionHandle,
     geometry: Rc<RefCell<SelectionGeometry>>,
     selected_lines: Option<DiffLineRange>,
+    /// ideae patch: the change a review by keys is at, marked apart from
+    /// the selection.
+    current_lines: Option<DiffLineRange>,
     selection_anchor: Option<DiffLinePosition>,
     selection_cursor: Option<DiffLinePosition>,
     selecting: bool,
@@ -357,6 +360,7 @@ impl DiffState {
             selection,
             geometry,
             selected_lines: None,
+            current_lines: None,
             selection_anchor: None,
             selection_cursor: None,
             selecting: false,
@@ -558,6 +562,17 @@ impl DiffState {
     }
     pub fn selected_lines(&self) -> Option<DiffLineRange> {
         self.selected_lines.clone()
+    }
+    /// ideae patch: the lines marked as the change at hand: a bar beside
+    /// them, the selection left as it is.
+    pub fn set_current_lines(&mut self, range: Option<DiffLineRange>, cx: &mut Context<Self>) {
+        if self.current_lines != range {
+            self.current_lines = range;
+            cx.notify();
+        }
+    }
+    pub fn current_lines(&self) -> Option<DiffLineRange> {
+        self.current_lines.clone()
     }
     /// Whether the file at `path` shows only its header.
     pub fn is_file_collapsed(&self, path: &str) -> bool {
@@ -1134,7 +1149,14 @@ impl DiffState {
 
     /// The selected lines, resolved for membership tests.
     pub(crate) fn selected_span(&self) -> Option<SelectedLines> {
-        let range = self.selected_lines.as_ref()?;
+        self.span_of(self.selected_lines.as_ref()?)
+    }
+
+    pub(crate) fn current_span(&self) -> Option<SelectedLines> {
+        self.span_of(self.current_lines.as_ref()?)
+    }
+
+    fn span_of(&self, range: &DiffLineRange) -> Option<SelectedLines> {
         let file = self.file_ix(range.path())?;
         if range.is_single_side() {
             let (start, end) = (

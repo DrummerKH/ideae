@@ -286,13 +286,16 @@ impl ChangesView {
         });
     }
 
-    pub(super) fn set_hunks(&mut self, hunks: Rc<Vec<git::Hunk>>) {
+    pub(super) fn set_hunks(&mut self, hunks: Rc<Vec<git::Hunk>>, cx: &mut Context<Self>) {
         let mut of: HashMap<String, Vec<usize>> = HashMap::new();
         for (i, hunk) in hunks.iter().enumerate() {
             of.entry(hunk.path.clone()).or_default().push(i);
         }
         self.hunks_of = Rc::new(of);
         self.hunks = hunks;
+        // The change at hand, staged or reverted, is marked no more.
+        let current = self.review_hunk(cx).map(|hunk| change_range(&hunk));
+        self.diff.update(cx, |d, cx| d.set_current_lines(current, cx));
     }
 
     fn hunks_in(&self, path: &str) -> &[usize] {
@@ -313,7 +316,7 @@ impl ChangesView {
             return;
         };
         self.first_lines = lines;
-        self.set_hunks(hunks);
+        self.set_hunks(hunks, cx);
         self.diff.update(cx, |d, cx| d.set_files(files, cx));
         // The other scope's files: those viewed fold there too.
         let diff = self.diff.clone();
@@ -403,20 +406,18 @@ impl ChangesView {
         self.select_change(&hunk, true, cx);
     }
 
-    /// Marks `hunk` as the change at hand by selecting its lines.
+    /// Marks `hunk` as the change at hand, beside its lines: what is
+    /// selected stays selected.
     fn select_change(&mut self, hunk: &git::Hunk, scroll: bool, cx: &mut Context<Self>) {
-        let (first, last) = change_lines(hunk);
-        let side = if hunk.modified { DiffSide::Modified } else { DiffSide::Original };
-        let range = DiffLineRange::new(hunk.path.clone(), side, first as usize, last as usize);
+        let range = change_range(hunk);
         self.diff.update(cx, |d, cx| {
             if scroll {
-                d.scroll_to_line_in_view(DiffLinePosition::new(hunk.path.clone(), side, first as usize), cx);
+                d.scroll_to_line_in_view(DiffLinePosition::new(range.path().clone(), range.side(), range.start()), cx);
             }
-            d.set_selected_lines(Some(range.clone()), cx);
+            d.set_current_lines(Some(range), cx);
         });
         self.review_file = Some(hunk.path.clone().into());
         self.review_change = Some((hunk.line, hunk.modified));
-        self.selection = Some(range);
         cx.notify();
     }
 
@@ -441,10 +442,9 @@ impl ChangesView {
         self.diff.update(cx, |d, cx| d.scroll_to_file(&path, cx));
         self.review_file = Some(path.clone());
         self.review_change = None;
-        self.selection = None;
         match self.hunks_in(&path).first().map(|&i| self.hunks[i].clone()) {
             Some(hunk) if !self.diff.read(cx).is_file_collapsed(&path) => self.select_change(&hunk, false, cx),
-            _ => self.diff.update(cx, |d, cx| d.set_selected_lines(None, cx)),
+            _ => self.diff.update(cx, |d, cx| d.set_current_lines(None, cx)),
         }
         cx.notify();
     }
@@ -486,8 +486,11 @@ impl ChangesView {
 
     fn comment_on_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(hunk) = self.review_hunk(cx) else { return self.comment_selection(window, cx) };
-        self.select_change(&hunk, false, cx);
-        self.comment_selection(window, cx);
+        let mut note = self.note_for(&change_range(&hunk), cx);
+        // Its own lines, removed ones too, rather than the file's.
+        let sign = if hunk.modified { '+' } else { '-' };
+        note.code = hunk.changes.lines().filter_map(|l| l.strip_prefix(sign)).collect::<Vec<_>>().join("\n");
+        self.ask_comment(note, window, cx);
     }
 }
 
@@ -759,6 +762,13 @@ pub(super) fn staged_key(path: &str, changes: &str) -> u64 {
 }
 
 /// The first and last line a change covers on the side `line` is on.
+/// The lines of a change, on the side it has them.
+fn change_range(hunk: &git::Hunk) -> DiffLineRange {
+    let (first, last) = change_lines(hunk);
+    let side = if hunk.modified { DiffSide::Modified } else { DiffSide::Original };
+    DiffLineRange::new(hunk.path.clone(), side, first as usize, last as usize)
+}
+
 pub(super) fn change_lines(hunk: &git::Hunk) -> (u32, u32) {
     let sign = if hunk.modified { '+' } else { '-' };
     let count = hunk.changes.lines().filter(|l| l.starts_with(sign)).count().max(1) as u32;

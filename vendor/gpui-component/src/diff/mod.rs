@@ -587,6 +587,7 @@ fn render_diff(
         selection: state.selection().clone(),
         selected_lines: state.selected_lines(),
         selected: state.selected_span(),
+        current: state.current_span(),
         geometry: state.geometry().clone(),
         state: cx.entity(),
     });
@@ -858,6 +859,7 @@ struct CodePresentation {
     selection: gpui_base::TextSelectionHandle,
     selected_lines: Option<DiffLineRange>,
     selected: Option<SelectedLines>,
+    current: Option<SelectedLines>,
     geometry: Rc<std::cell::RefCell<selection::SelectionGeometry>>,
     state: Entity<DiffState>,
 }
@@ -870,6 +872,12 @@ impl CodePresentation {
             side,
             document.line_number(side, ix),
         )
+    }
+
+    fn is_current(&self, file: usize, side: DiffSide, ix: usize) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(|current| current.contains(&self.files, file, side, ix))
     }
 
     fn is_selected(&self, file: usize, side: DiffSide, ix: usize) -> bool {
@@ -1807,6 +1815,18 @@ fn code_line(
             this.bg(status.opacity(0.12))
         })
         .when(selected, |this| this.bg(cx.theme().selection))
+        // ideae patch: the change at hand, a bar at the row's left edge.
+        .when(code.is_current(file, side, ix), |this| {
+            this.child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .h_full()
+                    .w(px(3.))
+                    .bg(cx.theme().primary),
+            )
+        })
         .when(hover_line && !selected, |this| {
             this.hover(|this| this.bg(cx.theme().list_hover))
         })

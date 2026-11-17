@@ -1690,8 +1690,8 @@ impl TaskView {
         if matches!(removed.kind, TabKind::Changes) {
             let diff = self.changes.read(cx).diff.clone();
             diff.update(cx, |state, cx| state.set_files([], cx));
-            self.changes.update(cx, |changes, _| {
-                changes.set_hunks(Rc::default());
+            self.changes.update(cx, |changes, cx| {
+                changes.set_hunks(Rc::default(), cx);
                 changes.first_lines = Rc::default();
             });
             self.diff_stale = true;

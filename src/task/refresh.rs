@@ -125,7 +125,7 @@ impl TaskView {
             c.shown_keys = keys;
             c.counts = counts;
             c.first_lines = lines;
-            c.set_hunks(hunks);
+            c.set_hunks(hunks, cx);
             cx.notify();
         });
     }
