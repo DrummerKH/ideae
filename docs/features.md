@@ -158,6 +158,15 @@ all: what is removed stays under `refs/ideae/variants` for two weeks.
   - with only a prediction: Tab takes it (and the next is asked), Esc
     drops it, Enter is a newline (and the next line is asked). Typing what it shows keeps the rest of it,
     with no menu over it; typing anything else drops it.
+  - a prediction may also change what is around the cursor (the next edit,
+    as in Cursor or Zed): each change is shown where it is, what goes
+    struck through in red, what comes in green, and Tab makes them all,
+    the caret after the last (or where the model puts it). One further
+    than a few lines, out of view, or of whole lines is told at the end of
+    the cursor's line, "⇥ Tab: jump to line N": the first Tab goes there,
+    the next makes them, and the next prediction is asked at once, so a
+    rename or a new field goes on with Tab after Tab. Gray text at the
+    cursor goes in first. Esc, typing anything else, or the menu drop it.
 - The declarations you are inside of stay at the top as you scroll.
 - File structure (Ctrl+F12), syntax-aware selection, folding, the next
   occurrence of a selection (Alt+J), lines deleted, duplicated, moved and

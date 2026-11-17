@@ -1,5 +1,6 @@
 //! What the model is asked and what its answer changes: the recent edits,
-//! the prompt of each format, the answer turned into one edit at the cursor.
+//! the prompt of each format, the answer turned into gray text at the
+//! cursor and the edits around it.
 
 use std::{collections::VecDeque, ops::Range, sync::Arc, time::{Duration, Instant}};
 
@@ -435,18 +436,27 @@ fn zeta(ask: &Ask) -> Prompt {
     Prompt { text: prompt, format: Format::Zeta, region: editable, marks }
 }
 
+/// The model's answer: the bytes of the file it rewrote, their new text,
+/// and where in it the model put the cursor (Zeta marks it; Sweep does not).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Answer {
+    pub range: Range<usize>,
+    pub new: String,
+    pub caret: Option<usize>,
+}
+
 /// The model's answer as a replacement: what of the file, by what.
-pub fn parse(prompt: &Prompt, text: &Rope, output: &str) -> Option<(Range<usize>, String)> {
+pub fn parse(prompt: &Prompt, text: &Rope, output: &str) -> Option<Answer> {
     match prompt.format {
         Format::Sweep => {
             let body = Format::Sweep.stops().iter().fold(output, |out, stop| out.split(stop).next().unwrap_or(out));
             let old = text.slice(prompt.region.clone()).to_string();
             let tail = &old[old.trim_end_matches(['\r', '\n']).len()..];
-            Some((prompt.region.clone(), body.trim_end_matches(['\r', '\n']).to_string() + tail))
+            Some(Answer { range: prompt.region.clone(), new: body.trim_end_matches(['\r', '\n']).to_string() + tail, caret: None })
         }
         Format::Zeta => {
-            let out = output.split(ZETA_EOS).next().unwrap_or_default().replace(CURSOR, "");
-            let tags = marker_tags(&out);
+            let out = output.split(ZETA_EOS).next().unwrap_or_default();
+            let tags = marker_tags(out);
             let (first, last) = (tags.first()?, tags.last()?);
             if tags.len() < 2 || first.2 == last.2 {
                 return None;
@@ -461,8 +471,10 @@ pub fn parse(prompt: &Prompt, text: &Rope, output: &str) -> Option<(Range<usize>
                 body += &out[at..tag.0];
                 at = tag.1;
             }
+            let caret = body.find(CURSOR);
+            let body = body.replace(CURSOR, "");
             let start = prompt.region.start;
-            Some((start + prompt.marks[a]..start + prompt.marks[b], body))
+            Some(Answer { range: start + prompt.marks[a]..start + prompt.marks[b], new: body, caret })
         }
     }
 }
@@ -494,13 +506,148 @@ pub struct Suggestion {
     pub replaces_to: Option<usize>,
 }
 
-/// The change of the answer that is at the cursor, as a suggestion there.
-/// Changes elsewhere are left for now; `None` when the one at the cursor
-/// cannot be shown as text typed there.
-pub fn suggestion(text: &Rope, cursor: usize, (range, new): (Range<usize>, String)) -> Option<Suggestion> {
+/// An answer as the editor shows it: what is typed at the cursor, and
+/// every change, that one among them.
+#[derive(Debug, PartialEq)]
+pub struct Prediction {
+    pub ghost: Option<Suggestion>,
+    /// Bytes of the text and what replaces them, in order and apart.
+    pub edits: Vec<(Range<usize>, String)>,
+    /// Where the model put the caret, in the text once edited.
+    pub caret: Option<usize>,
+}
+
+/// The change of the answer that is at the cursor, as a suggestion there;
+/// `None` when it cannot be shown as text typed there.
+#[cfg(test)]
+pub fn suggestion(text: &Rope, cursor: usize, answer: Answer) -> Option<Suggestion> {
+    prediction(text, cursor, answer).and_then(|p| p.ghost)
+}
+
+/// The answer as changes: the one at the cursor as text typed there when it
+/// can be, the others as the few words each replaces.
+pub fn prediction(text: &Rope, cursor: usize, answer: Answer) -> Option<Prediction> {
+    let Answer { range, new, caret } = answer;
     let old = text.slice(range.clone()).to_string();
-    let (start, end, insert) = at_cursor(&old, &new, text.offset_to_point(cursor).row - text.offset_to_point(range.start).row)?;
-    let (mut start, mut end, mut insert) = (range.start + start, range.start + end, insert);
+    let changes = line_changes(&old, &new);
+    let cursor_line = text.offset_to_point(cursor).row - text.offset_to_point(range.start).row;
+    let at = changes.iter().position(|c| {
+        c.lines.contains(&cursor_line) || (c.lines.is_empty() && (c.lines.start == cursor_line + 1 || c.lines.start == cursor_line))
+    });
+    let mut ghost = None;
+    let mut edits = Vec::new();
+    for (i, change) in changes.iter().enumerate() {
+        let base = range.start + change.old.start;
+        let mut hunks: Vec<(Range<usize>, String)> =
+            small(&old[change.old.clone()], &new[change.new.clone()]).into_iter().map(|(r, s)| (base + r.start..base + r.end, s)).collect();
+        if Some(i) == at
+            && let Some((rest, edit, shown)) = take_ghost(text, cursor, &hunks)
+        {
+            edits.push(edit);
+            ghost = Some(shown);
+            hunks = rest;
+        }
+        for (r, s) in hunks {
+            let (r, s) = slide(text, r, s, range.start);
+            if s.trim().is_empty() && text.slice(r.clone()).to_string().trim().is_empty() {
+                continue;
+            }
+            edits.push((r, s));
+        }
+    }
+    if edits.is_empty() {
+        return None;
+    }
+    edits.sort_by_key(|(r, _)| r.start);
+    Some(Prediction { ghost, edits, caret: caret.map(|c| range.start + c) })
+}
+
+/// Of `hunks`, those on the cursor's line (or lines inserted after it) as
+/// text typed at the cursor: the hunks left, the edit, and how it shows.
+fn take_ghost(text: &Rope, cursor: usize, hunks: &[(Range<usize>, String)]) -> Option<(Vec<(Range<usize>, String)>, (Range<usize>, String), Suggestion)> {
+    let row = text.offset_to_point(cursor).row;
+    let (bol, eol) = (text.line_start_offset(row), text.line_end_offset(row));
+    let mine: Vec<usize> = (0..hunks.len())
+        .filter(|&i| {
+            let r = &hunks[i].0;
+            (r.start >= bol && r.end <= eol) || (r.is_empty() && r.start == eol + 1)
+        })
+        .collect();
+    let (&first, &last) = (mine.first()?, mine.last()?);
+    let (start, end) = (hunks[first].0.start, hunks[last].0.end);
+    let mut insert = String::new();
+    let mut at = start;
+    for (r, s) in &hunks[first..=last] {
+        insert += &text.slice(at..r.start).to_string();
+        insert += s;
+        at = r.end;
+    }
+    let (edit, shown) = ghost(text, cursor, start, end, insert)?;
+    let rest = hunks[..first].iter().chain(&hunks[last + 1..]).cloned().collect();
+    Some((rest, edit, shown))
+}
+
+/// Lines of `old` that `new` changes, those next to each other as one: as
+/// bytes of `old`, bytes of `new`, and lines of `old`.
+struct LineChange {
+    old: Range<usize>,
+    new: Range<usize>,
+    lines: Range<usize>,
+}
+
+fn line_changes(old: &str, new: &str) -> Vec<LineChange> {
+    let a: Vec<&str> = old.split_inclusive('\n').collect();
+    let b: Vec<&str> = new.split_inclusive('\n').collect();
+    let starts = |lines: &[&str]| {
+        let mut at = vec![0];
+        for line in lines {
+            at.push(at.last().unwrap() + line.len());
+        }
+        at
+    };
+    let (sa, sb) = (starts(&a), starts(&b));
+    let ops = similar::capture_diff_slices(similar::Algorithm::Myers, &a, &b);
+    joined(ops).into_iter().map(|(ra, rb)| LineChange { old: sa[ra.start]..sa[ra.end], new: sb[rb.start]..sb[rb.end], lines: ra }).collect()
+}
+
+/// The ranges of a diff that differ, those next to each other as one.
+fn joined(ops: Vec<similar::DiffOp>) -> Vec<(Range<usize>, Range<usize>)> {
+    let mut changes: Vec<(Range<usize>, Range<usize>)> = Vec::new();
+    let mut next_to = false;
+    for op in ops {
+        let (tag, ra, rb) = op.as_tag_tuple();
+        if tag == similar::DiffTag::Equal {
+            next_to = false;
+            continue;
+        }
+        match changes.last_mut() {
+            Some((la, lb)) if next_to => {
+                la.end = ra.end;
+                lb.end = rb.end;
+            }
+            _ => changes.push((ra, rb)),
+        }
+        next_to = true;
+    }
+    changes
+}
+
+/// How many bytes `old` and `new` have the same at their start and at their end.
+fn common(old: &str, new: &str) -> (usize, usize) {
+    let mut prefix = old.bytes().zip(new.bytes()).take_while(|(x, y)| x == y).count();
+    while !old.is_char_boundary(prefix) || !new.is_char_boundary(prefix) {
+        prefix -= 1;
+    }
+    let mut suffix = old[prefix..].bytes().rev().zip(new[prefix..].bytes().rev()).take_while(|(x, y)| x == y).count();
+    while !old.is_char_boundary(old.len() - suffix) || !new.is_char_boundary(new.len() - suffix) {
+        suffix -= 1;
+    }
+    (prefix, suffix)
+}
+
+/// `start..end` replaced by `insert` as text typed at the cursor, and the
+/// edit that is.
+fn ghost(text: &Rope, cursor: usize, mut start: usize, mut end: usize, mut insert: String) -> Option<((Range<usize>, String), Suggestion)> {
     if start == end {
         while start > cursor && text.chars_at(start).reversed().next().is_some_and(|c| insert.ends_with(c)) {
             let c = insert.pop().unwrap();
@@ -519,62 +666,83 @@ pub fn suggestion(text: &Rope, cursor: usize, (range, new): (Range<usize>, Strin
         return None;
     }
     let eol = text.line_end_offset(text.offset_to_point(cursor).row);
-    if start < cursor || end > eol {
+    // Further on, it is shown where it is: what it replaces can be seen.
+    if start != cursor || end > eol {
         return None;
     }
-    if start == cursor && end == cursor && cursor == eol {
-        return Some(Suggestion { insert, replaces_to: None });
+    if end == cursor && cursor == eol {
+        return Some(((cursor..cursor, insert.clone()), Suggestion { insert, replaces_to: None }));
     }
-    let line = text.slice(cursor..start).to_string() + &insert + &text.slice(end..eol).to_string();
-    (line != text.slice(cursor..eol).to_string()).then_some(Suggestion { insert: line, replaces_to: Some(eol) })
+    let line = insert + &text.slice(end..eol).to_string();
+    (line != text.slice(cursor..eol).to_string()).then(|| ((cursor..eol, line.clone()), Suggestion { insert: line, replaces_to: Some(eol) }))
 }
 
-/// Of the lines `new` changes in `old`, those at line `cursor_line` (of
-/// `old`): as bytes of `old` replaced by text, the least that differs.
-fn at_cursor(old: &str, new: &str, cursor_line: usize) -> Option<(usize, usize, String)> {
-    let a: Vec<&str> = old.split_inclusive('\n').collect();
-    let b: Vec<&str> = new.split_inclusive('\n').collect();
-    let starts = |lines: &[&str]| {
-        let mut at = vec![0];
-        for line in lines {
-            at.push(at.last().unwrap() + line.len());
+/// Where the words, the runs of blanks and every other character of `s`
+/// start, and its end.
+fn tokens(s: &str) -> Vec<usize> {
+    let kind = |c: char| {
+        if c.is_alphanumeric() || c == '_' {
+            0
+        } else if c == ' ' || c == '\t' {
+            1
+        } else {
+            2
         }
-        at
     };
-    let (sa, sb) = (starts(&a), starts(&b));
-    let ops = similar::capture_diff_slices(similar::Algorithm::Myers, &a, &b);
-    let mut changes: Vec<(Range<usize>, Range<usize>)> = Vec::new();
-    let mut joined = false;
-    for op in ops {
-        let (tag, ra, rb) = op.as_tag_tuple();
-        if tag == similar::DiffTag::Equal {
-            joined = false;
-            continue;
+    let mut starts = Vec::new();
+    let mut previous = None;
+    for (i, c) in s.char_indices() {
+        let k = kind(c);
+        if k == 2 || previous != Some(k) {
+            starts.push(i);
         }
-        match changes.last_mut() {
-            Some((la, lb)) if joined => {
-                la.end = ra.end;
-                lb.end = rb.end;
+        previous = Some(k);
+    }
+    starts.push(s.len());
+    starts
+}
+
+/// The changes of `new` to `old` word by word, as bytes of `old` and their
+/// new text; all that differs as one when they are too many to read.
+fn small(old: &str, new: &str) -> Vec<(Range<usize>, String)> {
+    const MOST: usize = 6;
+    let (sa, sb) = (tokens(old), tokens(new));
+    let words = |s: &str, at: &[usize]| at.windows(2).map(|w| s[w[0]..w[1]].to_string()).collect::<Vec<_>>();
+    let ops = similar::capture_diff_slices(similar::Algorithm::Myers, &words(old, &sa), &words(new, &sb));
+    let changes = joined(ops);
+    if changes.len() > MOST {
+        let (prefix, suffix) = common(old, new);
+        return vec![(prefix..old.len() - suffix, new[prefix..new.len() - suffix].to_string())];
+    }
+    changes
+        .into_iter()
+        .map(|(ra, rb)| {
+            let (ra, rb) = (sa[ra.start]..sa[ra.end], sb[rb.start]..sb[rb.end]);
+            let (o, n) = (&old[ra.clone()], &new[rb.clone()]);
+            let (mut prefix, mut suffix) = common(o, n);
+            // A word changed is shown whole, one only added to or cut short is not.
+            if prefix + suffix < o.len().min(n.len()) {
+                (prefix, suffix) = (0, 0);
             }
-            _ => changes.push((ra, rb)),
-        }
-        joined = true;
+            (ra.start + prefix..ra.end - suffix, n[prefix..n.len() - suffix].to_string())
+        })
+        .filter(|(r, s)| !r.is_empty() || !s.is_empty())
+        .collect()
+}
+
+/// Whole lines inserted become an insertion at the end of the line before
+/// them, where the editor shows them as typed after it.
+fn slide(text: &Rope, mut range: Range<usize>, mut new: String, floor: usize) -> (Range<usize>, String) {
+    if !range.is_empty() || !new.contains('\n') {
+        return (range, new);
     }
-    let (ra, rb) = changes.into_iter().find(|(ra, _)| {
-        ra.contains(&cursor_line) || (ra.is_empty() && (ra.start == cursor_line + 1 || ra.start == cursor_line))
-    })?;
-    let old = &old[sa[ra.start]..sa[ra.end]];
-    let new = &new[sb[rb.start]..sb[rb.end]];
-    let mut prefix = old.bytes().zip(new.bytes()).take_while(|(x, y)| x == y).count();
-    while !old.is_char_boundary(prefix) || !new.is_char_boundary(prefix) {
-        prefix -= 1;
+    while range.start > floor && !new.starts_with('\n') && text.chars_at(range.start).reversed().next().is_some_and(|c| new.ends_with(c)) {
+        let c = new.pop().unwrap();
+        new.insert(0, c);
+        range.start -= c.len_utf8();
     }
-    let mut suffix = old[prefix..].bytes().rev().zip(new[prefix..].bytes().rev()).take_while(|(x, y)| x == y).count();
-    while !old.is_char_boundary(old.len() - suffix) || !new.is_char_boundary(new.len() - suffix) {
-        suffix -= 1;
-    }
-    let base = sa[ra.start];
-    Some((base + prefix, base + old.len() - suffix, new[prefix..new.len() - suffix].to_string()))
+    range.end = range.start;
+    (range, new)
 }
 
 #[cfg(test)]
@@ -584,6 +752,10 @@ mod tests {
     fn seen(before: &str, hunks: Vec<Hunk>) -> Seen {
         let before = Rope::from(before);
         Seen { context: Context::of(&before, 0), before, hunks }
+    }
+
+    fn answer(range: Range<usize>, new: String) -> Answer {
+        Answer { range, new, caret: None }
     }
 
     #[test]
@@ -669,7 +841,7 @@ mod tests {
         let text = Rope::from(file);
         let cursor = file.find(";").unwrap() + 1;
         let new = "fn main() {\n    let a = 1;\n    let b = 2;\n    println!(\"{a} {b}\");\n}\n";
-        let edit = (0..file.len(), new.to_string());
+        let edit = answer(0..file.len(), new.to_string());
         assert_eq!(
             suggestion(&text, cursor, edit),
             Some(Suggestion { insert: "\n    let b = 2;\n    println!(\"{a} {b}\");".into(), replaces_to: None })
@@ -681,11 +853,11 @@ mod tests {
         let file = "call(\n";
         let text = Rope::from(file);
         let cursor = 5;
-        let edit = (0..file.len(), "call(a, b)\n".to_string());
+        let edit = answer(0..file.len(), "call(a, b)\n".to_string());
         assert_eq!(suggestion(&text, cursor, edit), Some(Suggestion { insert: "a, b)".into(), replaces_to: None }));
         let file = "call()\n";
         let text = Rope::from(file);
-        let edit = (0..file.len(), "call(a, b);\n".to_string());
+        let edit = answer(0..file.len(), "call(a, b);\n".to_string());
         assert_eq!(suggestion(&text, 5, edit), Some(Suggestion { insert: "a, b);".into(), replaces_to: Some(6) }));
     }
 
@@ -695,16 +867,16 @@ mod tests {
         let text = Rope::from(file);
         let cursor = file.len() - 1;
         // The cursor's line completed, and the first line changed too.
-        let edit = (0..file.len(), "let a = 10;\nlet b = 2;\nlet c = 3;\n".to_string());
+        let edit = answer(0..file.len(), "let a = 10;\nlet b = 2;\nlet c = 3;\n".to_string());
         assert_eq!(suggestion(&text, cursor, edit), Some(Suggestion { insert: " = 3;".into(), replaces_to: None }));
         // Only elsewhere: nothing to show.
-        let edit = (0..file.len(), "let a = 10;\nlet b = 2;\nlet c\n".to_string());
+        let edit = answer(0..file.len(), "let a = 10;\nlet b = 2;\nlet c\n".to_string());
         assert_eq!(suggestion(&text, cursor, edit), None);
         // Before the cursor on its line: not as typed text.
-        let edit = (0..file.len(), "let a = 1;\nlet b = 2;\nconst c\n".to_string());
+        let edit = answer(0..file.len(), "let a = 1;\nlet b = 2;\nconst c\n".to_string());
         assert_eq!(suggestion(&text, cursor, edit), None);
         // The same text: nothing.
-        assert_eq!(suggestion(&text, cursor, (0..file.len(), file.to_string())), None);
+        assert_eq!(suggestion(&text, cursor, answer(0..file.len(), file.to_string())), None);
     }
 
     #[test]
@@ -724,6 +896,89 @@ mod tests {
         assert_eq!(suggestion(&text, cursor, edit), Some(Suggestion { insert: "Self { x, y }".into(), replaces_to: None }));
         // The same marker twice: no change.
         assert!(parse(&prompt, &text, "<|marker_1|><|marker_1|>").is_none());
+    }
+
+    fn edits(file: &str, cursor: usize, new: &str) -> Option<Prediction> {
+        prediction(&Rope::from(file), cursor, answer(0..file.len(), new.to_string()))
+    }
+
+    #[test]
+    fn a_change_before_the_cursor_on_its_line_is_shown_where_it_is() {
+        let file = "let c\n";
+        let p = edits(file, 5, "const c = 3;\n").unwrap();
+        assert_eq!(p.ghost, None);
+        assert_eq!(p.edits, vec![(0..3, "const".to_string()), (5..5, " = 3;".to_string())]);
+    }
+
+    #[test]
+    fn a_change_further_on_the_cursor_line_is_shown_where_it_is() {
+        let file = "    let email = user.get_name();\n";
+        let cursor = file.find(" =").unwrap();
+        let p = edits(file, cursor, &file.replace("get_name", "get_email")).unwrap();
+        let at = file.find("get_name").unwrap();
+        assert_eq!((p.ghost, p.edits), (None, vec![(at..at + 8, "get_email".to_string())]));
+    }
+
+    #[test]
+    fn a_rename_goes_on_to_the_other_uses_word_by_word() {
+        let file = "fn f(count: u32) -> u32 {\n    let y = x + 1;\n    y * x\n}\n";
+        let cursor = file.find(':').unwrap();
+        let p = edits(file, cursor, &file.replace(" x", " count")).unwrap();
+        assert_eq!(p.ghost, None);
+        let first = file.find(" x").unwrap() + 1;
+        let second = file.rfind(" x").unwrap() + 1;
+        assert_eq!(p.edits, vec![(first..first + 1, "count".to_string()), (second..second + 1, "count".to_string())]);
+    }
+
+    #[test]
+    fn a_new_field_reaches_the_constructor() {
+        let file = "struct P {\n    x: f64,\n    y: f64,\n    z: f64,\n}\n\nfn new() -> P {\n    P { x: 0.0, y: 0.0 }\n}\n";
+        let cursor = file.find("z: f64,").unwrap() + 7;
+        let p = edits(file, cursor, &file.replace("y: 0.0 }", "y: 0.0, z: 0.0 }")).unwrap();
+        let at = file.find("y: 0.0").unwrap() + 6;
+        assert_eq!((p.ghost, p.edits), (None, vec![(at..at, ", z: 0.0".to_string())]));
+    }
+
+    #[test]
+    fn whole_lines_inserted_elsewhere_go_after_the_line_before() {
+        let p = edits("a\nb\nc\n", 1, "a\nb\nX\nc\n").unwrap();
+        assert_eq!(p.edits, vec![(3..3, "\nX".to_string())]);
+        let p = edits("fn a() {\n    b();\n}\n", 8, "fn a() {\n    b();\n    c();\n}\n").unwrap();
+        assert_eq!(p.edits, vec![(17..17, "\n    c();".to_string())], "{p:?}");
+    }
+
+    #[test]
+    fn the_ghost_is_one_of_the_edits_and_blank_changes_are_left() {
+        let file = "let a = 1;\nlet b = 2;\nlet c\n";
+        let cursor = file.len() - 1;
+        let p = edits(file, cursor, "let a = 10;\n\nlet b = 2;  \nlet c = 3;\n").unwrap();
+        assert_eq!(p.ghost, Some(Suggestion { insert: " = 3;".into(), replaces_to: None }));
+        assert_eq!(p.edits, vec![(9..9, "0".to_string()), (cursor..cursor, " = 3;".to_string())]);
+        assert_eq!(edits(file, cursor, "let a = 1;\n\nlet b = 2;\nlet c\n"), None);
+    }
+
+    #[test]
+    fn many_changes_in_a_few_lines_are_one() {
+        let file = "a b c d e f g h i j k l m n\nx\n";
+        let p = edits(file, file.len() - 1, "1 b 2 d 3 f 4 h 5 j 6 l 7 n\nx\n").unwrap();
+        assert_eq!(p.edits, vec![(0..25, "1 b 2 d 3 f 4 h 5 j 6 l 7".to_string())]);
+    }
+
+    #[test]
+    fn zeta_says_where_the_caret_goes() {
+        let text = Rope::from(FILE);
+        let cursor = FILE.find("        \n").unwrap() + 8;
+        let seen = seen(FILE, vec![]);
+        let prompt = build(&Ask { format: Format::Zeta, path: "a.rs", root: "p", text: &text, cursor, seen: &seen, with_context: false });
+        let new = FILE.replace("x: f64,\n    y", "x: f32,\n    y").replace("        \n", "        Self { x, y }<|user_cursor|>\n");
+        let output = format!("<|marker_1|>{new}<|marker_2|><[end▁of▁sentence]>");
+        let answer = parse(&prompt, &text, &output).unwrap();
+        let caret = FILE.find("        \n").unwrap() + 8 + "Self { x, y }".len();
+        assert_eq!(answer.caret, Some(caret));
+        let p = prediction(&text, cursor, answer).unwrap();
+        assert_eq!(p.caret, Some(caret));
+        let at = FILE.find("x: f64").unwrap() + 3;
+        assert_eq!(p.edits, vec![(at..at + 3, "f32".to_string()), (cursor..cursor, "Self { x, y }".to_string())]);
     }
 
     #[test]

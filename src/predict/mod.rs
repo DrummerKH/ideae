@@ -1,5 +1,6 @@
 //! Edit prediction: a small model on this computer guesses what comes
-//! next at the cursor, shown as ghost text that Tab takes.
+//! next at the cursor, shown as ghost text, and the edits around it that
+//! follow, shown where they are; Tab takes them.
 //!
 //! llama.cpp's server runs the model, started on first use and ended with
 //! the app (server.rs); what it and the model are, and their download
@@ -28,13 +29,13 @@ use gpui_kit::component::{
     ActiveTheme as _, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
-    input::{CompletionProvider, Rope, RopeExt as _},
+    input::{CompletionProvider, EditPrediction, Rope, RopeExt as _},
     notification::Notification,
     setting::{SettingField, SettingGroup, SettingItem},
     v_flex,
 };
 use gpui_kit::{prelude::FluentBuilder as _, *};
-use lsp_types::{CompletionContext, CompletionResponse, InlineCompletionContext, InlineCompletionItem, InlineCompletionResponse};
+use lsp_types::{CompletionContext, CompletionResponse, InlineCompletionContext, InlineCompletionItem};
 
 use assets::Model;
 use server::Status;
@@ -164,8 +165,8 @@ impl CompletionProvider for Provider {
         }
     }
 
-    fn inline_completion(&self, text: &Rope, cursor: usize, _: InlineCompletionContext, window: &mut Window, cx: &mut App) -> Task<anyhow::Result<InlineCompletionResponse>> {
-        let none = || Task::ready(Ok(InlineCompletionResponse::Array(Vec::new())));
+    fn edit_prediction(&self, text: &Rope, cursor: usize, _: InlineCompletionContext, window: &mut Window, cx: &mut App) -> Task<anyhow::Result<Option<EditPrediction>>> {
+        let none = || Task::ready(Ok(None));
         match crate::state::with_settings(|s| s.edit_prediction) {
             None => {
                 offer(window, cx);
@@ -202,8 +203,7 @@ impl CompletionProvider for Provider {
         let job = cx.background_spawn(crate::procs::on_thread(move || ask.run()));
         cx.spawn(async move |_| {
             let _guard = guard;
-            let item = job.await.ok().flatten();
-            Ok(InlineCompletionResponse::Array(item.into_iter().collect()))
+            Ok(job.await.ok().flatten())
         })
     }
 }
@@ -222,7 +222,7 @@ struct Request {
 }
 
 impl Request {
-    fn run(self) -> anyhow::Result<Option<InlineCompletionItem>> {
+    fn run(self) -> anyhow::Result<Option<EditPrediction>> {
         let started = Instant::now();
         let line = self.text.offset_to_point(self.cursor).row;
         let seen = {
@@ -253,23 +253,37 @@ impl Request {
         let body = serde_json::to_vec(&body)?;
         let answer = http::complete(self.port, &body, &self.cancel, || LATEST.load(Ordering::SeqCst) == self.id)?;
         let edit = if answer.cut { None } else { prompt::parse(&prompt, &self.text, &answer.content) };
-        let suggestion = edit.and_then(|edit| prompt::suggestion(&self.text, self.cursor, edit));
+        let prediction = edit.and_then(|edit| prompt::prediction(&self.text, self.cursor, edit));
         if std::env::var_os("IDEAE_DEBUG").is_some() {
             eprintln!(
                 "predict: {} ms, prompt {} tokens ({} cached), {:?}",
                 started.elapsed().as_millis(),
                 answer.prompt_n,
                 answer.cached_n,
-                suggestion.as_ref().map(|s| &s.insert)
+                prediction.as_ref().map(|p| &p.edits)
             );
-            if suggestion.is_none() && std::env::var_os("IDEAE_DEBUG_PREDICT").is_some() {
+            if prediction.is_none() && std::env::var_os("IDEAE_DEBUG_PREDICT").is_some() {
                 eprintln!("predict: asked\n{}\npredict: answered\n{}", prompt.text, answer.content);
             }
         }
-        let Some(suggestion) = suggestion else { return Ok(None) };
-        let range = suggestion.replaces_to.map(|end| lsp_types::Range::new(self.text.offset_to_position(self.cursor), self.text.offset_to_position(end)));
-        Ok(Some(InlineCompletionItem { insert_text: suggestion.insert, filter_text: None, range, command: None, insert_text_format: None }))
+        Ok(prediction.map(|p| shown(&self.text, self.cursor, p)))
     }
+}
+
+/// A prediction as the editor takes it: the edits elsewhere only when
+/// there are any besides the one at the cursor.
+fn shown(text: &Rope, cursor: usize, prediction: prompt::Prediction) -> EditPrediction {
+    let ghost = prediction.ghost.map(|g| InlineCompletionItem {
+        range: g.replaces_to.map(|end| lsp_types::Range::new(text.offset_to_position(cursor), text.offset_to_position(end))),
+        insert_text: g.insert,
+        filter_text: None,
+        command: None,
+        insert_text_format: None,
+    });
+    if ghost.is_some() && prediction.edits.len() == 1 {
+        return EditPrediction { ghost, ..EditPrediction::default() };
+    }
+    EditPrediction { ghost, edits: prediction.edits, caret: prediction.caret }
 }
 
 /// Changes the settings as Settings' Save does.
@@ -369,7 +383,7 @@ pub fn settings_group(draft: &Rc<RefCell<crate::state::Settings>>) -> SettingGro
     SettingGroup::new()
         .title("Edit prediction")
         .item(SettingItem::new("Edit prediction", on).description(
-            "A model on this computer suggests what you type next, as gray text at the cursor: Tab takes it, Esc drops it. Off, nothing of it runs.",
+            "A model on this computer suggests what you type next, as gray text at the cursor, and the edits around it that should follow, in red and green where they are: Tab takes them, Esc drops them. Off, nothing of it runs.",
         ))
         .item(SettingItem::new("Model", model).description(
             "Auto: Sweep 1.5B on a graphics card, Sweep 0.5B on the processor without one. Zeta 2.1 is bigger and slower, and wants a card with 8 GB. Downloaded once, when first used.",
@@ -379,6 +393,76 @@ pub fn settings_group(draft: &Rc<RefCell<crate::state::Settings>>) -> SettingGro
 #[cfg(test)]
 mod tests {
     use super::{Arc, Duration, Instant, Model, Rope, http, prompt, server};
+    use gpui_kit::component::input::RopeExt as _;
+
+    /// llama-server with the model of `IDEAE_PREDICT_SERVER` and
+    /// `IDEAE_PREDICT_MODEL`, ended when dropped.
+    struct Local {
+        child: std::process::Child,
+        port: u16,
+        format: prompt::Format,
+        gpu: bool,
+        loaded: Duration,
+    }
+
+    impl Drop for Local {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn local() -> Option<Local> {
+        let (Some(server), Some(model)) = (std::env::var_os("IDEAE_PREDICT_SERVER"), std::env::var_os("IDEAE_PREDICT_MODEL")) else {
+            eprintln!("IDEAE_PREDICT_SERVER and IDEAE_PREDICT_MODEL are not set: skipped");
+            return None;
+        };
+        let (server, model) = (std::path::PathBuf::from(server), std::path::PathBuf::from(model));
+        let format = if model.to_string_lossy().contains("zeta") { prompt::Format::Zeta } else { prompt::Format::Sweep };
+        let devices = server::list_devices(&server).unwrap();
+        let device = server::choose(Some(Model::Sweep05), &devices).1;
+        let port = server::free_port().unwrap();
+        let child = std::process::Command::new(&server)
+            .args(server::server_args(&model, port, device.as_ref()))
+            .current_dir(server.parent().unwrap())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let since = Instant::now();
+        let mut local = Local { child, port, format, gpu: device.is_some(), loaded: Duration::ZERO };
+        while !matches!(http::status(port, "/health"), Ok(200)) {
+            assert!(local.child.try_wait().unwrap().is_none(), "llama-server ended");
+            assert!(since.elapsed() < Duration::from_secs(60), "llama-server not ready in a minute");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        local.loaded = since.elapsed();
+        Some(local)
+    }
+
+    impl Local {
+        /// The model asked about `text` at `cursor`, `before` being the file
+        /// before the change being made; its answer, and how long it took.
+        fn ask(&self, path: &str, before: &str, text: &str, cursor: usize) -> (Option<prompt::Prediction>, Duration) {
+            let text = Rope::from(text);
+            let mut tracker = prompt::Tracker::default();
+            let line = text.offset_to_point(cursor).row;
+            let path: Arc<str> = path.into();
+            let seen = tracker.see(&path, &text, line, Some(Rope::from(before)), Instant::now());
+            let ask = prompt::Ask { format: self.format, path: &path, root: "demo", text: &text, cursor, seen: &seen, with_context: self.gpu };
+            let built = prompt::build(&ask);
+            let body = serde_json::to_vec(&serde_json::json!({
+                "prompt": built.text, "n_predict": 512, "temperature": 0, "cache_prompt": true, "id_slot": 0, "stream": true, "stop": self.format.stops(),
+            }))
+            .unwrap();
+            let asked = Instant::now();
+            let answer = http::complete(self.port, &body, &http::Cancel::default(), || true).unwrap();
+            let took = asked.elapsed();
+            let answer = prompt::parse(&built, &text, &answer.content).expect("an answer in the format");
+            (prompt::prediction(&text, cursor, answer), took)
+        }
+    }
 
     /// A real llama-server and model, given by `IDEAE_PREDICT_SERVER` and
     /// `IDEAE_PREDICT_MODEL` (nothing is downloaded): it starts, predicts
@@ -387,63 +471,20 @@ mod tests {
     #[test]
     #[ignore]
     fn a_local_model_predicts_at_the_cursor() {
-        let (Some(server), Some(model)) = (std::env::var_os("IDEAE_PREDICT_SERVER"), std::env::var_os("IDEAE_PREDICT_MODEL")) else {
-            eprintln!("IDEAE_PREDICT_SERVER and IDEAE_PREDICT_MODEL are not set: skipped");
-            return;
-        };
-        let (server, model) = (std::path::PathBuf::from(server), std::path::PathBuf::from(model));
-        let format = if model.to_string_lossy().contains("zeta") { prompt::Format::Zeta } else { prompt::Format::Sweep };
-        let devices = server::list_devices(&server).unwrap();
-        let device = server::choose(Some(Model::Sweep05), &devices).1;
-        let port = server::free_port().unwrap();
-        let mut child = std::process::Command::new(&server)
-            .args(server::server_args(&model, port, device.as_ref()))
-            .current_dir(server.parent().unwrap())
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        struct Kill<'a>(&'a mut std::process::Child);
-        impl Drop for Kill<'_> {
-            fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-            }
-        }
-        let child = Kill(&mut child);
-        let since = Instant::now();
-        while !matches!(http::status(port, "/health"), Ok(200)) {
-            assert!(child.0.try_wait().unwrap().is_none(), "llama-server ended");
-            assert!(since.elapsed() < Duration::from_secs(60), "llama-server not ready in a minute");
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        let loaded = since.elapsed();
-
+        let Some(local) = local() else { return };
         let before = "struct Point {\n    x: f64,\n    y: f64,\n}\n\nimpl Point {\n}\n";
         let file = "struct Point {\n    x: f64,\n    y: f64,\n}\n\nimpl Point {\n    fn new(x: f64, y: f64) -> Self {\n        \n    }\n}\n";
-        let text = Rope::from(file);
         let cursor = file.find("        \n").unwrap() + 8;
-        let mut tracker = prompt::Tracker::default();
-        let seen = tracker.see(&"src/point.rs".into(), &text, 7, Some(Rope::from(before)), Instant::now());
-        let ask = prompt::Ask { format, path: "src/point.rs", root: "geometry", text: &text, cursor, seen: &seen, with_context: device.is_some() };
-        let built = prompt::build(&ask);
-        let body = serde_json::to_vec(&serde_json::json!({
-            "prompt": built.text, "n_predict": 400, "temperature": 0, "cache_prompt": true, "id_slot": 0, "stream": true, "stop": format.stops(),
-        }))
-        .unwrap();
         let mut timings = Vec::new();
         let mut shown = None;
         for _ in 0..3 {
-            let asked = Instant::now();
-            let answer = http::complete(port, &body, &http::Cancel::default(), || true).unwrap();
-            timings.push(asked.elapsed().as_millis());
-            let edit = prompt::parse(&built, &text, &answer.content).expect("an answer in the format");
-            shown = prompt::suggestion(&text, cursor, edit);
+            let (prediction, took) = local.ask("src/point.rs", before, file, cursor);
+            timings.push(took.as_millis());
+            shown = prediction.and_then(|p| p.ghost);
         }
         let shown = shown.expect("a suggestion at the cursor");
         assert!(shown.insert.contains("Self") || shown.insert.contains("Point"), "{shown:?}");
-        eprintln!("loaded in {loaded:?}; predictions in {timings:?} ms; on {:?}: {shown:?}", device.map(|d| d.name));
+        eprintln!("loaded in {:?}; predictions in {timings:?} ms; gpu {}: {shown:?}", local.loaded, local.gpu);
 
         // Dropped after a moment: the server is free again soon after.
         let cancel = Arc::new(http::Cancel::default());
@@ -458,13 +499,82 @@ mod tests {
             "prompt": "// the numbers from 1 to 5000, one per line\n1\n2\n3\n", "n_predict": 4000, "temperature": 0, "stream": true, "id_slot": 0,
         }))
         .unwrap();
-        assert!(http::complete(port, &long, &cancel, || true).is_err());
+        assert!(http::complete(local.port, &long, &cancel, || true).is_err());
         dropper.join().unwrap();
-        let asked = Instant::now();
-        http::complete(port, &body, &http::Cancel::default(), || true).unwrap();
-        let after = asked.elapsed();
+        let (_, after) = local.ask("src/point.rs", before, file, cursor);
         eprintln!("the next prediction after a dropped one: {after:?}");
         assert!(after < Duration::from_secs(10));
-        drop(child);
+    }
+
+    /// What the local model predicts after a change: the next edits it
+    /// offers, printed for a person to judge; one at least away from the
+    /// cursor. Without the model, skipped.
+    #[test]
+    #[ignore]
+    fn a_local_model_predicts_the_next_edits() {
+        let Some(local) = local() else { return };
+        let cases: [(&str, &str, &str, &str, &str); 7] = [
+            (
+                "a parameter renamed",
+                "src/area.rs",
+                "fn area(w: f64, h: f64) -> f64 {\n    let a = w * h;\n    println!(\"{} {}\", w, h);\n    a\n}\n",
+                "fn area(width: f64, h: f64) -> f64 {\n    let a = w * h;\n    println!(\"{} {}\", w, h);\n    a\n}\n",
+                "width",
+            ),
+            (
+                "a field added",
+                "src/point.rs",
+                "pub struct Point {\n    pub x: f64,\n    pub y: f64,\n}\n\nimpl Point {\n    pub fn new(x: f64, y: f64) -> Self {\n        Self { x, y }\n    }\n}\n",
+                "pub struct Point {\n    pub x: f64,\n    pub y: f64,\n    pub z: f64,\n}\n\nimpl Point {\n    pub fn new(x: f64, y: f64) -> Self {\n        Self { x, y }\n    }\n}\n",
+                "pub z: f64,",
+            ),
+            (
+                "the start of a line fixed",
+                "src/show.rs",
+                "fn show(user: &User) {\n    let name = user.name();\n    println!(\"{name}\");\n}\n",
+                "fn show(user: &User) {\n    let email = user.name();\n    println!(\"{name}\");\n}\n",
+                "email",
+            ),
+            (
+                "a variable renamed",
+                "src/shop.py",
+                "def total(items):\n    count = 0\n    for item in items:\n        count += item.price\n    return count\n",
+                "def total(items):\n    amount = 0\n    for item in items:\n        count += item.price\n    return count\n",
+                "amount",
+            ),
+            (
+                "a parameter added",
+                "src/greet.rs",
+                "fn greet(name: &str) {\n    println!(\"hi {name}\");\n}\n\nfn main() {\n    greet(\"ann\");\n    greet(\"bob\");\n}\n",
+                "fn greet(name: &str, loud: bool) {\n    println!(\"hi {name}\");\n}\n\nfn main() {\n    greet(\"ann\");\n    greet(\"bob\");\n}\n",
+                "loud: bool",
+            ),
+            (
+                "a list renamed",
+                "src/cart.js",
+                "const items = [];\nfunction add(item) {\n  items.push(item);\n}\nfunction count() {\n  return items.length;\n}\n",
+                "const list = [];\nfunction add(item) {\n  items.push(item);\n}\nfunction count() {\n  return items.length;\n}\n",
+                "list",
+            ),
+            (
+                "a type changed",
+                "src/id.rs",
+                "pub struct User {\n    pub id: u32,\n}\n\npub fn id(user: &User) -> u32 {\n    user.id\n}\n",
+                "pub struct User {\n    pub id: u64,\n}\n\npub fn id(user: &User) -> u32 {\n    user.id\n}\n",
+                "u64",
+            ),
+        ];
+        let mut elsewhere = 0;
+        for (name, path, before, after, typed) in cases {
+            let cursor = after.find(typed).unwrap() + typed.len();
+            let (prediction, took) = local.ask(path, before, after, cursor);
+            elsewhere += usize::from(prediction.as_ref().is_some_and(|p| p.edits.iter().any(|(r, _)| r.start != cursor)));
+            let shown = prediction.map(|p| {
+                let edits: Vec<String> = p.edits.iter().map(|(r, s)| format!("{:?} -> {s:?}", &after[r.clone()])).collect();
+                format!("ghost {:?}; edits {edits:?}", p.ghost.map(|g| g.insert))
+            });
+            eprintln!("{name}: {} ms: {shown:?}", took.as_millis());
+        }
+        assert!(elsewhere > 0, "no edit away from the cursor was offered");
     }
 }
