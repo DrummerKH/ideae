@@ -522,7 +522,6 @@ pub fn environ(pid: i32) -> Option<Vec<u8>> {
 #[cfg(unix)]
 pub fn task_processes(task: Option<&str>, socket: &str) -> Vec<i32> {
     use std::collections::HashMap;
-    const NEAREST: usize = 16;
     let me = std::process::id() as i32;
     let daemon = crate::daemon::client::get().and_then(|d| d.pid()).map(|p| p as i32);
     let sock = format!("{}={socket}", crate::agent::SOCK_ENV);
@@ -530,10 +529,6 @@ pub fn task_processes(task: Option<&str>, socket: &str) -> Vec<i32> {
 
     let running: Vec<i32> = pids().into_iter().filter(|&p| running(p)).collect();
     let parents: HashMap<i32, i32> = running.iter().filter_map(|&p| Some((p, ppid(p)?))).collect();
-    let mut children: HashMap<i32, Vec<i32>> = HashMap::new();
-    for (&pid, &parent) in &parents {
-        children.entry(parent).or_default().push(pid);
-    }
     // Whether its environment names the task; None when it shows none.
     let mut shown: HashMap<i32, Option<bool>> = HashMap::new();
     let mut own = |pid: i32| {
@@ -543,21 +538,20 @@ pub fn task_processes(task: Option<&str>, socket: &str) -> Vec<i32> {
             Some(vars.contains(&sock.as_bytes()) && task.as_ref().is_none_or(|t| vars.contains(&t.as_bytes())))
         })
     };
+    // Hidden, a process is the task's when its nearest ancestor that shows
+    // its environment is: never by what it started, nor by its siblings. The
+    // user's systemd hides its environment, and every orphan of the session
+    // is its child: judged by them, it was taken for the task's and ended,
+    // and the whole session with it.
     let mut tagged = |pid: i32| {
         let mut at = pid;
         for _ in 0..64 {
-            // The process, then what it started, nearest first.
-            let mut queue = std::collections::VecDeque::from([at]);
-            for _ in 0..NEAREST {
-                let Some(next) = queue.pop_front() else { break };
-                match own(next) {
-                    Some(tagged) => return tagged,
-                    None => queue.extend(children.get(&next).into_iter().flatten()),
-                }
-            }
-            match parents.get(&at) {
-                Some(&parent) if parent > 1 && parent != me && Some(parent) != daemon => at = parent,
-                _ => return false,
+            match own(at) {
+                Some(tagged) => return tagged,
+                None => match parents.get(&at) {
+                    Some(&parent) if parent > 1 && parent != me && Some(parent) != daemon => at = parent,
+                    _ => return false,
+                },
             }
         }
         false
@@ -575,7 +569,25 @@ pub fn task_processes(task: Option<&str>, socket: &str) -> Vec<i32> {
         }
         false
     };
-    running.iter().copied().filter(|&p| p != me && Some(p) != daemon && tagged(p) && !in_other_app(p)).collect()
+    running.iter().copied().filter(|&p| p != me && Some(p) != daemon && !protected(p) && tagged(p) && !in_other_app(p)).collect()
+}
+
+/// What no task's ending may signal, whatever is found: init, the user's
+/// service manager and session, and this process with its ancestors.
+#[cfg(unix)]
+fn protected(pid: i32) -> bool {
+    if pid <= 1 {
+        return true;
+    }
+    let mut at = Some(std::process::id() as i32);
+    for _ in 0..64 {
+        match at {
+            Some(p) if p == pid => return true,
+            Some(p) if p > 1 => at = ppid(p),
+            _ => break,
+        }
+    }
+    name(pid as u32).is_some_and(|n| matches!(n.as_str(), "systemd" | "init" | "gnome-session-binary" | "gnome-shell" | "dbus-daemon" | "dbus-broker" | "Xwayland" | "launchd" | "loginwindow"))
 }
 
 #[cfg(not(unix))]
@@ -591,7 +603,7 @@ pub fn task_processes(_: Option<&str>, _: &str) -> Vec<i32> {
 #[cfg(unix)]
 pub fn end_task_strays(task: Option<&str>, socket: &str, seen: Vec<i32>) {
     // Not root's `login`, which ends with its terminal.
-    let ours = |pid: &i32| running(*pid) && unsafe { libc::kill(*pid, 0) } == 0;
+    let ours = |pid: &i32| !protected(*pid) && running(*pid) && unsafe { libc::kill(*pid, 0) } == 0;
     let alive = || {
         let mut all = task_processes(task, socket);
         all.extend(&seen);
@@ -691,6 +703,14 @@ mod stray_tests {
         }
     }
 
+    #[test]
+    fn the_session_is_never_a_tasks() {
+        assert!(super::protected(1) && super::protected(0) && super::protected(-1));
+        assert!(super::protected(std::process::id() as i32), "this process");
+        let parent = super::ppid(std::process::id() as i32).unwrap();
+        assert!(super::protected(parent), "and what started it");
+    }
+
     fn gone(pid: i32) -> bool {
         let started = std::time::Instant::now();
         while super::running(pid) && started.elapsed() < std::time::Duration::from_secs(2) {
@@ -725,6 +745,11 @@ mod stray_tests {
         assert!(seen.contains(&sleeps[0]) && seen.contains(&sleeps[1]), "a sleep goes by the agent that started it");
         let _ = left.kill();
         let _ = left.wait();
+        // Its sleep is an orphan now, a child of whatever adopts orphans
+        // (the user's systemd): that one is not the task's for it.
+        let found = super::task_processes(Some("/t/a"), &socket);
+        assert!(found.iter().all(|&p| !super::protected(p)), "nothing of the session in {found:?}");
+        assert!(found.iter().all(|&p| super::ppid(p) != Some(1) || p == sleeps[1]), "only the orphan itself");
         super::end_task_strays(Some("/t/a"), &socket, seen);
 
         assert!(ours.try_wait().unwrap().is_some() || gone(ours.id() as i32), "the task's agent is ended");
