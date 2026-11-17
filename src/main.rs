@@ -23,6 +23,7 @@ mod keymap;
 mod keys;
 mod lsp;
 mod lsp_install;
+mod merged_branches;
 mod naming;
 mod palette;
 mod pr;

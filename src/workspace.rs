@@ -81,6 +81,7 @@ pub struct TaskEntry {
 
 pub mod agents_ui;
 pub mod archive_ui;
+mod merged_ui;
 pub mod automation;
 pub mod present;
 pub mod side;
@@ -123,6 +124,9 @@ pub struct Project {
     pub hints_off: std::collections::BTreeSet<String>,
     /// The agent of its new tasks, by profile id; none for the default.
     pub agent: Option<String>,
+    /// Branches of origin whose PR was merged, and when they were looked for.
+    pub merged_branches: Vec<crate::merged_branches::MergedBranch>,
+    pub merged_checked: Option<std::time::Instant>,
 }
 
 impl Project {
@@ -139,6 +143,8 @@ impl Project {
             trusted: Default::default(),
             hints_off: Default::default(),
             agent: None,
+            merged_branches: Vec::new(),
+            merged_checked: None,
         }
     }
 }
@@ -467,6 +473,7 @@ impl Workspace {
                     if n % 10 == 0 {
                         this.sleep_idle_language_servers(cx);
                         this.refresh_prs(false, window, cx);
+                        this.refresh_merged_branches(window, cx);
                     }
                     if n % often == 1 {
                         this.refresh_touched(false, window, cx);
@@ -1045,6 +1052,13 @@ impl Workspace {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 for (path, pr) in found {
+                    // A PR merged since: its branch may be left on origin.
+                    let merged = |pr: &Option<crate::pr::Pr>| pr.as_ref().is_some_and(|pr| pr.state == PrState::Merged);
+                    if merged(&pr) && this.entry_mut(&path).is_some_and(|entry| !merged(&entry.pr)) {
+                        if let Some((pi, _)) = this.find(&path) {
+                            this.projects[pi].merged_checked = None;
+                        }
+                    }
                     if let Some(entry) = this.entry_mut(&path) {
                         if let Some(view) = &entry.view {
                             view.update(cx, |t, cx| {

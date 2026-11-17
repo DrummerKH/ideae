@@ -460,12 +460,13 @@ impl Workspace {
         // Which agent its new tasks run, when there is a choice.
         let profiles: Vec<(String, String)> = crate::state::with_settings(|s| if s.several_agents() { s.agents.iter().map(|a| (a.id.clone(), a.name.clone())).collect() } else { Vec::new() });
         let project_agent = p.agent.clone();
+        let stale = if self.is_presenting() { 0 } else { p.merged_branches.len() };
         let menu = move |menu: PopupMenu, this: WeakEntity<Workspace>| {
             let (spaces, in_space) = (spaces.clone(), in_space.clone());
             let (profiles, project_agent, agent_w) = (profiles.clone(), project_agent.clone(), this.clone());
             let settings = this.clone();
             let (a, b, c, d) = (this.clone(), this.clone(), this.clone(), this.clone());
-            let archived = this;
+            let (archived, stale_w) = (this.clone(), this);
             menu.item(PopupMenuItem::new("Open main thread").on_click(move |_, window, cx| {
                 let _ = a.update(cx, |w, cx| w.open_main(pi, window, cx));
             }))
@@ -479,6 +480,11 @@ impl Workspace {
             .when(merged > 0, |menu| {
                 menu.item(PopupMenuItem::new(format!("Archive {merged} merged task{}…", if merged == 1 { "" } else { "s" })).on_click(move |_, window, cx| {
                     let _ = d.update(cx, |w, cx| w.archive_merged(pi, window, cx));
+                }))
+            })
+            .when(stale > 0, |menu| {
+                menu.item(PopupMenuItem::new(format!("Delete remote branches of merged PRs ({stale})…")).on_click(move |_, window, cx| {
+                    let _ = stale_w.update(cx, |w, cx| w.merged_branches_dialog(pi, window, cx));
                 }))
             })
             .item(PopupMenuItem::new("Project settings…").on_click(move |_, window, cx| {

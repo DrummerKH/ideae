@@ -2353,7 +2353,7 @@ pub fn main_worktree(path: &Path) -> Option<PathBuf> {
 /// The remote's default branch without `origin/`: what origin/HEAD names,
 /// else main or master when origin has it (a repository given its remote by
 /// `git remote add` has no origin/HEAD).
-fn remote_default(repo: &Path) -> Option<String> {
+pub(crate) fn remote_default(repo: &Path) -> Option<String> {
     let head = git(repo, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]).map(|s| s.trim().to_string());
     if let Some(branch) = head.as_deref().and_then(|h| h.strip_prefix("origin/")) {
         return Some(branch.to_string());
