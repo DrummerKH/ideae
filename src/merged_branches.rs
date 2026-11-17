@@ -355,7 +355,8 @@ mod tests {
             assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
             String::from_utf8_lossy(&out.stdout).into_owned()
         };
-        git(&root, &["init", "-q", "--bare", "origin.git"]);
+        // With main as the remote's HEAD, as git 2.48+ then makes origin/HEAD on fetch.
+        git(&root, &["init", "-q", "--bare", "-b", "main", "origin.git"]);
         git(&root, &["init", "-q", "-b", "main", "repo"]);
         let repo = root.join("repo");
         git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
@@ -374,7 +375,7 @@ mod tests {
         assert_eq!(done.deleted, ["gone", "done"]);
         assert_eq!(done.failed.iter().map(|(b, _)| b.as_str()).collect::<Vec<_>>(), ["kept"]);
         let left = git(&repo, &["for-each-ref", "--format=%(refname:strip=3)", "refs/remotes/origin"]);
-        assert_eq!(left.lines().collect::<Vec<_>>(), ["kept", "main"]);
+        assert_eq!(left.lines().filter(|b| *b != "HEAD").collect::<Vec<_>>(), ["kept", "main"]);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

@@ -810,7 +810,8 @@ mod tests {
         // The shell takes a moment to start what runs under it, whose
         // environment tells the task where the shell's own is kept back.
         let told = |snap: &super::Snapshot| snap.procs.iter().any(|p| p.pid == shell.id() as i32 && p.task.is_some());
-        while !told(&snap) && started.elapsed() < std::time::Duration::from_secs(5) {
+        // A ceiling, not a wait: under a parallel test run the start can be slow.
+        while !told(&snap) && started.elapsed() < std::time::Duration::from_secs(20) {
             std::hint::black_box((0..1_000_000u64).sum::<u64>());
             snap = sampler.sample();
         }
@@ -832,6 +833,7 @@ mod tests {
         assert!(own.cpu > 0., "a busy process uses CPU");
         let agent = snap.procs.iter().find(|p| p.pid == shell.id() as i32).expect("the shell it started");
         assert_eq!((agent.task.as_deref(), agent.kind == Kind::Agent), (Some("a-task"), true));
-        assert_eq!(snap.by_task.first().map(|t| t.0.as_str()), Some("a-task"));
+        // Among the others: tests running alongside start tasks' processes of their own.
+        assert!(snap.by_task.iter().any(|t| t.0 == "a-task"), "{:?}", snap.by_task.iter().map(|t| &t.0).collect::<Vec<_>>());
     }
 }
