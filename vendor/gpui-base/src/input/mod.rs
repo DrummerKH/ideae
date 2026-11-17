@@ -123,6 +123,7 @@ pub use lsp::{
     CompletionMenuOptions, CompletionMenuState, CompletionProvider, DefinitionProvider,
     DocumentColorProvider, DocumentRangeSemanticTokensProvider, HoverPopoverState, HoverProvider,
     INLAY_HINTS_KEY, InlayHintsProvider,
+    EDIT_PREDICTION_KEY, EditPrediction, // ideae patch
     InputOverlayKind, Lsp, ShowDocumentHandler, expand_snippet, highlight_characters,
     highlight_contains, highlight_prefix,
 };

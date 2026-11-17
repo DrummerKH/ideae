@@ -9,6 +9,8 @@ mod code_actions;
 mod completions;
 mod definitions;
 mod document_colors;
+// ideae patch: a prediction that edits elsewhere than at the cursor.
+mod edit_prediction;
 mod hover;
 // ideae patch: the server's inlay hints.
 mod inlay_hints;
@@ -19,6 +21,7 @@ pub use code_actions::*;
 pub use completions::*;
 pub use definitions::*;
 pub use document_colors::*;
+pub use edit_prediction::{EDIT_PREDICTION_KEY, EditPrediction};
 pub use hover::*;
 pub use inlay_hints::{INLAY_HINTS_KEY, InlayHintsProvider};
 pub use overlay::*;

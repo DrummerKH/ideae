@@ -82,7 +82,8 @@ impl TextDecoration {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct DecorationCollectionId(usize);
+// ideae patch: seen by the rest of the input, for a prediction's marks.
+pub(super) struct DecorationCollectionId(usize);
 
 /// An independently managed collection of [`TextDecoration`]s.
 ///
@@ -335,14 +336,14 @@ impl<T> Default for DecorationCollections<T> {
 }
 
 impl<T: TrackedDecoration> DecorationCollections<T> {
-    fn create(&mut self, decorations: Vec<T>) -> DecorationCollectionId {
+    pub(super) fn create(&mut self, decorations: Vec<T>) -> DecorationCollectionId {
         let id = DecorationCollectionId(self.next_id);
         self.next_id += 1;
         self.entries.insert(id, DecorationEntries::new(decorations));
         id
     }
 
-    fn set(&mut self, id: DecorationCollectionId, decorations: Vec<T>) -> bool {
+    pub(super) fn set(&mut self, id: DecorationCollectionId, decorations: Vec<T>) -> bool {
         let Some(current) = self.entries.get_mut(&id) else {
             return false;
         };
@@ -473,7 +474,8 @@ fn adjust_range_for_edit(
     start..end
 }
 
-fn normalize<T: TrackedDecoration>(text: &Rope, decorations: Vec<T>) -> Vec<T> {
+// ideae patch: create, set and normalize are also used for a prediction's marks (lsp/edit_prediction.rs).
+pub(super) fn normalize<T: TrackedDecoration>(text: &Rope, decorations: Vec<T>) -> Vec<T> {
     decorations
         .into_iter()
         .filter_map(|mut decoration| {

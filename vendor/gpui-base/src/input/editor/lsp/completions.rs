@@ -9,7 +9,11 @@ use lsp_types::{
 use ropey::Rope;
 use std::{cell::RefCell, ops::Range, rc::Rc, time::Duration};
 
-use crate::input::{InputBaseState, RopeExt as _, ShowCompletions};
+// ideae patch: a prediction that edits elsewhere than at the cursor.
+use super::edit_prediction::{EditPrediction, NextEdit};
+use crate::input::{
+    InputBaseState, RopeExt as _, ShowCompletions, decorations::DecorationCollectionId,
+};
 
 /// Default debounce duration for inline completions.
 const DEFAULT_INLINE_COMPLETION_DEBOUNCE: Duration = Duration::from_millis(300);
@@ -305,6 +309,26 @@ pub trait CompletionProvider {
         Task::ready(Ok(InlineCompletionResponse::Array(vec![])))
     }
 
+    /// ideae patch: a prediction that may edit elsewhere than at the cursor;
+    /// by default the first inline completion, at the cursor.
+    fn edit_prediction(
+        &self,
+        rope: &Rope,
+        offset: usize,
+        trigger: InlineCompletionContext,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<Option<EditPrediction>>> {
+        let task = self.inline_completion(rope, offset, trigger, window, cx);
+        cx.spawn(async move |_| {
+            let item = match task.await? {
+                InlineCompletionResponse::Array(items) => items.into_iter().next(),
+                InlineCompletionResponse::List(list) => list.items.into_iter().next(),
+            };
+            Ok(item.map(EditPrediction::ghost))
+        })
+    }
+
     /// Returns the debounce duration for inline completions.
     ///
     /// Default: 300ms
@@ -345,13 +369,18 @@ pub(crate) struct InlineCompletion {
     /// Completion item to display as an inline completion suggestion
     pub(crate) item: Option<InlineCompletionItem>,
     /// Task for debouncing inline completion requests
-    pub(crate) task: Task<Result<InlineCompletionResponse>>,
+    pub(crate) task: Task<Result<()>>,
     /// ideae patch: the suggestion the last clear took away, for an edit that types along it.
     pub(crate) cleared: Option<ClearedInlineCompletion>,
+    /// ideae patch: a prediction's edits elsewhere, Tab takes them with the item.
+    pub(crate) next: Option<NextEdit>,
+    /// ideae patch: where they are drawn struck through, kept across clears.
+    pub(in crate::input) marks: Option<DecorationCollectionId>,
 }
 
 pub(crate) struct ClearedInlineCompletion {
     item: InlineCompletionItem,
+    next: Option<NextEdit>,
     cursor: usize,
     len: usize,
 }
@@ -360,8 +389,10 @@ impl Default for InlineCompletion {
     fn default() -> Self {
         Self {
             item: None,
-            task: Task::ready(Ok(InlineCompletionResponse::Array(vec![]))),
+            task: Task::ready(Ok(())),
             cleared: None,
+            next: None,
+            marks: None,
         }
     }
 }
@@ -678,11 +709,11 @@ impl InputBaseState<EditorMode> {
                     selected_completion_info: None,
                 };
 
-                Some(provider.inline_completion(&text, offset, trigger, window, cx))
+                Some(provider.edit_prediction(&text, offset, trigger, window, cx))
             })?;
 
             let Some(task) = task else {
-                return Ok(InlineCompletionResponse::Array(vec![]));
+                return Ok(());
             };
 
             let response = task.await?;
@@ -698,16 +729,12 @@ impl InputBaseState<EditorMode> {
                     return;
                 }
 
-                if let Some(item) = match response.clone() {
-                    InlineCompletionResponse::Array(items) => items.into_iter().next(),
-                    InlineCompletionResponse::List(comp_list) => comp_list.items.into_iter().next(),
-                } {
-                    editor.extras.inline_completion.item = Some(item);
-                    cx.notify();
+                if let Some(prediction) = response {
+                    editor.show_edit_prediction(prediction, cx);
                 }
             })?;
 
-            Ok(response)
+            Ok(())
         });
     }
 
@@ -715,17 +742,25 @@ impl InputBaseState<EditorMode> {
     #[inline]
     pub(crate) fn has_inline_completion(&self) -> bool {
         self.extras.inline_completion.item.is_some()
+            || self.extras.inline_completion.next.is_some()
     }
 
     /// Clear the inline completion suggestion.
     pub(crate) fn clear_inline_completion(&mut self, cx: &mut Context<Self>) {
+        // ideae patch: a prediction's edits elsewhere go with it.
+        let next = self.extras.inline_completion.next.take();
+        if next.is_some() {
+            self.unmark_next_edit(cx);
+        }
         let cleared = self.extras.inline_completion.item.take().map(|item| ClearedInlineCompletion {
             item,
+            next,
             cursor: self.cursor(),
             len: self.text.len(),
         });
         self.extras.inline_completion = InlineCompletion {
             cleared,
+            marks: self.extras.inline_completion.marks,
             ..InlineCompletion::default()
         };
         cx.notify();
@@ -765,6 +800,12 @@ impl InputBaseState<EditorMode> {
             replaced.start = self.text.offset_to_position(self.cursor());
         }
         self.extras.inline_completion.item = Some(item);
+        if let Some(next) = cleared.next
+            && !self.follow_next_edit(next, cleared.cursor, new_text.len(), cx)
+        {
+            self.extras.inline_completion.item = None;
+            return false;
+        }
         cx.notify();
         true
     }
@@ -776,6 +817,12 @@ impl InputBaseState<EditorMode> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        // ideae patch: a prediction with edits elsewhere is taken whole.
+        if let Some(next) = self.extras.inline_completion.next.take() {
+            self.extras.inline_completion.item = None;
+            self.accept_next_edit(next, window, cx);
+            return true;
+        }
         let Some(completion_item) = self.extras.inline_completion.item.take() else {
             return false;
         };
