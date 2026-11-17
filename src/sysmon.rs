@@ -645,22 +645,23 @@ impl Render for SysMon {
         let mon = cx.entity();
         let muted = cx.theme().muted_foreground;
         let mem_pct = if s.mem_total > 0 { 100. * s.mem_used as f32 / s.mem_total as f32 } else { 0. };
-        // A dial each, as the tasks have for their agents' context: the numbers are in the tooltip.
-        let dial = |id: &'static str, pct: f32, cx: &App| {
-            use crate::sidebar::{DIAL_AMBER, DIAL_BLUE, DIAL_RED};
-            let color = if pct >= 85. { DIAL_RED } else if pct >= 60. { DIAL_AMBER } else { DIAL_BLUE };
-            crate::sidebar::dial(id, pct.clamp(0., 100.) / 100., color, cx.theme().foreground)
+        // The percentages as figures: a ring read as something still loading.
+        // Amber, then red, as the load gets high.
+        let figure = |pct: f32| {
+            use crate::sidebar::{DIAL_AMBER, DIAL_RED};
+            let color = if pct >= 85. { Some(DIAL_RED) } else if pct >= 60. { Some(DIAL_AMBER) } else { None };
+            div().min_w(px(26.)).when_some(color, |d, c| d.text_color(c)).child(format!("{:.0}%", pct.clamp(0., 100.)))
         };
         let tip = mon;
         h_flex()
             .id("sysmon")
-            .gap_1p5()
+            .gap_1()
             .text_xs()
             .text_color(muted)
             .child("CPU")
-            .child(dial("cpu-dial", s.cpu, cx))
+            .child(figure(s.cpu))
             .child(div().pl_1().child("RAM"))
-            .child(dial("ram-dial", mem_pct, cx))
+            .child(figure(mem_pct))
             .child(div().pl_1().child(format!(
                 "ideae {} · tasks {}",
                 bytes(s.own_mem),

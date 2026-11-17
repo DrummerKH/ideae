@@ -167,6 +167,9 @@ pub struct Workspace {
     /// The agents' worktrees shown under a task (or a project's path, for
     /// those in temporary places): folded until opened.
     pub open_sides: std::collections::HashSet<PathBuf>,
+    /// The task whose menu a right click opened: its tooltip would cover
+    /// the menu, so it is not shown till the pointer leaves the row.
+    pub menu_on: Option<PathBuf>,
     /// What the group's screen shows of each variant, by worktree path.
     pub variant_info: std::collections::HashMap<PathBuf, variants::VariantInfo>,
     /// What each task's agent has used, by worktree, with when the
@@ -469,6 +472,7 @@ impl Workspace {
             active_group: None,
             collapsed_groups: Default::default(),
             open_sides: Default::default(),
+            menu_on: None,
             variant_info: Default::default(),
             usage: Default::default(),
             reading_usage: false,
@@ -1694,9 +1698,24 @@ impl Workspace {
             prompt: Some("Add".into()),
         });
         cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some(paths))) = picked.await else { return };
+            let paths = match picked.await {
+                Ok(Ok(Some(paths))) => paths,
+                Ok(Ok(None)) => return,
+                // No folder picker (no desktop portal): say how else to add one.
+                _ => {
+                    let _ = this.update_in(cx, |_, window, cx| {
+                        let told = "The folder picker is not available here. Start ideae with the repository instead: ideae /path/to/repo";
+                        window.push_notification(Notification::error(told).title("Add project"), cx);
+                    });
+                    return;
+                }
+            };
+            let picked_any = !paths.is_empty();
             let roots = cx.background_spawn(async move { paths.iter().filter_map(|path| project_root(path)).collect::<Vec<_>>() }).await;
             let _ = this.update_in(cx, |this, window, cx| {
+                if picked_any && roots.is_empty() {
+                    window.push_notification(Notification::error("Not in a git repository: a project is a git repository's folder.").title("Add project"), cx);
+                }
                 for root in roots {
                     this.add_project_root(root);
                 }

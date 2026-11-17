@@ -53,16 +53,22 @@ use gpui_kit::{prelude::FluentBuilder as _, *};
 use theme::Appearance;
 use workspace::Workspace;
 
+/// A window narrower than this has the sidebar as a rail, whatever it was
+/// dragged to: the task keeps the room it needs.
+const RAIL_WINDOW: Pixels = px(900.);
+
 impl Render for Workspace {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Focus mode: the task's zoomed pane floats over the whole window, a
         // few pixels in from its edges so the rest still shows around it.
         let zoomed_pane = self.active_view().and_then(|task| task.update(cx, |t, cx| t.render_zoomed(cx)));
         let presenting = self.is_presenting();
+        // Go to file and Find look in the task in view: none, nothing to show.
+        let has_task = self.active_view().is_some();
         let shown = state::settings();
         // What the machine and the agents do is not for an audience.
         let quiet = presenting && shown.present_hide_readouts;
-        let rail = self.sidebar_is_rail();
+        let rail = self.sidebar_is_rail() || window.viewport_size().width < RAIL_WINDOW;
         let content = match (self.active_group.clone(), self.active_view()) {
             (Some(group), _) => self.render_group(&group, cx),
             // A variant has its siblings above it.
@@ -129,7 +135,7 @@ impl Render for Workspace {
                                 .children(self.render_update(cx).filter(|_| !presenting))
                                 .children(self.render_new_build(cx).filter(|_| !presenting))
                                 .child(self.render_power_saving(cx))
-                                .child(
+                                .when(has_task, |bar| bar.child(
                                     Button::new("go-to-file")
                                         .xsmall()
                                         .ghost()
@@ -138,8 +144,8 @@ impl Render for Workspace {
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.finder(finder::FinderKind::Files, window, cx)
                                         })),
-                                )
-                                .child(
+                                ))
+                                .when(has_task, |bar| bar.child(
                                     Button::new("find-in-files")
                                         .xsmall()
                                         .ghost()
@@ -148,7 +154,7 @@ impl Render for Workspace {
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.finder(finder::FinderKind::Grep, window, cx)
                                         })),
-                                )
+                                ))
                                 .child(self.render_space_switch(cx))
                                 .child(self.render_appearance(cx)),
                         ),
@@ -402,16 +408,24 @@ impl Workspace {
             .on_click(cx.listener(|this, _, _, cx| this.toggle_power_saving(cx)))
     }
 
-    /// One button: the current mode's icon, a click moves to the next.
+    /// One button: a click always changes what is seen, light to dark or
+    /// back; a right click follows the system again.
     fn render_appearance(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let current = self.appearance;
-        let next = current.next();
+        let dark = cx.theme().mode.is_dark();
+        let other = if dark { Appearance::Light } else { Appearance::Dark };
+        let shown = if dark { "☾" } else { "☀" };
+        let tip = match current {
+            Appearance::Auto => format!("{}, as the system is. Click: {}.", if dark { "Dark" } else { "Light" }, other.label().to_lowercase()),
+            _ => format!("{}. Click: {}; right click: as the system is.", current.label(), other.label().to_lowercase()),
+        };
         Button::new("appearance")
             .xsmall()
             .ghost()
-            .label(current.icon())
-            .tooltip(format!("Theme: {} (click: {})", current.label(), next.label()))
-            .on_click(cx.listener(move |this, _, window, cx| this.set_appearance(next, window, cx)))
+            .label(shown)
+            .tooltip(tip)
+            .on_click(cx.listener(move |this, _, window, cx| this.set_appearance(other, window, cx)))
+            .on_mouse_down(MouseButton::Right, cx.listener(|this, _, window, cx| this.set_appearance(Appearance::Auto, window, cx)))
     }
 
     /// The app's menu, in the order one comes to it: what to start, where
@@ -423,15 +437,25 @@ impl Workspace {
         let pinned = self.pinned;
         let presenting = self.is_presenting();
         let saving = lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed);
+        let zoomed = zoom::any_set(cx);
         Button::new("app-menu").xsmall().ghost().label("☰").dropdown_menu(move |menu, _, _| {
-            // One line of the menu: its words, its keys when it has some, what it does.
+            // One line of the menu: its words, its keys at the right and dimmer
+            // as in the command list, what it does.
             let entry = |menu: PopupMenu, label: &str, key: Option<&str>, act: fn(&mut Workspace, &mut Window, &mut Context<Workspace>)| {
                 let this = this.clone();
-                let label = match key {
-                    Some(key) => format!("{label}  {}", keymap::label(key)),
-                    None => label.to_string(),
+                let label = SharedString::from(label.to_string());
+                let key = key.map(|key| SharedString::from(keymap::label(key))).filter(|k| !k.is_empty());
+                let item = match key {
+                    Some(key) => PopupMenuItem::element(move |_, cx| {
+                        h_flex()
+                            .w_full()
+                            .gap_6()
+                            .child(div().flex_1().child(label.clone()))
+                            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(key.clone()))
+                    }),
+                    None => PopupMenuItem::new(label),
                 };
-                menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                menu.item(item.on_click(move |_, window, cx| {
                     let _ = this.update(cx, |w, cx| act(w, window, cx));
                 }))
             };
@@ -456,8 +480,15 @@ impl Workspace {
                 if w.is_presenting() { w.end_presentation(window, cx) } else { w.presentation_dialog(window, cx) }
             });
             menu = entry(menu, "Theme…", Some("theme"), |w, window, cx| w.theme_picker(window, cx));
-            menu = entry(menu, "Text of its usual size", None, |_, _, cx| zoom::reset_all(cx));
-            menu = entry(menu, if saving { "Leave power saving" } else { "Save power" }, None, |w, _, cx| w.toggle_power_saving(cx)).separator();
+            if zoomed {
+                menu = entry(menu, "Text of its usual size", None, |_, _, cx| zoom::reset_all(cx));
+            }
+            let power = this.clone();
+            menu = menu
+                .item(PopupMenuItem::new("Save power").checked(saving).on_click(move |_, _, cx| {
+                    let _ = power.update(cx, |w, cx| w.toggle_power_saving(cx));
+                }))
+                .separator();
             menu = entry(menu, "Settings…", Some("settings"), |w, window, cx| w.open_settings(window, cx));
             menu = entry(menu, "Keyboard shortcuts…", None, |w, window, cx| w.open_settings_at(settings_ui::KEYS_PAGE, window, cx)).separator();
             if desktop::can_pin() {

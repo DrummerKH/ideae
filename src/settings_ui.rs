@@ -129,7 +129,7 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
         SettingItem::new(program, field).description(format!("{}{missing}", def.extensions()))
     });
     vec![
-        SettingPage::new("General").group(
+        SettingPage::new("General").default_open(true).group(
             SettingGroup::new().title("Notices")
                 .item(switch(
                     draft,
@@ -187,7 +187,7 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
                         .description("Dragged as narrow as it goes, the sidebar is a rail of tasks to click. The whole of it opens over the task when the pointer rests on the rail this long."),
                 ),
         ),
-        SettingPage::new("Agent").group(
+        SettingPage::new("Agent").default_open(true).group(
             SettingGroup::new().title("Command")
                 .item(
                     SettingItem::new("Agent command", agent)
@@ -207,7 +207,7 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
                         .description("A notification, once for a session, when its agent has used this much: input not read from the cache, and output. The agent is not stopped."),
                 ),
         ),
-        SettingPage::new("Editor").group(
+        SettingPage::new("Editor").default_open(true).group(
             SettingGroup::new().title("Typing")
                 .item(switch(
                     draft,
@@ -259,7 +259,7 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
                     |s, v| s.gutter_since_base = v,
                 )),
         ),
-        SettingPage::new("Tasks").group(
+        SettingPage::new("Tasks").default_open(true).group(
             SettingGroup::new().title("New tasks")
                 .item(switch(
                     draft,
@@ -304,11 +304,11 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
                     .description("A task out of view this long stops its language servers."),
             ),
         ]),
-        SettingPage::new("Keys")
+        SettingPage::new("Keys").default_open(true)
             .description("Click a shortcut and press the new keys: Esc leaves them, Backspace removes them.")
             .default_open(true)
             .groups(key_groups(draft, recording, catcher)),
-        SettingPage::new("Spaces")
+        SettingPage::new("Spaces").default_open(true)
             .description("Projects sorted into sets (work, personal, a client), one of them in the window at a time. The mark at the right of the title bar goes from one to another.")
             .group(SettingGroup::new().item(
                 SettingItem::new(
@@ -324,7 +324,7 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
                 )
                 .description("Add, name, mark and remove them. Which space a project is of is set from its menu in the sidebar."),
             )),
-        SettingPage::new("Presentation")
+        SettingPage::new("Presentation").default_open(true)
             .description("For showing the window to others: ☰ → Enter presentation mode leaves in it only the tasks you tick.")
             .group(
                 SettingGroup::new().title("Shown larger").item(

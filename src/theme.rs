@@ -23,22 +23,6 @@ impl Appearance {
         }
     }
 
-    pub fn icon(self) -> &'static str {
-        match self {
-            Appearance::Auto => "◐",
-            Appearance::Light => "☀",
-            Appearance::Dark => "☾",
-        }
-    }
-
-    pub fn next(self) -> Self {
-        match self {
-            Appearance::Auto => Appearance::Light,
-            Appearance::Light => Appearance::Dark,
-            Appearance::Dark => Appearance::Auto,
-        }
-    }
-
     pub fn parse(s: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|a| a.label().eq_ignore_ascii_case(s))
     }

@@ -224,6 +224,9 @@ struct ClosedTab {
     right: bool,
 }
 
+/// A window narrower than this has the side panel over the task, on asking.
+const NARROW_WINDOW: Pixels = px(1100.);
+
 /// How a file is opened: to look at (a jump, a search result, a click in
 /// the tree), to keep, or back from the last run, when its tabs are not to
 /// be closed for the limit while they are coming back.
@@ -389,6 +392,9 @@ pub struct TaskView {
     /// The last result told by a notification, for when the Changes panel,
     /// which shows it, is not in view: a Fetch from the branch bar is not
     /// to go unanswered.
+    /// In a narrow window the side panel is over the task, shown on asking.
+    narrow: bool,
+    side_over: bool,
     told_action: Option<(bool, String)>,
     /// Wakes the refresh loop: file events, actions, the fallback tick.
     refresh_tx: async_channel::Sender<()>,
@@ -661,6 +667,8 @@ impl TaskView {
             discard_undo: None,
             action: None,
             told_action: None,
+            narrow: false,
+            side_over: false,
             refresh_tx,
             base_override,
             _watching: watching,
@@ -1619,6 +1627,7 @@ impl TaskView {
     /// Alt+1/2/3: shows the panel and moves the keyboard there. Arrows move,
     /// Enter opens, Escape goes back to the tab.
     pub fn show_side_panel(&mut self, which: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.side_over = true;
         self.right = match which {
             0 => RightPane::Changes,
             1 => RightPane::Files,
@@ -1767,6 +1776,12 @@ impl TaskView {
 impl Render for TaskView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.side_has_focus.set(self.side_focus.is_focused(window));
+        // Narrow, the side panel would leave the task too little: it goes over it.
+        let narrow = window.viewport_size().width < NARROW_WINDOW;
+        if narrow != self.narrow {
+            self.narrow = narrow;
+            self.side_over = false;
+        }
         if self.action != self.told_action {
             self.told_action = self.action.clone();
             let seen = self.right == RightPane::Changes && self.zoomed.is_none();
@@ -1807,7 +1822,33 @@ impl Render for TaskView {
             .on_action(cx.listener(|this, _: &SendToAgent, window, cx| this.send_editor_selection(window, cx)))
             .on_action(cx.listener(|this, _: &ShowBranches, window, cx| this.branches_dialog(window, cx)))
             .on_action(cx.listener(|this, _: &CompareFileWith, window, cx| this.compare_open_file(window, cx)))
-            .child(
+            .map(|view| if narrow {
+                let main = v_flex().size_full().min_w_0().child(self.render_branch(cx)).child(div().flex_1().min_h_0().child(content));
+                view.child(div().relative().size_full().child(main).when(self.side_over, |over| {
+                    over.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .h_full()
+                            .w(px(320.))
+                            .bg(cx.theme().background)
+                            .border_l_1()
+                            .border_color(cx.theme().border)
+                            .shadow_lg()
+                            .child(self.render_files(cx))
+                            .child(
+                                div().absolute().top_1().right_1().child(
+                                    Button::new("side-close").xsmall().ghost().label("×").tooltip("Close the panel").on_click(cx.listener(|this, _, _, cx| {
+                                        this.side_over = false;
+                                        cx.notify();
+                                    })),
+                                ),
+                            ),
+                    )
+                }))
+            } else {
+                view.child(
                 h_resizable("task")
                     .on_resize(|state, _, cx| {
                         if let Some(width) = state.read(cx).sizes().get(1).copied() {
@@ -1828,7 +1869,8 @@ impl Render for TaskView {
                             .fixed()
                             .child(self.render_files(cx)),
                     ),
-            )
+                )
+            })
             .into_any_element()
     }
 }

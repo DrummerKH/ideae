@@ -9,6 +9,8 @@ impl TaskView {
             .px_3()
             .py_1()
             .text_xs()
+            // Narrow, what does not fit is cut at the right, not drawn over the panel beside.
+            .overflow_hidden()
             .border_b_1()
             .border_color(cx.theme().border)
             .child(
@@ -38,6 +40,22 @@ impl TaskView {
                             })),
                     ),
             )
+            // Narrow, the side panel is over the task: from here, or Alt+1/2/3.
+            .when(self.narrow, |bar| {
+                bar.child(
+                    Button::new("side-open")
+                        .xsmall()
+                        .ghost()
+                        .label("◨")
+                        .selected(self.side_over)
+                        .tooltip(format!("Changes, Files, Structure, Run  {}", crate::keymap::label("changes_panel")))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.side_over = !this.side_over;
+                            cx.notify();
+                        })),
+                )
+            })
             .child(
                 div()
                     .id("branch-name")

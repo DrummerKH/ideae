@@ -9,7 +9,9 @@ impl TaskView {
         let (root, task, here) = (self.root.clone(), cx.weak_entity(), self.branch_info.head.clone());
         cx.spawn_in(window, async move |_, cx| {
             let from = root.clone();
-            let rows = cx.background_spawn(async move { git::branch_rows(&from) }).await;
+            let mut rows = cx.background_spawn(async move { git::branch_rows(&from) }).await;
+            // Local ones first, then those of the remote; each as git lists them.
+            rows.sort_by_key(|row| row.remote);
             let detail = crate::finder::DETAIL;
             // Merged, here, in no task and not the one in hand: nothing is lost with these.
             let spent: Vec<git::BranchRow> = rows.iter().filter(|r| r.merged && !r.remote && r.held.is_none() && r.name != here).cloned().collect();
@@ -34,7 +36,7 @@ impl TaskView {
             let picked = task.clone();
             let _ = cx.update(|window, cx| {
                 crate::finder::Finder::open_pick(
-                    "Branches…".into(),
+                    "Branches · Enter: open as a task, compare or delete".into(),
                     root,
                     items,
                     Rc::new(move |name, window, cx| {

@@ -165,7 +165,7 @@ impl Workspace {
                     Button::new("add-first-project")
                         .small()
                         .outline()
-                        .label("Add a project…")
+                        .label("Add project…")
                         .on_click(cx.listener(|this, _, window, cx| this.add_project_dialog(window, cx))),
                 ),
             );
@@ -936,7 +936,21 @@ impl Workspace {
                 crate::usage::tokens(usage.recent)
             ));
         }
-        row = row.tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(told.clone()).build(window, cx));
+        let (pressed, left) = (path.clone(), path.clone());
+        row = row
+            .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, _, cx| {
+                this.menu_on = Some(pressed.clone());
+                cx.notify();
+            }))
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                if !hovered && this.menu_on.as_ref() == Some(&left) {
+                    this.menu_on = None;
+                    cx.notify();
+                }
+            }));
+        if self.menu_on.as_ref() != Some(&path) {
+            row = row.tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(told.clone()).build(window, cx));
+        }
         row.context_menu(menu).into_any_element()
     }
 }

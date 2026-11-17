@@ -303,7 +303,7 @@ impl TaskView {
                 .background_spawn(crate::procs::on_thread(move || { open_client.did_open(&open_path, language_id, &content) }))
                 .await;
             let (ok, status) = match result {
-                Ok(()) => (true, "ready · hover, Ctrl+click = definition".to_string()),
+                Ok(()) => (true, "ready".to_string()),
                 Err(error) => (false, format!("failed: {error:#}")),
             };
             let _ = weak_file.update(cx, |f, cx| {

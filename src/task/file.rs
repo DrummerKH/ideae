@@ -1019,6 +1019,7 @@ impl FileView {
                 let short: String = problem.chars().take(90).collect();
                 format!("{}: {short}{}", self.lsp_program, if short.len() < problem.len() { "…" } else { "" })
             }
+            (false, Some(true), None) if self.lsp_status == "ready" => format!("{} ●", self.lsp_program),
             (false, _, _) => format!("{}: {}", self.lsp_program, self.lsp_status),
         }
     }
@@ -1121,6 +1122,14 @@ impl Render for FileView {
                             .id("lsp-status")
                             .flex_none()
                             .when(self.lsp_ok == Some(true) && !self.is_busy(), |s| s.text_color(gpui_kit::green()))
+                            // How to use it, where it takes no room.
+                            .when(self.lsp_ok == Some(true) && self.lsp_problem().is_none(), |s| {
+                                let told = format!(
+                                    "The language server is ready: hover a name for what it is, {} or Ctrl+click to go to where it is declared",
+                                    crate::keymap::label("definition")
+                                );
+                                s.tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(told.clone()).build(window, cx))
+                            })
                             .when(self.lsp_ok == Some(false) && self.lsp_status.contains("failed"), |s| {
                                 s.text_color(gpui_kit::red())
                             })

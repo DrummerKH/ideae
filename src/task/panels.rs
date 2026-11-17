@@ -334,6 +334,11 @@ impl TaskView {
                                     .map(|ix| {
                                         let item = &items[ix];
                                         let (file, line) = (file.clone(), item.line);
+                                        // "function open" read slowly down a list: a colored
+                                        // letter for the kind, the word in the tooltip.
+                                        let (kind, name) = item.label.rsplit_once(' ').unwrap_or(("", item.label.as_str()));
+                                        let (mark, color) = kind_mark(kind);
+                                        let kind = SharedString::from(kind.to_string());
                                         div()
                                             .id(("decl", ix))
                                             .w_full()
@@ -346,7 +351,17 @@ impl TaskView {
                                             .when(Some(ix) == current, |d| d.bg(cx.theme().accent))
                                             .when(keyboard && ix == this.side_selected, |d| d.border_l_2().border_color(cx.theme().primary))
                                             .hover(|d| d.bg(cx.theme().accent))
-                                            .child(item.label.clone())
+                                            .when(!kind.is_empty(), |d| {
+                                                let kind = kind.clone();
+                                                d.tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(kind.clone()).build(window, cx))
+                                            })
+                                            .child(
+                                                h_flex()
+                                                    .gap_1p5()
+                                                    .min_w_0()
+                                                    .child(div().w(px(12.)).flex_none().text_xs().font_semibold().text_color(color).child(mark))
+                                                    .child(div().min_w_0().truncate().child(name.to_string())),
+                                            )
                                             .on_click(cx.listener(move |this, _, window, cx| {
                                                 if let Some(ix) = this.tabs.iter().position(|t| t.id == id) {
                                                     this.activate(ix, window, cx);
@@ -364,4 +379,31 @@ impl TaskView {
             )
             .into_any_element()
     }
+}
+
+/// A declaration's kind as a letter and a color, as IDEs mark them.
+fn kind_mark(kind: &str) -> (&'static str, Hsla) {
+    let has = |words: &[&str]| words.iter().any(|w| kind.contains(w));
+    let (mark, hue) = if has(&["method"]) {
+        ("m", 0.58)
+    } else if has(&["function", "fn"]) {
+        ("f", 0.58)
+    } else if has(&["interface", "trait", "protocol"]) {
+        ("I", 0.38)
+    } else if has(&["enum"]) {
+        ("E", 0.78)
+    } else if has(&["impl"]) {
+        ("i", 0.78)
+    } else if has(&["class", "struct", "object", "record"]) {
+        ("C", 0.08)
+    } else if has(&["type"]) {
+        ("T", 0.48)
+    } else if has(&["module", "namespace", "package", "mod"]) {
+        ("M", 0.12)
+    } else if has(&["field", "property", "const", "static", "var", "let"]) {
+        ("v", 0.15)
+    } else {
+        return ("·", hsla(0., 0., 0.5, 1.));
+    };
+    (mark, hsla(hue, 0.6, 0.5, 1.))
 }

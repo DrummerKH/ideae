@@ -101,6 +101,12 @@ pub fn set(kind: Kind, size: Option<f32>, cx: &mut App) {
     cx.refresh_windows();
 }
 
+/// Whether any kind has a size of its own, for "back to the usual size".
+pub fn any_set(cx: &App) -> bool {
+    let zoom = current(cx);
+    [Kind::Editor, Kind::Changes, Kind::Terminal].into_iter().any(|kind| zoom.get(kind).is_some())
+}
+
 /// Every kind back to the theme's size.
 pub fn reset_all(cx: &mut App) {
     for kind in [Kind::Editor, Kind::Changes, Kind::Terminal] {
