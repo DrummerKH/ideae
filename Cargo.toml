@@ -88,6 +88,9 @@ gpui-cn = { path = "vendor/gpui-cn" }
 # input/base/gutter.rs (new) + state.rs + element.rs + layout.rs patched: notes left of the
 # line numbers (blame) with hover and click, and bookmarked lines that follow edits.
 gpui-base = { path = "vendor/gpui-base" }
+# wayland/window.rs patched: the first commit waits for maximize/fullscreen, so a
+# window opened maximized is placed by the compositor and restores to that place.
+gpui-fast-linux = { path = "vendor/gpui-fast-linux" }
 
 [dev-dependencies]
 gpui-kit = { version = "0.8.1", features = ["test-support"] }
