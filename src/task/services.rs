@@ -231,9 +231,7 @@ impl TaskView {
             self.services_error = Some(e);
         }
         self.services_found.remove(ix);
-        if let Ok(services) = crate::services::load(&self.root) {
-            self.services = services;
-        }
+        self.refresh_services(cx);
         cx.notify();
     }
 
