@@ -197,9 +197,11 @@ impl TaskView {
     pub fn compare_with(&mut self, rev: String, file: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         let root = self.root.clone();
         cx.spawn_in(window, async move |_, cx| {
+            // A commit's whole hash says no more than its first ten characters.
+            let shown = if rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_hexdigit()) { &rev[..10] } else { rev.as_str() };
             let title = match &file {
-                Some(file) => format!("{file}: {rev} on the left, as it is now on the right"),
-                None => format!("{rev} on the left, the working tree on the right"),
+                Some(file) => format!("{file}: {shown} on the left, as it is now on the right"),
+                None => format!("{shown} on the left, the working tree on the right"),
             };
             let files = cx
                 .background_spawn(async move { DiffFile::parse(&git::diff_against(&root, &rev, file.as_deref())).map(with_languages).unwrap_or_default() })

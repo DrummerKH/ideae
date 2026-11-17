@@ -93,13 +93,29 @@ pub fn show_diff_dialog(title: String, files: Vec<DiffFile>, window: &mut Window
     if files.is_empty() {
         return window.push_notification(Notification::info(format!("{title}: nothing differs.")), cx);
     }
-    let diff = cx.new(|cx| DiffState::new(files, cx).with_mode(DiffMode::Split));
+    // As the Changes tab shows diffs: in the mode chosen there.
+    let mode = if crate::state::with_settings(|s| s.diff_unified) { DiffMode::Unified } else { DiffMode::Split };
+    let diff = cx.new(|cx| DiffState::new(files, cx).with_mode(mode));
     let room = window.viewport_size();
     let (width, height) = (room.width * 0.92, room.height * 0.72);
     window.open_dialog(cx, move |dialog, _, _| {
         let diff = diff.clone();
         dialog.title(title.clone()).w(width).content(move |content, _, cx| {
-            content.child(div().h(height).child(Diff::new(&diff).line_number(true).code_font_size(crate::zoom::size(crate::zoom::Kind::Changes, cx))))
+            // Wrapped, as in Changes and History: unwrapped, the two sides share the
+            // longest line's width and the right one goes past the dialog's edge.
+            let mode = diff.read(cx).mode();
+            content
+                .child(h_flex().gap_1().pb_1().children([("compare-split", "Split", DiffMode::Split), ("compare-unified", "Unified", DiffMode::Unified)].map(|(id, label, to)| {
+                    let diff = diff.clone();
+                    Button::new(id).small().ghost().label(label).selected(mode == to).on_click(move |_, _, cx| {
+                        // The one choice of mode, as the Changes tab's buttons make it.
+                        let mut settings = crate::state::settings();
+                        settings.diff_unified = to == DiffMode::Unified;
+                        crate::state::set_settings(settings);
+                        diff.update(cx, |d, cx| d.set_mode(to, cx));
+                    })
+                })))
+                .child(div().h(height).child(Diff::new(&diff).line_number(true).soft_wrap(true).code_font_size(crate::zoom::size(crate::zoom::Kind::Changes, cx))))
         })
     });
 }
