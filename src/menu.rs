@@ -1,11 +1,13 @@
-//! The menu bar macOS keeps at the top of the screen, kept short: the tasks,
-//! their git and the window, not the editor's commands. The keys shown are
+//! The menu bar: macOS keeps it at the top of the screen; on Linux and
+//! Windows it is in the title bar, behind ☰ or always shown, drawn from the
+//! same menus. Kept short: the tasks, their git and the window, not the
+//! editor's commands. The keys shown are
 //! those in force. An item is grey where it would do nothing: no handler on
 //! the focus path, nothing for the task or git to do, a dialog up. The menus
 //! are made once; what each item says, and whether it is grey or checked, is
 //! told when its menu opens.
 
-use gpui_kit::component::input;
+use gpui_kit::component::{WindowExt as _, input, menu::AppMenuBar};
 use gpui_kit::{App, Context, KeyBinding, Menu, MenuItem, OsAction, SystemMenuType, Window, actions};
 
 use crate::commands::{GroupCommand, InHand, ProjectCommand, TaskCommand, git_name};
@@ -33,6 +35,17 @@ struct Shown {
     replace: bool,
     spaces: Vec<String>,
     space: Option<String>,
+    /// What the focused view takes, which AppKit tells by itself on macOS:
+    /// Edit's items, Save, Find.
+    edit: bool,
+    save: bool,
+    find: bool,
+    /// What only the in-window menu bar shows: macOS has its own for these.
+    zoomed: bool,
+    fullscreen: bool,
+    maximized: bool,
+    /// Pinned to the dash; none where there is no dash to pin to.
+    pinned: Option<bool>,
 }
 
 #[derive(Clone, PartialEq, gpui_kit::Action)]
@@ -72,6 +85,25 @@ impl Workspace {
             judging: self.group_in_hand().is_some_and(|g| self.is_judging(g)),
             group_settled: self.group_in_hand().is_some_and(|g| self.group_settled(g, cx)),
             task: self.in_hand(cx),
+            edit: window.is_action_available(&input::Copy, cx),
+            save: keymap::find("save").is_some_and(|s| window.is_action_available(s.action().as_ref(), cx)),
+            find: window.is_action_available(&input::Search, cx),
+            zoomed: crate::zoom::any_set(cx),
+            fullscreen: window.is_fullscreen(),
+            maximized: window.is_maximized(),
+            pinned: crate::desktop::can_pin().then_some(self.pinned),
+        }
+    }
+
+    /// Writes the launcher entry and adds it to the dash, or takes it off.
+    fn toggle_pin(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let result = if self.pinned { Ok(crate::desktop::unpin()) } else { crate::desktop::pin() };
+        match result {
+            Ok(()) => {
+                self.pinned = !self.pinned;
+                cx.notify();
+            }
+            Err(err) => window.push_notification(gpui_kit::component::notification::Notification::error(err).title("Pin to dash"), cx),
         }
     }
 
@@ -79,7 +111,6 @@ impl Workspace {
     /// not on the way: focus on nothing, or on a view no longer drawn. Not
     /// from a dialog, which keeps it.
     fn focus_task_unless_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        use gpui_kit::component::WindowExt as _;
         if !window.has_active_dialog(cx)
             && let Some(view) = self.active_view()
         {
@@ -90,16 +121,26 @@ impl Workspace {
 
 actions!(
     ideae,
-    [FindAndReplace, AddProject, PresentationMode, PowerSaving, Restart, KeyboardShortcuts, About, BringAllToFront, CloseWindow, Documentation, Hide, HideOthers, ShowAll, Minimize, ZoomWindow]
+    [
+        FindAndReplace, AddProject, PresentationMode, PowerSaving, Restart, KeyboardShortcuts, About, BringAllToFront, CloseWindow, Documentation, Hide, HideOthers, ShowAll,
+        Minimize, ZoomWindow, FullScreen, ResetTextSize, PinToDash, OpenMenuBar
+    ]
 );
 
 pub fn init(cx: &mut App) {
-    if !cfg!(target_os = "macos") {
-        return;
+    if cfg!(target_os = "macos") {
+        cx.on_action(|_: &Hide, cx| cx.hide());
+        cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
+        cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
+    } else {
+        // Alt pressed and let go alone: gpui tells it as a keystroke of its own,
+        // so Alt with another key is still that key's.
+        cx.bind_keys([KeyBinding::new("alt", OpenMenuBar, None)]);
+        cx.on_action(|_: &OpenMenuBar, cx| toggle_bar(cx));
+        cx.on_action(|_: &FullScreen, cx| in_window(cx, |_, window, _| window.toggle_fullscreen()));
+        cx.on_action(|_: &ResetTextSize, cx| crate::zoom::reset_all(cx));
+        cx.on_action(|_: &PinToDash, cx| in_window(cx, |w, window, cx| w.toggle_pin(window, cx)));
     }
-    cx.on_action(|_: &Hide, cx| cx.hide());
-    cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
-    cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
     // The window's own handlers are out of reach while a dialog holds focus,
     // nothing does, or the window is in the Dock: these still have to work.
     cx.on_action(|_: &crate::Quit, cx| {
@@ -117,7 +158,16 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &Restart, cx| in_window(cx, |w, window, cx| w.restart(window, cx)));
     cx.on_action(|_: &Minimize, cx| in_window(cx, |_, window, _| window.minimize_window()));
     cx.on_action(|_: &ZoomWindow, cx| in_window(cx, |_, window, _| window.zoom_window()));
-    cx.on_action(|_: &About, _| about_panel());
+    cx.on_action(|_: &About, cx| {
+        if cfg!(target_os = "macos") {
+            about_panel()
+        } else {
+            in_window(cx, |_, window, cx| {
+                let told = format!("{}\n{COPYRIGHT}", crate::build_watch::version());
+                window.push_notification(gpui_kit::component::notification::Notification::info(told).title(state::APP_ID), cx)
+            })
+        }
+    });
     cx.on_action(|_: &Documentation, cx| cx.open_url(DOCS));
     // The window's ×: the agents keep running.
     cx.on_action(|_: &CloseWindow, cx| {
@@ -135,7 +185,6 @@ pub fn init(cx: &mut App) {
             return cx.propagate();
         }
         in_window(cx, move |w, window, cx| {
-            use gpui_kit::component::WindowExt as _;
             // Out of the Dock first: what opens would open unseen.
             window.activate_window();
             if !window.has_active_dialog(cx) {
@@ -268,7 +317,6 @@ fn about_panel() {
     }
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const COPYRIGHT: &str = "Mozilla Public License 2.0 · github.com/scillarium/ideae";
 
 /// AppKit adds Start Dictation and Emoji & Symbols to any menu named Edit;
@@ -370,7 +418,7 @@ const REACHED: &[&str] = &[
 /// The item's action, sent again once the window is up and the task has
 /// the keyboard. Once for each kind of action, however many shortcuts share it.
 pub fn reach<A: gpui_kit::Action + Clone>(_: &A, cx: &mut App) {
-    if !cfg!(target_os = "macos") || !REACHING.with_borrow_mut(|seen| seen.insert(std::any::TypeId::of::<A>())) {
+    if !REACHING.with_borrow_mut(|seen| seen.insert(std::any::TypeId::of::<A>())) {
         return;
     }
     cx.on_action(|a: &A, cx| {
@@ -449,7 +497,6 @@ fn shown_now(cx: &mut App) -> Option<Shown> {
     let (window, workspace) = (target.window, target.workspace.clone());
     window
         .update(cx, |_, window, cx| {
-            use gpui_kit::component::WindowExt as _;
             let workspace = workspace.upgrade()?;
             let dialog = window.has_active_dialog(cx);
             Some(workspace.read(cx).shown(dialog, window, cx))
@@ -478,8 +525,8 @@ fn keep_live(menus: &[Menu]) {
 /// Puts the menus in the bar; again after shortcuts changed, so the keys
 /// shown are the ones in force, and after the spaces did.
 pub fn install(cx: &mut App) {
+    watch_dialogs(cx);
     if cfg!(target_os = "macos") {
-        watch_dialogs(cx);
         let shown = shown_now(cx).unwrap_or_default();
         let menus = menus(shown);
         keep_live(&menus);
@@ -487,6 +534,47 @@ pub fn install(cx: &mut App) {
         help_menu();
         strip_edit();
     }
+}
+
+/// The menu bar in the window's title bar, on Linux and Windows.
+struct Bar(gpui_kit::Entity<AppMenuBar>);
+
+impl gpui_kit::Global for Bar {}
+
+/// Made once the window is, with its workspace, which the menus are read
+/// from as each opens.
+pub fn make_bar(cx: &mut App) {
+    if cfg!(target_os = "macos") {
+        return;
+    }
+    let Some(window) = cx.try_global::<Target>().map(|t| t.window) else { return };
+    if let Ok(bar) = window.update(cx, |_, window, cx| AppMenuBar::with_source(std::rc::Rc::new(bar_menus), window, cx)) {
+        cx.set_global(Bar(bar));
+        cx.refresh_windows();
+    }
+}
+
+fn bar_menus(window: &mut Window, cx: &mut App) -> Vec<gpui_kit::OwnedMenu> {
+    let dialog = window.has_active_dialog(cx);
+    let shown = cx.try_global::<Target>().and_then(|t| t.workspace.upgrade()).map(|w| w.read(cx).shown(dialog, window, cx));
+    menus(shown.unwrap_or_default()).into_iter().map(Menu::owned).collect()
+}
+
+/// The bar for the title bar: collapsed, a ☰ until a menu opens.
+pub fn bar(collapsed: bool, cx: &mut App) -> Option<gpui_kit::Entity<AppMenuBar>> {
+    let bar = cx.try_global::<Bar>()?.0.clone();
+    if bar.read(cx).collapsed() != collapsed {
+        bar.update(cx, |bar, cx| bar.set_collapsed(collapsed, cx));
+    }
+    Some(bar)
+}
+
+/// After the key's dispatch: the window cannot be entered while it is the one dispatching.
+fn toggle_bar(cx: &mut App) {
+    cx.defer(|cx| {
+        let (Some(window), Some(bar)) = (cx.try_global::<Target>().map(|t| t.window), cx.try_global::<Bar>().map(|b| b.0.clone())) else { return };
+        let _ = window.update(cx, |_, window, cx| bar.update(cx, |bar, cx| bar.toggle(window, cx)));
+    });
 }
 
 thread_local! {
@@ -557,11 +645,17 @@ fn act(name: impl Into<gpui_kit::SharedString>, action: impl gpui_kit::Action) -
 
 /// macOS adds items of its own, which are therefore not here: Enter Full
 /// Screen to View, the window's tiling to Window, dictation and emoji to
-/// Edit, the search over all items to Help.
+/// Edit, the search over all items to Help. Linux and Windows have no menu
+/// named after the app: its items are where their users look, Settings and
+/// Exit at the end of File, About in Help.
 fn menus(shown: Shown) -> Vec<Menu> {
+    let mac = cfg!(target_os = "macos");
     let sep = MenuItem::separator;
     let app = state::APP_ID;
-    let Shown { dialog, power_saving, presenting, focus_mode, projects, project, task: in_hand, replace, spaces, space, group, showing_group, group_settled, judging } = shown;
+    let Shown {
+        dialog, power_saving, presenting, focus_mode, projects, project, task: in_hand, replace, spaces, space, group, showing_group, group_settled, judging, edit, save, find, zoomed,
+        fullscreen, maximized, pinned,
+    } = shown;
     // Under a dialog only Edit's, the window's and the app's own but Quit do something.
     let free = !dialog;
     let open = free && in_hand.is_some_and(|t| t.open);
@@ -572,7 +666,7 @@ fn menus(shown: Shown) -> Vec<Menu> {
     let variants = |what: GroupCommand, on: bool| when(group && on, act(what.name(), OnGroup(what)));
     let git = |what: GitCommand| when(open && in_hand.is_some_and(|t| t.git(what)), act(git_name(what), Git(what)));
     // The handler on the focus path greys these by itself where they do nothing.
-    let in_editor = |name: &'static str, id: &str| when(open, key(name, id));
+    let in_editor = |name: &'static str, id: &str| when(open && (mac || save), key(name, id));
     let in_task = |name: &'static str, id: &str| {
         debug_assert!(REACHED.contains(&id), "{id} is out of reach with nothing focused");
         when(open, key(name, id))
@@ -595,8 +689,65 @@ fn menus(shown: Shown) -> Vec<Menu> {
         space_items.push(sep());
     }
     space_items.push(when(true, act(ProjectCommand::EditSpaces.name(), OnProject(ProjectCommand::EditSpaces))));
-    vec![
-        Menu::new(app).items([
+    // AppKit greys what the focused view does not take; in the window, what Copy is not taken by.
+    let editing = |item: MenuItem| if mac || edit { item } else { off(item) };
+    let mut file = vec![
+        when(projects, key("New Task…", "new_task")),
+        sep(),
+        when(!presenting, act("Add Project…", AddProject)),
+        project_item(ProjectCommand::Remove),
+        project_item(ProjectCommand::ArchiveMerged),
+        sep(),
+        in_editor("Save", "save"),
+        has("Close Tab", "close_tab", |t| t.closable),
+        has("Reopen Closed Tab", "reopen_tab", |t| t.reopen),
+        sep(),
+    ];
+    let mut view = vec![
+        checked(front == Some(FrontTab::Agent), has("Agent Tab", "agent", |t| t.agent)),
+        checked(front == Some(FrontTab::Changes), in_task("Changes Tab", "changes")),
+        checked(front == Some(FrontTab::Shell), in_task("Shell Tab", "shell")),
+        sep(),
+        checked(panel == Some(RightPane::Changes), in_task("Changes Panel", "changes_panel")),
+        checked(panel == Some(RightPane::Files), in_task("Files Panel", "files_panel")),
+        checked(panel == Some(RightPane::Structure), in_task("Structure Panel", "structure_panel")),
+        checked(panel == Some(RightPane::Run), in_task("Run Panel", "run_panel")),
+        sep(),
+        checked(focus_mode, in_task("Focus Mode", "focus_mode")),
+        checked(power_saving, when(true, act("Power Save Mode", PowerSaving))),
+        when(true, act(if presenting { "End Presentation" } else { "Presentation Mode…" }, PresentationMode)),
+    ];
+    if !mac {
+        view.push(when(zoomed, act("Text of Its Usual Size", ResetTextSize)));
+    }
+    view.extend([sep(), MenuItem::submenu(Menu::new("Spaces").items(space_items)), when(true, key("Theme…", "theme"))]);
+    let mut window = vec![act("Minimize", Minimize)];
+    let mut help = vec![
+        when(true, key("Command Palette…", "command_palette")),
+        when(true, act("Keyboard Shortcuts…", KeyboardShortcuts)),
+        sep(),
+        act(format!("{app} Documentation"), Documentation),
+    ];
+    if mac {
+        file.push(act("Close Window", CloseWindow));
+        window.extend([act("Zoom", ZoomWindow), sep(), act("Bring All to Front", BringAllToFront)]);
+    } else {
+        file.extend([when(true, key("Settings…", "settings")), sep()]);
+        if let Some(pinned) = pinned {
+            file.push(act(if pinned { "Unpin from Dash" } else { "Pin to Dash" }, PinToDash));
+        }
+        // Without a daemon to keep the agents, closing the window is Exit.
+        if cfg!(unix) {
+            file.push(act("Close Window", CloseWindow));
+        }
+        file.extend([act("Restart", Restart), when(true, key("Exit", "quit"))]);
+        view.extend([sep(), checked(fullscreen, act("Full Screen", FullScreen))]);
+        window.push(checked(maximized, act("Maximize", ZoomWindow)));
+        help.extend([sep(), act(format!("About {app}"), About)]);
+    }
+    let mut menus = Vec::new();
+    if mac {
+        menus.push(Menu::new(app).items([
             act(format!("About {app}"), About),
             sep(),
             when(true, key("Settings…", "settings")),
@@ -609,31 +760,21 @@ fn menus(shown: Shown) -> Vec<Menu> {
             sep(),
             act(format!("Restart {app}"), Restart),
             when(true, key(format!("Quit {app}"), "quit")),
-        ]),
-        Menu::new("File").items([
-            when(projects, key("New Task…", "new_task")),
-            sep(),
-            when(!presenting, act("Add Project…", AddProject)),
-            project_item(ProjectCommand::Remove),
-            project_item(ProjectCommand::ArchiveMerged),
-            sep(),
-            in_editor("Save", "save"),
-            has("Close Tab", "close_tab", |t| t.closable),
-            has("Reopen Closed Tab", "reopen_tab", |t| t.reopen),
-            sep(),
-            act("Close Window", CloseWindow),
-        ]),
+        ]));
+    }
+    menus.extend([
+        Menu::new("File").items(file),
         Menu::new("Edit").items([
-            MenuItem::os_action("Undo", input::Undo, OsAction::Undo),
-            MenuItem::os_action("Redo", input::Redo, OsAction::Redo),
+            editing(MenuItem::os_action("Undo", input::Undo, OsAction::Undo)),
+            editing(MenuItem::os_action("Redo", input::Redo, OsAction::Redo)),
             sep(),
-            MenuItem::os_action("Cut", input::Cut, OsAction::Cut),
-            MenuItem::os_action("Copy", input::Copy, OsAction::Copy),
-            MenuItem::os_action("Paste", input::Paste, OsAction::Paste),
-            MenuItem::os_action("Select All", input::SelectAll, OsAction::SelectAll),
+            editing(MenuItem::os_action("Cut", input::Cut, OsAction::Cut)),
+            editing(MenuItem::os_action("Copy", input::Copy, OsAction::Copy)),
+            editing(MenuItem::os_action("Paste", input::Paste, OsAction::Paste)),
+            editing(MenuItem::os_action("Select All", input::SelectAll, OsAction::SelectAll)),
             sep(),
             MenuItem::submenu(Menu::new("Find").items([
-                when(true, act("Find…", input::Search)),
+                when(mac || find, act("Find…", input::Search)),
                 // Its keys, ⇧⌘F in the editor, are Find in Files' everywhere else.
                 when(replace, act("Find and Replace…", FindAndReplace)),
                 sep(),
@@ -641,23 +782,7 @@ fn menus(shown: Shown) -> Vec<Menu> {
                 in_task("Replace in Files…", "replace_in_files"),
             ])),
         ]),
-        Menu::new("View").items([
-            checked(front == Some(FrontTab::Agent), has("Agent Tab", "agent", |t| t.agent)),
-            checked(front == Some(FrontTab::Changes), in_task("Changes Tab", "changes")),
-            checked(front == Some(FrontTab::Shell), in_task("Shell Tab", "shell")),
-            sep(),
-            checked(panel == Some(RightPane::Changes), in_task("Changes Panel", "changes_panel")),
-            checked(panel == Some(RightPane::Files), in_task("Files Panel", "files_panel")),
-            checked(panel == Some(RightPane::Structure), in_task("Structure Panel", "structure_panel")),
-            checked(panel == Some(RightPane::Run), in_task("Run Panel", "run_panel")),
-            sep(),
-            checked(focus_mode, in_task("Focus Mode", "focus_mode")),
-            checked(power_saving, when(true, act("Power Save Mode", PowerSaving))),
-            when(true, act(if presenting { "End Presentation" } else { "Presentation Mode…" }, PresentationMode)),
-            sep(),
-            MenuItem::submenu(Menu::new("Spaces").items(space_items)),
-            when(true, key("Theme…", "theme")),
-        ]),
+        Menu::new("View").items(view),
         Menu::new("Navigate").items([
             in_task("Go to File…", "go_to_file"),
             in_task("Go to Class or Symbol…", "go_to_symbol"),
@@ -710,19 +835,10 @@ fn menus(shown: Shown) -> Vec<Menu> {
             in_task("Branches…", "branches"),
             task(TaskCommand::CompareWithBranch),
         ]),
-        Menu::new("Window").items([
-            act("Minimize", Minimize),
-            act("Zoom", ZoomWindow),
-            sep(),
-            act("Bring All to Front", BringAllToFront),
-        ]),
-        Menu::new("Help").items([
-            when(true, key("Command Palette…", "command_palette")),
-            when(true, act("Keyboard Shortcuts…", KeyboardShortcuts)),
-            sep(),
-            act(format!("{app} Documentation"), Documentation),
-        ]),
-    ]
+        Menu::new("Window").items(window),
+        Menu::new("Help").items(help),
+    ]);
+    menus
 }
 
 #[cfg(test)]
@@ -765,7 +881,9 @@ mod tests {
     #[test]
     fn the_menus_are_made() {
         let menus = super::menus(Shown { projects: true, project: true, task: Some(InHand { main: false, side: false, ready: true, grouped: true, starred: false, open: true, agent: true, agent_ended: true, closable: true, file: true, back: true, forward: true, reopen: true, services: true, services_running: true, services_waiting: true, git: [true; 9], front: Some(FrontTab::Agent), panel: None }), spaces: vec!["Work".into()], ..Default::default() });
-        assert_eq!(menus.iter().map(|m| m.name.as_ref()).collect::<Vec<_>>()[1..], ["File", "Edit", "View", "Navigate", "Task", "Git", "Window", "Help"]);
+        let titles: Vec<_> = menus.iter().map(|m| m.name.as_ref()).collect();
+        // Linux and Windows have no menu named after the app: its items are in File and Help.
+        assert_eq!(titles[usize::from(cfg!(target_os = "macos"))..], ["File", "Edit", "View", "Navigate", "Task", "Git", "Window", "Help"]);
         for id in super::REACHED {
             assert!(crate::keymap::find(id).is_some(), "no shortcut {id}");
         }
@@ -822,11 +940,15 @@ mod tests {
         assert!(live(&idle, "Git", "Fetch") && !live(&idle, "Git", "Commit…") && !live(&idle, "Task", "Archive Task"));
 
         // Under a dialog only Edit's, the window's and the app's own but Quit do something.
-        let dialog = super::menus(Shown { dialog: true, task: Some(task), projects: true, ..Default::default() });
+        let dialog = super::menus(Shown { dialog: true, edit: true, task: Some(task), projects: true, ..Default::default() });
         assert!(!live(&dialog, "File", "New Task…") && !live(&dialog, "Git", "Pull") && !live(&dialog, "Task", "Unstar Task") && !live(&dialog, "View", "Agent Tab"));
         assert!(live(&dialog, "Edit", "Copy") && live(&dialog, "Window", "Minimize"));
         // The question to quit is a dialog too: a second Cmd+Q asks nothing again.
-        assert!(!live(&dialog, crate::state::APP_ID, &format!("Quit {}", crate::state::APP_ID)));
+        if cfg!(target_os = "macos") {
+            assert!(!live(&dialog, crate::state::APP_ID, &format!("Quit {}", crate::state::APP_ID)));
+        } else {
+            assert!(!live(&dialog, "File", "Exit") && live(&dialog, "File", "Restart"));
+        }
 
         let main = super::menus(Shown { task: Some(InHand { main: true, starred: false, ..task }), ..Default::default() });
         assert!(live(&main, "Task", "Star Task") && live(&main, "Task", "Pause Task"));
@@ -841,6 +963,166 @@ mod tests {
 
         let presenting = super::menus(Shown { presenting: true, ..Default::default() });
         assert!(live(&presenting, "View", "End Presentation") && !live(&presenting, "File", "Add Project…"));
+    }
+}
+
+/// The bar in the title bar, as Linux and Windows have it.
+#[cfg(all(test, not(target_os = "macos")))]
+mod bar {
+    use std::{cell::RefCell, rc::Rc};
+
+    use gpui_kit::component::menu::AppMenuBar;
+    use gpui_kit::test::{TestEventExt as _, TestQueryExt as _, TestWindowExt as _};
+    use gpui_kit::{
+        AppContext as _, Bounds, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement, KeyBinding, Menu, Modifiers, MouseButton, ParentElement as _,
+        Point, Render, Styled as _, TestAppContext, Window, WindowBounds, WindowOptions, div, px, size,
+    };
+
+    use super::{OnTask, OpenMenuBar, Shown};
+    use crate::commands::{InHand, TaskCommand};
+
+    struct Root {
+        bar: Entity<AppMenuBar>,
+        focus: FocusHandle,
+    }
+
+    impl Render for Root {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().track_focus(&self.focus).child(div().h(px(32.)).child(self.bar.clone()))
+        }
+    }
+
+    type Sent = Rc<RefCell<Vec<TaskCommand>>>;
+
+    /// A window with the bar over the given state; the task items it sends, kept.
+    fn open(cx: &mut TestAppContext, shown: Shown, collapsed: bool) -> (gpui_kit::AnyWindowHandle, Entity<AppMenuBar>, Sent) {
+        cx.update(gpui_kit::init);
+        let sent: Sent = Rc::default();
+        cx.update(|cx| {
+            let kept = sent.clone();
+            cx.on_action(move |a: &OnTask, _| kept.borrow_mut().push(a.0));
+            let bounds = Bounds { origin: Point::default(), size: size(px(1000.), px(700.)) };
+            let options = WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() };
+            let mut bar = None;
+            let window = gpui_kit::open_window(options, cx, |window, cx| {
+                let made = AppMenuBar::with_source(Rc::new(move |_, _| super::menus(shown.clone()).into_iter().map(Menu::owned).collect()), window, cx);
+                made.update(cx, |b, cx| b.set_collapsed(collapsed, cx));
+                bar = Some(made.clone());
+                cx.new(|cx| {
+                    let focus = cx.focus_handle();
+                    focus.focus(window, cx);
+                    Root { bar: made, focus }
+                })
+            })
+            .expect("a test window")
+            .0;
+            (window, bar.unwrap(), sent)
+        })
+    }
+
+    fn task() -> InHand {
+        InHand { main: true, side: false, ready: true, grouped: false, starred: false, open: true, agent: true, agent_ended: false, closable: true, file: false, back: false, forward: false, reopen: false, services: false, services_running: false, services_waiting: false, git: [true; 9], front: None, panel: None }
+    }
+
+    fn click_label(window: &mut Window, label: &str, cx: &mut gpui_kit::App) {
+        let at = window.find_by_label(label).bounds().center();
+        window.pointer_move(at, None, cx);
+        window.pointer_down(at, MouseButton::Left, cx);
+        window.pointer_up(at, MouseButton::Left, cx);
+    }
+
+    /// ☰ opens the bar on its first menu; another name hovered opens that one;
+    /// an item sends its action and the bar is ☰ again; a grey one does nothing.
+    #[gpui_kit::test]
+    fn the_bar_opens_and_sends(cx: &mut TestAppContext) {
+        let (handle, bar, sent) = open(cx, Shown { task: Some(task()), projects: true, ..Default::default() }, true);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("app-menu-bar").is_none(), "collapsed, only ☰");
+            window.click("app-menu", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("menu-Help").is_some(), "the names, in place of ☰");
+            assert!(window.try_find_by_label("New Task…").is_some(), "File is open");
+
+            window.hover("menu-Task", cx);
+            window.render_frame(cx);
+            assert!(window.try_find_by_label("New Task…").is_none() && window.try_find_by_label("Star Task").is_some(), "Task, by the pointer");
+
+            // The main thread has no name of its own to change.
+            click_label(window, "Rename Task…", cx);
+            window.render_frame(cx);
+            assert!(sent.borrow().is_empty() && bar.read(cx).is_open(), "a grey item does nothing");
+
+            click_label(window, "Star Task", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(*sent.borrow() == [TaskCommand::Star]);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(!bar.read(cx).is_open() && window.try_find("app-menu").is_some(), "back to ☰");
+        })
+        .unwrap();
+    }
+
+    /// Esc closes the menu; with the bar always shown, the names stay.
+    #[gpui_kit::test]
+    fn escape_closes_and_the_names_stay_when_shown(cx: &mut TestAppContext) {
+        let (handle, bar, _) = open(cx, Shown::default(), false);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("app-menu").is_none() && window.try_find("menu-File").is_some(), "shown without a click");
+            window.click("menu-Git", cx);
+            window.render_frame(cx);
+            // Nothing in hand: git has nothing to act on.
+            click_label(window, "Push", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            assert!(bar.read(cx).is_open(), "a grey item leaves the menu open");
+            window.press("right", cx);
+            window.render_frame(cx);
+            assert!(window.try_find_by_label("Minimize").is_some(), "Right moves to Window");
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(!bar.read(cx).is_open() && window.try_find("menu-File").is_some(), "closed, the names still there");
+        })
+        .unwrap();
+    }
+
+    /// Alt pressed and let go alone opens the bar; Alt with a key does not.
+    #[gpui_kit::test]
+    fn alt_alone_opens_it(cx: &mut TestAppContext) {
+        let (handle, bar, _) = open(cx, Shown::default(), true);
+        cx.update(|cx| {
+            cx.bind_keys([KeyBinding::new("alt", OpenMenuBar, None)]);
+            cx.on_action(|_: &OpenMenuBar, cx| super::toggle_bar(cx));
+            cx.set_global(super::Bar(bar.clone()));
+            cx.set_global(super::Target { window: handle, workspace: gpui_kit::WeakEntity::new_invalid() });
+        });
+        let alt = Modifiers { alt: true, ..Default::default() };
+        cx.update_window(handle, |_, window, cx| {
+            window.change_modifiers(alt, cx);
+            window.key_down("alt-j", false, cx);
+            window.key_up("alt-j", cx);
+            window.change_modifiers(Modifiers::default(), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(!cx.read(|cx| bar.read(cx).is_open()), "Alt+J is J's");
+        cx.update_window(handle, |_, window, cx| {
+            window.change_modifiers(alt, cx);
+            window.change_modifiers(Modifiers::default(), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(cx.read(|cx| bar.read(cx).is_open()), "Alt alone opens it");
     }
 }
 

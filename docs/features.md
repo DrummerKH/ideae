@@ -195,12 +195,16 @@ picture of it go into the prompt.
 
 ## Window
 
+- One menu bar on every system: File, Edit, View, Navigate, Task, Git, Window
+  and Help. macOS has it at the top of the screen; on Linux and Windows it is
+  behind ☰ in the title bar, or Alt pressed alone (Settings → Title bar can
+  keep it shown). Items show the keys in force and are grey where they would
+  do nothing.
 - Themes: Ayu, Catppuccin, Gruvbox, Solarized, Everforest and Flexoki, each
   light and dark (Theme… in the menu shows each as you go through the list).
 - Spaces sort projects into sets (work, personal, a client); the window shows
   one at a time, and the agents of the others keep working unseen.
-- Presentation mode (☰ → Enter presentation mode; on macOS, View →
-  Presentation Mode…) leaves only the tasks you pick in the window, draws code
+- Presentation mode (View → Presentation Mode…) leaves only the tasks you pick in the window, draws code
   larger, and hides what git ignores (keys, local settings) until asked for.
 - Focus mode (Shift+Esc) puts one pane over the whole window.
 - Dragged narrow, the sidebar becomes a rail of tasks that opens on hover.

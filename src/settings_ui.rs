@@ -192,7 +192,15 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
                     "What the agents of the tasks open here took in the last 24 hours.",
                     |s| s.show_tokens,
                     |s, v| s.show_tokens = v,
-                )),
+                ))
+                // macOS has its own at the top of the screen.
+                .items((!cfg!(target_os = "macos")).then(|| switch(
+                    draft,
+                    "Menu bar always shown",
+                    "File, Edit, View and the others stay in the title bar. Off, they are behind ☰, or Alt pressed alone.",
+                    |s| s.menu_bar_shown,
+                    |s, v| s.menu_bar_shown = v,
+                ))),
         ).group(
             SettingGroup::new().title("Sidebar")
                 .item(switch(

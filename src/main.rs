@@ -52,7 +52,7 @@ mod zoom;
 use std::path::PathBuf;
 
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Sizable as _, TitleBar, WindowExt as _,
+    ActiveTheme as _, Disableable as _, Sizable as _, TitleBar,
     button::{Button, ButtonVariants as _},
     resizable::{h_resizable, resizable_panel},
     h_flex, v_flex,
@@ -99,17 +99,19 @@ impl Render for Workspace {
                     .child(
                     h_flex()
                         .w_full()
+                        .min_w_0()
                         .pr_4()
                         .justify_between()
                         .child(
                             h_flex()
                                 .id("title-menu")
                                 .gap_2()
-                                .min_w_0()
+                                // The menus, when open, before what the title bar reads out.
+                                .flex_shrink_0()
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .on_click(|_, _, cx| cx.stop_propagation())
-                                // On macOS the menu bar takes its place; the rest is in the command palette.
-                                .when(!cfg!(target_os = "macos"), |row| row.child(self.render_menu(cx))),
+                                // On macOS the menu bar is the system's. A narrow window keeps the room for the title.
+                                .children(menu::bar(!shown.menu_bar_shown || window.viewport_size().width < RAIL_WINDOW, cx)),
                         )
                         .child(self.render_title(cx))
                         .child(
@@ -118,6 +120,8 @@ impl Render for Workspace {
                             // slight move while pressed would start dragging it.
                             h_flex()
                                 .id("title-actions")
+                                .min_w_0()
+                                .overflow_hidden()
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .on_click(|_, _, cx| cx.stop_propagation())
                                 .gap_3()
@@ -460,87 +464,6 @@ impl Workspace {
             .on_mouse_down(MouseButton::Right, cx.listener(|this, _, window, cx| this.set_appearance(Appearance::Auto, window, cx)))
     }
 
-    /// The app's menu, in the order one comes to it: what to start, where
-    /// to go, how the window is, the app itself.
-    fn render_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
-        let this = cx.weak_entity();
-        let project = self.active_project();
-        let pinned = self.pinned;
-        let presenting = self.is_presenting();
-        let saving = lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed);
-        let zoomed = zoom::any_set(cx);
-        Button::new("app-menu").xsmall().ghost().label("☰").dropdown_menu(move |menu, _, _| {
-            // One line of the menu: its words, its keys at the right and dimmer
-            // as in the command list, what it does.
-            let entry = |menu: PopupMenu, label: &str, key: Option<&str>, act: fn(&mut Workspace, &mut Window, &mut Context<Workspace>)| {
-                let this = this.clone();
-                let label = SharedString::from(label.to_string());
-                let key = key.map(|key| SharedString::from(keymap::label(key))).filter(|k| !k.is_empty());
-                let item = match key {
-                    Some(key) => PopupMenuItem::element(move |_, cx| {
-                        h_flex()
-                            .w_full()
-                            .gap_6()
-                            .child(div().flex_1().child(label.clone()))
-                            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(key.clone()))
-                    }),
-                    None => PopupMenuItem::new(label),
-                };
-                menu.item(item.on_click(move |_, window, cx| {
-                    let _ = this.update(cx, |w, cx| act(w, window, cx));
-                }))
-            };
-            let mut menu = menu;
-            // Not while presenting: nothing is added to the window by a stray click.
-            if !presenting {
-                if project.is_some() {
-                    menu = entry(menu, "New task…", Some("new_task"), |w, window, cx| {
-                        if let Some(project) = w.active_project() {
-                            w.new_task_dialog(project, window, cx)
-                        }
-                    });
-                }
-                menu = entry(menu, "Add project…", None, |w, window, cx| w.add_project_dialog(window, cx)).separator();
-            }
-            menu = entry(menu, "Go to file…", Some("go_to_file"), |w, window, cx| w.finder(finder::FinderKind::Files, window, cx));
-            menu = entry(menu, "Go to class or symbol…", Some("go_to_symbol"), |w, window, cx| w.finder(finder::FinderKind::Symbols, window, cx));
-            menu = entry(menu, "Find in files…", Some("find_in_files"), |w, window, cx| w.finder(finder::FinderKind::Grep, window, cx));
-            menu = entry(menu, "Replace in files…", Some("replace_in_files"), |w, window, cx| w.replace_in_files(window, cx));
-            menu = entry(menu, "Run a command…", Some("command_palette"), |w, window, cx| w.command_palette(window, cx)).separator();
-            menu = entry(menu, if presenting { "End presentation" } else { "Enter presentation mode…" }, None, |w, window, cx| w.toggle_presentation(window, cx));
-            menu = entry(menu, "Theme…", Some("theme"), |w, window, cx| w.theme_picker(window, cx));
-            if zoomed {
-                menu = entry(menu, "Text of its usual size", None, |_, _, cx| zoom::reset_all(cx));
-            }
-            let power = this.clone();
-            menu = menu
-                .item(PopupMenuItem::new("Power save mode").checked(saving).on_click(move |_, _, cx| {
-                    let _ = power.update(cx, |w, cx| w.toggle_power_saving(cx));
-                }))
-                .separator();
-            menu = entry(menu, "Settings…", Some("settings"), |w, window, cx| w.open_settings(window, cx));
-            menu = entry(menu, "Keyboard shortcuts…", None, |w, window, cx| w.open_settings_at(settings_ui::KEYS_PAGE, window, cx)).separator();
-            if desktop::can_pin() {
-                let pin = this.clone();
-                menu = menu.item(PopupMenuItem::new(if pinned { "Unpin from dash" } else { "Pin to dash" }).on_click(move |_, window, cx| {
-                    let result = if pinned { Ok(desktop::unpin()) } else { desktop::pin() };
-                    match result {
-                        Ok(()) => {
-                            let _ = pin.update(cx, |w, cx| {
-                                w.pinned = !pinned;
-                                cx.notify();
-                            });
-                        }
-                        Err(err) => window.push_notification(gpui_kit::component::notification::Notification::error(err).title("Pin to dash"), cx),
-                    }
-                }));
-            }
-            menu = entry(menu, "Restart", None, |w, window, cx| w.restart(window, cx));
-            entry(menu, "Exit", Some("quit"), |w, window, cx| w.request_quit(window, cx))
-        })
-    }
-
     /// The project and task in view.
     fn render_title(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let title = self
@@ -742,6 +665,7 @@ fn main() {
                 })
             })
             .expect("failed to open window");
+            menu::make_bar(cx);
             if !behind {
                 cx.activate(true);
             }

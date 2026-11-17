@@ -164,6 +164,8 @@ pub struct Settings {
     pub edit_prediction: Option<bool>,
     /// "auto", or the id of a model (predict::assets::Model).
     pub prediction_model: String,
+    /// Linux and Windows: the menu names stay in the title bar; off, they are behind ☰.
+    pub menu_bar_shown: bool,
 }
 
 fn yes() -> bool {
@@ -217,6 +219,7 @@ impl Default for Settings {
             agents_welcomed: false,
             edit_prediction: None,
             prediction_model: "auto".into(),
+            menu_bar_shown: false,
         }
     }
 }
