@@ -113,6 +113,13 @@ impl HistoryView {
     pub fn new(root: PathBuf, task: WeakEntity<TaskView>, cx: &mut Context<Self>) -> Self {
         let diff = cx.new(|cx| DiffState::new([], cx).with_mode(DiffMode::Unified));
         cx.observe(&diff, |_, _, cx| cx.notify()).detach();
+        // The commit shown, read again with whitespace left out or put back.
+        cx.observe_global::<crate::task::DiffWhitespace>(|this: &mut Self, cx| {
+            if let Some(ix) = this.selected.take() {
+                this.select(ix, cx);
+            }
+        })
+        .detach();
         Self {
             root,
             commits: Rc::default(),
@@ -866,7 +873,8 @@ impl Render for HistoryView {
                                                     let hash = hash.clone();
                                                     let _ = task.update(cx, |t, cx| t.compare_with(hash, None, window, cx));
                                                 })
-                                        }),
+                                        })
+                                        .child(crate::task::whitespace_button("commit-whitespace").xsmall()),
                                 ),
                         )
                     })

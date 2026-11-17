@@ -2207,6 +2207,9 @@ impl Workspace {
                 view.update(cx, |t, cx| t.reload_gutters(cx));
             }
         }
+        if old.diff_ignore_whitespace != new.diff_ignore_whitespace {
+            cx.set_global(crate::task::DiffWhitespace);
+        }
         if old.keys != new.keys {
             crate::keymap::rebind(&old, cx);
         }

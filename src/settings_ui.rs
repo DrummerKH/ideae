@@ -325,6 +325,13 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
                 ))
                 .item(switch(
                     draft,
+                    "Ignore whitespace",
+                    "Diffs leave out changes of spaces, tabs, line endings and blank lines, as GitHub's \"Hide whitespace\" does. A single change staged or reverted is then what is shown.",
+                    |s| s.diff_ignore_whitespace,
+                    |s, v| s.diff_ignore_whitespace = v,
+                ))
+                .item(switch(
+                    draft,
                     "Conflicts go to the agent",
                     "A pull, rebase, cherry-pick or revert that would conflict changes nothing, and the agent's prompt gets the request to do it and resolve the conflicts. Off, you are only told.",
                     |s| s.conflicts_to_agent,

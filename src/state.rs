@@ -131,6 +131,8 @@ pub struct Settings {
     pub tab_limit: u32,
     /// The Changes tab starts with old and new one under the other.
     pub diff_unified: bool,
+    /// Diffs leave out changes of whitespace and blank lines.
+    pub diff_ignore_whitespace: bool,
     /// A pull, rebase, pick or revert that would conflict asks the agent
     /// to do it and resolve the conflicts.
     pub conflicts_to_agent: bool,
@@ -191,6 +193,7 @@ impl Default for Settings {
             semantic_colors: true,
             format_on_save: false,
             diff_unified: false,
+            diff_ignore_whitespace: false,
             conflicts_to_agent: true,
             present_rail: true,
             present_veil: true,

@@ -117,6 +117,29 @@ const DIFF_ARGS: &[&str] = &[
     "--submodule=short",
 ];
 
+/// Diffs to look at leave out changes of whitespace and blank lines
+/// (Settings, the diffs' "Ignore whitespace").
+pub fn ignore_whitespace() -> bool {
+    #[cfg(test)]
+    return IGNORE_WHITESPACE.get();
+    #[cfg(not(test))]
+    crate::state::with_settings(|s| s.diff_ignore_whitespace)
+}
+
+#[cfg(test)]
+thread_local! {
+    static IGNORE_WHITESPACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `DIFF_ARGS`, and what leaves whitespace out when it is.
+fn diff_args() -> Vec<&'static str> {
+    let mut args = DIFF_ARGS.to_vec();
+    if ignore_whitespace() {
+        args.extend(["--ignore-all-space", "--ignore-blank-lines"]);
+    }
+    args
+}
+
 /// Uncommitted changes against HEAD, untracked files included, as one patch.
 pub fn working_patch(root: &Path) -> String {
     let untracked = git(root, &["ls-files", "--others", "--exclude-standard", "-z"]).unwrap_or_default();
@@ -127,7 +150,7 @@ pub fn working_patch(root: &Path) -> String {
 /// The tracked files of the worktree against `rev`.
 fn tracked_patch(root: &Path, rev: &str, light: bool) -> String {
     let mut args = light_args(light, &["diff", rev]);
-    args.extend_from_slice(DIFF_ARGS);
+    args.extend(diff_args());
     without_huge_files(git(root, &args).unwrap_or_default())
 }
 
@@ -259,6 +282,41 @@ impl Hunk {
     }
 }
 
+/// A one-hunk patch whose context lines differ from `text` in whitespace
+/// only, with those lines as `text` has them: `text` is its new side when
+/// `new_side` (to apply in reverse), else its old one. None when the lines
+/// are not there.
+fn as_written(patch: &str, text: &str, new_side: bool) -> Option<String> {
+    let at = patch.find("\n@@ ").map(|at| at + 1).or_else(|| patch.starts_with("@@ ").then_some(0))?;
+    let (header, hunk) = patch.split_at(at);
+    let (range, body) = hunk.split_once('\n')?;
+    let side = range.split_whitespace().find(|part| part.starts_with(if new_side { '+' } else { '-' }))?;
+    let first: usize = side[1..].split(',').next()?.parse().ok()?;
+    let own = if new_side { '+' } else { '-' };
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let squeeze = |line: &str| line.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    let mut cursor = first.max(1) - 1;
+    let mut out = format!("{header}{range}\n");
+    for line in body.split_inclusive('\n') {
+        let sign = line.chars().next().unwrap_or(' ');
+        if sign == ' ' || sign == own {
+            let written = lines.get(cursor)?;
+            if squeeze(written) != squeeze(&line[1..]) {
+                return None;
+            }
+            out.push(sign);
+            out.push_str(written);
+            if !written.ends_with('\n') {
+                out.push('\n');
+            }
+            cursor += 1;
+        } else {
+            out.push_str(line);
+        }
+    }
+    Some(out)
+}
+
 /// The changes of a patch `git diff` made. Not those of files that are new
 /// or gone: there the file is the change.
 pub fn hunks(patch: &str) -> Vec<Hunk> {
@@ -353,7 +411,7 @@ pub fn stage_change(root: &Path, change: &Hunk, stage: bool) -> Result<String, S
     // The whole of what is staged, not the file's alone: a renamed file
     // would be a new one there, with no change to take out.
     let mut args = if stage { vec!["diff"] } else { vec!["diff", "--cached"] };
-    args.extend_from_slice(DIFF_ARGS);
+    args.extend(diff_args());
     if stage {
         args.extend(["--", change.path.as_str()]);
     }
@@ -370,6 +428,17 @@ pub fn apply_hunk(root: &Path, patch: &str, reverse: bool, cached: bool) -> Resu
     use std::io::Write as _;
     let mut command = crate::procs::command("git");
     command.current_dir(root).args(["apply", "--whitespace=nowarn"]);
+    // Shown without whitespace, a change has its context lines as the new
+    // side has them: they are made what the side it applies to has.
+    let exact;
+    let patch = if ignore_whitespace() {
+        let path = patch.lines().find_map(|l| l.strip_prefix("+++ b/").or_else(|| l.strip_prefix("--- a/"))).unwrap_or_default().trim_end_matches('\t');
+        let text = if cached { git(root, &["show", &format!(":{path}")]) } else { std::fs::read_to_string(root.join(path)).ok() };
+        exact = text.and_then(|text| as_written(patch, &text, reverse)).ok_or("the change no longer applies")?;
+        exact.as_str()
+    } else {
+        patch
+    };
     if reverse {
         command.arg("-R");
     }
@@ -728,7 +797,12 @@ pub fn stash_drop(root: &Path, stash: &Stash) -> Result<String, String> {
 
 /// What a stash holds, as a patch against the commit it was made on.
 pub fn stash_patch(root: &Path, name: &str) -> String {
-    git(root, &["stash", "show", "-p", "--include-untracked", name]).unwrap_or_default()
+    let mut args = vec!["stash", "show", "-p", "--include-untracked"];
+    if ignore_whitespace() {
+        args.extend(["--ignore-all-space", "--ignore-blank-lines"]);
+    }
+    args.push(name);
+    git(root, &args).unwrap_or_default()
 }
 
 /// `picked`: the branch to compare with when not the one work starts from.
@@ -811,7 +885,7 @@ pub fn refresh(root: &Path, picked: Option<String>, light: bool, known: &mut Kno
     let mut made_of = std::collections::hash_map::DefaultHasher::new();
     // Not what is ignored: a build writing its output changes no patch.
     raw.split('\0').filter(|entry| !entry.starts_with("! ")).for_each(|entry| entry.hash(&mut made_of));
-    (&history.fork, &compared).hash(&mut made_of);
+    (&history.fork, &compared, ignore_whitespace()).hash(&mut made_of);
     for path in changed.iter().chain(&untracked) {
         stamp(&root.join(path)).hash(&mut made_of);
     }
@@ -851,7 +925,7 @@ pub fn refresh(root: &Path, picked: Option<String>, light: bool, known: &mut Kno
         }
         info.pull_conflicts = known.pull.1.clone();
     }
-    let staged = if states.values().any(|state| state.staged) { git(root, &[&["diff", "--cached"][..], DIFF_ARGS].concat()).unwrap_or_default() } else { String::new() };
+    let staged = if states.values().any(|state| state.staged) { git(root, &[&["diff", "--cached"][..], &diff_args()].concat()).unwrap_or_default() } else { String::new() };
     Refreshed { files, ignored, watch, info, states, base, patches: Some(Patches { working, branch, staged }), stashes, failed }
 }
 
@@ -876,7 +950,7 @@ fn changed_patch(root: &Path, head: &str, changed: &[String], light: bool) -> St
         return tracked_patch(root, head, light);
     }
     let mut args = vec!["--literal-pathspecs", "diff", head];
-    args.extend_from_slice(DIFF_ARGS);
+    args.extend(diff_args());
     args.push("--");
     args.extend(changed.iter().map(String::as_str));
     without_huge_files(git(root, &args).unwrap_or_default())
@@ -1136,7 +1210,7 @@ pub fn commit_body(root: &Path, hash: &str) -> String {
 
 pub fn commit_patch(root: &Path, hash: &str) -> String {
     let mut args = vec!["show", "--format=", "--patch", "--first-parent", "-m"];
-    args.extend_from_slice(DIFF_ARGS);
+    args.extend(diff_args());
     args.extend_from_slice(&[hash, "--"]);
     git(root, &args).unwrap_or_default()
 }
@@ -2347,7 +2421,7 @@ pub fn work_of(root: &Path, rev: &str, file: Option<&str>) -> Option<(String, St
     let now = if now == "HEAD" { rev.to_string() } else { now };
     let base = git(root, &["merge-base", "HEAD", rev])?.trim().to_string();
     let mut args = vec!["diff", base.as_str(), now.as_str()];
-    args.extend_from_slice(DIFF_ARGS);
+    args.extend(diff_args());
     if let Some(file) = file {
         args.extend(["--", file]);
     }
@@ -2356,7 +2430,7 @@ pub fn work_of(root: &Path, rev: &str, file: Option<&str>) -> Option<(String, St
 
 pub fn diff_against(root: &Path, rev: &str, file: Option<&str>) -> String {
     let mut args = vec!["diff", rev];
-    args.extend_from_slice(DIFF_ARGS);
+    args.extend(diff_args());
     if let Some(file) = file {
         args.extend(["--", file]);
     }
@@ -3108,6 +3182,31 @@ mod edge_tests {
         let files = gpui_kit::component::diff::DiffFile::parse(&working).unwrap();
         assert_eq!(files.iter().map(|f| f.path().to_string()).collect::<Vec<_>>(), ["a.txt", "b.txt", "big.txt"]);
         assert!(hunks(&working).iter().all(|hunk| hunk.path != "big.txt"), "no single change of it to take back");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With whitespace left out the diff has the real change only, and that
+    /// change is staged and reverted alone: the reindent stays as it is.
+    #[test]
+    fn a_change_shown_without_whitespace_is_staged_and_reverted_alone() {
+        let dir = repo("whitespace");
+        sh(&dir, "printf 'fn f() {\\na();\\nb();\\n}\\n' > f.rs; git add f.rs; git commit -qm base");
+        sh(&dir, "printf 'fn f() {\\n    a();\\n\\n    c();\\n}\\n' > f.rs");
+        IGNORE_WHITESPACE.set(true);
+        let patch = diff_against(&dir, "HEAD", None);
+        assert!(patch.contains("+    c();") && patch.contains("-b();"), "{patch}");
+        assert!(!patch.contains("+    a();") && !patch.contains("-a();"), "{patch}");
+        let change = hunks(&patch).into_iter().next().expect("one change");
+        stage_change(&dir, &change, true).expect("staged");
+        let staged = out(&dir, "git show :f.rs");
+        // The blank line is shown with the change it is in, and goes with it.
+        assert_eq!(staged, "fn f() {\na();\n\n    c();\n}\n", "the reindent of a() is not staged");
+        stage_change(&dir, &change, false).expect("taken out of the index");
+        assert_eq!(out(&dir, "git show :f.rs"), "fn f() {\na();\nb();\n}\n");
+        apply_hunk(&dir, &change.patch(), true, false).expect("reverted");
+        let now = std::fs::read_to_string(dir.join("f.rs")).unwrap();
+        assert!(now.contains("    a();") && now.contains("b();") && !now.contains("c();"), "{now}");
+        IGNORE_WHITESPACE.set(false);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -574,6 +574,7 @@ impl Render for ChangesView {
                             }))
                         },
                     ))
+                    .child(whitespace_button("changes-whitespace"))
                     .child(div().w(px(1.)).h(px(16.)).bg(cx.theme().border))
                     .children([("fold-all", "Collapse all", true, "Every file to its header"), ("unfold-all", "Expand all", false, "Every file open, those viewed too")].map(
                         |(id, label, folded, tip)| {

@@ -325,12 +325,9 @@ impl TaskView {
     pub(super) fn show_stash(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
         let root = self.root.clone();
         let what = self.stashes.iter().find(|s| s.name == name).map(|s| s.what.clone()).unwrap_or_default();
-        cx.spawn_in(window, async move |this, cx| {
-            let (label, title) = (name.clone(), format!("{name} · {what}"));
-            let files = cx.background_spawn(async move { DiffFile::parse(&git::stash_patch(&root, &name)).map(with_languages).unwrap_or_default() }).await;
-            let _ = this.update_in(cx, |task, window, cx| task.show_diff_tab(label, title, files, window, cx));
-        })
-        .detach();
+        let (label, title) = (name.clone(), format!("{name} · {what}"));
+        let source: DiffSource = std::sync::Arc::new(move || (title.clone(), git::stash_patch(&root, &name)));
+        self.show_diff_tab(label, source, window, cx);
     }
 
     pub(super) fn drop_stash_dialog(&mut self, stash: git::Stash, window: &mut Window, cx: &mut Context<Self>) {

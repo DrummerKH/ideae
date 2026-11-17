@@ -88,18 +88,65 @@ pub fn status_glyph(status: &crate::agent::AgentStatus) -> Option<(&'static str,
 
 /// Highlights diffs with the editor's language table, which knows more
 /// (Kotlin aliases, XML, Gradle, properties) than the diff's own detection.
+/// Diffs leave whitespace out, or not: set, and every diff on screen is read again.
+pub struct DiffWhitespace;
+impl gpui::Global for DiffWhitespace {}
+
+pub fn set_ignore_whitespace(on: bool, cx: &mut App) {
+    let mut settings = crate::state::settings();
+    settings.diff_ignore_whitespace = on;
+    crate::state::set_settings(settings);
+    cx.set_global(DiffWhitespace);
+}
+
+/// The switch next to Split and Unified, one choice for every diff.
+pub fn whitespace_button(id: &'static str) -> Button {
+    let on = crate::state::with_settings(|s| s.diff_ignore_whitespace);
+    Button::new(id)
+        .small()
+        .ghost()
+        .label("Ignore whitespace")
+        .tooltip("Leave out changes of spaces, tabs, line endings and blank lines")
+        .selected(on)
+        .on_click(move |_, _, cx| set_ignore_whitespace(!on, cx))
+}
+
+/// What a diff tab shows, read again when whitespace is shown or left out:
+/// the title, then the patch.
+pub type DiffSource = std::sync::Arc<dyn Fn() -> (String, String) + Send + Sync>;
+
 /// A diff of its own in a tab: the worktree against a commit or a branch, a stash.
 pub struct DiffTab {
     what: SharedString,
     diff: Entity<DiffState>,
+    source: DiffSource,
+    _reload: Option<Task<()>>,
 }
 
 impl DiffTab {
-    pub fn new(what: String, files: Vec<DiffFile>, cx: &mut Context<Self>) -> Self {
+    pub fn new(what: String, files: Vec<DiffFile>, source: DiffSource, cx: &mut Context<Self>) -> Self {
         // As the Changes tab shows diffs: in the mode chosen there.
         let mode = if crate::state::with_settings(|s| s.diff_unified) { DiffMode::Unified } else { DiffMode::Split };
-        Self { what: what.into(), diff: cx.new(|cx| DiffState::new(files, cx).with_mode(mode)) }
+        cx.observe_global::<DiffWhitespace>(|this, cx| this.reload(cx)).detach();
+        Self { what: what.into(), diff: cx.new(|cx| DiffState::new(files, cx).with_mode(mode)), source, _reload: None }
     }
+
+    fn reload(&mut self, cx: &mut Context<Self>) {
+        let source = self.source.clone();
+        self._reload = Some(cx.spawn(async move |this, cx| {
+            let (what, files) = cx.background_spawn(async move { read_source(&source) }).await;
+            let _ = this.update(cx, |this, cx| {
+                this.what = what.into();
+                this.diff.update(cx, |d, cx| d.set_files(files, cx));
+                cx.notify();
+            });
+        }));
+    }
+}
+
+pub fn read_source(source: &DiffSource) -> (String, Vec<DiffFile>) {
+    let (what, patch) = source();
+    (what, DiffFile::parse(&patch).map(with_languages).unwrap_or_default())
 }
 
 impl Render for DiffTab {
@@ -124,6 +171,7 @@ impl Render for DiffTab {
                             diff.update(cx, |d, cx| d.set_mode(to, cx));
                         })
                     }))
+                    .child(whitespace_button("diff-whitespace"))
                     .child(div().pl_2().min_w_0().truncate().text_sm().text_color(cx.theme().muted_foreground).child(self.what.clone())),
             )
             // Wrapped: unwrapped, the two sides share the longest line's width.

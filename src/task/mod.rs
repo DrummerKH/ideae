@@ -508,6 +508,11 @@ impl TaskView {
         // Out of view a task is looked at once a minute: every open task pays
         // for its refresh with a handful of git processes.
         let tick_tx = refresh_tx.clone();
+        let ws_tx = refresh_tx.clone();
+        cx.observe_global::<DiffWhitespace>(move |_, _| {
+            let _ = ws_tx.try_send(());
+        })
+        .detach();
         cx.spawn(async move |this, cx| {
             let mut n = 0u32;
             loop {
