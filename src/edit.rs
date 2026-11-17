@@ -60,7 +60,11 @@ impl ChangeRun {
 
 pub fn change_runs(committed: &str, now: &str) -> Vec<ChangeRun> {
     use similar::DiffOp;
-    similar::TextDiff::from_lines(committed, now)
+    // A whole rewrite of a long file takes the full search over a second, and
+    // runs after every pause in typing: past this, the marks are coarser.
+    similar::TextDiff::configure()
+        .timeout(std::time::Duration::from_millis(500))
+        .diff_lines(committed, now)
         .ops()
         .iter()
         .filter_map(|op| match *op {
