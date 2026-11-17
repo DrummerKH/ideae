@@ -98,7 +98,7 @@ static OWN: LazyLock<RwLock<HashMap<PathBuf, Config>>> = LazyLock::new(Default::
 static PROJECT_OF: LazyLock<RwLock<HashMap<PathBuf, PathBuf>>> = LazyLock::new(Default::default);
 
 pub fn set_own(project: &Path, own: Option<Config>) {
-    let mut all = OWN.write().unwrap();
+    let mut all = OWN.write().unwrap_or_else(|e| e.into_inner());
     match own {
         Some(own) => all.insert(project.to_path_buf(), own),
         None => all.remove(project),
@@ -106,15 +106,20 @@ pub fn set_own(project: &Path, own: Option<Config>) {
 }
 
 pub fn own(project: &Path) -> Option<Config> {
-    OWN.read().unwrap().get(project).cloned()
+    OWN.read().unwrap_or_else(|e| e.into_inner()).get(project).cloned()
 }
 
 pub fn register(task_root: &Path, project: &Path) {
-    PROJECT_OF.write().unwrap().insert(task_root.to_path_buf(), project.to_path_buf());
+    PROJECT_OF.write().unwrap_or_else(|e| e.into_inner()).insert(task_root.to_path_buf(), project.to_path_buf());
+}
+
+/// Forgets the tasks no longer listed.
+pub fn retain_tasks(listed: &std::collections::HashSet<PathBuf>) {
+    PROJECT_OF.write().unwrap_or_else(|e| e.into_inner()).retain(|task, _| listed.contains(task));
 }
 
 pub fn project_of(task_root: &Path) -> PathBuf {
-    PROJECT_OF.read().unwrap().get(task_root).cloned().unwrap_or_else(|| task_root.to_path_buf())
+    PROJECT_OF.read().unwrap_or_else(|e| e.into_inner()).get(task_root).cloned().unwrap_or_else(|| task_root.to_path_buf())
 }
 
 #[derive(Clone, Default, Debug, PartialEq)]

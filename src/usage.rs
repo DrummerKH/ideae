@@ -163,7 +163,7 @@ pub fn read(path: &Path) -> Option<Usage> {
     use std::io::Seek as _;
     let mut file = std::fs::File::open(path).ok()?;
     let length = file.metadata().ok()?.len();
-    let mut tail = TAILS.lock().unwrap().get_or_insert_with(HashMap::new).remove(path).unwrap_or_default();
+    let mut tail = TAILS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).remove(path).unwrap_or_default();
     // Shorter than what was read: another file under the name.
     if length < tail.offset {
         tail = Tail::default();
@@ -187,7 +187,7 @@ pub fn read(path: &Path) -> Option<Usage> {
     }
     let usage = tail.usage();
     tail.used = READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut tails = TAILS.lock().unwrap();
+    let mut tails = TAILS.lock().unwrap_or_else(|e| e.into_inner());
     let tails = tails.get_or_insert_with(HashMap::new);
     tails.insert(path.to_path_buf(), tail);
     while tails.len() > TAILS_KEPT {

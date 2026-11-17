@@ -162,7 +162,7 @@ impl HistoryView {
                     .background_spawn(async move {
                         let stamp = git::refs_stamp(&root);
                         let families: Vec<(String, usize)> = git::branch_families(&root, FAMILY).into_iter().filter(|(prefix, _)| !filter.hide.contains(prefix)).collect();
-                        let read = git::graph(&root, limit, &filter, &mut known.lock().unwrap());
+                        let read = git::graph(&root, limit, &filter, &mut known.lock().unwrap_or_else(|e| e.into_inner()));
                         let rows = graph::layout(read.iter().map(|c| (c.commit.hash.as_str(), c.parents.as_slice())));
                         (read.into_iter().map(|c| c.commit).collect::<Vec<_>>(), rows, stamp, families)
                     })

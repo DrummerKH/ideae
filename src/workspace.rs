@@ -2061,6 +2061,7 @@ impl Workspace {
                 let listed: std::collections::HashSet<PathBuf> = this.projects.iter().flat_map(|p| &p.tasks).map(|t| t.path.clone()).collect();
                 this.usage.retain(|path, _| listed.contains(path));
                 this.usage_warned.retain(|path| listed.contains(path));
+                crate::project_config::retain_tasks(&listed);
                 this.last_in_space.retain(|_, path| listed.contains(path));
                 let limit = u64::from(state::with_settings(|s| s.token_warn_k)) * 1000;
                 for (path, written, usage) in read {
