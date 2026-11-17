@@ -1285,12 +1285,9 @@ impl Workspace {
         }
         let entry = &mut self.projects[pi].tasks[ti];
         view.update(cx, |t, cx| t.shut_down(cx));
-        let tears_down = !entry.main;
-        // The main thread shows only while it runs.
-        if entry.main {
-            self.projects[pi].tasks.remove(ti);
-        }
-        if tears_down {
+        // Paused as any task is, the main thread too: the branch work starts
+        // from is one click away, with its tabs.
+        if !entry.main {
             self.teardown(path, window, cx);
         }
         if self.active.as_deref() == Some(path) {
@@ -1384,6 +1381,16 @@ impl Workspace {
     }
 
     /// Opens the project's own worktree as a task, adding it to the list.
+    /// A paused main thread out of the list; Open main thread brings it back.
+    pub fn remove_main(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let Some((pi, ti)) = self.find(path) else { return };
+        if self.projects[pi].tasks[ti].main && self.projects[pi].tasks[ti].view.is_none() {
+            self.projects[pi].tasks.remove(ti);
+            self.save(cx);
+            cx.notify();
+        }
+    }
+
     pub fn open_main(&mut self, project: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(p) = self.projects.get_mut(project) else { return };
         if !p.tasks.iter().any(|t| t.main) {
