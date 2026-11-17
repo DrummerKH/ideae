@@ -21,8 +21,10 @@ Projects, tasks, open tabs, cursor lines and open folders survive a restart
 ## Agent status
 
 Claude Code runs with hooks passed through `--settings`; nothing is written
-to `~/.claude` or the repository. The sidebar shows working / needs input /
-done, and a desktop notification fires when a task out of view wants you.
+to `~/.claude` or the repository. Other agents (Codex, OpenCode, any program)
+report what they can, and the rest is guessed from their terminal: see
+[agents](agents.md) for profiles, sessions and what each kind of agent can
+do. The sidebar shows working / needs input / done, and a desktop notification fires when a task out of view wants you.
 The Changes and Files panels mark the file the agent is writing to and those
 it wrote to since your last prompt.
 
@@ -30,23 +32,24 @@ By a task in the sidebar, a small dial shows how full its agent's context is
 (yellow from three quarters, red from nine tenths; the numbers when the
 pointer rests on the task). The title bar shows what all the agents took in
 the last 24 hours. A session that has used more than a limit you set is told
-of once (Settings → Agent).
+of once (Settings → Agents).
 
 ## Variants
 
 A hard task can be started as up to four variants: the same prompt to as
 many agents, each in a worktree of its own from the same commit, with a line
 for each one alone if you like (the smallest patch, a failing test first…).
-Their agents run in Claude Code's auto mode, so the same question is not
-asked in each.
+Their agents run in Claude Code's auto mode (or the like for other agents),
+so the same question is not asked in each. With more than one agent profile,
+each variant can run a different one.
 
 They show as one group. Its screen has, for each variant, what its agent
 says it did, what it changed and what it cost, and which variant changed
 which file. Any two can be compared file by file (A ↔ B); a message goes to
 all of them at once. A command typed there (tests, a benchmark) runs in every
 variant, one after another so that their times compare; with Auto it runs by
-itself when all of them have finished. A judge, one more Claude Code run that
-can only read, says which to keep and what to take from the others, and that
+itself when all of them have finished. A judge, one more agent run that
+can only read (the agent for quick questions), says which to keep and what to take from the others, and that
 can be sent on to the agent of the one it picks.
 
 For a site, "Start servers" runs every variant's [services](services.md) on

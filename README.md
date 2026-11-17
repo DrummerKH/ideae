@@ -35,6 +35,9 @@ Claude Code and git should be installed.
   tells you when one out of view wants you.
 - **Variants.** One prompt to up to four agents at once, compared side by
   side, with a judge to say which to keep.
+- **[Agents](docs/agents.md)**: Claude Code by default; Codex, OpenCode or any
+  program as profiles (two accounts of one agent too), chosen per project,
+  task or variant, and a task carried on by another agent.
 - **Editor.** Tree-sitter highlighting, language servers (installed on
   request), go to definition and usages, rename, fixes, sticky scroll,
   replace in files, git blame in the gutter, bookmarks.
