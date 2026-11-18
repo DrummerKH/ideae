@@ -777,8 +777,8 @@ fn render_diff(
             gpui::canvas(
                 {
                     let state = cx.entity();
-                    move |bounds, _, cx| {
-                        state.update(cx, |state, cx| {
+                    move |bounds, window, cx| {
+                        let relayout = state.update(cx, |state, _| {
                             // Runs after the list's prepaint, which drops
                             // every row height when its width changes.
                             let rehinted = state.keep_row_height_hint();
@@ -790,10 +790,15 @@ fn render_diff(
                                 let painted = state.geometry().borrow().painted_width();
                                 code_width(painted, gutter_width, rem, mode)
                             };
-                            if state.record_paint(bounds.size, painted) || rehinted {
-                                cx.notify();
-                            }
+                            state.record_paint(bounds.size, painted) || rehinted
                         });
+                        // ideae patch: asked for during a draw, a redraw is
+                        // dropped, and the new width waited for whatever drew
+                        // the window next; the next frame's is not.
+                        if relayout {
+                            let state = state.clone();
+                            window.on_next_frame(move |_, cx| state.update(cx, |_, cx| cx.notify()));
+                        }
                     }
                 },
                 |_, _, _, _| {},

@@ -1853,28 +1853,20 @@ impl TaskView {
         }
     }
 
-    /// The tabs `which` picks in a pane, closed without asking: those of
-    /// files, pictures and pages. Pinned ones, files with unsaved edits,
-    /// terminals and the agent stay.
+    /// The tabs `which` picks in a pane that [`closed_in_bulk`] allows.
     fn close_many(&mut self, right: bool, which: impl Fn(usize, &TabItem) -> bool, window: &mut Window, cx: &mut Context<Self>) {
-        let ids: Vec<usize> = self
-            .tabs
-            .iter()
-            .enumerate()
-            .filter(|(ix, t)| t.right == right && !t.pinned && which(*ix, t))
-            .filter(|(_, t)| match &t.kind {
-                TabKind::File(f) => !f.read(cx).dirty && f.read(cx).saving.is_none(),
-                TabKind::Binary(_) | TabKind::Browser(_) | TabKind::Diff(_) => true,
-                _ => false,
-            })
-            .map(|(_, t)| t.id)
-            .collect();
+        let ids: Vec<usize> = self.closed_together(right, which, cx);
         for id in ids {
             if let Some(ix) = self.ix_of(id) {
                 self.remember_closed(ix, cx);
                 self.remove_tab(ix, window, cx);
             }
         }
+    }
+
+    /// The ids of the tabs [`Self::close_many`] would close.
+    fn closed_together(&self, right: bool, which: impl Fn(usize, &TabItem) -> bool, cx: &App) -> Vec<usize> {
+        self.tabs.iter().enumerate().filter(|(ix, t)| t.right == right && which(*ix, t) && closed_in_bulk(t, cx)).map(|(_, t)| t.id).collect()
     }
 
     fn toggle_pin(&mut self, id: usize, cx: &mut Context<Self>) {
@@ -2736,4 +2728,21 @@ mod diff_update_tests {
         draw(cx);
         assert_eq!(top(cx).as_deref(), Some("a.txt"));
     }
+}
+
+/// A tab's ×, a middle click on it and its Close: every tab but the agent's.
+fn closable(tab: &TabItem) -> bool {
+    !(matches!(tab.kind, TabKind::Terminal(_)) && tab.title == "agent")
+}
+
+/// Close others, to the right and all close without asking: files, pictures,
+/// pages and the views that come back with a key (Changes, History). Pinned
+/// tabs, files with unsaved edits and terminals stay.
+fn closed_in_bulk(tab: &TabItem, cx: &App) -> bool {
+    !tab.pinned
+        && match &tab.kind {
+            TabKind::File(f) => !f.read(cx).dirty && f.read(cx).saving.is_none(),
+            TabKind::Binary(_) | TabKind::Browser(_) | TabKind::Diff(_) | TabKind::Changes | TabKind::History => true,
+            TabKind::Terminal(_) => false,
+        }
 }

@@ -216,7 +216,8 @@ impl Element for SelectableText {
             cx,
         );
         if selected_text_before != TextSelection::selected_text(window, cx) {
-            window.refresh();
+            // ideae patch: asked for during a draw, a redraw is dropped; the next frame's is not.
+            window.on_next_frame(|window, _| window.refresh());
         }
         let color = self
             .selection_color

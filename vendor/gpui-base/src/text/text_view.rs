@@ -872,10 +872,10 @@ impl Element for TextView {
             // Notify on change so observers (e.g. an "expand" button gated on
             // `is_clamped`) re-render once the flag flips.
             if state.read(cx).clamped != clipped {
-                state.update(cx, |state, cx| {
-                    state.clamped = clipped;
-                    cx.notify();
-                });
+                state.update(cx, |state, _| state.clamped = clipped);
+                // ideae patch: asked for during a draw, a redraw is dropped; the next frame's is not.
+                let state = state.clone();
+                window.on_next_frame(move |_, cx| state.update(cx, |_, cx| cx.notify()));
             }
             if clipped {
                 clip_bottom = line_safe_clip_bottom(&line_spans, bounds.bottom(), content_bottom);

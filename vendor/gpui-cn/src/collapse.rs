@@ -32,7 +32,8 @@ impl Measured {
                 let width = bounds.size.width;
                 if (f32::from(cell.get()) - f32::from(width)).abs() > 0.5 {
                     cell.set(width);
-                    window.refresh();
+                    // ideae patch: asked for during a draw, a redraw is dropped; the next frame's is not.
+                    window.on_next_frame(|window, _| window.refresh());
                 }
             },
             |_, _, _, _| {},

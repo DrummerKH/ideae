@@ -478,7 +478,8 @@ impl RenderOnce for SidebarLayout {
                 move |bounds, window, cx| {
                     if *keyed.read(cx) != Some(bounds) {
                         keyed.update(cx, |held, _| *held = Some(bounds));
-                        window.refresh();
+                        // ideae patch: asked for during a draw, a redraw is dropped; the next frame's is not.
+                        window.on_next_frame(|window, _| window.refresh());
                     }
                 },
                 |_, _, _, _| {},

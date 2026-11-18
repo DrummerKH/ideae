@@ -32,6 +32,7 @@ impl AssetSource for Assets {
             "side-icons/folder-tree.svg" => include_bytes!("../../assets/side-icons/folder-tree.svg"),
             "side-icons/folder-plus.svg" => include_bytes!("../../assets/side-icons/folder-plus.svg"),
             "side-icons/plus.svg" => include_bytes!("../../assets/side-icons/plus.svg"),
+            "side-icons/globe.svg" => include_bytes!("../../assets/side-icons/globe.svg"),
             "side-icons/history.svg" => include_bytes!("../../assets/side-icons/history.svg"),
             "side-icons/undo-2.svg" => include_bytes!("../../assets/side-icons/undo-2.svg"),
             "side-icons/arrow-right-left.svg" => include_bytes!("../../assets/side-icons/arrow-right-left.svg"),
@@ -252,7 +253,7 @@ impl TaskView {
             // What can be told without the panel: how many files changed (green when some are staged), how many services run.
             let told = match pane {
                 RightPane::Changes if !self.files.is_empty() => Some((self.files.len().to_string(), if self.staged_paths().is_empty() { muted } else { gpui_kit::green() })),
-                RightPane::Run => Some(self.running_services(cx).len()).filter(|running| *running > 0).map(|running| (format!("●{running}"), gpui_kit::green())),
+                RightPane::Run => Some(self.running_services(cx).len()).filter(|running| *running > 0).map(|running| (running.to_string(), gpui_kit::green())),
                 _ => None,
             };
             let tip = SharedString::from(format!("{}  {}", pane.name(), crate::keymap::label(pane.key())));
@@ -271,7 +272,26 @@ impl TaskView {
                 .when(shown, |mark| mark.bg(cx.theme().accent))
                 .hover(|mark| mark.bg(cx.theme().accent))
                 .child(pane.mark(if shown { cx.theme().foreground } else { muted }))
-                .when_some(told, |mark, (told, color)| mark.child(div().text_size(px(9.)).line_height(px(11.)).text_color(color).child(told)))
+                // Over the drawing's corner, so a mark is as tall with a count as without.
+                .when_some(told, |mark, (told, color)| {
+                    mark.relative().child(
+                        div()
+                            .absolute()
+                            .right(px(1.))
+                            .bottom(px(1.))
+                            .min_w(px(12.))
+                            .px(px(2.))
+                            .rounded(px(6.))
+                            .bg(color)
+                            .text_color(cx.theme().background)
+                            .text_size(px(9.))
+                            .line_height(px(12.))
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .flex()
+                            .justify_center()
+                            .child(told),
+                    )
+                })
                 .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx))
                 .on_hover(cx.listener(move |this, hovered: &bool, window, cx| this.peek_panel(hovered.then_some(pane), window, cx)))
                 .on_click(cx.listener(move |this, _, _, cx| this.toggle_panel(pane, cx)))

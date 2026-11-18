@@ -56,7 +56,7 @@ impl TaskView {
                         Button::new("new-browser")
                             .small()
                             .ghost()
-                            .label("Web")
+                            .child(svg().path("side-icons/globe.svg").size(px(14.)).text_color(cx.theme().muted_foreground))
                             .tooltip("New browser tab here")
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.focus_right = right && this.is_split();
@@ -114,13 +114,7 @@ impl TaskView {
                 if tab.pinned {
                     label = format!("⚑ {label}").into();
                 }
-                // Middle click closes what the user opened, never the agent, the
-                // first shell or the Changes/History views.
-                let middle_closes = match &tab.kind {
-                    TabKind::File(_) | TabKind::Browser(_) | TabKind::Binary(_) | TabKind::Diff(_) => true,
-                    TabKind::Terminal(_) => tab.title != "agent" && tab.title != "shell",
-                    _ => false,
-                };
+                let closable = closable(tab);
                 let dragged = DraggedTab { tab_id: tab.id, title: label.clone() };
                 let item = if tab.title == "agent" {
                     let root = self.root.clone();
@@ -150,7 +144,7 @@ impl TaskView {
                 let menu_tab = self.menu_tab.clone();
                 let item = item
                     .on_mouse_down(MouseButton::Right, move |_, _, _| menu_tab.set(Some(id)))
-                    .when(middle_closes, |tab| {
+                    .when(closable, |tab| {
                         tab.on_mouse_down(
                             MouseButton::Middle,
                             cx.listener(move |this, _, window, cx| {
@@ -163,11 +157,6 @@ impl TaskView {
                         start_drag(Drag::Tab);
                         cx.new(|_| dragged.clone())
                     });
-                let closable = match &tab.kind {
-                    TabKind::Terminal(_) => tab.title != "agent",
-                    TabKind::File(_) | TabKind::Browser(_) | TabKind::Binary(_) | TabKind::Diff(_) => true,
-                    TabKind::Changes | TabKind::History => true,
-                };
                 if closable {
                     item.suffix(
                         Button::new(("close", ix))
@@ -192,6 +181,12 @@ impl TaskView {
             let reopen = !t.closed.is_empty();
             let can_move = tab.is_some_and(|tab| tab.right || t.tabs.iter().filter(|t| !t.right).count() > 1);
             let (pinned, id) = (tab.is_some_and(|t| t.pinned), tab.map(|t| t.id));
+            // Each shown only when it would close something.
+            let from = tab.and_then(|tab| t.ix_of(tab.id)).unwrap_or(usize::MAX);
+            let others = !t.closed_together(right, |_, other| Some(other.id) != id, cx).is_empty();
+            let to_right = !t.closed_together(right, |ix, _| ix > from, cx).is_empty();
+            let all = !t.closed_together(right, |_, _| true, cx).is_empty();
+            let close = tab.is_some_and(closable);
             let act = |label: &'static str, f: fn(&mut TaskView, Option<usize>, bool, &mut Window, &mut Context<TaskView>)| {
                 let view = view.downgrade();
                 PopupMenuItem::new(label).on_click(move |_, window, cx| {
@@ -200,18 +195,22 @@ impl TaskView {
             };
             let menu = match id {
                 Some(_) => menu
-                    .item(act("Close", |t, id, _, window, cx| {
-                        if let Some(ix) = id.and_then(|id| t.ix_of(id)) {
-                            t.close_tab(ix, window, cx)
-                        }
-                    }))
-                    .item(act("Close others", |t, id, right, window, cx| t.close_many(right, |_, tab| Some(tab.id) != id, window, cx)))
-                    .item(act("Close to the right", |t, id, right, window, cx| {
-                        let from = id.and_then(|id| t.ix_of(id)).unwrap_or(usize::MAX);
-                        t.close_many(right, |ix, _| ix > from, window, cx)
-                    }))
-                    .item(act("Close all", |t, _, right, window, cx| t.close_many(right, |_, _| true, window, cx)))
-                    .separator()
+                    .when(close, |menu| {
+                        menu.item(act("Close", |t, id, _, window, cx| {
+                            if let Some(ix) = id.and_then(|id| t.ix_of(id)) {
+                                t.close_tab(ix, window, cx)
+                            }
+                        }))
+                    })
+                    .when(others, |menu| menu.item(act("Close others", |t, id, right, window, cx| t.close_many(right, |_, tab| Some(tab.id) != id, window, cx))))
+                    .when(to_right, |menu| {
+                        menu.item(act("Close to the right", |t, id, right, window, cx| {
+                            let from = id.and_then(|id| t.ix_of(id)).unwrap_or(usize::MAX);
+                            t.close_many(right, |ix, _| ix > from, window, cx)
+                        }))
+                    })
+                    .when(all, |menu| menu.item(act("Close all", |t, _, right, window, cx| t.close_many(right, |_, _| true, window, cx))))
+                    .when(close || others || to_right || all, |menu| menu.separator())
                     .item(act(if pinned { "Unpin" } else { "Pin" }, |t, id, _, _, cx| {
                         if let Some(id) = id {
                             t.toggle_pin(id, cx)
@@ -224,7 +223,7 @@ impl TaskView {
                             }
                         }))
                     }),
-                None => menu.item(act("Close all", |t, _, right, window, cx| t.close_many(right, |_, _| true, window, cx))),
+                None => menu.when(all, |menu| menu.item(act("Close all", |t, _, right, window, cx| t.close_many(right, |_, _| true, window, cx)))),
             };
             menu.when(reopen, |menu| menu.separator().item(act("Reopen closed tab", |t, _, _, window, cx| t.reopen_closed(window, cx))))
         })
