@@ -102,7 +102,7 @@ pub(crate) fn dial(id: &'static str, fill: f32, color: Hsla, ink: Hsla) -> impl 
 
 /// The width of the sidebar as a rail, and how narrow the whole one is
 /// dragged to become it.
-pub const RAIL: Pixels = px(86.);
+pub const RAIL: Pixels = px(96.);
 pub const RAIL_BELOW: Pixels = px(120.);
 
 /// "now", "5m", "3h", "2d", "2w", "4mo".
@@ -306,6 +306,7 @@ impl Workspace {
     /// pointer that crosses the rail, or clicks a task on it, opens
     /// nothing, and one that slips off the edge for an instant closes nothing.
     pub fn peek_sidebar(&mut self, open: bool, window: &Window, cx: &mut Context<Self>) {
+        self.peek_hovered = open;
         // Not closed under a search being typed.
         let searching = !open && self.search.read(cx).focus_handle(cx).is_focused(window);
         let rest = crate::state::with_settings(|s| s.rail_open_ms);
@@ -319,6 +320,16 @@ impl Workspace {
         let wait = std::time::Duration::from_millis(if open { u64::from(rest) } else { 300 });
         self.peek_wait = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(wait).await;
+            // A row's menu is drawn over the task, not over the sidebar: the pointer on it has
+            // not left, and the sidebar going would take the menu with it. Waited out, for a
+            // while at most; then it goes unless the pointer is back.
+            if !open && menu_waited_out(cx).await && this.read_with(cx, |this, _| this.peek_hovered).unwrap_or(false) {
+                return;
+            }
+            // A menu of the rail is up: it is what was asked for, not the sidebar.
+            if open && gpui_kit::component::menu::context_menu_open() {
+                return;
+            }
             let _ = this.update(cx, |this, cx| {
                 this.sidebar_peek = open;
                 cx.notify();
@@ -332,37 +343,201 @@ impl Workspace {
         let muted = cx.theme().muted_foreground;
         let dialed = crate::state::with_settings(|s| s.context_dial);
         let mut rail = v_flex().id("sidebar-rail").w(RAIL).h_full().flex_none().items_center().py_2().gap_0p5().overflow_hidden().border_r_1().border_color(cx.theme().border);
+        // As the list has them, above the projects: what waits for you, then what is starred.
+        let heading = |name: &'static str, color: Hsla| div().w_full().px_2().pt_1().text_size(px(10.)).font_weight(FontWeight::SEMIBOLD).text_color(color).child(name);
+        let waiting = self.active_rows(cx);
+        if !waiting.is_empty() {
+            rail = rail.child(heading("NEEDS YOU", hsla(0.08, 0.9, 0.55, 1.)));
+            for &(pi, ti) in &waiting {
+                rail = rail.child(self.render_rail_row(pi, ti, "waiting", dialed, cx));
+            }
+        }
+        let starred: Vec<(usize, usize)> = self
+            .projects
+            .iter()
+            .enumerate()
+            .flat_map(|(pi, p)| p.tasks.iter().enumerate().filter(|(_, t)| t.starred && t.side.is_none()).map(move |(ti, _)| (pi, ti)))
+            .filter(|&(pi, ti)| self.shows(pi, ti) && !waiting.contains(&(pi, ti)))
+            .collect();
+        if !starred.is_empty() {
+            rail = rail.child(heading("STARRED", muted));
+            for (pi, ti) in starred {
+                rail = rail.child(self.render_rail_row(pi, ti, "starred", dialed, cx));
+            }
+        }
         for (pi, project) in self.projects.iter().enumerate() {
             let tasks: Vec<usize> = (0..project.tasks.len()).filter(|&ti| self.shows(pi, ti) && project.tasks[ti].side.is_none()).collect();
             if tasks.is_empty() {
                 continue;
             }
-            // The start of each name: enough to tell which is which.
-            let start = |name: &str, most: usize| name.chars().take(most).collect::<String>();
-            rail = rail.child(div().w_full().px_2().pt_1().text_size(px(10.)).text_color(muted).child(start(&project.name, 9)));
+            // A name is cut where the rail ends, not after so many letters. Under the pointer the project's
+            // archived tasks and its + are over the name's end, and a right click has its menu, as in the list:
+            // a task is made and a project seen to without the sidebar opening.
+            let (menu, this) = (self.project_menu(pi), cx.weak_entity());
+            let (menu_a, this_a) = (menu.clone(), this.clone());
+            let group = SharedString::from(format!("rail-project-{pi}"));
+            let presenting = self.is_presenting();
+            rail = rail.child(
+                h_flex()
+                    .id(("rail-project", pi))
+                    .group(group.clone())
+                    .relative()
+                    .w_full()
+                    .px_2()
+                    .pt_1()
+                    .text_size(px(10.))
+                    .text_color(muted)
+                    .child(div().flex_1().min_w_0().truncate().child(project.name.clone()))
+                    .when(!presenting, |head| {
+                        head.child(
+                            h_flex()
+                                .absolute()
+                                .right_0()
+                                .top_0()
+                                .bottom_0()
+                                .pl_1()
+                                .bg(cx.theme().background)
+                                .invisible()
+                                .group_hover(group, |buttons| buttons.visible())
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(
+                                    Button::new(SharedString::from(format!("rail-archived-{pi}")))
+                                        .xsmall()
+                                        .ghost()
+                                        .child(svg().path("side-icons/history.svg").size(px(13.)).text_color(muted))
+                                        .tooltip("Archived tasks of the project")
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.archived_dialog(Some(pi), window, cx)
+                                        })),
+                                )
+                                .child(
+                                    Button::new(SharedString::from(format!("rail-add-{pi}")))
+                                        .xsmall()
+                                        .ghost()
+                                        .child(svg().path("side-icons/plus.svg").size(px(14.)).text_color(muted))
+                                        .dropdown_menu(move |m, _, _| menu_a(m, this_a.clone())),
+                                ),
+                        )
+                    })
+                    .context_menu(move |m, _, _| menu(m, this.clone())),
+            );
             for ti in tasks {
+                rail = rail.child(self.render_rail_row(pi, ti, "project", dialed, cx));
+            }
+        }
+        rail.test_support()
+            .on_hover(cx.listener(|this, hovered: &bool, window, cx| this.peek_sidebar(*hovered, window, cx)))
+            // The wait is for a pointer that rests: one on its way down the rail to a task
+            // is not asking for the sidebar, and on a touchpad that way takes a while.
+            .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, window, cx| {
+                if !this.sidebar_peek && this.peek_moved.elapsed() > std::time::Duration::from_millis(40) {
+                    this.peek_moved = std::time::Instant::now();
+                    this.peek_wait = Task::ready(());
+                    this.peek_sidebar(true, window, cx);
+                }
+            }))
+    }
+
+    /// A task's row in the rail. `section`: which part of the rail it is in,
+    /// a task being in its project's and in Needs you or Starred as well.
+    fn render_rail_row(&self, pi: usize, ti: usize, section: &'static str, dialed: bool, cx: &mut Context<Self>) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let project = &self.projects[pi];
                 let task = &project.tasks[ti];
                 let path = task.path.clone();
-                let glyph = task.view.as_ref().and_then(|view| crate::task::status_glyph(&view.read(cx).agent_status));
+                let title = self.task_title(pi, ti, cx);
                 let fill = self.usage.get(&path).map_or(0., |(_, usage)| usage.fill());
                 let in_hand = self.active.as_deref() == Some(path.as_path());
-                rail = rail.child(
-                    h_flex()
-                        .id(SharedString::from(format!("rail-{}", path.display())))
+                // Paused: no agent runs for it. Told apart from one that rests, which has the same circle in the list.
+                let paused = task.view.is_none() && task.busy.is_none();
+                let (glyph, unseen) = match &task.view {
+                    Some(view) => {
+                        let view = view.read(cx);
+                        (crate::task::status_glyph(&view.agent_status), view.unseen)
+                    }
+                    None => (None, false),
+                };
+                let mut notes = self.rail_notes(pi, ti, cx);
+                // Out of its project's own part of the rail, a task is told whose it is: "main" is in every one.
+                let whose: Option<String> = (section != "project").then(|| project.name.chars().take(8).collect());
+                if section != "project" {
+                    notes.insert(0, (project.name.clone(), None));
+                }
+                let (doing, figures) = (self.rail_doing(pi, ti, cx), self.rail_figures(pi, ti, cx));
+                let menu = self.task_menu(pi, ti, cx);
+                let never_opens = crate::state::with_settings(|s| s.rail_open_ms) == 0;
+                // In the tooltip too, when it is not one of the notes: what the agent does, or how long ago.
+                if let Some((doing, _)) = doing.as_ref().filter(|(doing, _)| !notes.iter().any(|(note, _)| note == doing)) {
+                    notes.push((doing.clone(), None));
+                }
+                let told: SharedString = match notes.is_empty() {
+                    true => title.clone().into(),
+                    false => format!("{title}\n{}", notes.iter().map(|(note, _)| note.as_str()).collect::<Vec<_>>().join(" · ")).into(),
+                };
+                // Finished or asking while out of view: the line at its side has the color of that, as in the list.
+                let side = match (in_hand, unseen, glyph) {
+                    (true, ..) => cx.theme().primary,
+                    (false, true, Some((_, color))) => color,
+                    _ => transparent_black(),
+                };
+                (
+                    v_flex()
+                        .id(SharedString::from(format!("rail-{section}-{}", path.display())))
                         .w_full()
-                        .h(px(24.))
                         .px_2()
-                        .gap_1()
+                        .py_0p5()
                         .cursor_pointer()
                         .border_l_2()
-                        .border_color(if in_hand { cx.theme().primary } else { transparent_black() })
+                        .border_color(side)
                         .when(in_hand, |row| row.bg(cx.theme().accent))
-                        .child(div().w(px(10.)).text_xs().map(|mark| match glyph {
-                            Some((glyph, color)) => mark.text_color(color).child(glyph),
-                            None => mark.text_color(muted).child("○"),
-                        }))
-                        .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_size(px(12.)).child(start(&self.task_title(pi, ti, cx), 5)))
-                        .when(dialed && fill > 0., |row| row.child(context_dial(fill, cx)))
+                        .hover(|row| row.bg(cx.theme().accent.opacity(0.6)))
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .gap_1()
+                                .child(div().w(px(10.)).flex_none().text_xs().map(|mark| match (glyph, paused) {
+                                    (Some((glyph, color)), _) => mark.text_color(color).child(glyph),
+                                    (None, true) => mark.text_color(muted).child("‖"),
+                                    (None, false) => mark.text_color(muted).child("○"),
+                                }))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(px(12.))
+                                        .when(paused, |name| name.text_color(muted))
+                                        .when(unseen && !in_hand, |name| name.font_weight(FontWeight::SEMIBOLD))
+                                        .child(title),
+                                )
+                                .when(dialed && fill > 0., |row| row.child(context_dial(fill, cx))),
+                        )
+                        // What goes on in it, in a line of its own: the one thing most worth knowing, all the width its.
+                        .when(doing.is_some() || whose.is_some(), |row| {
+                            row.child(
+                                h_flex()
+                                    .w_full()
+                                    .pl(px(14.))
+                                    .gap_1()
+                                    .text_size(px(10.))
+                                    .line_height(px(12.))
+                                    .text_color(muted)
+                                    .when_some(whose, |line, whose| line.child(div().flex_none().child(whose)))
+                                    .when_some(doing, |line, (doing, color)| line.child(div().flex_1().min_w_0().truncate().text_color(color.unwrap_or(muted)).child(doing))),
+                            )
+                        })
+                        // Its figures in another: signs and numbers, short enough to be there together.
+                        .when(!figures.is_empty(), |row| {
+                            row.child(
+                                h_flex().w_full().pl(px(14.)).gap_1p5().overflow_hidden().text_size(px(10.)).line_height(px(12.)).children(
+                                    figures.into_iter().map(|(figure, color)| div().flex_none().text_color(color.unwrap_or(muted)).child(figure)),
+                                ),
+                            )
+                        })
+                        // A tooltip only on a rail that never opens: where it does, the pointer resting
+                        // brings the whole list, and a tooltip would be left over it.
+                        .when(never_opens, |row| row.tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(told.clone()).build(window, cx)))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             // Gone to a task: the rail did its work, and does not open over it.
                             this.peek_wait = Task::ready(());
@@ -370,11 +545,122 @@ impl Workspace {
                             if let Some(view) = this.active_view() {
                                 view.update(cx, |t, cx| t.show_view(0, window, cx));
                             }
-                        })),
-                );
+                        }))
+                        // The task's own menu, as on its row in the list.
+                        .context_menu(menu)
+                )
+                .into_any_element()
+    }
+
+    /// What goes on in a task, for the rail's second line: one thing, the
+    /// most pressing there is. Being made; asking; its setup or check
+    /// failed; what its agent does now; setting up or checking; or how long
+    /// ago it last moved.
+    pub(crate) fn rail_doing(&self, pi: usize, ti: usize, cx: &App) -> Option<(String, Option<Hsla>)> {
+        let task = &self.projects[pi].tasks[ti];
+        if let Some(busy) = &task.busy {
+            return Some((busy.to_string(), None));
+        }
+        // Paused is told by the sign before the name and its color: of these there can be many, and they keep to one line.
+        let view = task.view.as_ref()?;
+        let view = view.read(cx);
+        if matches!(view.agent_status, AgentStatus::NeedsInput(_)) {
+            return Some(("asks".into(), Some(hsla(0.08, 0.9, 0.55, 1.))));
+        }
+        let marks = view.auto_marks();
+        if let Some((failed, color)) = marks.iter().find(|(mark, _)| mark.starts_with('✗')) {
+            return Some((failed.to_string(), Some(*color)));
+        }
+        if let Some(activity) = view.agent_activity.clone().filter(|_| view.agent_status == AgentStatus::Working) {
+            return Some((activity, None));
+        }
+        if let Some((running, _)) = marks.iter().find(|(mark, _)| mark.ends_with('…')) {
+            return Some((running.to_string(), None));
+        }
+        Some(ago(task.last_active)).filter(|when| !when.is_empty()).map(|when| (when, None))
+    }
+
+    /// A task's figures, for the rail's third line: the check passed, files
+    /// changed, commits not pushed, services running, review comments, its
+    /// pull request, the star.
+    pub(crate) fn rail_figures(&self, pi: usize, ti: usize, cx: &App) -> Vec<(String, Option<Hsla>)> {
+        let task = &self.projects[pi].tasks[ti];
+        let mut figures: Vec<(String, Option<Hsla>)> = Vec::new();
+        if let Some(view) = &task.view {
+            let view = view.read(cx);
+            if view.auto_marks().iter().any(|(mark, _)| *mark == "✓ check") {
+                figures.push(("✓".into(), Some(gpui_kit::green())));
+            }
+            let (changes, unpushed, services) = (view.change_count(), view.unpushed(), view.running_services(cx).len());
+            if changes > 0 {
+                figures.push((format!("±{changes}"), None));
+            }
+            if unpushed > 0 {
+                figures.push((format!("↑{unpushed}"), None));
+            }
+            if services > 0 {
+                figures.push((if services == 1 { "▶".into() } else { format!("▶{services}") }, Some(gpui_kit::green())));
             }
         }
-        rail.test_support().on_hover(cx.listener(|this, hovered: &bool, window, cx| this.peek_sidebar(*hovered, window, cx)))
+        if let Some(pr) = task.pr.as_ref().filter(|_| crate::state::with_settings(|s| s.pr_status)) {
+            use crate::pr::{Checks, PrState};
+            if pr.open_feedback > 0 {
+                figures.push((format!("{} rev", pr.open_feedback), None));
+            }
+            figures.push(match (pr.state, pr.checks) {
+                (PrState::Open, Checks::Passed) => (format!("#{}✓", pr.number), Some(gpui_kit::green())),
+                (PrState::Open, Checks::Failed) => (format!("#{}✗", pr.number), Some(gpui_kit::red())),
+                (PrState::Open, Checks::Pending) => (format!("#{}…", pr.number), None),
+                _ => (format!("#{}", pr.number), None),
+            });
+        }
+        if task.starred {
+            figures.push(("★".into(), None));
+        }
+        figures
+    }
+
+    /// All there is to say of a task in the rail, for its tooltip: the few
+    /// things that are worth going to it for, the most pressing first.
+    pub(crate) fn rail_notes(&self, pi: usize, ti: usize, cx: &App) -> Vec<(String, Option<Hsla>)> {
+        let task = &self.projects[pi].tasks[ti];
+        let mut notes: Vec<(String, Option<Hsla>)> = Vec::new();
+        if let Some(busy) = &task.busy {
+            notes.push((busy.to_string(), None));
+        }
+        match &task.view {
+            Some(view) => {
+                let view = view.read(cx);
+                if matches!(view.agent_status, AgentStatus::NeedsInput(_)) {
+                    notes.push(("asks".into(), Some(hsla(0.08, 0.9, 0.55, 1.))));
+                }
+                // How the project's setup and check went: a failure first of all.
+                let mut marks = view.auto_marks();
+                marks.sort_by_key(|(mark, _)| !mark.starts_with('✗'));
+                notes.extend(marks.into_iter().map(|(mark, color)| (mark.to_string(), Some(color))));
+                let (changes, unpushed) = (view.change_count(), view.unpushed());
+                if changes > 0 {
+                    notes.push((format!("±{changes}"), None));
+                }
+                if unpushed > 0 {
+                    notes.push((format!("↑{unpushed}"), None));
+                }
+                let services = view.running_services(cx).len();
+                if services > 0 {
+                    notes.push((if services == 1 { "▶".into() } else { format!("▶{services}") }, Some(gpui_kit::green())));
+                }
+            }
+            None if task.busy.is_none() => notes.push(("paused".into(), None)),
+            None => {}
+        }
+        let pr_status = crate::state::with_settings(|s| s.pr_status);
+        if let Some(pr) = task.pr.as_ref().filter(|pr| pr.open_feedback > 0 && pr_status) {
+            notes.push((format!("{} review", pr.open_feedback), None));
+        }
+        if task.starred {
+            notes.push(("★".into(), None));
+        }
+        notes
     }
 
     fn task_matches(&self, pi: usize, ti: usize, query: &str, cx: &App) -> bool {
@@ -450,13 +736,9 @@ impl Workspace {
         }
     }
 
-    fn render_project(&self, pi: usize, first: bool, cx: &mut Context<Self>) -> AnyElement {
+    /// What a project's menu offers: from its row in the list (a right click, and its +) and from the rail.
+    fn project_menu(&self, pi: usize) -> impl Fn(PopupMenu, WeakEntity<Workspace>) -> PopupMenu + Clone + 'static {
         let p = &self.projects[pi];
-        let name: SharedString = p.name.clone().into();
-        let running = p.tasks.iter().filter(|t| t.view.is_some()).count();
-        let group = SharedString::from(format!("project-group-{pi}"));
-        let muted = cx.theme().muted_foreground;
-        let this = cx.weak_entity();
         let spaces: Vec<(String, String)> = self.spaces.iter().map(|s| (s.name.clone(), s.mark())).collect();
         let in_space = p.space.clone();
         let merged = p.tasks.iter().filter(|t| !t.main && t.side.is_none() && t.busy.is_none() && t.pr.as_ref().is_some_and(|pr| pr.state == crate::pr::PrState::Merged)).count();
@@ -529,6 +811,84 @@ impl Workspace {
                 menu.separator()
             })
         };
+        menu
+    }
+
+    /// What a right click on a task offers: the same from its row in the list and from the rail.
+    fn task_menu(&self, pi: usize, ti: usize, cx: &mut Context<Self>) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        let t = &self.projects[pi].tasks[ti];
+        let path = t.path.clone();
+        let several = crate::state::with_settings(|s| s.several_agents());
+        let this = cx.weak_entity();
+        let (starred, main) = (t.starred, t.main);
+        let (ready, side) = (t.busy.is_none(), t.side.is_some());
+        let can_continue = several && t.side.is_none() && ready;
+        let hand = crate::commands::InHand::basic(t);
+        let can = move |what| hand.allows(what);
+        let named = move |what: T| crate::commands::sentence(what.name(starred));
+        use crate::commands::TaskCommand as T;
+        let menu_path = path.clone();
+        let branch = t.branch.clone();
+        let menu = move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
+            let (a, b, c, d) = (this.clone(), this.clone(), this.clone(), this.clone());
+            let (pa, pb, pc, pd) = (menu_path.clone(), menu_path.clone(), menu_path.clone(), menu_path.clone());
+            let (e, f, pe, pf) = (this.clone(), this.clone(), menu_path.clone(), menu_path.clone());
+            let (g, pg) = (this.clone(), menu_path.clone());
+            let branch = branch.clone();
+            // What it is called and how it is found; its variants; its end.
+            menu.when(can(T::Rename), |m| {
+                m.item(PopupMenuItem::new(named(T::Rename)).on_click(move |_, window, cx| {
+                    let _ = d.update(cx, |w, cx| w.rename_task_dialog(&pd, window, cx));
+                }))
+            })
+            .item(PopupMenuItem::new(named(T::Star)).on_click(move |_, _, cx| {
+                let _ = a.update(cx, |w, cx| w.toggle_star(&pa, cx));
+            }))
+            .item(PopupMenuItem::new(named(T::CopyBranchName)).on_click(move |_, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(branch.clone()));
+            }))
+            .when(can(T::AnotherVariant), |m| {
+                m.separator()
+                    .item(PopupMenuItem::new(named(T::AnotherVariant)).on_click(move |_, window, cx| {
+                        let _ = e.update(cx, |w, cx| w.another_variant_dialog(&pe, window, cx));
+                    }))
+                    .when(can(T::KeepVariant), |m| {
+                        m.item(PopupMenuItem::new(named(T::KeepVariant)).on_click(move |_, window, cx| {
+                            let _ = f.update(cx, |w, cx| w.keep_variant_dialog(&pf, window, cx));
+                        }))
+                    })
+            })
+            .when(can_continue, |m| {
+                m.when(main, |m| m.separator()).item(PopupMenuItem::new("Continue with another agent…").on_click(move |_, window, cx| {
+                    let _ = g.update(cx, |w, cx| w.continue_with_dialog(&pg, window, cx));
+                }))
+            })
+            .when(can(T::Pause) || can(T::Archive) || can(T::RemoveSide), |m| m.separator())
+            // Pause stops what runs and keeps the task; Archive is the end
+            // of one, which a restore takes up again.
+            .when(can(T::Pause), |m| {
+                m.item(PopupMenuItem::new("Pause").on_click(move |_, window, cx| {
+                    let _ = b.update(cx, |w, cx| w.close_task(&pb, window, cx));
+                }))
+            })
+            .when(can(T::Archive) || can(T::RemoveSide), |m| {
+                // In a row of its own the task needs no naming: "Pause", not "Pause task".
+                m.item(PopupMenuItem::new(if side { "Remove" } else { "Archive" }).on_click(move |_, window, cx| {
+                    let _ = c.update(cx, |w, cx| if side { w.remove_side(&pc, window, cx) } else { w.archive_task(&pc, window, cx) });
+                }))
+            })
+        };
+        menu
+    }
+
+    fn render_project(&self, pi: usize, first: bool, cx: &mut Context<Self>) -> AnyElement {
+        let p = &self.projects[pi];
+        let name: SharedString = p.name.clone().into();
+        let running = p.tasks.iter().filter(|t| t.view.is_some()).count();
+        let group = SharedString::from(format!("project-group-{pi}"));
+        let muted = cx.theme().muted_foreground;
+        let this = cx.weak_entity();
+        let menu = self.project_menu(pi);
         let (menu_a, this_a) = (menu.clone(), this.clone());
         let (presenting, in_hand) = (self.is_presenting(), self.active_project() == Some(pi));
         h_flex()
@@ -818,65 +1178,8 @@ impl Workspace {
         let overlaps = self.overlaps(project, &path);
         let whole_branch = t.branch.clone();
 
-        let this = cx.weak_entity();
-        let (starred, main) = (t.starred, t.main);
-        let (grouped, ready, side) = (!t.group.is_empty(), t.busy.is_none(), t.side.is_some());
-        let can_continue = several && t.side.is_none() && ready;
-        let hand = crate::commands::InHand::basic(t);
-        let can = move |what| hand.allows(what);
-        let named = move |what: T| crate::commands::sentence(what.name(starred));
-        use crate::commands::TaskCommand as T;
-        let menu_path = path.clone();
-        let branch = t.branch.clone();
-        let menu = move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
-            let (a, b, c, d) = (this.clone(), this.clone(), this.clone(), this.clone());
-            let (pa, pb, pc, pd) = (menu_path.clone(), menu_path.clone(), menu_path.clone(), menu_path.clone());
-            let (e, f, pe, pf) = (this.clone(), this.clone(), menu_path.clone(), menu_path.clone());
-            let (g, pg) = (this.clone(), menu_path.clone());
-            let branch = branch.clone();
-            // What it is called and how it is found; its variants; its end.
-            menu.when(can(T::Rename), |m| {
-                m.item(PopupMenuItem::new(named(T::Rename)).on_click(move |_, window, cx| {
-                    let _ = d.update(cx, |w, cx| w.rename_task_dialog(&pd, window, cx));
-                }))
-            })
-            .item(PopupMenuItem::new(named(T::Star)).on_click(move |_, _, cx| {
-                let _ = a.update(cx, |w, cx| w.toggle_star(&pa, cx));
-            }))
-            .item(PopupMenuItem::new(named(T::CopyBranchName)).on_click(move |_, _, cx| {
-                cx.write_to_clipboard(ClipboardItem::new_string(branch.clone()));
-            }))
-            .when(can(T::AnotherVariant), |m| {
-                m.separator()
-                    .item(PopupMenuItem::new(named(T::AnotherVariant)).on_click(move |_, window, cx| {
-                        let _ = e.update(cx, |w, cx| w.another_variant_dialog(&pe, window, cx));
-                    }))
-                    .when(can(T::KeepVariant), |m| {
-                        m.item(PopupMenuItem::new(named(T::KeepVariant)).on_click(move |_, window, cx| {
-                            let _ = f.update(cx, |w, cx| w.keep_variant_dialog(&pf, window, cx));
-                        }))
-                    })
-            })
-            .when(can_continue, |m| {
-                m.when(main, |m| m.separator()).item(PopupMenuItem::new("Continue with another agent…").on_click(move |_, window, cx| {
-                    let _ = g.update(cx, |w, cx| w.continue_with_dialog(&pg, window, cx));
-                }))
-            })
-            .when(can(T::Pause) || can(T::Archive) || can(T::RemoveSide), |m| m.separator())
-            // Pause stops what runs and keeps the task; Archive is the end
-            // of one, which a restore takes up again.
-            .when(can(T::Pause), |m| {
-                m.item(PopupMenuItem::new("Pause").on_click(move |_, window, cx| {
-                    let _ = b.update(cx, |w, cx| w.close_task(&pb, window, cx));
-                }))
-            })
-            .when(can(T::Archive) || can(T::RemoveSide), |m| {
-                // In a row of its own the task needs no naming: "Pause", not "Pause task".
-                m.item(PopupMenuItem::new(if side { "Remove" } else { "Archive" }).on_click(move |_, window, cx| {
-                    let _ = c.update(cx, |w, cx| if side { w.remove_side(&pc, window, cx) } else { w.archive_task(&pc, window, cx) });
-                }))
-            })
-        };
+        let grouped = !t.group.is_empty();
+        let menu = self.task_menu(pi, ti, cx);
 
         let click_path = path.clone();
         let drop_path = path.clone();
@@ -1132,4 +1435,18 @@ mod tests {
         assert!(!branch_follows("Сборка приложения", "main"));
         assert!(!branch_follows("", "anything"));
     }
+}
+
+/// Waits while a context menu is up, a minute at the most (one whose owner
+/// went away is never told closed). Whether there was one to wait for.
+pub(crate) async fn menu_waited_out(cx: &mut AsyncApp) -> bool {
+    let mut waited = false;
+    for _ in 0..300 {
+        if !gpui_kit::component::menu::context_menu_open() {
+            break;
+        }
+        waited = true;
+        cx.background_executor().timer(std::time::Duration::from_millis(200)).await;
+    }
+    waited
 }

@@ -163,15 +163,26 @@ impl TaskView {
                         cx.new(|_| dragged.clone())
                     });
                 if closable {
-                    item.suffix(
-                        Button::new(("close", ix))
-                            .xsmall()
-                            .ghost()
-                            .label("×")
-                            .on_click(cx.listener(move |this, _, window, cx| {
+                    // The cross is there under the pointer only, over the tab's end: it keeps no room
+                    // of its own, so the tabs are as wide as their names and the row is quieter.
+                    // A tab is closed without it too: the middle button, its menu, the key.
+                    let group = SharedString::from(format!("tab-{}", tab.id));
+                    let ground = if self.is_shown(tab.id) { cx.theme().tab_active } else { cx.theme().tab_bar };
+                    item.group(group.clone()).suffix(
+                        h_flex()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .right_0()
+                            .pl_1()
+                            .pr_0p5()
+                            .bg(ground)
+                            .invisible()
+                            .group_hover(group, |cross| cross.visible())
+                            .child(Button::new(("close", ix)).xsmall().ghost().label("×").on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 this.close_tab(ix, window, cx)
-                            })),
+                            }))),
                     )
                 } else {
                     item

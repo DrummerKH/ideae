@@ -1452,6 +1452,8 @@ impl TaskView {
         self.fill_tree(cx);
         self.sync_visibility(cx);
         if visible {
+            // How the lists are shown may have changed in another task meanwhile.
+            self.reorder_diffs(cx);
             // What it skipped while out of view.
             let _ = self.refresh_tx.try_send(());
             self.show_diff_if_seen(cx);

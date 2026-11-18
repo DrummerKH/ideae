@@ -189,6 +189,12 @@ pub struct Workspace {
     pub sidebar_rail: bool,
     pub sidebar_peek: bool,
     pub(crate) peek_wait: Task<()>,
+    /// Whether the pointer is on the rail or the sidebar open from it, as last told.
+    pub(crate) peek_hovered: bool,
+    /// When the pointer last moved on the rail: the sidebar opens once it rests.
+    pub(crate) peek_moved: std::time::Instant,
+    /// Told that the battery runs low, this time it runs down.
+    battery_told: bool,
     /// In the GNOME dash; asked once, not while the menu opens.
     /// How the app stands with the desktop, and whether it was told once that it is not listed there.
     pub desk: crate::desktop::Standing,
@@ -534,6 +540,10 @@ impl Workspace {
                         // Tasks come and go with their worktrees.
                         this.tell_what_is_hidden();
                     }
+                    // Every two minutes: a battery runs down slowly.
+                    if n % 40 == 5 {
+                        this.look_at_battery(window, cx);
+                    }
                     if n % 10 == 0 {
                         this.sleep_idle_language_servers(cx);
                         this.refresh_prs(false, window, cx);
@@ -576,6 +586,9 @@ impl Workspace {
             sidebar_rail: saved.sidebar_rail,
             sidebar_peek: false,
             peek_wait: Task::ready(()),
+            peek_hovered: false,
+            peek_moved: std::time::Instant::now(),
+            battery_told: false,
             desk: Default::default(),
             told_unlisted: saved.told_unlisted,
             search: {
@@ -2276,6 +2289,42 @@ impl Workspace {
             }
         });
         by.into_iter().filter(|(_, n)| *n > 0).collect()
+    }
+
+    /// The battery low and in use, and power not saved: said once as it
+    /// runs down, with the way to save. Read off the UI thread.
+    fn look_at_battery(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !state::with_settings(|s| s.battery_hint) {
+            return;
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            let read = cx.background_spawn(async { crate::battery::read() }).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let (tell, told) = crate::battery::tell(read, this.battery_told);
+                this.battery_told = told;
+                if !tell || crate::lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                let full = read.map_or(0, |(full, _)| full);
+                let this = cx.weak_entity();
+                let note = Notification::info(format!("The battery is at {full}%. Power save mode stops the language servers, the background fetch, the pull request status and the load readout; File → Power Save Mode, or the battery in the title bar."))
+                    .title("Save power?")
+                    .autohide(false)
+                    .action(move |_, _, cx| {
+                        let (this, me) = (this.clone(), cx.entity().downgrade());
+                        gpui_kit::component::button::Button::new("battery-save").xsmall().outline().label("Turn it on").on_click(move |_, window, cx| {
+                            let _ = this.update(cx, |this, cx| {
+                                if !crate::lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed) {
+                                    this.toggle_power_saving(cx);
+                                }
+                            });
+                            let _ = me.update(cx, |note, cx| note.dismiss(window, cx));
+                        })
+                    });
+                window.push_notification(note, cx);
+            });
+        })
+        .detach();
     }
 
     pub fn toggle_power_saving(&mut self, cx: &mut Context<Self>) {

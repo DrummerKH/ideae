@@ -72,6 +72,50 @@ impl TaskView {
         });
     }
 
+    /// The list of changed files became a tree or a list: the diffs are in
+    /// the order of that again, without waiting for a file to change.
+    pub(super) fn reorder_diffs(&mut self, cx: &mut Context<Self>) {
+        // The diffs kept in tabs of their own, and the commit shown in History.
+        self.reorder_kept_diffs(cx);
+        let flat = crate::state::with_settings(|s| s.changes_flat);
+        // Each in the order shown, and whether it was not: in order already, nothing is laid out again.
+        fn ordered<T>(items: &mut Vec<T>, flat: bool, path: impl Fn(&T) -> String) -> bool {
+            let paths: Vec<String> = items.iter().map(path).collect();
+            let order = shown_order(&paths, flat);
+            if order.iter().copied().eq(0..paths.len()) {
+                return false;
+            }
+            let mut taken: Vec<Option<T>> = std::mem::take(items).into_iter().map(Some).collect();
+            *items = order.into_iter().filter_map(|ix| taken.get_mut(ix)?.take()).collect();
+            true
+        }
+        let diffs = ordered(&mut self.uncommitted_diff, flat, |file| file.path().to_string()) | ordered(&mut self.branch_diff, flat, |file| file.path().to_string());
+        // The panel's own list is of the same files, and is in the same order.
+        let list = ordered(&mut self.files, flat, |file| file.path.to_string());
+        if list {
+            self.side_selected = 0;
+        }
+        if diffs {
+            self.diff_stale = true;
+            self.show_diff_if_seen(cx);
+        }
+        if diffs || list {
+            cx.notify();
+        }
+    }
+
+    /// The diffs a task keeps on screen between refreshes: a tab comparing
+    /// with a branch, a commit or a stash, and History's commit. Cheap when
+    /// they are in order already, which is nearly always.
+    pub(super) fn reorder_kept_diffs(&mut self, cx: &mut Context<Self>) {
+        for tab in &self.tabs {
+            if let TabKind::Diff(diff) = &tab.kind {
+                diff.read(cx).reorder_handle().map(|state| reorder_shown(&state, cx));
+            }
+        }
+        self.history.read(cx).reorder_handle().map(|state| reorder_shown(&state, cx));
+    }
+
     /// The Changes tab gets a new diff when it is looked at: laying one out
     /// and colouring it for a tab that is closed, behind another, or in a
     /// task out of view would be done again on every change an agent makes.

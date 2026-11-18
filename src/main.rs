@@ -3,6 +3,7 @@
 
 mod acp;
 mod agent;
+mod battery;
 mod agents;
 mod archive;
 mod browser;

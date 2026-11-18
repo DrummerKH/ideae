@@ -216,6 +216,10 @@ impl TaskView {
         let wait = std::time::Duration::from_millis(if want.is_some() { u64::from(rest) } else { 300 });
         self.side_peek_wait = cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(wait).await;
+            // A row's menu is over the task, not over the panel: the pointer on it has not left.
+            if want.is_none() {
+                crate::sidebar::menu_waited_out(cx).await;
+            }
             let _ = this.update_in(cx, |this, window, cx| {
                 // Not taken from under the keyboard: a commit message is being written there.
                 if want.is_none() && this.peek_focus.contains_focused(window, cx) {
@@ -346,6 +350,9 @@ impl TaskView {
                     crate::state::set_settings(settings);
                     if id == "tree-follow" && !on {
                         this.locate_in_tree(cx);
+                    }
+                    if id == "changes-tree" {
+                        this.reorder_diffs(cx);
                     }
                     cx.refresh_windows();
                 }))

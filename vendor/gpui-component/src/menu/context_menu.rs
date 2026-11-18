@@ -13,6 +13,15 @@ use gpui::{
 
 use crate::{input::AnyInputState, menu::PopupMenu, root::WindowState};
 
+// ideae patch: how many context menus are up, for what would close under
+// one because the pointer left it for the menu (a panel shown on hover).
+static OPEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether a context menu is open anywhere.
+pub fn any_open() -> bool {
+    OPEN.load(std::sync::atomic::Ordering::Relaxed) > 0
+}
+
 /// A extension trait for adding a context menu to an element.
 pub trait ContextMenuExt: InteractiveElement + ParentElement + Styled {
     /// Add a context menu to the element.
@@ -455,7 +464,10 @@ fn open_menu(
         shared_state.selection_input = None;
         shared_state._subscription = None;
         shared_state.position = position;
-        shared_state.open = true;
+        // ideae patch: counted once for a menu that replaces one still open.
+        if !std::mem::replace(&mut shared_state.open, true) {
+            OPEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     // Use defer to build the menu in the next frame, avoiding race conditions
@@ -515,7 +527,10 @@ fn open_menu(
                 move |_, _: &DismissEvent, window, _cx| {
                     if let Some(shared_state) = shared_state.upgrade() {
                         let mut state = shared_state.borrow_mut();
-                        state.open = false;
+                        // ideae patch: see `any_open`.
+                        if std::mem::replace(&mut state.open, false) {
+                            OPEN.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                         state.selection_input = None;
                         window.refresh();
                     }

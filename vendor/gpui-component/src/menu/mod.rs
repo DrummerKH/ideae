@@ -7,7 +7,8 @@ mod menu_item;
 mod popup_menu;
 
 pub use app_menu_bar::{AppMenuBar, MenuSource};
-pub use context_menu::{ContextMenu, ContextMenuExt, ContextMenuState};
+// ideae patch: `any_open`.
+pub use context_menu::{ContextMenu, ContextMenuExt, ContextMenuState, any_open as context_menu_open};
 pub use dropdown_menu::DropdownMenu;
 pub(crate) use menu_item::MenuItemElement;
 pub use popup_menu::{PopupMenu, PopupMenuItem};

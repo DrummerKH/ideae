@@ -260,6 +260,10 @@ pub struct DiffTab {
 }
 
 impl DiffTab {
+    pub fn reorder_handle(&self) -> Option<Entity<DiffState>> {
+        Some(self.diff.clone())
+    }
+
     pub fn new(what: String, files: Vec<DiffFile>, source: DiffSource, cx: &mut Context<Self>) -> Self {
         // As the Changes tab shows diffs: in the mode chosen there.
         let mode = if crate::state::with_settings(|s| s.diff_unified) { DiffMode::Unified } else { DiffMode::Split };
@@ -360,13 +364,59 @@ pub fn show_diff_dialog(title: String, files: Vec<DiffFile>, window: &mut Window
 }
 
 pub fn with_languages(files: Vec<DiffFile>) -> Vec<DiffFile> {
-    files
-        .into_iter()
-        .map(|f| match lsp::language_for(std::path::Path::new(f.path().as_ref())) {
-            "text" => f,
-            language => f.with_language(language),
-        })
-        .collect()
+    in_shown_order(
+        files
+            .into_iter()
+            .map(|f| match lsp::language_for(std::path::Path::new(f.path().as_ref())) {
+                "text" => f,
+                language => f.with_language(language),
+            })
+            .collect(),
+    )
+}
+
+/// A diff's files in the order their list has them: as a tree, a folder's
+/// folders before its files; as a list, by name, then by folder.
+/// Read down, the diff then goes file by file as the list beside it does.
+pub fn in_shown_order(files: Vec<DiffFile>) -> Vec<DiffFile> {
+    let flat = crate::state::with_settings(|s| s.changes_flat);
+    let paths: Vec<String> = files.iter().map(|file| file.path().to_string()).collect();
+    let order = shown_order(&paths, flat);
+    let mut files: Vec<Option<DiffFile>> = files.into_iter().map(Some).collect();
+    order.into_iter().filter_map(|ix| files.get_mut(ix)?.take()).collect()
+}
+
+/// A diff that is on screen for longer than it takes to change how the
+/// lists are shown (a tab comparing with a branch, a commit in History):
+/// its files are put in the order shown now, when they are not.
+pub fn reorder_shown(diff: &Entity<DiffState>, cx: &mut App) {
+    let paths: Vec<String> = diff.read(cx).files().iter().map(|file| file.path().to_string()).collect();
+    let order = shown_order(&paths, crate::state::with_settings(|s| s.changes_flat));
+    if order.iter().copied().eq(0..paths.len()) {
+        return;
+    }
+    diff.update(cx, |state, cx| {
+        let mut files: Vec<Option<DiffFile>> = state.files().iter().cloned().map(Some).collect();
+        let ordered: Vec<DiffFile> = order.into_iter().filter_map(|ix| files.get_mut(ix)?.take()).collect();
+        state.set_files(ordered, cx);
+    });
+}
+
+/// Where each of `paths` goes: the indices in the order shown.
+pub(super) fn shown_order(paths: &[String], flat: bool) -> Vec<usize> {
+    let mut sorted: Vec<(usize, &str)> = paths.iter().enumerate().map(|(ix, path)| (ix, path.as_str())).collect();
+    sorted.sort_by(|a, b| a.1.cmp(b.1));
+    if flat {
+        // A list has the name first and its folder after it: by the name, as it is read, then by the folder.
+        let name = |path: &str| path.rsplit('/').next().unwrap_or(path).to_lowercase();
+        sorted.sort_by_cached_key(|(_, path)| (name(path), path.to_string()));
+        return sorted.into_iter().map(|(ix, _)| ix).collect();
+    }
+    change_tree(&sorted).into_iter().filter_map(|node| match node {
+        ChangeNode::File { ix, .. } => Some(ix),
+        ChangeNode::Dir { .. } => None,
+    })
+    .collect()
 }
 
 pub(super) fn human_size(bytes: u64) -> String {

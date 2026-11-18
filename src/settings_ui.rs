@@ -231,6 +231,13 @@ fn pages(
             SettingGroup::new().title("Title bar")
                 .item(switch(
                     draft,
+                    "Say when the battery runs low",
+                    "Once as it runs down past 30% while in use: that there is a power save mode, with the way to turn it on.",
+                    |s| s.battery_hint,
+                    |s, v| s.battery_hint = v,
+                ))
+                .item(switch(
+                    draft,
                     "Load",
                     "CPU, memory, and what the app and its tasks hold; the tooltip has every process.",
                     |s| s.show_load,

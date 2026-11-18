@@ -315,7 +315,19 @@ take the whole page; say what to do with them and send them all in one prompt.
 - Presentation mode (View → Presentation Mode…) leaves only the tasks you pick in the window, draws code
   larger, and hides what git ignores (keys, local settings) until asked for.
 - Focus mode (Shift+Esc) puts one pane over the whole window.
-- Dragged narrow, the sidebar becomes a rail of tasks that opens on hover.
+- Dragged narrow, the sidebar becomes a rail: Needs you, Starred and the
+  projects' tasks, each with its name, what goes on in it (it asks, its
+  check failed, what its agent does, how long ago) and its figures (files
+  changed, commits not pushed, services, its pull request). A paused task
+  has a sign of its own and one line. A right click has the task's menu,
+  and a project's name under the pointer its archived tasks and its +. The
+  whole sidebar opens over the task once the pointer rests on the rail, not
+  while it moves along it to a task; not from under a menu.
+- A tab's cross shows under the pointer, over the tab's end.
+- A diff's files are in the order of the list beside them: as a tree, a
+  folder's folders before its files; as a list, by name.
+- On a battery that runs down past 30% the app says once that there is a
+  power save mode (Settings → General).
 - Recent tasks (Ctrl+E) marks each with its agent's status, as the sidebar
   does, and says which are paused and how many files changed. Lists of this
   kind go a page at a time with Page Up and Page Down.

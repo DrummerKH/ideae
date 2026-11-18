@@ -2373,6 +2373,21 @@ pub(crate) mod tests {
             }
         })
         .unwrap();
+        // The rail says what is worth going to a task for: one whose agent does not run is paused, one that asks says so first.
+        workspace.update(cx, |w, cx| {
+            let said = |w: &Workspace, pi: usize, ti: usize, cx: &gpui_kit::App| w.rail_notes(pi, ti, cx).into_iter().map(|(note, _)| note).collect::<Vec<_>>();
+            let (pi, ti) = w.find(&paths[0]).unwrap();
+            assert!(!said(w, pi, ti, cx).contains(&"paused".to_string()), "its agent runs");
+            let view = w.projects[pi].tasks[ti].view.take();
+            assert_eq!(said(w, pi, ti, cx).first().map(String::as_str), Some("paused"));
+            w.projects[pi].tasks[ti].starred = true;
+            assert_eq!(said(w, pi, ti, cx), ["paused", "★"]);
+            // On the rail itself: what goes on in a line, the figures in another.
+            assert_eq!(w.rail_doing(pi, ti, cx), None, "paused is the sign before its name: no line of its own");
+            assert_eq!(w.rail_figures(pi, ti, cx).into_iter().map(|(figure, _)| figure).collect::<Vec<_>>(), ["★"]);
+            w.projects[pi].tasks[ti].starred = false;
+            w.projects[pi].tasks[ti].view = view;
+        });
         workspace.update(cx, |w, cx| {
             (w.sidebar_rail, w.sidebar_peek) = (false, false);
             cx.notify();

@@ -110,6 +110,11 @@ const BODY_LINES: usize = 4;
 const FIRST: usize = 2_000;
 
 impl HistoryView {
+    /// The commit's diff, to put its files in the order the lists are shown in now.
+    pub fn reorder_handle(&self) -> Option<Entity<DiffState>> {
+        Some(self.diff.clone())
+    }
+
     pub fn new(root: PathBuf, task: WeakEntity<TaskView>, cx: &mut Context<Self>) -> Self {
         let diff = cx.new(|cx| DiffState::new([], cx).with_mode(DiffMode::Unified));
         cx.observe(&diff, |_, _, cx| cx.notify()).detach();

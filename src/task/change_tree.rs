@@ -80,6 +80,19 @@ mod change_tree_tests {
         assert!(matches!(super::changes_shown(&paths)[0], ChangeNode::Dir { .. }) && super::folder_shown("src/task/mod.rs").is_none());
     }
 
+    /// A diff's files are in the order of the list beside them: as a tree a
+    /// folder's folders come before its files, which is not git's order.
+    #[test]
+    fn a_diff_s_files_follow_the_tree_or_the_list() {
+        let paths: Vec<String> = ["README.md", "src/sidebar.rs", "src/workspace/variants.rs", "src/task/mod.rs"].map(String::from).to_vec();
+        let named = |order: Vec<usize>| order.into_iter().map(|ix| paths[ix].as_str()).collect::<Vec<_>>();
+        assert_eq!(named(super::shown_order(&paths, false)), ["src/task/mod.rs", "src/workspace/variants.rs", "src/sidebar.rs", "README.md"]);
+        assert_eq!(named(super::shown_order(&paths, true)), ["src/task/mod.rs", "README.md", "src/sidebar.rs", "src/workspace/variants.rs"], "a list is by name: mod, README, sidebar, variants");
+        // Two of a name, by their folders.
+        let same: Vec<String> = ["src/task/mod.rs", "src/acp/mod.rs", "src/agents/mod.rs"].map(String::from).to_vec();
+        assert_eq!(super::shown_order(&same, true), [1, 2, 0]);
+    }
+
     #[test]
     fn folders_compact_and_nest() {
         let paths = [(0, "README.md"), (1, "src/main/kotlin/App.kt"), (2, "src/main/kotlin/ui/View.kt"), (3, "src/test/T.kt")];
