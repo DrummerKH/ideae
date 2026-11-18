@@ -133,15 +133,32 @@ impl Render for BinaryView {
     }
 }
 
-/// Set when a tab drag starts. Pane dividers drag too (gpui's drag-and-drop
-/// does not say what is dragged), and those must not show the drop zones.
-static TAB_DRAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// What is being dragged, set when the drag starts. Pane dividers drag too
+/// (gpui's drag-and-drop does not say what is dragged), and those must not
+/// show the drop zones.
+#[derive(Clone, Copy, PartialEq)]
+enum Drag {
+    None,
+    Tab,
+    Files,
+}
 
-fn tab_drag_active(cx: &App) -> bool {
+static DRAG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn start_drag(drag: Drag) {
+    DRAG.store(drag as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn drag_active(cx: &App) -> Drag {
     if !cx.has_active_drag() {
-        TAB_DRAG.store(false, std::sync::atomic::Ordering::Relaxed);
+        DRAG.store(0, std::sync::atomic::Ordering::Relaxed);
+        return Drag::None;
     }
-    cx.has_active_drag() && TAB_DRAG.load(std::sync::atomic::Ordering::Relaxed)
+    match DRAG.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => Drag::Tab,
+        2 => Drag::Files,
+        _ => Drag::None,
+    }
 }
 
 /// A tab being dragged to the other pane; also its drag preview.
@@ -153,15 +170,58 @@ struct DraggedTab {
 
 impl Render for DraggedTab {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .px_3()
-            .py_1()
-            .text_sm()
-            .rounded_md()
-            .bg(cx.theme().secondary)
-            .border_1()
-            .border_color(cx.theme().primary)
-            .child(self.title.clone())
+        drag_preview(self.title.clone(), cx)
+    }
+}
+
+fn drag_preview(title: SharedString, cx: &App) -> impl IntoElement {
+    div()
+        .px_3()
+        .py_1()
+        .text_sm()
+        .rounded_md()
+        .bg(cx.theme().secondary)
+        .border_1()
+        .border_color(cx.theme().primary)
+        .child(title)
+}
+
+/// Files dragged from the Files or the Changes panel: to a terminal, which
+/// types their paths, or to a pane, which opens them.
+#[derive(Clone)]
+pub(crate) struct DraggedFiles {
+    /// Absolute.
+    pub paths: Vec<PathBuf>,
+    /// Files on the disk; not a folder, nor a deletion in Changes, which
+    /// have a path to type and nothing to open.
+    pub opens: bool,
+    /// The task's worktree: in its terminals the paths are typed from there.
+    pub root: PathBuf,
+}
+
+impl DraggedFiles {
+    fn new(paths: Vec<PathBuf>, opens: bool, root: PathBuf) -> Self {
+        Self { paths, opens, root }
+    }
+
+    /// As typed in a shell or to an agent: relative to the worktree when in it.
+    pub fn text(&self) -> String {
+        self.paths
+            .iter()
+            .map(|p| term::shell_quote(&p.strip_prefix(&self.root).unwrap_or(p).display().to_string()))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+impl Render for DraggedFiles {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let name = |p: &PathBuf| p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned());
+        let title = match self.paths.as_slice() {
+            [one] => name(one),
+            many => format!("{} files", many.len()),
+        };
+        drag_preview(title.into(), cx)
     }
 }
 
@@ -1102,8 +1162,12 @@ impl TaskView {
         // drop and shows the highlight: content such as a terminal paints an
         // opaque background over anything set on the pane itself. Unsplit,
         // the right edge is a separate zone that opens the right pane.
-        let dragging = tab_drag_active(cx);
-        let split_zone = !self.is_split() && dragging;
+        let drag = drag_active(cx);
+        // A terminal takes dropped files itself, as paths typed in: over it
+        // only the tab bar opens them.
+        let over_terminal = shown.and_then(|id| self.ix_of(id)).is_some_and(|ix| matches!(self.tabs[ix].kind, TabKind::Terminal(_)));
+        let split_zone = !self.is_split() && drag != Drag::None;
+        let layer = drag == Drag::Tab || drag == Drag::Files && !over_terminal;
         v_flex()
             .id(if right { "pane-right" } else { "pane-left" })
             .relative()
@@ -1114,12 +1178,25 @@ impl TaskView {
             .capture_any_mouse_down(cx.listener(move |this, _, _, cx| this.focus_pane(right, cx)))
             .child(
                 div()
+                    .relative()
                     .border_t_2()
                     .border_color(if focused { cx.theme().primary } else { cx.theme().transparent })
-                    .child(self.render_tabs(right, cx)),
+                    .child(self.render_tabs(right, cx))
+                    .when(drag == Drag::Files && over_terminal, |bar| {
+                        bar.child(
+                            div()
+                                .id("tab-bar-drop")
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .size_full()
+                                .drag_over::<DraggedFiles>(move |style, _, _, _| style.bg(highlight))
+                                .on_drop(cx.listener(move |this, files: &DraggedFiles, window, cx| this.drop_files(files, right, window, cx))),
+                        )
+                    }),
             )
             .child(div().flex_1().min_h_0().child(self.tab_content(shown.and_then(|id| self.ix_of(id)))))
-            .when(dragging, |pane| {
+            .when(layer, |pane| {
                 pane.child(
                     div()
                         .id("drop-layer")
@@ -1129,9 +1206,11 @@ impl TaskView {
                         .h_full()
                         .w(if split_zone { relative(0.7) } else { relative(1.) })
                         .drag_over::<DraggedTab>(move |style, _, _, _| style.bg(highlight))
+                        .drag_over::<DraggedFiles>(move |style, _, _, _| style.bg(highlight))
                         .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
                             this.drop_tab(dragged.tab_id, right, window, cx)
-                        })),
+                        }))
+                        .on_drop(cx.listener(move |this, files: &DraggedFiles, window, cx| this.drop_files(files, right, window, cx))),
                 )
             })
             .when(split_zone, |pane| {
@@ -1146,19 +1225,41 @@ impl TaskView {
                         .border_l_2()
                         .border_color(cx.theme().primary)
                         .drag_over::<DraggedTab>(move |style, _, _, _| style.bg(highlight))
+                        .drag_over::<DraggedFiles>(move |style, _, _, _| style.bg(highlight))
                         .on_drop(cx.listener(|this, dragged: &DraggedTab, window, cx| {
                             if let Some(ix) = this.ix_of(dragged.tab_id) {
                                 this.move_to_other_pane(ix, window, cx);
                             }
                         }))
+                        .on_drop(cx.listener(|this, files: &DraggedFiles, window, cx| this.drop_files(files, true, window, cx)))
                         .flex()
                         .items_center()
                         .justify_center()
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
-                        .child("Drop to split"),
+                        .child(if drag == Drag::Files { "Drop to open beside" } else { "Drop to split" }),
                 )
             })
+    }
+
+    /// Files dropped on a pane open there, kept; one open already moves over.
+    fn drop_files(&mut self, files: &DraggedFiles, right: bool, window: &mut Window, cx: &mut Context<Self>) {
+        cx.stop_propagation();
+        if !files.opens {
+            return;
+        }
+        for path in &files.paths {
+            self.focus_right = right && self.is_split();
+            self.open_file_as(path.clone(), 0, 0, OpenAs::Kept, window, cx);
+            let opened = self.tabs.iter().position(|t| match &t.kind {
+                TabKind::File(f) => f.read(cx).path == *path,
+                TabKind::Binary(b) => b.read(cx).path == *path,
+                _ => false,
+            });
+            if let Some(ix) = opened.filter(|&ix| self.tabs[ix].right != right) {
+                self.move_to_other_pane(ix, window, cx);
+            }
+        }
     }
 
     pub fn show_commit(&mut self, hash: &str, window: &mut Window, cx: &mut Context<Self>) {

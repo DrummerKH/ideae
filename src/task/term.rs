@@ -262,12 +262,35 @@ impl Render for TermView {
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                 cx.stop_propagation();
                 let text = paths.paths().iter().map(|p| shell_quote(&p.display().to_string())).collect::<Vec<_>>().join(" ");
-                this.state.update(cx, |s, cx| s.paste_text(format!("{text} "), cx));
-                this.state.read(cx).focus_handle().clone().focus(window, cx);
+                this.type_dropped(text, window, cx);
             }))
             .child(crate::zoom::wheel(crate::zoom::Kind::Terminal))
-            .child(Terminal::new(self.id.clone(), &self.state)),
+            .child(Terminal::new(self.id.clone(), &self.state))
+            // From the Files and Changes panels, relative to the task's worktree, where its terminals start.
+            // A layer over the terminal: its own background would hide the highlight.
+            .when(drag_active(cx) == Drag::Files, |area| {
+                area.child(
+                    div()
+                        .id("terminal-files-drop")
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .drag_over::<DraggedFiles>(move |style, _, _, _| style.bg(highlight))
+                        .on_drop(cx.listener(|this, files: &DraggedFiles, window, cx| {
+                            cx.stop_propagation();
+                            this.type_dropped(files.text(), window, cx);
+                        })),
+                )
+            }),
         )
+    }
+}
+
+impl TermView {
+    fn type_dropped(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.state.update(cx, |s, cx| s.paste_text(format!("{text} "), cx));
+        self.state.read(cx).focus_handle().clone().focus(window, cx);
     }
 }
 

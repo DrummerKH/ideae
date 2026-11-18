@@ -355,6 +355,7 @@ impl TaskView {
                     None
                 };
                 let path = root.join(item.id.as_ref());
+                let dragged = DraggedFiles::new(vec![path.clone()], !folder, root.clone());
                 let view = view.clone();
                 row.child(
                     h_flex()
@@ -365,6 +366,10 @@ impl TaskView {
                         .child(div().truncate().child(label))
                         .when_some(agent, |this, mark| this.child(div().text_xs().text_color(gpui_kit::blue()).child(mark))),
                 )
+                .on_drag(dragged, |dragged, _, _, cx| {
+                    start_drag(Drag::Files);
+                    cx.new(|_| dragged.clone())
+                })
                 .on_click(move |event, window, cx| {
                     if folder {
                         return;

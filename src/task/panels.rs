@@ -160,7 +160,7 @@ impl TaskView {
                         )
                     })
                     .on_drag(dragged, |dragged, _, _, cx| {
-                        TAB_DRAG.store(true, std::sync::atomic::Ordering::Relaxed);
+                        start_drag(Drag::Tab);
                         cx.new(|_| dragged.clone())
                     });
                 let closable = match &tab.kind {

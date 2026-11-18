@@ -606,6 +606,10 @@ impl TaskView {
                             })),
                     ),
             )
+            .on_drag(DraggedFiles::new(vec![open_path.clone()], !deleted, self.root.clone()), |dragged, _, _, cx| {
+                start_drag(Drag::Files);
+                cx.new(|_| dragged.clone())
+            })
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.side_selected = ix;
                 this.show_changed_file(path.clone(), window, cx)
