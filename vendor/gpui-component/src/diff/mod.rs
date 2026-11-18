@@ -593,9 +593,10 @@ fn render_diff(
     });
     let rows = state.rows().clone();
     let scrollbar = state.list().clone();
-    // ideae patch: room past the end, so the last file can come up to where
-    // scroll_to_file puts a header.
-    let tail = state.viewport().height * (2. / 3.);
+    // ideae patch: room past the end, so the last file's header can come up
+    // to the top, where scroll_to_file puts it. Less than the whole view: a
+    // list padded all the way down draws no rows.
+    let tail = (state.viewport().height - px(48.)).max(px(0.));
     let horizontal = state.horizontal_scroll().clone();
     let has_rows = !rows.is_empty();
     // ideae patch: the header of the file under the top edge stays there

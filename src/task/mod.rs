@@ -2471,8 +2471,8 @@ mod diff_update_tests {
         for _ in 0..3 {
             draw(cx);
         }
-        // To the third file: its header comes a third down the view, the end of the second above it.
-        cx.update(|_, cx| state.update(cx, |state, cx| state.scroll_to_file("c.txt", cx)));
+        // To a file: its header comes to the top of the view.
+        cx.update(|_, cx| state.update(cx, |state, cx| state.scroll_to_file("b.txt", cx)));
         draw(cx);
         let top = |cx: &mut VisualTestContext| cx.update(|_, cx| state.read(cx).top_file().map(|path| path.to_string()));
         assert_eq!(top(cx).as_deref(), Some("b.txt"));
