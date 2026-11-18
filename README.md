@@ -41,6 +41,13 @@ Claude Code and git should be installed.
 - **[Agents](docs/agents.md)**: Claude Code by default; Codex, OpenCode or any
   program as profiles (two accounts of one agent too), chosen per project,
   task or variant, and a task carried on by another agent.
+- **[Chat agents](docs/agents.md#chat-agents-acp)**: any agent that speaks the
+  Agent Client Protocol (Gemini, Kimi, Qwen, OpenCode, Codex's and Claude
+  Code's adapters, the ACP registry's) as a chat instead of a terminal: tool
+  calls with their diffs, questions answered with a key or by the app's
+  rules, its model and effort, the files before each prompt to go back to,
+  ideae's own tools (open files, problems, the check) for its task, a daily
+  cost limit, keys kept sealed.
 - **Editor.** Tree-sitter highlighting, language servers (installed on
   request), go to definition and usages, rename, fixes, sticky scroll,
   replace in files, git blame in the gutter, bookmarks.

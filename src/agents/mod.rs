@@ -19,6 +19,7 @@ pub mod codex;
 pub mod find;
 pub mod generic;
 pub mod opencode;
+pub mod registry;
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
 #[serde(rename_all = "lowercase")]
@@ -63,6 +64,18 @@ impl Kind {
         }
     }
 
+    /// What starts its ACP server, for a chat profile. Claude Code's
+    /// adapter never bills a claude.ai plan (`--hide-claude-auth`): a third
+    /// party may not offer that login; it runs on an API key.
+    pub fn acp_command(self) -> &'static str {
+        match self {
+            Kind::Claude => "npx -y @agentclientprotocol/claude-agent-acp@0.108.0 --hide-claude-auth",
+            Kind::Codex => "npx -y @agentclientprotocol/codex-acp",
+            Kind::OpenCode => "opencode acp",
+            Kind::Generic => "",
+        }
+    }
+
     pub fn program(self) -> &'static str {
         match self {
             Kind::Claude => "claude",
@@ -87,7 +100,30 @@ pub struct Profile {
     /// second account.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+    /// It runs as a chat: the command starts its Agent Client Protocol
+    /// server (`opencode acp`), which the app speaks with (src/acp).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub acp: bool,
+    /// Variables whose values are kept sealed by the app ([`crate::secrets`]),
+    /// not in the state: an API key.
+    #[serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub secrets: std::collections::BTreeSet<String>,
+    /// A chat agent's choices made last (model, effort, mode, by the
+    /// agent's ids): a new session starts with them.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub choices: BTreeMap<String, String>,
+    /// What it offered to choose from last time: for choosing before it
+    /// runs (a variant's model).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub offered: Vec<crate::acp::thread::ConfigOption>,
+    /// A chat agent's turn is stopped once its sessions cost this much
+    /// today (USD, as the agent reports its cost).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_limit: Option<f64>,
 }
+
+/// What a secret's value shows as in the profile editor.
+pub const MASK: &str = "••••••••";
 
 pub const DEFAULT_ID: &str = "claude";
 
@@ -95,7 +131,7 @@ impl Profile {
     /// What a fresh install has, and what a Claude command of an older
     /// state becomes.
     pub fn claude_code() -> Self {
-        Self { id: DEFAULT_ID.into(), name: "Claude Code".into(), kind: Kind::Claude, command: "claude".into(), env: BTreeMap::new() }
+        Self { id: DEFAULT_ID.into(), name: "Claude Code".into(), kind: Kind::Claude, command: "claude".into(), env: BTreeMap::new(), ..Default::default() }
     }
 
     /// The single agent command of an older state, as a profile.
@@ -109,7 +145,7 @@ impl Profile {
             Kind::Generic => command.split_whitespace().next().map(|p| Path::new(p).file_name().map_or(p.to_string(), |n| n.to_string_lossy().into_owned())).unwrap_or_default(),
             kind => kind.label().to_string(),
         };
-        Self { id: "agent".into(), name, kind, command, env: BTreeMap::new() }
+        Self { id: "agent".into(), name, kind, command, env: BTreeMap::new(), ..Default::default() }
     }
 
     pub fn adapter(&self) -> &'static dyn Adapter {
@@ -126,12 +162,15 @@ impl Profile {
         }
     }
 
-    /// Its environment, `~/` made the home folder.
+    /// Its environment, `~/` made the home folder and the secrets read.
+    /// A value made by a command (`$(op read …)`) is left as it is: it is
+    /// run where the agent starts ([`run_made`], or by its shell).
     pub fn env_vars(&self) -> Vec<(String, String)> {
         let home = std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).unwrap_or_default();
-        self.env
+        let mut vars: Vec<(String, String)> = self
+            .env
             .iter()
-            .filter(|(key, _)| !key.trim().is_empty())
+            .filter(|(key, _)| !key.trim().is_empty() && !self.secrets.contains(key.trim()))
             .map(|(key, value)| {
                 let value = match value.strip_prefix("~/") {
                     Some(rest) if !home.is_empty() => format!("{home}/{rest}"),
@@ -139,7 +178,48 @@ impl Profile {
                 };
                 (key.trim().to_string(), value)
             })
-            .collect()
+            .collect();
+        for name in &self.secrets {
+            if let Some(value) = crate::secrets::get(&self.secret_scope(name)) {
+                vars.push((name.clone(), value));
+            }
+        }
+        vars
+    }
+
+    pub fn secret_scope(&self, name: &str) -> String {
+        format!("{}/{name}", self.id)
+    }
+
+    /// Values in the state that are secrets by their name go to the
+    /// sealed store. Whether any did.
+    pub fn seal_secrets(&mut self) -> bool {
+        let found: Vec<(String, String)> = self
+            .env
+            .iter()
+            .filter(|(k, v)| crate::secrets::secret_name(k) && !v.trim().is_empty() && crate::secrets::command_value(v).is_none() && v.as_str() != MASK)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for (name, value) in &found {
+            crate::secrets::set(&self.secret_scope(name), value);
+            self.env.remove(name);
+            self.secrets.insert(name.clone());
+        }
+        !found.is_empty()
+    }
+
+    /// The editor's text made the environment: a masked secret left as
+    /// it was stays, a new value of a secret goes to the sealed store, one
+    /// taken out is forgotten.
+    pub fn set_env_text(&mut self, text: &str) {
+        let parsed = Self::parse_env(text);
+        let kept: std::collections::BTreeSet<String> = parsed.iter().filter(|(k, v)| v.as_str() == MASK && self.secrets.contains(k.as_str())).map(|(k, _)| k.clone()).collect();
+        for gone in self.secrets.iter().filter(|name| !parsed.contains_key(name.as_str())) {
+            crate::secrets::remove(&self.secret_scope(gone));
+        }
+        self.secrets = kept;
+        self.env = parsed.into_iter().filter(|(k, v)| !(v.as_str() == MASK && self.secrets.contains(k.as_str()))).collect();
+        self.seal_secrets();
     }
 
     /// A variable as the agent sees it: its own, else the app's.
@@ -147,9 +227,11 @@ impl Profile {
         self.env_vars().into_iter().find(|(key, _)| key == name).map(|(_, value)| value).or_else(|| std::env::var(name).ok()).filter(|v| !v.is_empty())
     }
 
-    /// `KEY=value` lines, for editing.
+    /// `KEY=value` lines, for editing: a secret's value masked.
     pub fn env_text(&self) -> String {
-        self.env.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("\n")
+        let mut lines: Vec<String> = self.env.iter().filter(|(k, _)| !self.secrets.contains(k.as_str())).map(|(k, v)| format!("{k}={v}")).collect();
+        lines.extend(self.secrets.iter().map(|k| format!("{k}={MASK}")));
+        lines.join("\n")
     }
 
     pub fn parse_env(text: &str) -> BTreeMap<String, String> {
@@ -163,6 +245,19 @@ impl Profile {
             })
             .collect()
     }
+}
+
+/// Whether `to` can go on with a session of `from` itself, a chat with a
+/// terminal's or the other way: the same agent, keeping its sessions in
+/// the same place. Claude Code's adapter shares the CLI's session ids, as
+/// OpenCode's server does; Codex's are not known to.
+pub fn shares_sessions(from: &Profile, to: &Profile) -> bool {
+    let store = match (from.kind, to.kind) {
+        (Kind::Claude, Kind::Claude) => "CLAUDE_CONFIG_DIR",
+        (Kind::OpenCode, Kind::OpenCode) => "XDG_DATA_HOME",
+        _ => return false,
+    };
+    from.var(store) == to.var(store)
 }
 
 /// A new id for a profile: not one of `taken`.
@@ -258,9 +353,10 @@ impl OneShot {
         std::iter::once(&self.program).chain(&self.args).map(|word| quote(word)).collect::<Vec<_>>().join(" ")
     }
 
+    /// Runs the commands of variables made by one: not for the UI thread.
     pub fn command(&self) -> std::process::Command {
         let mut command = crate::procs::command(&self.program);
-        command.args(&self.args).envs(self.env.iter().map(|(k, v)| (k, v))).env_remove(crate::agent::SOCK_ENV);
+        command.args(&self.args).envs(run_made(self.env.clone())).env_remove(crate::agent::SOCK_ENV);
         command
     }
 
@@ -377,6 +473,30 @@ pub fn files_under(base: &Path, dir: &Path) -> Vec<PathBuf> {
     found
 }
 
+/// Variables made by a command (`$(pass show key)`) given their values:
+/// the command's output, its last line end dropped. Not for the UI thread.
+pub fn run_made(env: Vec<(String, String)>) -> Vec<(String, String)> {
+    env.into_iter()
+        .filter_map(|(k, v)| match crate::secrets::command_value(&v) {
+            None => Some((k, v)),
+            Some(made) => {
+                let mut command = if cfg!(windows) {
+                    let mut c = crate::procs::command("cmd");
+                    c.args(["/C", made]);
+                    c
+                } else {
+                    let mut c = std::process::Command::new("sh");
+                    c.args(["-c", made]);
+                    c
+                };
+                let out = command.stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output().ok()?;
+                let value = String::from_utf8_lossy(&out.stdout).trim_end_matches(['\n', '\r']).to_string();
+                (out.status.success() && !value.is_empty()).then_some((k, value))
+            }
+        })
+        .collect()
+}
+
 /// The program of a command, its first word.
 pub fn program(command: &str) -> &str {
     command.split_whitespace().next().unwrap_or_default()
@@ -435,16 +555,31 @@ pub struct Launch {
     pub profile: Profile,
     pub start: Start,
     pub unasked: bool,
+    /// A chat agent's choices for this task alone (a variant's model), over
+    /// those the profile remembers.
+    pub options: Vec<(String, String)>,
 }
 
 impl Launch {
+    /// What its terminal's shell is given. Variables made by a command
+    /// are set before it, so that shell runs the command.
     pub fn command(&self) -> String {
-        self.profile.adapter().command(&self.profile, &self.start, self.unasked, hooks().as_ref())
+        let command = self.profile.adapter().command(&self.profile, &self.start, self.unasked, hooks().as_ref());
+        let made: Vec<String> = self
+            .profile
+            .env_vars()
+            .into_iter()
+            .filter_map(|(k, v)| crate::secrets::command_value(&v).map(|c| format!("{k}=\"$({c})\"")))
+            .collect();
+        if made.is_empty() || cfg!(windows) {
+            return command;
+        }
+        format!("{} {command}", made.join(" "))
     }
 
     pub fn env(&self) -> Vec<(String, String)> {
         let mut env = self.profile.adapter().env(&self.profile, hooks().as_ref());
-        env.extend(self.profile.env_vars());
+        env.extend(self.profile.env_vars().into_iter().filter(|(_, v)| crate::secrets::command_value(v).is_none()));
         env
     }
 
@@ -505,11 +640,27 @@ pub fn start_of(session: Option<&crate::state::AgentSession>) -> Start {
 }
 
 #[cfg(test)]
+mod sessions_tests {
+    use super::*;
+
+    #[test]
+    fn the_same_agent_with_the_same_store_shares_sessions() {
+        let chat = Profile { kind: Kind::Claude, acp: true, ..Default::default() };
+        let term = Profile { kind: Kind::Claude, ..Default::default() };
+        assert!(shares_sessions(&chat, &term));
+        let other = Profile { kind: Kind::Claude, env: [("CLAUDE_CONFIG_DIR".to_string(), "/elsewhere".to_string())].into(), ..Default::default() };
+        assert!(!shares_sessions(&chat, &other), "another account's sessions");
+        assert!(!shares_sessions(&chat, &Profile { kind: Kind::OpenCode, ..Default::default() }));
+        assert!(!shares_sessions(&Profile { kind: Kind::Codex, ..Default::default() }, &Profile { kind: Kind::Codex, acp: true, ..Default::default() }), "not known to");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     fn profile(id: &str, kind: Kind, command: &str) -> Profile {
-        Profile { id: id.into(), name: id.into(), kind, command: command.into(), env: BTreeMap::new() }
+        Profile { id: id.into(), name: id.into(), kind, command: command.into(), env: BTreeMap::new(), ..Default::default() }
     }
 
     #[test]
@@ -569,7 +720,7 @@ mod tests {
 
     #[test]
     fn restart_resumes() {
-        let launch = Launch { profile: Profile::claude_code(), start: Start::New(Some("abc".into())), unasked: false };
+        let launch = Launch { profile: Profile::claude_code(), start: Start::New(Some("abc".into())), unasked: false, options: Vec::new() };
         assert_eq!(launch.again().start, Start::Resume("abc".into()));
         let legacy = Launch { start: Start::Last, ..launch.clone() };
         assert_eq!(legacy.again().start, Start::Last);

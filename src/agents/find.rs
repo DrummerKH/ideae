@@ -17,14 +17,23 @@ pub struct Known {
     pub name: &'static str,
     /// Where to read how to install it.
     pub url: &'static str,
+    /// It speaks ACP with these arguments, and has no adapter of its own
+    /// for a terminal: its profile is a chat (src/acp), where what it
+    /// does is told, not guessed.
+    pub chat: Option<&'static str>,
 }
 
-pub const KNOWN: [Known; 4] = [
-    Known { kind: Kind::Claude, program: "claude", name: "Claude Code", url: "https://github.com/anthropics/claude-code" },
-    Known { kind: Kind::Codex, program: "codex", name: "Codex", url: "https://github.com/openai/codex" },
-    Known { kind: Kind::OpenCode, program: "opencode", name: "OpenCode", url: "https://opencode.ai" },
-    // No adapter of its own: its status is guessed from its terminal.
-    Known { kind: Kind::Generic, program: "gemini", name: "Gemini CLI", url: "https://github.com/google-gemini/gemini-cli" },
+pub const KNOWN: [Known; 10] = [
+    Known { kind: Kind::Claude, program: "claude", name: "Claude Code", url: "https://github.com/anthropics/claude-code", chat: None },
+    Known { kind: Kind::Codex, program: "codex", name: "Codex", url: "https://github.com/openai/codex", chat: None },
+    Known { kind: Kind::OpenCode, program: "opencode", name: "OpenCode", url: "https://opencode.ai", chat: None },
+    Known { kind: Kind::Generic, program: "gemini", name: "Gemini CLI", url: "https://github.com/google-gemini/gemini-cli", chat: Some("--acp") },
+    Known { kind: Kind::Generic, program: "kimi", name: "Kimi Code", url: "https://www.kimi.com/code", chat: Some("acp") },
+    Known { kind: Kind::Generic, program: "qwen", name: "Qwen Code", url: "https://github.com/QwenLM/qwen-code", chat: Some("--acp") },
+    Known { kind: Kind::Generic, program: "goose", name: "Goose", url: "https://block.github.io/goose", chat: Some("acp") },
+    Known { kind: Kind::Generic, program: "cursor-agent", name: "Cursor", url: "https://cursor.com/cli", chat: Some("acp") },
+    Known { kind: Kind::Generic, program: "copilot", name: "GitHub Copilot", url: "https://github.com/github/copilot-cli", chat: Some("--acp") },
+    Known { kind: Kind::Generic, program: "vibe-acp", name: "Mistral Vibe", url: "https://mistral.ai/products/vibe", chat: Some("") },
 ];
 
 /// An agent found installed.
@@ -58,7 +67,11 @@ impl Found {
 
     /// A new profile for it, its id not one of `taken`'s.
     pub fn profile(&self, taken: &[Profile]) -> Profile {
-        Profile { id: super::new_profile_id(self.known.name, taken), name: self.known.name.into(), kind: self.known.kind, command: self.command(), env: Default::default() }
+        let command = match self.known.chat {
+            Some(args) if !args.is_empty() => format!("{} {args}", self.command()),
+            _ => self.command(),
+        };
+        Profile { id: super::new_profile_id(self.known.name, taken), name: self.known.name.into(), kind: self.known.kind, command, acp: self.known.chat.is_some(), ..Default::default() }
     }
 }
 
@@ -127,6 +140,11 @@ pub fn find_in(path: Option<&OsStr>, places: &[PathBuf]) -> Vec<Found> {
             }
         })
         .collect()
+}
+
+/// Whether `program` is on PATH. Off the UI thread: it reads folders.
+pub fn on_path(program: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|path| std::env::split_paths(&path).any(|dir| !dir.as_os_str().is_empty() && executable(&dir, program).is_some()))
 }
 
 /// The agents installed here. Off the UI thread: it reads folders.
@@ -240,7 +258,8 @@ mod tests {
         let Welcome::Offer(offers) = welcome(&all, &claude) else { panic!("an offer") };
         assert_eq!(offers.iter().map(|f| f.known.name).collect::<Vec<_>>(), ["Codex", "Gemini CLI"]);
         let gemini = offers[1].profile(&claude);
-        assert_eq!((gemini.id.as_str(), gemini.kind, gemini.command.as_str(), gemini.letter().as_str()), ("gemini-cli", Kind::Generic, "gemini", "G"));
+        assert_eq!((gemini.id.as_str(), gemini.kind, gemini.command.as_str(), gemini.letter().as_str()), ("gemini-cli", Kind::Generic, "gemini --acp", "G"));
+        assert!(gemini.acp, "it speaks ACP: a chat, its status told");
         // A profile of a kind, whatever its command, counts as added.
         let mut with_codex = claude.clone();
         with_codex.push(Profile { id: "x".into(), name: "Work".into(), kind: Kind::Codex, command: "/opt/codex --full-auto".into(), ..Default::default() });

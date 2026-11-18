@@ -35,6 +35,8 @@ src/task/          one task, a module: what is private to it is seen by all of i
   changes.rs       the Changes tab: the diff, review notes, single changes, review by keys (J/K, N/P, V, S, R, C)
   change_popup.rs  a change of an open file, from its mark in the gutter: what was there, Revert, Stage
   term.rs          a terminal tab
+  chat.rs          an ACP agent's tab: the conversation, permission answers, the agent's choices, the prompt
+  tell.rs          what a task tells its agent through ideae's MCP server
   session.rs       session save/restore, language servers asleep
   services.rs      the Run panel
   auto.rs          the project's setup (a terminal) and check (background) in this task, CI failure to the agent
@@ -49,10 +51,21 @@ src/commands.rs    the commands on a task, its project, its variants, its git: n
 src/file_icons.rs  file and folder icons (assets/file-icons, JetBrains' new UI), by name
 src/state.rs       state.json; APP_ID (ideae vs ideae-dev)
 src/archive.rs     an archived task's .tar.gz (task.json, sessions, unpushed bundle, patch): write, list, restore, clean up
+src/acp/           agents that speak ACP, shown as a chat (docs/agents.md)
+  host.rs          the host process (`ideae --acp-host`): speaks ACP with the agent, keeps the thread and its journal, answers its file reads and writes
+  link.rs wire.rs  the window's end of a host (in the daemon, or a thread), and the messages between them
+  thread.rs        the conversation and its ops, the same on both sides
+  checkpoint.rs    the files before a prompt as a git tree, put back on request
+  policy.rs        who answers an agent's permission questions: you, the app's rules, or nobody
+  terminal.rs      commands an agent runs through the app (`terminal/*`)
+  fake.rs          a stand-in agent for the tests: the test binary run again
+src/mcp.rs         ideae as an MCP server for a chat agent (`ideae --mcp`): its task's open files, problems, check; asked of the window with a worktree's token
+src/secrets.rs     agents' keys out of the state: sealed for this machine in secrets.json, no keyring
 src/agent.rs       agents' reports bridge: Claude Code hooks, Codex notify, OpenCode plugin (unix socket, `ideae --hook`)
 src/agents/        agent profiles and adapters (docs/agents.md): how each kind starts, resumes, reports, is asked once
   mod.rs           profiles, resolution (task > project > default), the Adapter trait, Launch
   claude.rs codex.rs opencode.rs generic.rs   one adapter each; Codex and OpenCode follow their source, not tried live
+  registry.rs      the ACP registry: how its agents would run here, a download checked and unpacked
 src/crash.rs       what a panic leaves: crashes.log next to the state, told at the next start
 src/stalls.rs      debug aid: tells when the UI thread was held (debug builds, `IDEAE_DEBUG`): stderr and stalls.log
 src/git.rs         git CLI wrappers, worktrees
@@ -60,7 +73,7 @@ src/lsp.rs         language server client
 src/lsp_install.rs language servers installed on request, ~/.local/share/ideae/lsp
 src/trash.rs       files to the system's trash and back (Undo of Delete in the Files panel)
 src/procs.rs       starting helper programs (no console on Windows), ending child sessions on quit
-src/daemon/        terminals in a daemon (`ideae --daemon`, unix): they outlive the window (×, Restart); Exit/Ctrl+Q ends them;
+src/daemon/        terminals and agents' hosts (pipe.rs) in a daemon (`ideae --daemon`, unix): they outlive the window (×, Restart); Exit/Ctrl+Q ends them;
                    a window of another build makes the daemon hand its ptys to a new one (SCM_RIGHTS), agents keep running
 src/desktop.rs     launcher entry, dash pin, restart, `--install` / `--uninstall` (run by scripts/install.sh, install.ps1)
 src/predict/       edit prediction: llama-server and a model downloaded on consent, run for the app, ghost text at the cursor;
@@ -83,6 +96,7 @@ scripts/           Xvfb driver for UI checks, wayland.sh (the same in a headless
 - Saving a file and following it on disk have one too: `cargo test -- --ignored an_open_file` after changing how an open file is written, reloaded or refreshed.
 - So has the start: `cargo test -- --ignored the_tasks_of_the_last_run` after changing how the tasks of the last run are restored.
 - So has archiving and restoring: `cargo test -- --ignored an_archived_task` after changing either.
+- And chat agents (ACP): `cargo build && cargo test -- --ignored an_acp_agent` after changing the host, the chat's link or the daemon's pipes (a stand-in agent, the real daemon, an upgrade of it).
 - And the daemon's terminals: `cargo test -- --ignored a_window_that_does_not_read` after changing how output goes from a session to a window (it floods one that reads nothing).
 - And a project's setup, check and teardown: `cargo test -- --ignored a_task_is_set_up_checked_and_torn_down` after changing them.
 - `scripts/check.sh` runs all of these and the Windows check: before every push, and again after merging main. A new end-to-end test goes into it; none of them waits on real time except for a timeout it is about, and together they stay under a minute.

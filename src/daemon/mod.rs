@@ -2,5 +2,6 @@
 //! attach. Unix only; elsewhere terminals stay in the window.
 
 pub mod client;
+pub mod pipe;
 pub mod proto;
 pub mod server;

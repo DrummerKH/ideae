@@ -190,6 +190,7 @@ impl TaskView {
     pub(super) fn tab_content(&self, ix: Option<usize>) -> AnyElement {
         match ix.and_then(|ix| self.tabs.get(ix)).map(|t| &t.kind) {
             Some(TabKind::Terminal(view)) => view.clone().into_any_element(),
+            Some(TabKind::Chat(chat)) => chat.clone().into_any_element(),
             Some(TabKind::Changes) => self.changes.clone().into_any_element(),
             Some(TabKind::History) => self.history.clone().into_any_element(),
             Some(TabKind::File(file)) => file.clone().into_any_element(),

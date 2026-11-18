@@ -2838,6 +2838,14 @@ pub fn remove_side_worktree(repo: &Path, path: &Path, branch: &str) -> Result<Op
 /// Removes a task's worktree and its branch; a lock is overridden only
 /// when `unlock`.
 pub fn remove_task_worktree(repo: &Path, path: &Path, branch: &str, unlock: bool) -> Result<(), String> {
+    // A chat agent's conversation goes with its task (an archive keeps its copy).
+    let journal = crate::acp::journal_path(path);
+    let _ = std::fs::remove_file(&journal);
+    let log = crate::acp::host::log_path(&journal);
+    let _ = std::fs::remove_file(log.with_extension("log.old"));
+    let _ = std::fs::remove_file(log);
+    // Its chat's checkpoints: refs of the repository, not of the worktree.
+    crate::acp::checkpoint::forget(repo, &crate::acp::checkpoint::thread_name(Some(&journal)));
     let path_s = path.to_string_lossy().into_owned();
     if path.exists() {
         let mut args = vec!["worktree", "remove", "--force"];

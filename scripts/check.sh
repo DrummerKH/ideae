@@ -6,8 +6,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+cargo build
 cargo test
 cargo test -- --ignored \
+  an_acp_agent \
   an_open_file \
   two_variants \
   two_agents \

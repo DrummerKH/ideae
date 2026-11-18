@@ -34,6 +34,53 @@ pub fn picker(id: impl Into<ElementId>, chosen: Rc<RefCell<String>>) -> impl Int
     })
 }
 
+/// An agent picked in the new-task dialog: its profile id, with a chat
+/// agent's model for this task after a tab (`claude\tmodel=sonnet`).
+pub fn pick_profile(pick: &str) -> String {
+    pick.split('\t').next().unwrap_or_default().to_string()
+}
+
+pub fn pick_choices(pick: &str) -> Vec<(String, String)> {
+    pick.split('\t').skip(1).filter_map(|c| c.split_once('=')).map(|(k, v)| (k.to_string(), v.to_string())).collect()
+}
+
+/// The model a chat agent's new task starts with, when that agent has
+/// shown its models before: none for one that has not, or a terminal one.
+pub fn model_picker(id: impl Into<ElementId>, chosen: Rc<RefCell<String>>) -> Option<impl IntoElement> {
+    let pick = chosen.borrow().clone();
+    let profile = state::with_settings(|s| s.profile(&pick_profile(&pick)).cloned())?;
+    let option = profile.offered.iter().find(|o| o.category == "model").filter(|_| profile.acp)?.clone();
+    let picked = pick_choices(&pick).into_iter().find(|(k, _)| *k == option.id).map(|(_, v)| v);
+    let usual = profile.choices.get(&option.id).cloned().unwrap_or_else(|| option.current.clone());
+    let values = Rc::new(option.values.clone());
+    let name_of = {
+        let values = values.clone();
+        move |value: &str| values.iter().find(|v| v.value == value).map_or(value.to_string(), |v| v.name.clone())
+    };
+    let label = match &picked {
+        Some(value) => name_of(value),
+        None => format!("{} (as last time)", name_of(&usual)),
+    };
+    let profile_id = profile.id.clone();
+    Some(Button::new(id).xsmall().ghost().label(format!("{label} ▾")).tooltip("The model this task starts with; the agent's own default is what you chose last in its chat").dropdown_menu(move |mut menu, _, _| {
+        menu = menu.scrollable(true).max_h(px(420.));
+        let (as_before, chosen_before) = (profile_id.clone(), chosen.clone());
+        menu = menu.item(PopupMenuItem::new(format!("As last time: {}", name_of(&usual))).checked(picked.is_none()).on_click(move |_, window, _| {
+            *chosen_before.borrow_mut() = as_before.clone();
+            window.refresh();
+        }));
+        menu = menu.separator();
+        for value in values.iter() {
+            let (chosen, set) = (chosen.clone(), format!("{}\t{}={}", profile_id, option.id, value.value));
+            menu = menu.item(PopupMenuItem::new(value.name.clone()).checked(picked.as_deref() == Some(value.value.as_str())).on_click(move |_, window, _| {
+                *chosen.borrow_mut() = set.clone();
+                window.refresh();
+            }));
+        }
+        menu
+    }))
+}
+
 /// What the agent that carries a task on is told first: the task, what
 /// the one before said last, and where to look for what was done.
 pub fn handoff(title: &str, prompt: &str, before: &str, said: Option<&str>, base: Option<&str>) -> String {
@@ -88,6 +135,9 @@ impl Workspace {
     pub fn continue_with_dialog(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
         let current = self.task_profile(path, cx);
         let others: Vec<agents::Profile> = state::with_settings(|s| s.agents.iter().filter(|p| Some(&p.id) != current.as_ref().map(|c| &c.id)).cloned().collect());
+        // The profiles that can go on with the session itself.
+        let session = self.task_session(path, cx);
+        let same: std::collections::HashSet<String> = others.iter().filter(|p| session.is_some() && current.as_ref().is_some_and(|c| agents::shares_sessions(c, p))).map(|p| p.id.clone()).collect();
         if others.is_empty() {
             return;
         }
@@ -96,19 +146,22 @@ impl Workspace {
         let now = current.map_or_else(|| "No agent".to_string(), |c| c.name);
         window.open_dialog(cx, move |dialog, _, cx| {
             let muted = cx.theme().muted_foreground;
-            let (chosen, this, path, now) = (chosen.clone(), this.clone(), path.clone(), now.clone());
+            let (chosen, this, path, now, same) = (chosen.clone(), this.clone(), path.clone(), now.clone(), same.clone());
             let picked = chosen.clone();
             dialog
                 .title("Continue with another agent")
                 .w(px(560.))
                 .content(move |content, _, _| {
+                    let native = same.contains(chosen.borrow().as_str());
                     content.child(
                         v_flex()
                             .gap_3()
                             .child(h_flex().gap_2().items_center().child(div().text_sm().child(format!("{now} stops; carrying on:"))).child(picker("continue-with", chosen.clone())))
-                            .child(div().text_xs().text_color(muted).child(
-                                "The new agent starts a session of its own in the same worktree. It is told the task, what the one before said last, and that git log and git diff show what was done. The earlier session stays recorded with the task.",
-                            )),
+                            .child(div().text_xs().text_color(muted).child(if native {
+                                "The same agent, as a chat or in a terminal: it goes on with the same session, the whole conversation in its memory. If it cannot load it, it starts anew and is told where the work stands."
+                            } else {
+                                "The new agent starts a session of its own in the same worktree. It is told the task, what the one before said last, and that git log and git diff show what was done. The earlier session stays recorded with the task."
+                            })),
                     )
                 })
                 .footer(h_flex().justify_end().child(Button::new("continue-with-start").primary().label("Continue").on_click(move |_, window, cx| {
@@ -119,11 +172,21 @@ impl Workspace {
         });
     }
 
+    /// The session the task's agent runs, when it is known.
+    fn task_session(&self, path: &Path, cx: &App) -> Option<String> {
+        let (pi, ti) = self.find(path)?;
+        let t = &self.projects[pi].tasks[ti];
+        let launched = t.view.as_ref().and_then(|v| v.read(cx).launch.as_ref().and_then(|l| l.session_id()));
+        launched.or_else(|| t.sessions.last().and_then(|s| s.id.clone()))
+    }
+
     /// Stops the task's agent and starts the profile `id` in its place,
     /// in a new session, told where the work stands.
     pub fn continue_with(&mut self, path: &Path, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(profile) = state::with_settings(|s| s.profile(id).cloned()) else { return };
         let before = self.task_profile(path, cx);
+        // The same agent's session, gone on with rather than told about.
+        let resume = self.task_session(path, cx).filter(|_| before.as_ref().is_some_and(|b| agents::shares_sessions(b, &profile)));
         let Some((pi, ti)) = self.find(path) else { return };
         let t = &self.projects[pi].tasks[ti];
         let (title, prompt, base) = (t.label(), t.prompt.clone(), Some(t.base.clone()).filter(|b| !b.is_empty()));
@@ -144,14 +207,21 @@ impl Workspace {
             let _ = this.update_in(cx, |this, window, cx| {
                 let text = handoff(&title, &prompt, &before_name, said.as_deref(), base.as_deref());
                 let Some(entry) = this.find(&root).map(|(pi, ti)| &mut this.projects[pi].tasks[ti]) else { return };
-                let session = profile.adapter().chooses_session_id().then(agents::uuid);
+                let (session, start) = match resume.clone() {
+                    Some(id) => (Some(id.clone()), agents::Start::Resume(id)),
+                    None => {
+                        let session = profile.adapter().chooses_session_id().then(agents::uuid);
+                        (session.clone(), agents::Start::New(session))
+                    }
+                };
                 entry.sessions.push(state::AgentSession { profile: profile.id.clone(), id: session.clone(), started: state::now() });
-                let launch = agents::Launch { profile: profile.clone(), start: agents::Start::New(session), unasked };
+                let launch = agents::Launch { profile: profile.clone(), start, unasked, options: Vec::new() };
                 let view = match entry.view.clone() {
                     Some(view) => view,
                     None => {
-                        // Not running: it starts with the new agent.
-                        entry.fresh = true;
+                        // Not running: it starts with the new agent, in a new
+                        // session or (not fresh) going on with the last.
+                        entry.fresh = resume.is_none();
                         match this.load(&root, window, cx) {
                             Some(view) => view,
                             None => return,
@@ -163,10 +233,15 @@ impl Workspace {
                     if fresh {
                         t.switch_agent(launch, window, cx);
                     }
-                    t.queue_prompt(text, true, window, cx);
+                    match resume.is_some() {
+                        // Its own session: it knows; a chat that cannot load it is told.
+                        true => t.otherwise_tell(text, cx),
+                        false => t.queue_prompt(text, true, window, cx),
+                    }
                 });
                 this.switch(&root, window, cx);
-                window.push_notification(Notification::info(format!("{} carries the task on.", profile.name)), cx);
+                let how = if resume.is_some() { " in the same session" } else { "" };
+                window.push_notification(Notification::info(format!("{} carries the task on{how}.", profile.name)), cx);
                 cx.notify();
             });
         })
@@ -236,7 +311,7 @@ mod tests {
         let mut settings = crate::state::Settings { notifications: false, pr_status: false, ..Default::default() };
         settings.agents = vec![
             Profile { command: claude.display().to_string(), ..Profile::claude_code() },
-            Profile { id: "other".into(), name: "Other".into(), kind: Kind::Generic, command: other.display().to_string(), env: [("OTHER_ACCOUNT".to_string(), "second".to_string())].into() },
+            Profile { id: "other".into(), name: "Other".into(), kind: Kind::Generic, command: other.display().to_string(), env: [("OTHER_ACCOUNT".to_string(), "second".to_string())].into(), ..Default::default() },
         ];
         crate::state::set_settings(settings);
         cx.update(|cx| {

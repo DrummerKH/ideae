@@ -1,6 +1,7 @@
 // A release build on Windows opens no console window next to its own.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod acp;
 mod agent;
 mod agents;
 mod archive;
@@ -35,6 +36,8 @@ mod project_config;
 mod replace;
 mod said;
 mod search;
+mod mcp;
+mod secrets;
 mod services;
 mod stalls;
 mod settings_ui;
@@ -531,6 +534,16 @@ fn main() {
         daemon::server::run(argv.get(2).map(String::as_str) == Some("--adopt"));
         return;
     }
+    if argv.get(1).map(String::as_str) == Some("--acp-host") {
+        crash::install("acp-host");
+        acp::host::run_process();
+        return;
+    }
+    if argv.get(1).map(String::as_str) == Some("--mcp") {
+        crash::install("mcp");
+        mcp::run_server();
+        return;
+    }
     if argv.get(1).map(String::as_str) == Some("--hook") {
         agent::run_hook(argv.get(2..).unwrap_or_default());
         return;
@@ -546,6 +559,9 @@ fn main() {
         }
         return;
     }
+    secrets::preload();
+    mcp::preload();
+    acp::spend::preload();
     let mut repos = Vec::new();
     // None: as Settings say; Some(None): --no-agent.
     let mut agent: Option<Option<String>> = None;

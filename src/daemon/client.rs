@@ -19,9 +19,22 @@ use super::proto::{self, Frame, Hook, KIND_BYTES, KIND_REPLAY, Msg, Size, Spec};
 /// the program made long ago) must not reach the program as typing.
 const REPLAY_MUTE: Duration = Duration::from_millis(800);
 
+/// What a pipe session (an agent's host) gives the window.
+pub enum PipeEvent {
+    Bytes(Vec<u8>),
+    /// The window attached again, to another daemon or after losing this
+    /// one for a moment: what it holds may be behind.
+    Reattached,
+    Exited,
+}
+
+enum Link {
+    Term { peer: StreamPeer, mute_until: Option<Instant> },
+    Pipe(async_channel::Sender<PipeEvent>),
+}
+
 struct Peer {
-    peer: StreamPeer,
-    mute_until: Option<Instant>,
+    link: Link,
     /// To open the session again on another daemon: how to start it, and
     /// the grid it last had.
     spec: Spec,
@@ -85,8 +98,15 @@ pub fn connect(on_hook: impl Fn(Hook) + Send + Sync + 'static) -> Option<(Arc<Da
             }
             reading.lost.store(true, std::sync::atomic::Ordering::Relaxed);
             for (_, p) in reading.peers.lock().unwrap().drain() {
-                p.peer.output(b"\r\n[ideae: lost the daemon]\r\n");
-                p.peer.exit(ExitStatus::new(None, Some("daemon gone")));
+                match p.link {
+                    Link::Term { peer, .. } => {
+                        peer.output(b"\r\n[ideae: lost the daemon]\r\n");
+                        peer.exit(ExitStatus::new(None, Some("daemon gone")));
+                    }
+                    Link::Pipe(tx) => {
+                        let _ = tx.try_send(PipeEvent::Exited);
+                    }
+                }
             }
         })
         .ok()?;
@@ -222,8 +242,13 @@ impl Daemon {
         let peers = self.peers.lock().unwrap();
         for (id, p) in peers.iter() {
             let Some(size) = p.size else { continue };
-            p.peer.output(b"\x1b[H\x1b[2J\x1b[3J\x1bc");
+            if let Link::Term { peer, .. } = &p.link {
+                peer.output(b"\x1b[H\x1b[2J\x1b[3J\x1bc");
+            }
             self.send(proto::encode_msg(&Msg::Open { id: id.clone(), spec: p.spec.clone(), size }));
+            if let Link::Pipe(tx) = &p.link {
+                let _ = tx.try_send(PipeEvent::Reattached);
+            }
         }
     }
 
@@ -233,10 +258,22 @@ impl Daemon {
                 let peer = {
                     let mut peers = self.peers.lock().unwrap();
                     let Some(p) = peers.get_mut(&id) else { return };
-                    if kind == KIND_REPLAY {
-                        p.mute_until = Some(Instant::now() + REPLAY_MUTE);
+                    match &mut p.link {
+                        Link::Term { peer, mute_until } => {
+                            if kind == KIND_REPLAY {
+                                *mute_until = Some(Instant::now() + REPLAY_MUTE);
+                            }
+                            peer.clone()
+                        }
+                        Link::Pipe(tx) => {
+                            let tx = tx.clone();
+                            drop(peers);
+                            // Waits while the window is behind: the daemon then
+                            // holds the host back, as for a terminal.
+                            let _ = tx.send_blocking(PipeEvent::Bytes(bytes));
+                            return;
+                        }
                     }
-                    p.peer.clone()
                 };
                 if kind == KIND_BYTES || kind == KIND_REPLAY {
                     // Not under the lock, which the UI thread takes too. While
@@ -248,12 +285,17 @@ impl Daemon {
             }
             Frame::Msg(Msg::Exited { id, code, signal }) => {
                 if let Some(p) = self.peers.lock().unwrap().remove(&id) {
-                    p.peer.exit(ExitStatus::new(code, signal));
+                    match p.link {
+                        Link::Term { peer, .. } => peer.exit(ExitStatus::new(code, signal)),
+                        Link::Pipe(tx) => {
+                            let _ = tx.try_send(PipeEvent::Exited);
+                        }
+                    }
                 }
             }
             Frame::Msg(Msg::Foreground { id, fg }) => {
-                if let Some(p) = self.peers.lock().unwrap().get(&id) {
-                    p.peer.set_foreground(fg.map(|f| {
+                if let Some(Peer { link: Link::Term { peer, .. }, .. }) = self.peers.lock().unwrap().get(&id) {
+                    peer.set_foreground(fg.map(|f| {
                         let mut process = ForegroundProcess::new(f.pid, f.name).with_argv(f.argv).with_shell(f.shell);
                         if let Some(cwd) = f.cwd {
                             process = process.with_cwd(cwd);
@@ -279,7 +321,7 @@ impl Daemon {
     ) -> TerminalState {
         let (source, peer) = StreamSource::new();
         let events = peer.clone();
-        self.peers.lock().unwrap().insert(id.clone(), Peer { peer, mute_until: None, spec: spec.clone(), size: None });
+        self.peers.lock().unwrap().insert(id.clone(), Peer { link: Link::Term { peer, mute_until: None }, spec: spec.clone(), size: None });
         let daemon = self.clone();
         cx.background_spawn(async move {
             let mut opened = false;
@@ -291,7 +333,10 @@ impl Daemon {
                             .lock()
                             .unwrap()
                             .get(&id)
-                            .and_then(|p| p.mute_until)
+                            .and_then(|p| match p.link {
+                                Link::Term { mute_until, .. } => mute_until,
+                                Link::Pipe(_) => None,
+                            })
                             .is_some_and(|until| Instant::now() < until);
                         if !muted {
                             daemon.send(proto::encode_bytes(KIND_BYTES, &id, &bytes));
@@ -320,6 +365,22 @@ impl Daemon {
         })
         .detach();
         TerminalState::new(Engine::new(source, EngineOptions::default()), config, window, cx)
+    }
+
+    /// A pipe session `id` (an agent's host): attached when it runs, else
+    /// started from `spec`. What it prints comes as events; [`Self::write`]
+    /// gives it input.
+    pub fn pipe(&self, id: String, spec: Spec) -> async_channel::Receiver<PipeEvent> {
+        let (tx, rx) = async_channel::unbounded();
+        // Pipes have no grid; the size only marks the session as opened.
+        let size = Size { cols: 80, rows: 24, cell_w: 8, cell_h: 16 };
+        self.peers.lock().unwrap().insert(id.clone(), Peer { link: Link::Pipe(tx), spec: spec.clone(), size: Some(size) });
+        self.send(proto::encode_msg(&Msg::Open { id, spec, size }));
+        rx
+    }
+
+    pub fn write(&self, id: &str, bytes: &[u8]) {
+        self.send(proto::encode_bytes(KIND_BYTES, id, bytes));
     }
 
     pub fn kill(&self, id: &str) {

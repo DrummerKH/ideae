@@ -304,7 +304,7 @@ mod tests {
     use super::*;
 
     fn profile(command: &str) -> Profile {
-        Profile { id: "codex".into(), name: "Codex".into(), kind: Kind::Codex, command: command.into(), env: Default::default() }
+        Profile { id: "codex".into(), name: "Codex".into(), kind: Kind::Codex, command: command.into(), env: Default::default(), ..Default::default() }
     }
 
     #[test]

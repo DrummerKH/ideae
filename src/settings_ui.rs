@@ -493,9 +493,10 @@ fn agents_page(draft: &Draft, lsp_switch: SettingItem, token_warn: SettingField<
             let d = draft.borrow();
             let rows = d.agents.iter().enumerate().map(|(ix, p)| {
                 let default = p.id == d.default_agent;
-                let mut about = format!("{} · {}", p.kind.label(), if p.command.trim().is_empty() { p.kind.program() } else { p.command.trim() });
-                if !p.env.is_empty() {
-                    about.push_str(&format!(" · {}", p.env.keys().cloned().collect::<Vec<_>>().join(", ")));
+                let how = if p.acp { "chat" } else { "terminal" };
+                let mut about = format!("{} · {how} · {}", p.kind.label(), if p.command.trim().is_empty() { p.kind.program() } else { p.command.trim() });
+                if !p.env.is_empty() || !p.secrets.is_empty() {
+                    about.push_str(&format!(" · {}", p.env.keys().cloned().chain(p.secrets.iter().map(|k| format!("{k} (sealed)"))).collect::<Vec<_>>().join(", ")));
                 }
                 let (edit, remove) = (draft.clone(), draft.clone());
                 h_flex()
@@ -511,9 +512,9 @@ fn agents_page(draft: &Draft, lsp_switch: SettingItem, token_warn: SettingField<
                             .min_w_0()
                             .child(div().text_sm().child(if default { format!("{} (default)", p.name) } else { p.name.clone() }))
                             .child(div().text_xs().text_color(muted).truncate().child(about))
-                            .when(!p.adapter().tried_live(), |s| s.child(div().text_xs().text_color(muted).child("Not tried live: its adapter follows the agent's source code."))),
+                            .when(!p.acp && !p.adapter().tried_live(), |s| s.child(div().text_xs().text_color(muted).child("Not tried live: its adapter follows the agent's source code."))),
                     )
-                    .child(Button::new(SharedString::from(format!("agent-edit-{ix}"))).xsmall().ghost().label("Edit…").on_click(move |_, window, cx| profile_dialog(edit.clone(), Some(ix), window, cx)))
+                    .child(Button::new(SharedString::from(format!("agent-edit-{ix}"))).xsmall().ghost().label("Edit…").on_click(move |_, window, cx| profile_dialog(edit.clone(), Some(ix), None, window, cx)))
                     .child(Button::new(SharedString::from(format!("agent-remove-{ix}"))).xsmall().ghost().label("Remove").on_click(move |_, window, _| {
                         let mut d = remove.borrow_mut();
                         if ix < d.agents.len() {
@@ -523,7 +524,7 @@ fn agents_page(draft: &Draft, lsp_switch: SettingItem, token_warn: SettingField<
                         window.refresh();
                     }))
             });
-            let (add, find) = (draft.clone(), draft.clone());
+            let (add, find, registry_draft) = (draft.clone(), draft.clone(), draft.clone());
             gpui_kit::component::v_flex()
                 .gap_1()
                 .children(rows)
@@ -532,7 +533,16 @@ fn agents_page(draft: &Draft, lsp_switch: SettingItem, token_warn: SettingField<
                     h_flex()
                         .pt_1()
                         .gap_2()
-                        .child(Button::new("agent-add").small().outline().label("Add agent…").on_click(move |_, window, cx| profile_dialog(add.clone(), None, window, cx)))
+                        .child(Button::new("agent-add").small().outline().label("Add agent…").on_click(move |_, window, cx| profile_dialog(add.clone(), None, None, window, cx)))
+                        .child({
+                            let browse = registry_draft.clone();
+                            Button::new("agent-registry")
+                                .small()
+                                .outline()
+                                .label("Browse ACP agents…")
+                                .tooltip("Agents that speak the Agent Client Protocol, from its registry: run as a chat")
+                                .on_click(move |_, window, cx| registry_dialog(browse.clone(), window, cx))
+                        })
                         .child(Button::new("agent-find").small().outline().label("Find installed agents").on_click(move |_, window, cx| crate::workspace::welcome::find_into(find.clone(), window, cx))),
                 )
                 .when_some(crate::workspace::welcome::find_said(), |s, said| s.child(div().text_xs().text_color(muted).child(said)))
@@ -577,6 +587,28 @@ fn agents_page(draft: &Draft, lsp_switch: SettingItem, token_warn: SettingField<
         })
         .group(SettingGroup::new().title("Profiles").item(list))
         .group(choose)
+        .group(
+            SettingGroup::new().title("Chat agents").item(
+                SettingItem::new("Out of view, an idle one stops after", {
+                    let (read, write) = (draft.clone(), draft.clone());
+                    SettingField::number_input(NumberFieldOptions { min: 0., max: 24. * 60., step: 5. }, move |_| f64::from(read.borrow().agent_idle_minutes), move |value, _| {
+                        write.borrow_mut().agent_idle_minutes = value as u32
+                    })
+                    .default_value(f64::from(state::Settings::default().agent_idle_minutes))
+                })
+                .description("Minutes; 0 for never. A chat agent that is not working or asking, in a task out of view this long, is stopped to free its memory (hundreds of MB each). Its conversation stays; it starts again, going on with it, when the task is shown. Terminal agents run on."),
+            )
+            .item(
+                SettingItem::new("A question nobody answers is declined after", {
+                    let (read, write) = (draft.clone(), draft.clone());
+                    SettingField::number_input(NumberFieldOptions { min: 0., max: 24. * 60., step: 5. }, move |_| f64::from(read.borrow().agent_unanswered_minutes), move |value, _| {
+                        write.borrow_mut().agent_unanswered_minutes = value as u32
+                    })
+                    .default_value(f64::from(state::Settings::default().agent_unanswered_minutes))
+                })
+                .description("Minutes; 0 for never. A chat agent goes on working when the window closes: what it asks then shows as a desktop notification, and waits for you. Set, it is declined after this long, and the agent goes on with something else."),
+            ),
+        )
         .group(SettingGroup::new().title("Claude Code").item(lsp_switch))
         .group(
             SettingGroup::new().title("Tokens").item(
@@ -597,10 +629,186 @@ fn kind_hint(kind: crate::agents::Kind) -> &'static str {
     }
 }
 
-/// Adds a profile (`at` none) or edits one, in the draft.
-fn profile_dialog(draft: Draft, at: Option<usize>, window: &mut Window, cx: &mut App) {
+/// The ACP registry's agents, searched: the one chosen opens in the
+/// profile editor, ready to save; one to download is fetched first.
+fn registry_dialog(draft: Draft, window: &mut Window, cx: &mut App) {
+    use crate::agents::registry::{self, How};
+    use gpui_kit::component::command::{Command, CommandItem, CommandState};
+    enum Listed {
+        Fetching,
+        Failed(String),
+        Ready(Vec<(registry::Entry, How)>),
+    }
+    let listed: Rc<RefCell<Listed>> = Rc::new(RefCell::new(Listed::Fetching));
+    let command = cx.new(|cx| CommandState::new(window, cx));
+    {
+        let listed = listed.clone();
+        window
+            .spawn(cx, async move |cx| {
+                let got = cx
+                    .background_spawn(async move {
+                        let entries = registry::fetch()?;
+                        Ok::<_, String>(entries.into_iter().map(|e| {
+                            let how = registry::how(&e, &|p| crate::agents::find::on_path(p));
+                            (e, how)
+                        }).collect::<Vec<_>>())
+                    })
+                    .await;
+                *listed.borrow_mut() = match got {
+                    Ok(entries) => Listed::Ready(entries),
+                    Err(e) => Listed::Failed(e),
+                };
+                let _ = cx.update(|window, _| window.refresh());
+            })
+            .detach();
+    }
+    let focused = Rc::new(Cell::new(false));
+    window.open_dialog(cx, move |dialog, _, _| {
+        let (listed, command, focused, draft) = (listed.clone(), command.clone(), focused.clone(), draft.clone());
+        dialog.title("ACP agents").w(px(640.)).p_0().content(move |content, window, cx| {
+            let muted = cx.theme().muted_foreground;
+            let note = |text: String| div().p_4().text_sm().text_color(muted).child(text);
+            let entries = match &*listed.borrow() {
+                Listed::Fetching => return content.child(note("Fetching the registry…".into())),
+                Listed::Failed(why) => return content.child(note(why.clone())),
+                Listed::Ready(entries) => entries.clone(),
+            };
+            if !focused.replace(true) {
+                let command = command.clone();
+                window.defer(cx, move |window, cx| command.read(cx).focus_handle(cx).focus(window, cx));
+            }
+            // Grouped by how each would run here: what is installed first.
+            let mut groups: Vec<(&'static str, Vec<(registry::Entry, How)>)> = vec![("Installed", vec![]), ("Run with npx or uvx", vec![]), ("Downloaded when added", vec![]), ("Not available here", vec![])];
+            for (e, how) in entries {
+                let at = match how {
+                    How::Installed(_) => 0,
+                    How::Package(_) => 1,
+                    How::Download => 2,
+                    How::Not(_) => 3,
+                };
+                groups[at].1.push((e, how));
+            }
+            groups.retain(|(_, list)| !list.is_empty());
+            let mut list = Command::new(&command).bordered(false).placeholder("Search agents…").max_h(px(460.));
+            for (head, members) in &groups {
+                let items = members.iter().map(|(e, how)| {
+                    let tag = match how {
+                        How::Installed(c) | How::Package(c) => c.clone(),
+                        How::Download => e.version.clone(),
+                        How::Not(why) => why.clone(),
+                    };
+                    let (name, about) = (e.name.clone(), short(&e.description, 110));
+                    let words = vec![e.id.clone(), e.description.clone()];
+                    CommandItem::new().label(name.clone()).keywords(words).child(move |_, cx| {
+                        let muted = cx.theme().muted_foreground;
+                        gpui_kit::component::v_flex()
+                            .w_full()
+                            .py_0p5()
+                            .child(h_flex().gap_2().child(div().text_sm().child(name.clone())).child(div().flex_1()).child(div().text_xs().text_color(muted).truncate().max_w(px(260.)).child(tag.clone())))
+                            .child(div().text_xs().text_color(muted).truncate().child(about.clone()))
+                    })
+                });
+                list = list.group(gpui_kit::component::command::CommandGroup::new().label(*head).items(items));
+            }
+            let groups: Vec<Vec<(registry::Entry, How)>> = groups.into_iter().map(|(_, list)| list).collect();
+            let draft = draft.clone();
+            content
+                .child(
+                    list
+                        .on_confirm(move |index, window, cx| {
+                            let Some((entry, how)) = groups.get(index.section).and_then(|g| g.get(index.row)).cloned() else { return };
+                            let made = entry.clone();
+                            let template = move |command: String| crate::agents::Profile {
+                                name: made.name.clone(),
+                                kind: registry::kind_of(&made),
+                                command: registry::adjust(&made, command),
+                                acp: true,
+                                env: made.distribution.npx.as_ref().map(|p| p.env.clone()).unwrap_or_default(),
+                                ..Default::default()
+                            };
+                            match how {
+                                How::Installed(command) | How::Package(command) => {
+                                    window.close_dialog(cx);
+                                    profile_dialog(draft.clone(), None, Some(template(command)), window, cx);
+                                }
+                                How::Download => {
+                                    window.close_dialog(cx);
+                                    let note = gpui_kit::component::notification::Notification::new().title(format!("Downloading {} {}…", entry.name, entry.version)).message("Checked against the registry's checksum, unpacked into the app's data folder.");
+                                    window.push_notification(note, cx);
+                                    let draft = draft.clone();
+                                    window
+                                        .spawn(cx, async move |cx| {
+                                            let job = entry.clone();
+                                            let installed = cx.background_spawn(async move { registry::install(&job) }).await;
+                                            let _ = cx.update(|window, cx| match installed {
+                                                Ok(command) => profile_dialog(draft, None, Some(template(command)), window, cx),
+                                                Err(e) => window.push_notification(gpui_kit::component::notification::Notification::error(format!("{}: {e}", entry.name)), cx),
+                                            });
+                                        })
+                                        .detach();
+                                }
+                                How::Not(why) => {
+                                    let site = entry.website.clone().or(entry.repository.clone()).unwrap_or_default();
+                                    window.push_notification(gpui_kit::component::notification::Notification::warning(format!("{} does not run here: {why}. {site}", entry.name)), cx);
+                                }
+                            }
+                        }),
+                )
+                .child(div().px_4().pb_3().text_xs().text_color(muted).child("From agentclientprotocol.com's registry. Installed ones run as they are; others through npx or uvx, or downloaded. Each signs in its own way; Claude Code's adapter runs on an API key."))
+        })
+    });
+}
+
+fn short(text: &str, most: usize) -> String {
+    let text = text.split(['.', '\n']).next().unwrap_or(text).trim();
+    if text.chars().count() <= most {
+        return text.to_string();
+    }
+    format!("{}…", text.chars().take(most).collect::<String>())
+}
+
+/// What each kind of agent does as a chat, for the profile editor.
+fn chat_hint(kind: crate::agents::Kind) -> &'static str {
+    use crate::agents::Kind;
+    match kind {
+        Kind::Claude => "Anthropic's ACP adapter for Claude Code, always on an API key (below): an app may not offer a claude.ai plan's login. For your plan, use a terminal profile.",
+        Kind::Codex => "The ACP adapter for Codex: signs in with ChatGPT or an API key (OPENAI_API_KEY), as it asks in the chat.",
+        Kind::OpenCode => "OpenCode's own ACP server: its providers and models are OpenCode's (opencode auth login).",
+        Kind::Generic => "Any program that speaks ACP: what it does, asks and costs is told by it, not guessed. It signs in its own way when it asks.",
+    }
+}
+
+/// The key a chat agent runs on, when it is one known: its variable, and
+/// where to make one.
+fn api_key_var(kind: crate::agents::Kind, command: &str) -> Option<(&'static str, &'static str)> {
+    use crate::agents::Kind;
+    match kind {
+        Kind::Claude => Some(("ANTHROPIC_API_KEY", "console.anthropic.com → API keys")),
+        Kind::Codex => Some(("OPENAI_API_KEY", "platform.openai.com → API keys")),
+        Kind::Generic if command.contains("gemini") => Some(("GEMINI_API_KEY", "aistudio.google.com → Get API key")),
+        _ => None,
+    }
+}
+
+/// `text` (KEY=value lines) with `name` set to `value`, in place of what it had.
+fn with_env_line(text: &str, name: &str, value: &str) -> String {
+    let mut lines: Vec<String> = text
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            let line = line.strip_prefix("export ").unwrap_or(line);
+            line.split_once('=').is_none_or(|(k, _)| k.trim() != name)
+        })
+        .map(str::to_string)
+        .collect();
+    lines.push(format!("{name}={value}"));
+    lines.join("\n").trim_start().to_string()
+}
+
+/// Adds a profile (`at` none, from `template` if given) or edits one, in the draft.
+fn profile_dialog(draft: Draft, at: Option<usize>, template: Option<crate::agents::Profile>, window: &mut Window, cx: &mut App) {
     use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
-    let editing = at.and_then(|ix| draft.borrow().agents.get(ix).cloned()).unwrap_or_else(|| crate::agents::Profile {
+    let editing = at.and_then(|ix| draft.borrow().agents.get(ix).cloned()).or(template).unwrap_or_else(|| crate::agents::Profile {
         kind: crate::agents::Kind::Codex,
         name: "Codex".into(),
         command: "codex".into(),
@@ -609,20 +817,44 @@ fn profile_dialog(draft: Draft, at: Option<usize>, window: &mut Window, cx: &mut
     let name = cx.new(|cx| InputState::new(window, cx).placeholder("Claude — work account"));
     let command = cx.new(|cx| InputState::new(window, cx).placeholder("claude --model opus"));
     let env = cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 6).placeholder("KEY=value, one a line: CLAUDE_CONFIG_DIR=~/.claude-work"));
+    let key = cx.new(|cx| InputState::new(window, cx).placeholder("Paste a key"));
+    let limit = cx.new(|cx| InputState::new(window, cx).placeholder("No limit"));
+    limit.update(cx, |i, cx| i.set_value(editing.daily_limit.map(|l| format!("{l}")).unwrap_or_default(), window, cx));
+    key.update(cx, |i, cx| i.set_masked(true, window, cx));
     name.update(cx, |i, cx| i.set_value(editing.name.clone(), window, cx));
     command.update(cx, |i, cx| i.set_value(editing.command.clone(), window, cx));
     env.update(cx, |i, cx| i.set_value(editing.env_text(), window, cx));
     let kind = Rc::new(Cell::new(editing.kind));
+    let chat = Rc::new(Cell::new(editing.acp));
+    // What its chat chose last, shown by name; cleared by Forget.
+    let remembered: Vec<String> = editing
+        .choices
+        .iter()
+        .map(|(id, value)| {
+            let option = editing.offered.iter().find(|o| &o.id == id);
+            let name = option.map_or(id.as_str(), |o| o.name.as_str());
+            let shown = option.and_then(|o| o.values.iter().find(|v| &v.value == value)).map_or(value.as_str(), |v| v.name.as_str());
+            format!("{name}: {shown}")
+        })
+        .collect();
+    let forget = Rc::new(Cell::new(false));
     window.open_dialog(cx, move |dialog, _, cx| {
         let muted = cx.theme().muted_foreground;
-        let (name, command, env, kind, draft, editing) = (name.clone(), command.clone(), env.clone(), kind.clone(), draft.clone(), editing.clone());
-        let (save_name, save_command, save_env, save_kind) = (name.clone(), command.clone(), env.clone(), kind.clone());
+        let (name, command, env, kind, chat, draft, editing, key, limit) = (name.clone(), command.clone(), env.clone(), kind.clone(), chat.clone(), draft.clone(), editing.clone(), key.clone(), limit.clone());
+        let spent = crate::acp::spend::spent_today(&editing.id);
+        let (save_name, save_command, save_env, save_kind, save_chat, save_forget, save_key, save_limit) = (name.clone(), command.clone(), env.clone(), kind.clone(), chat.clone(), forget.clone(), key.clone(), limit.clone());
+        let (remembered, forget) = (remembered.clone(), forget.clone());
         let label = |text: &'static str| div().text_sm().w(px(110.)).flex_none().child(text);
         dialog
             .title(if at.is_some() { "Edit agent" } else { "Add agent" })
             .w(px(620.))
-            .content(move |content, _, _| {
+            .content(move |content, _, cx| {
                 let current = kind.get();
+                let as_chat = chat.get();
+                let key_var = as_chat.then(|| api_key_var(current, &command.read(cx).value())).flatten();
+                // Set: in the environment below, sealed or not.
+                let key_set = key_var.is_some_and(|(var, _)| crate::agents::Profile::parse_env(&env.read(cx).value()).get(var).is_some_and(|v| !v.is_empty()));
+                let own = move |k: crate::agents::Kind, chat: bool| if chat { k.acp_command() } else { k.program() };
                 content.child(
                     gpui_kit::component::v_flex()
                         .gap_2()
@@ -631,8 +863,8 @@ fn profile_dialog(draft: Draft, at: Option<usize>, window: &mut Window, cx: &mut
                             Button::new(("agent-kind", k as usize)).xsmall().ghost().label(k.label()).selected(current == k).on_click(move |_, window, cx| {
                                 let before = kind.replace(k);
                                 // A command or name that was the old kind's own follows the new kind.
-                                if command.read(cx).value().trim() == before.program() {
-                                    command.update(cx, |i, cx| i.set_value(k.program(), window, cx));
+                                if command.read(cx).value().trim() == own(before, as_chat) {
+                                    command.update(cx, |i, cx| i.set_value(own(k, as_chat), window, cx));
                                 }
                                 if name.read(cx).value().trim().is_empty() || name.read(cx).value() == before.label() {
                                     name.update(cx, |i, cx| i.set_value(if k == crate::agents::Kind::Generic { "" } else { k.label() }, window, cx));
@@ -640,19 +872,66 @@ fn profile_dialog(draft: Draft, at: Option<usize>, window: &mut Window, cx: &mut
                                 window.refresh();
                             })
                         })))
-                        .child(div().text_xs().text_color(muted).child(kind_hint(current)))
+                        .child(div().text_xs().text_color(muted).child(if as_chat { chat_hint(current) } else { kind_hint(current) }))
+                        .child(h_flex().gap_2().items_center().child(label("Runs as")).children([(false, "Terminal"), (true, "Chat (ACP)")].into_iter().map(|(c, text)| {
+                            let (chat, command) = (chat.clone(), command.clone());
+                            Button::new(("agent-chat", c as usize)).xsmall().ghost().label(text).selected(as_chat == c).on_click(move |_, window, cx| {
+                                let before = chat.replace(c);
+                                if command.read(cx).value().trim() == own(current, before) {
+                                    command.update(cx, |i, cx| i.set_value(own(current, c), window, cx));
+                                }
+                                window.refresh();
+                            })
+                        })))
+                        .when(as_chat && !remembered.is_empty() && !forget.get(), |this| {
+                            let forget = forget.clone();
+                            this.child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(label("Starts with"))
+                                    .child(div().flex_1().text_sm().child(remembered.join(" · ")))
+                                    .child(Button::new("agent-forget").xsmall().ghost().label("Forget").tooltip("New sessions start with the agent's own defaults again").on_click(move |_, window, _| {
+                                        forget.set(true);
+                                        window.refresh();
+                                    })),
+                            )
+                            .child(div().text_xs().text_color(muted).child("What you chose last in its chat (model, effort, mode): every new session starts with it."))
+                        })
+                        .when(as_chat, |this| {
+                            this.child(div().text_xs().text_color(muted).child(
+                                "Its conversation shows in a chat, not a terminal: messages, tool calls with their changes, questions with buttons. It goes on working when the window closes.",
+                            ))
+                        })
                         .child(h_flex().gap_2().items_center().child(label("Name")).child(div().flex_1().child(Input::new(&name))))
                         .child(h_flex().gap_2().items_center().child(label("Command")).child(div().flex_1().child(Input::new(&command))))
-                        .child(div().text_xs().text_color(muted).child("The program and its flags, as typed in a shell: a model, a mode. ideae adds what starts or resumes a session and what reports to it."))
+                        .child(div().text_xs().text_color(muted).child(if as_chat {
+                            "What starts its ACP server: opencode acp, gemini --acp, kimi acp, qwen --acp, npx -y <package>. ideae resumes its sessions itself."
+                        } else {
+                            "The program and its flags, as typed in a shell: a model, a mode. ideae adds what starts or resumes a session and what reports to it."
+                        }))
+                        .when_some(key_var, |this, (var, where_)| {
+                            this.child(h_flex().gap_2().items_center().child(label("API key")).child(div().flex_1().child(Input::new(&key).mask_toggle())))
+                                .child(div().text_xs().text_color(muted).child(if key_set {
+                                    format!("{var} is set and kept sealed for this machine. Type a new one to replace it, or remove its line below.")
+                                } else {
+                                    format!("Goes in {var}, kept sealed for this machine, not in the settings. Make one at {where_}.")
+                                }))
+                        })
+                        .when(as_chat, |this| {
+                            this.child(h_flex().gap_2().items_center().child(label("Daily limit, $")).child(div().w(px(120.)).child(Input::new(&limit))).child(div().text_xs().text_color(muted).child(if spent > 0.0 { format!("${spent:.2} today") } else { String::new() })))
+                                .child(div().text_xs().text_color(muted).child("Its turn is stopped once its sessions cost this much today (UTC), by the cost the agent reports: Claude Code's adapter reports it; agents that report none are not held."))
+                        })
                         .child(h_flex().gap_2().items_start().child(label("Environment")).child(div().flex_1().child(Textarea::new(&env))))
-                        .child(div().text_xs().text_color(muted).child("For the agent alone. Another account of the same agent is another profile with its own config folder here.")),
+                        .child(div().text_xs().text_color(muted).child("For the agent alone. Another account of the same agent is another profile with its own config folder here. Keys and tokens (…_KEY, …_TOKEN) are kept sealed for this machine, not in the settings; $(pass show anthropic) takes one from a password manager when the agent starts.")),
                 )
             })
             .footer(h_flex().justify_end().gap_2().child(Button::new("agent-cancel").ghost().label("Cancel").on_click(|_, window, cx| window.close_dialog(cx))).child(
                 Button::new("agent-save").primary().label("Save").on_click(move |_, window, cx| {
                     let k = save_kind.get();
                     let command = save_command.read(cx).value().trim().to_string();
-                    let command = if command.is_empty() { k.program().to_string() } else { command };
+                    let acp = save_chat.get();
+                    let command = if command.is_empty() { if acp { k.acp_command() } else { k.program() }.to_string() } else { command };
                     if command.is_empty() {
                         return;
                     }
@@ -660,14 +939,21 @@ fn profile_dialog(draft: Draft, at: Option<usize>, window: &mut Window, cx: &mut
                     if name.is_empty() {
                         name = command.split_whitespace().next().unwrap_or("Agent").to_string();
                     }
-                    let env = crate::agents::Profile::parse_env(&save_env.read(cx).value());
+                    let mut env_text = save_env.read(cx).value().to_string();
+                    let typed = save_key.read(cx).value().trim().to_string();
+                    if let (true, Some((var, _))) = (acp && !typed.is_empty(), api_key_var(k, &command)) {
+                        env_text = with_env_line(&env_text, var, &typed);
+                    }
                     {
                         let mut d = draft.borrow_mut();
                         let id = match at {
                             Some(_) if !editing.id.is_empty() => editing.id.clone(),
                             _ => crate::agents::new_profile_id(&name, &d.agents),
                         };
-                        let profile = crate::agents::Profile { id, name, kind: k, command, env };
+                        let choices = if save_forget.get() { Default::default() } else { editing.choices.clone() };
+                        let daily_limit = save_limit.read(cx).value().trim().trim_start_matches('$').parse::<f64>().ok().filter(|l| *l > 0.0 && acp);
+                        let mut profile = crate::agents::Profile { id, name, kind: k, command, acp, secrets: editing.secrets.clone(), choices, offered: editing.offered.clone(), daily_limit, ..Default::default() };
+                        profile.set_env_text(&env_text);
                         match at.filter(|ix| *ix < d.agents.len()) {
                             Some(ix) => d.agents[ix] = profile,
                             None => d.agents.push(profile),
@@ -893,6 +1179,15 @@ fn key_groups(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_key_typed_takes_its_line_in_the_environment() {
+        let text = "CLAUDE_CONFIG_DIR=~/.c\nexport ANTHROPIC_API_KEY=••••••••";
+        assert_eq!(super::with_env_line(text, "ANTHROPIC_API_KEY", "sk-new"), "CLAUDE_CONFIG_DIR=~/.c\nANTHROPIC_API_KEY=sk-new");
+        assert_eq!(super::with_env_line("", "OPENAI_API_KEY", "x"), "OPENAI_API_KEY=x");
+        assert_eq!(super::api_key_var(crate::agents::Kind::Generic, "gemini --acp").map(|k| k.0), Some("GEMINI_API_KEY"));
+        assert_eq!(super::api_key_var(crate::agents::Kind::OpenCode, "opencode acp"), None);
+    }
+
     use crate::theme::Appearance;
     use gpui_kit::test::TestWindowExt as _;
     use gpui_kit::{AppContext as _, Bounds, Empty, Point, ScrollDelta, TestAppContext, WindowBounds, WindowOptions, point, px, size};

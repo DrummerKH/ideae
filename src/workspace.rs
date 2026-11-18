@@ -71,6 +71,9 @@ pub struct TaskEntry {
     /// The agent chosen when it was made, by profile id; empty for its
     /// project's or the default.
     pub agent: String,
+    /// A chat agent's choices for this task alone (a variant's model), by
+    /// the agent's option ids.
+    pub choices: Vec<(String, String)>,
     /// Its agents' sessions; the last is the one it runs.
     pub sessions: Vec<state::AgentSession>,
     /// Made this run and not started yet, or its latest session recorded
@@ -296,7 +299,13 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        state::init_settings(&saved.settings);
+        // Keys an older version kept in the state go to the sealed store.
+        let mut settings = saved.settings.clone();
+        if settings.agents.iter_mut().fold(false, |any, p| p.seal_secrets() || any) {
+            state::set_settings(settings);
+        } else {
+            state::init_settings(&saved.settings);
+        }
         cx.background_spawn(async { crate::lsp::look_for_servers() }).detach();
         let appearance = appearance
             .or_else(|| saved.appearance.as_deref().and_then(Appearance::parse))
@@ -353,6 +362,24 @@ impl Workspace {
                 None => eprintln!("daemon unavailable: terminals run in the window"),
             }
         }
+        // Chat agents' questions through ideae's MCP server, each about its
+        // own worktree. Tests leave the socket to the app.
+        let (mcp_tx, mcp_rx) = async_channel::unbounded::<(crate::mcp::Request, async_channel::Sender<crate::mcp::Answer>)>();
+        if !cfg!(test) {
+            let _ = crate::mcp::listen(move |request, answer| {
+                let _ = mcp_tx.send_blocking((request, answer));
+            })
+            .inspect_err(|e| eprintln!("ideae's MCP server off: {e}"));
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            while let Ok((request, answer)) = mcp_rx.recv().await {
+                if this.update_in(cx, |this, window, cx| this.on_mcp(request, answer, window, cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+
         // Reports wait until the tasks of the last run are back: one for a
         // task not loaded yet would be lost.
         let (restored_tx, restored_rx) = async_channel::bounded::<()>(1);
@@ -787,6 +814,7 @@ impl Workspace {
                     base: t.base.clone(),
                     side: None,
                     agent: t.agent.clone(),
+                    choices: t.choices.clone(),
                     sessions: t.sessions.clone(),
                     fresh: false,
                     archive: t.archive.clone(),
@@ -905,6 +933,7 @@ impl Workspace {
                             base: t.base.clone(),
                             check: self.checks.get(&t.path).filter(|run| run.is_over()).cloned(),
                             agent: t.agent.clone(),
+                            choices: t.choices.clone(),
                             sessions: t.sessions.clone(),
                             archive: t.archive.clone(),
                             archive_keep: t.archive_keep,
@@ -924,6 +953,7 @@ impl Workspace {
         let json = self.serialize(cx);
         self.save_seq += 1;
         write_state(&self.last_saved, self.save_seq, json);
+        crate::secrets::flush();
     }
 
     /// The now-and-then save: what it takes from the UI thread is the copy
@@ -1046,6 +1076,7 @@ impl Workspace {
         view.update(cx, |t, cx| {
             t.unseen = false;
             t.wake_language_servers(cx);
+            t.wake_agent(cx);
             t.set_visible(true, window, cx)
         });
         self.refresh_prs(true, window, cx);
@@ -1255,6 +1286,13 @@ impl Workspace {
         std::time::Duration::from_secs(secs)
     }
 
+    /// Chat agents of tasks out of view this long stop; IDEAE_AGENT_IDLE_SECS
+    /// shortens it for tests. Zero: they run on.
+    fn agent_idle() -> std::time::Duration {
+        let secs = std::env::var("IDEAE_AGENT_IDLE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(u64::from(state::settings().agent_idle_minutes) * 60);
+        std::time::Duration::from_secs(secs)
+    }
+
     fn sleep_idle_language_servers(&mut self, cx: &mut Context<Self>) {
         for view in self.views() {
             view.update(cx, |t, cx| t.drop_unused_language_servers(Self::lsp_idle(), cx));
@@ -1266,6 +1304,10 @@ impl Workspace {
                     if view.read(cx).has_language_servers() {
                         view.update(cx, |t, cx| t.put_language_servers_to_sleep(cx));
                     }
+                }
+                let agent_idle = Self::agent_idle();
+                if !agent_idle.is_zero() && self.active.as_deref() != Some(t.path.as_path()) && left.elapsed() >= agent_idle {
+                    view.update(cx, |t, cx| t.put_agent_to_sleep(cx));
                 }
             }
         }
@@ -1584,13 +1626,14 @@ impl Workspace {
                                     .child(branch_hint(&input.read(cx).value())),
                             )
                             .child(Textarea::new(&prompt))
-                            .when(several && many == 1, |form| {
+                            .when(many == 1 && (several || agents_ui::model_picker("probe", agents[0].clone()).is_some()), |form| {
                                 form.child(
                                     h_flex()
                                         .gap_2()
                                         .items_center()
                                         .child(div().text_sm().child("Agent"))
-                                        .child(agents_ui::picker("new-task-agent", agents[0].clone())),
+                                        .child(agents_ui::picker("new-task-agent", agents[0].clone()))
+                                        .children(agents_ui::model_picker("new-task-model", agents[0].clone())),
                                 )
                             })
                             .child(
@@ -1626,6 +1669,7 @@ impl Workspace {
                                         .gap_2()
                                         .child(div().flex_1().child(Input::new(note).small()))
                                         .when(several, |row| row.child(agents_ui::picker(("variant-agent", ix), agent.clone())))
+                                        .children(agents_ui::model_picker(("variant-model", ix), agent.clone()))
                                 })).child(
                                     h_flex().gap_1().children(ways.into_iter().enumerate().map(|(ix, (name, text))| {
                                         let notes: Vec<Entity<InputState>> = notes.iter().take(many).cloned().collect();
@@ -1686,7 +1730,8 @@ impl Workspace {
             busy: Some("creating…".into()),
             prompt: prompt.clone(),
             created: state::now(),
-            agent: agents.into_iter().next().unwrap_or_default(),
+            agent: agents_ui::pick_profile(agents.first().map_or("", String::as_str)),
+            choices: agents_ui::pick_choices(agents.first().map_or("", String::as_str)),
             fresh: true,
             ..Default::default()
         });
@@ -2279,7 +2324,7 @@ impl Workspace {
             Start::New(id)
         };
         t.fresh = false;
-        Some(Launch { profile, start, unasked })
+        Some(Launch { profile, start, unasked, options: t.choices.clone() })
     }
 
     /// New settings: they go to the state, and what they change now
@@ -2287,6 +2332,13 @@ impl Workspace {
     pub fn apply_settings(&mut self, new: state::Settings, cx: &mut Context<Self>) {
         let old = state::settings();
         state::set_settings(new.clone());
+        // The keys of profiles that are gone.
+        for scope in crate::secrets::scopes() {
+            let (profile, name) = scope.split_once('/').unwrap_or_default();
+            if !new.agents.iter().any(|p| p.id == profile && p.secrets.contains(name)) {
+                crate::secrets::remove(&scope);
+            }
+        }
         if !cfg!(test) {
             gpui_kit::base::input::HUMP_WORDS.store(new.hump_words, std::sync::atomic::Ordering::Relaxed);
         }

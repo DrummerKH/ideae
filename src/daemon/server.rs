@@ -33,6 +33,8 @@ struct Session {
     fg: Option<Fg>,
     /// The grid the windows last asked for.
     size: Size,
+    /// A program on pipes (an agent's host), not a shell on a pty.
+    pipe: Option<Arc<super::pipe::Pipe>>,
 }
 
 #[derive(Default)]
@@ -186,7 +188,7 @@ fn housekeeping(shared: Shared) {
         }
         let handles: Vec<(String, Arc<Mutex<Box<dyn ByteHandle>>>)> = {
             let s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            s.sessions.iter().filter(|(_, x)| !x.attached.is_empty()).map(|(id, x)| (id.clone(), x.handle.clone())).collect()
+            s.sessions.iter().filter(|(_, x)| !x.attached.is_empty() && x.pipe.is_none()).map(|(id, x)| (id.clone(), x.handle.clone())).collect()
         };
         for (id, handle) in handles {
             let fg = fg_of(&handle);
@@ -282,13 +284,22 @@ fn serve(shared: Shared, stream: UnixStream) {
     }
     let mut s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     s.clients.remove(&client);
-    for session in s.sessions.values_mut() {
-        session.attached.remove(&client);
+    let mut alone = Vec::new();
+    for (id, session) in s.sessions.iter_mut() {
+        if session.attached.remove(&client) && session.attached.is_empty() && session.pipe.is_some() {
+            alone.push(id.clone());
+        }
     }
+
     if registered && s.clients.is_empty() {
         s.alone_since = Some(Instant::now());
     }
     drop(s);
+    // An agent's host is told no window is there: what it asks now goes
+    // to the desktop.
+    for id in alone {
+        input(&shared, &id, b"{\"m\":\"Detached\"}\n");
+    }
     drop(tx);
     let _ = writer_thread.join();
 }
@@ -307,8 +318,12 @@ fn input(shared: &Shared, id: &str, bytes: &[u8]) {
 fn open(shared: &Shared, client: u64, id: String, spec: Spec, size: Size) {
     let mut s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(session) = s.sessions.get_mut(&id) {
-        // Attach: what it printed so far, then live output.
         session.attached.insert(client);
+        if session.pipe.is_some() {
+            // It tells the window what it needs when the window asks.
+            return;
+        }
+        // Attach: what it printed so far, then live output.
         session.size = size;
         let replay: Vec<u8> = session.replay.iter().copied().collect();
         let fg = session.fg.clone();
@@ -332,13 +347,29 @@ fn open(shared: &Shared, client: u64, id: String, spec: Spec, size: Size) {
         });
         return;
     }
-    let mut options = LocalTerminalOptions::default().with_cwd(WorkingDirectory::Path(spec.cwd.clone()));
-    for (name, value) in &spec.env {
-        options = options.with_env(name.clone(), value.clone());
-    }
     let (sink, detached) = ByteSink::detached();
-    let handle = match Box::new(LocalPty::new(options)).start(sink, viewport(size)) {
+    let mut pipe = None;
+    let started: std::io::Result<Box<dyn ByteHandle>> = if spec.program.is_empty() {
+        let mut options = LocalTerminalOptions::default().with_cwd(WorkingDirectory::Path(spec.cwd.clone()));
+        for (name, value) in &spec.env {
+            options = options.with_env(name.clone(), value.clone());
+        }
+        Box::new(LocalPty::new(options)).start(sink, viewport(size))
+    } else {
+        super::pipe::Pipe::start(&spec, sink).map(|p| {
+            let p = Arc::new(p);
+            pipe = Some(p.clone());
+            Box::new(super::pipe::Handle(p)) as Box<dyn ByteHandle>
+        })
+    };
+    let handle = match started {
         Ok(handle) => handle,
+        Err(e) if pipe.is_none() && !spec.program.is_empty() => {
+            let msg = format!("ideae: could not start {}: {e}\n", spec.program.join(" "));
+            s.send(client, proto::encode_bytes(KIND_BYTES, &id, msg.as_bytes()));
+            s.send(client, proto::encode_msg(&Msg::Exited { id, code: Some(127), signal: None }));
+            return;
+        }
         Err(e) => {
             let msg = format!("\r\nideae: could not start the shell: {e}\r\n");
             s.send(client, proto::encode_bytes(KIND_BYTES, &id, msg.as_bytes()));
@@ -361,6 +392,7 @@ fn open(shared: &Shared, client: u64, id: String, spec: Spec, size: Size) {
             pending: Vec::new(),
             fg: None,
             size,
+            pipe,
         },
     );
     drop(s);
@@ -400,9 +432,11 @@ fn pump(shared: Shared, id: String, handle: Arc<Mutex<Box<dyn ByteHandle>>>, sin
         }
         let mut frames = Vec::new();
         for chunk in &batch.output {
-            session.replay.extend(chunk.iter().copied());
-            let excess = session.replay.len().saturating_sub(REPLAY_BYTES);
-            session.replay.drain(..excess);
+            if session.pipe.is_none() {
+                session.replay.extend(chunk.iter().copied());
+                let excess = session.replay.len().saturating_sub(REPLAY_BYTES);
+                session.replay.drain(..excess);
+            }
             frames.push(proto::encode_bytes(KIND_BYTES, &id, chunk));
         }
         if batch.writable && !session.pending.is_empty() {
@@ -540,6 +574,15 @@ mod handover {
         for (id, session) in s.sessions.iter_mut() {
             // What the session printed and no window was sent yet goes along
             // too: left here, it would be shown by nobody.
+            if let Some(pipe) = &session.pipe {
+                // What it printed meanwhile is lost: the next window asks it
+                // for the whole thread anyway.
+                let Some((pid, input, output)) = pipe.handover() else { continue };
+                fds.push(input);
+                fds.push(output);
+                state.sessions.push(Handover { id: id.clone(), pid, size: session.size, fg: None, replay: Vec::new(), pipe: true });
+                continue;
+            }
             for chunk in session.sink.next(Duration::ZERO).output {
                 session.replay.extend(chunk);
             }
@@ -558,6 +601,7 @@ mod handover {
                 size: session.size,
                 fg: session.fg.clone(),
                 replay: session.replay.iter().copied().collect(),
+                pipe: false,
             });
         }
         let Ok(result) = send(exe, &state, &fds) else { return };
@@ -685,15 +729,24 @@ mod handover {
         let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
         channel.read_exact(&mut body)?;
         let state: Handovers = serde_json::from_slice(&body).map_err(std::io::Error::other)?;
-        let fds = receive_fds(&channel, state.sessions.len())?;
+        let count = state.sessions.iter().map(|s| if s.pipe { 2 } else { 1 }).sum();
+        let mut fds = receive_fds(&channel, count)?.into_iter();
         let mut s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for hook in state.hooks {
             s.hooks.insert(hook.task.clone(), hook);
         }
-        for (session, fd) in state.sessions.into_iter().zip(fds) {
-            let program = crate::procs::name(session.pid);
+        for session in state.sessions {
             let (sink, detached) = ByteSink::detached();
-            let Ok(handle) = gpui_cn::terminal::adopt(fd, session.pid, program, sink) else { continue };
+            let (handle, pipe): (Box<dyn gpui_cn::terminal::ByteHandle>, _) = if session.pipe {
+                let (Some(input), Some(output)) = (fds.next(), fds.next()) else { break };
+                let pipe = Arc::new(crate::daemon::pipe::Pipe::adopt(session.pid, input, output, sink));
+                (Box::new(crate::daemon::pipe::Handle(pipe.clone())), Some(pipe))
+            } else {
+                let Some(fd) = fds.next() else { break };
+                let program = crate::procs::name(session.pid);
+                let Ok(handle) = gpui_cn::terminal::adopt(fd, session.pid, program, sink) else { continue };
+                (handle, None)
+            };
             let handle = Arc::new(Mutex::new(handle));
             let detached = Arc::new(detached);
             s.sessions.insert(
@@ -706,6 +759,7 @@ mod handover {
                     pending: Vec::new(),
                     fg: session.fg,
                     size: session.size,
+                    pipe,
                 },
             );
             let shared = shared.clone();
@@ -765,7 +819,7 @@ mod tests {
             .expect("the daemon listens");
         proto::write_msg(&mut stream, &Msg::Hello { protocol: proto::PROTOCOL, version: crate::build_watch::build_id() }).unwrap();
         assert!(matches!(proto::read_frame(&mut stream), Ok(Frame::Msg(Msg::Welcome { .. }))));
-        let spec = Spec { cwd: dir.clone(), env: Vec::new(), input: Some("yes 0123456789012345678901234567890123456789\n".into()) };
+        let spec = Spec { cwd: dir.clone(), env: Vec::new(), input: Some("yes 0123456789012345678901234567890123456789\n".into()), program: Vec::new() };
         let size = Size { cols: 80, rows: 24, cell_w: 8, cell_h: 16 };
         proto::write_msg(&mut stream, &Msg::Open { id: "flood".into(), spec, size }).unwrap();
 
@@ -797,7 +851,7 @@ mod tests {
         proto::write_msg(&mut stream, &Msg::Hello { protocol: proto::PROTOCOL, version: crate::build_watch::build_id() }).unwrap();
         let Ok(Frame::Msg(Msg::Welcome { sessions, .. })) = proto::read_frame(&mut stream) else { panic!("no welcome") };
         assert_eq!(sessions, ["flood".to_string()]);
-        let spec = Spec { cwd: dir.clone(), env: Vec::new(), input: None };
+        let spec = Spec { cwd: dir.clone(), env: Vec::new(), input: None, program: Vec::new() };
         proto::write_msg(&mut stream, &Msg::Open { id: "flood".into(), spec, size }).unwrap();
         let replay = (0..50).find_map(|_| match proto::read_frame(&mut stream) {
             Ok(Frame::Bytes { kind: KIND_REPLAY, bytes, .. }) => Some(bytes),
@@ -805,6 +859,38 @@ mod tests {
         });
         assert!(replay.is_some_and(|bytes| bytes.windows(10).any(|w| w == b"0123456789")), "the replay has what it printed");
         proto::write_msg(&mut stream, &Msg::Kill { id: "flood".into() }).unwrap();
+
+        // The same for a program on pipes (an agent's host): held back
+        // through its pipe, its window let go of, the program kept.
+        MOST_QUEUED.store(0, std::sync::atomic::Ordering::Relaxed);
+        let mut flooded = UnixStream::connect(&path).unwrap();
+        proto::write_msg(&mut flooded, &Msg::Hello { protocol: proto::PROTOCOL, version: crate::build_watch::build_id() }).unwrap();
+        assert!(matches!(proto::read_frame(&mut flooded), Ok(Frame::Msg(Msg::Welcome { .. }))));
+        let spec = Spec { cwd: dir.clone(), env: Vec::new(), input: None, program: vec!["yes".into(), "0123456789012345678901234567890123456789".into()] };
+        proto::write_msg(&mut flooded, &Msg::Open { id: "pipe-flood".into(), spec, size }).unwrap();
+        std::thread::sleep(Duration::from_secs(1) + CLIENT_STALL + Duration::from_secs(2));
+        flooded.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let (mut waited, mut closed) = (0usize, false);
+        loop {
+            match flooded.read(&mut chunk) {
+                Ok(0) => {
+                    closed = true;
+                    break;
+                }
+                Ok(n) if waited > 16 * CLIENT_QUEUE_BYTES => panic!("{} bytes and more to come from the pipe", waited + n),
+                Ok(n) => waited += n,
+                Err(_) => break,
+            }
+        }
+        let most = MOST_QUEUED.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(most > 100_000 && most < 3 * CLIENT_QUEUE_BYTES, "{most} bytes of a pipe waited for a window that read none");
+        assert!(closed, "the window that took nothing from a pipe was let go of");
+        let mut stream = UnixStream::connect(&path).unwrap();
+        proto::write_msg(&mut stream, &Msg::Hello { protocol: proto::PROTOCOL, version: crate::build_watch::build_id() }).unwrap();
+        let Ok(Frame::Msg(Msg::Welcome { sessions, .. })) = proto::read_frame(&mut stream) else { panic!("no welcome") };
+        assert!(sessions.contains(&"pipe-flood".to_string()), "the program on pipes ran on: {sessions:?}");
+        proto::write_msg(&mut stream, &Msg::Kill { id: "pipe-flood".into() }).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(&dir);
     }

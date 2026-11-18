@@ -23,6 +23,11 @@ pub struct Spec {
     pub env: Vec<(String, String)>,
     /// Typed into the shell once it starts, such as the agent's command.
     pub input: Option<String>,
+    /// A program on pipes instead of a shell on a pty: the host of an ACP
+    /// agent. Its output is not replayed; it tells a window that attaches
+    /// what it needs itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub program: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -166,6 +171,9 @@ pub struct Handover {
     pub size: Size,
     pub fg: Option<Fg>,
     pub replay: Vec<u8>,
+    /// A pipe session: two descriptors travel for it, its input then its output.
+    #[serde(default)]
+    pub pipe: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]

@@ -127,7 +127,7 @@ mod tests {
     use super::*;
 
     fn profile(command: &str) -> Profile {
-        Profile { id: "oc".into(), name: "OpenCode".into(), kind: Kind::OpenCode, command: command.into(), env: Default::default() }
+        Profile { id: "oc".into(), name: "OpenCode".into(), kind: Kind::OpenCode, command: command.into(), env: Default::default(), ..Default::default() }
     }
 
     #[test]

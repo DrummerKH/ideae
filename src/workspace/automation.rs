@@ -65,6 +65,68 @@ impl Hint {
 }
 
 impl Workspace {
+    /// A chat agent's question through ideae's MCP server, about the task
+    /// its worktree is (the listener checked its token): answered from
+    /// that task alone.
+    pub(crate) fn on_mcp(&mut self, request: crate::mcp::Request, answer: async_channel::Sender<crate::mcp::Answer>, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::mcp::Answer;
+        let reply = |a: Answer| {
+            let _ = answer.try_send(a);
+        };
+        let Some(view) = self.find(&request.root).and_then(|(pi, ti)| self.projects[pi].tasks[ti].view.clone()) else {
+            return reply(Answer::error("This task is not open in ideae now."));
+        };
+        match request.tool.as_str() {
+            "open_files" => reply(Answer::ok(view.read(cx).mcp_open_files(cx))),
+            "diagnostics" => {
+                let path = request.args.get("path").and_then(serde_json::Value::as_str);
+                reply(match view.read(cx).mcp_diagnostics(path, cx) {
+                    Ok(text) => Answer::ok(text),
+                    Err(e) => Answer::error(e),
+                })
+            }
+            "run_check" => {
+                let root = request.root.clone();
+                self.resolved(&root.clone(), window, cx, move |this, resolved, window, cx| {
+                    let check = resolved.config.task.check.trim().to_string();
+                    if check.is_empty() {
+                        let _ = answer.try_send(Answer::error("This project has no check set up in ideae (Project settings… → Check): run its tests yourself."));
+                        return;
+                    }
+                    this.trusting(&root, &resolved, window, cx, move |_, allowed, _, cx| {
+                        if !allowed {
+                            let _ = answer.try_send(Answer::error("The user has not allowed this repository's .ideae.toml commands to run."));
+                            return;
+                        }
+                        let before = view.read(cx).mcp_check_started();
+                        view.update(cx, |t, cx| t.start_check(check, true, cx));
+                        // Its end, as the task's badge shows it; not past the task's,
+                        // nor past the check's own limit.
+                        let view = view.downgrade();
+                        let until = std::time::Instant::now() + std::time::Duration::from_secs(31 * 60);
+                        cx.spawn(async move |_, cx| {
+                            while std::time::Instant::now() < until {
+                                cx.background_executor().timer(std::time::Duration::from_millis(500)).await;
+                                let done = view.read_with(cx, |t, _| t.mcp_check_done(before));
+                                match done {
+                                    Ok(Some(text)) => {
+                                        let _ = answer.try_send(Answer::ok(text));
+                                        return;
+                                    }
+                                    Ok(None) if !answer.is_closed() => {}
+                                    _ => return,
+                                }
+                            }
+                            let _ = answer.try_send(Answer::error("The check did not end in its time."));
+                        })
+                        .detach();
+                    });
+                });
+            }
+            other => reply(Answer::error(format!("ideae has no tool {other}"))),
+        }
+    }
+
     /// What applies to the task at `path`, read off the UI thread.
     fn resolved(&self, path: &Path, window: &mut Window, cx: &mut Context<Self>, then: impl FnOnce(&mut Self, Resolved, &mut Window, &mut Context<Self>) + 'static) {
         let root = path.to_path_buf();

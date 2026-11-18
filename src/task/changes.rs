@@ -406,6 +406,22 @@ impl ChangesView {
         self.select_change(&hunk, true, cx);
     }
 
+    /// The change of `path` at or after `line` (else its last), as the
+    /// one at hand, in view.
+    pub(super) fn show_change_at(&mut self, path: &str, line: u32, cx: &mut Context<Self>) -> bool {
+        let found = {
+            let hunks = self.hunks_in(path);
+            hunks.iter().map(|&i| &self.hunks[i]).find(|h| h.line >= line).or_else(|| hunks.last().map(|&i| &self.hunks[i])).cloned()
+        };
+        match found {
+            Some(hunk) => {
+                self.select_change(&hunk, true, cx);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Marks `hunk` as the change at hand, beside its lines: what is
     /// selected stays selected.
     fn select_change(&mut self, hunk: &git::Hunk, scroll: bool, cx: &mut Context<Self>) {

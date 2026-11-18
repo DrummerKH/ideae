@@ -43,6 +43,7 @@ use panes::Pane;
 mod git_ui;
 mod helpers;
 mod term;
+mod chat;
 mod file;
 mod changes;
 mod session;
@@ -56,12 +57,14 @@ mod bookmarks;
 mod change_popup;
 mod file_tree;
 mod strip;
+mod tell;
 use file_tree::*;
 use git_ui::*;
 pub use helpers::*;
 // Named, to come before the one of the same name in gpui's own glob.
 use helpers::outline;
 pub use term::*;
+pub use chat::{ChatEvent, ChatView};
 pub use file::*;
 pub use changes::*;
 pub use session::*;
@@ -76,6 +79,8 @@ pub use auto::AutoAsk;
 
 enum TabKind {
     Terminal(Entity<TermView>),
+    /// An agent that speaks ACP: its conversation and a prompt.
+    Chat(Entity<ChatView>),
     Changes,
     History,
     File(Entity<FileView>),
@@ -350,6 +355,8 @@ pub enum TaskEvent {
 impl EventEmitter<TaskEvent> for TaskView {}
 
 pub struct TaskView {
+    /// What the chat's agent was last reported doing, not to report it twice.
+    chat_told: Option<(String, Option<String>)>,
     pub root: PathBuf,
     pub branch: SharedString,
     pub agent_status: crate::agent::AgentStatus,
@@ -572,6 +579,7 @@ impl TaskView {
         // The agent's terminal, or a shell when there is no agent; more shells
         // are a "+" away.
         match &launch {
+            Some(launch) if launch.profile.acp => tabs.push(Self::make_chat(&root, launch, task_env.clone(), window, cx)),
             Some(launch) => {
                 let mut env = task_env.clone();
                 env.extend(launch.env());
@@ -728,6 +736,7 @@ impl TaskView {
         });
 
         let mut this = Self {
+            chat_told: None,
             root,
             branch: branch.into(),
             agent_status: crate::agent::AgentStatus::Unknown,
@@ -897,7 +906,7 @@ impl TaskView {
         let (state, session) = match daemon {
             #[cfg(unix)]
             Some(daemon) => {
-                let spec = crate::daemon::proto::Spec { cwd: cwd.clone(), env, input };
+                let spec = crate::daemon::proto::Spec { cwd: cwd.clone(), env, input, program: Vec::new() };
                 let id = session.clone();
                 (cx.new(|cx| daemon.terminal(id, spec, config, window, cx)), Some(session))
             }
@@ -986,7 +995,14 @@ impl TaskView {
     /// What Restart Agent asks: its program is not running in its tab.
     pub fn agent_restartable(&self, cx: &App) -> bool {
         self.has_agent()
-            && self.tabs.iter().any(|t| t.title == "agent" && matches!(&t.kind, TabKind::Terminal(v) if v.read(cx).agent_at_prompt(cx)))
+            && self.tabs.iter().any(|t| {
+                t.title == "agent"
+                    && match &t.kind {
+                        TabKind::Terminal(v) => v.read(cx).agent_at_prompt(cx),
+                        TabKind::Chat(chat) => !chat.read(cx).thread.status.live(),
+                        _ => false,
+                    }
+            })
     }
 
     pub fn focus_mode(&self) -> bool {
@@ -996,7 +1012,7 @@ impl TaskView {
     pub fn tabs_state(&self) -> TabsState {
         let focused = self.focused_ix();
         let front = focused.map(|ix| &self.tabs[ix]);
-        let agent = |t: &TabItem| t.title == "agent" && matches!(t.kind, TabKind::Terminal(_));
+        let agent = |t: &TabItem| t.title == "agent" && matches!(t.kind, TabKind::Terminal(_) | TabKind::Chat(_));
         // The terminal Shell goes to: another one in front is not it.
         let shell = self.tabs.iter().position(|t| t.title != "agent" && matches!(t.kind, TabKind::Terminal(_)));
         TabsState {
@@ -1402,6 +1418,7 @@ impl TaskView {
     pub fn front_tab_has_focus(&self, window: &Window, cx: &App) -> bool {
         match self.focused_ix().and_then(|ix| self.tabs.get(ix)).map(|t| &t.kind) {
             Some(TabKind::Terminal(view)) => view.read(cx).state.read(cx).focus_handle().is_focused(window),
+            Some(TabKind::Chat(chat)) => chat.read(cx).is_focused(window, cx),
             Some(TabKind::File(file)) => file.read(cx).editor.read(cx).focus_handle(cx).is_focused(window),
             Some(TabKind::Browser(view)) => view.focus_handle(cx).is_focused(window),
             Some(TabKind::Changes) => self.changes.read(cx).diff.read(cx).focus_handle(cx).is_focused(window),
@@ -1420,6 +1437,10 @@ impl TaskView {
         match self.focused_ix().and_then(|ix| self.tabs.get(ix)).map(|t| &t.kind) {
             Some(TabKind::Terminal(view)) => {
                 view.read(cx).state.read(cx).focus_handle().clone().focus(window, cx)
+            }
+            Some(TabKind::Chat(chat)) => {
+                let handle = chat.read(cx).focus_handle(cx);
+                handle.focus(window, cx)
             }
             Some(TabKind::File(file)) => {
                 file.read(cx).editor.read(cx).focus_handle(cx).focus(window, cx)
@@ -1532,6 +1553,7 @@ impl TaskView {
                 self.remove_tab(ix, window, cx)
             }
             Some(TabKind::Terminal(_)) if self.tabs[ix].title == "agent" => {}
+            Some(TabKind::Chat(_)) => {}
             Some(TabKind::Terminal(view)) => {
                 let state = view.read(cx).state.clone();
                 if !state.read(cx).needs_confirm_close() {
@@ -1868,6 +1890,29 @@ impl TaskView {
             }
         };
         self.activate(ix, window, cx);
+    }
+
+    /// An agent's change of `path` (absolute or in the task) in the Changes
+    /// tab, at its line, where it is staged or reverted by parts.
+    pub(super) fn review_change(&mut self, path: &str, line: u32, window: &mut Window, cx: &mut Context<Self>) {
+        let rel = std::path::Path::new(path).strip_prefix(&self.root).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| path.to_string());
+        if !self.changed_paths.contains(rel.as_str()) {
+            window.push_notification(Notification::info(format!("{rel} has no uncommitted change now: committed or put back since.")), cx);
+            return;
+        }
+        self.changes.update(cx, |c, cx| c.set_scope(DiffScope::Uncommitted, cx));
+        // Beside the chat, as the files it follows, not over it.
+        self.show_changed_file(rel.clone().into(), window, cx);
+        if let Some(ix) = self.tabs.iter().position(|t| matches!(t.kind, TabKind::Changes)) {
+            self.beside_chat(ix, window, cx);
+            self.show_changed_file(rel.clone().into(), window, cx);
+            if let Some(chat) = self.tabs.iter().position(|t| matches!(t.kind, TabKind::Chat(_))) {
+                self.activate(chat, window, cx);
+            }
+        }
+        self.changes.update(cx, |c, cx| {
+            c.show_change_at(&rel, line, cx);
+        });
     }
 
     fn show_changed_file(&mut self, path: SharedString, window: &mut Window, cx: &mut Context<Self>) {
@@ -2495,9 +2540,10 @@ mod diff_update_tests {
     }
 }
 
-/// A tab's ×, a middle click on it and its Close: every tab but the agent's.
+/// A tab's ×, a middle click on it and its Close: every tab but the agent's
+/// (a terminal or a chat).
 fn closable(tab: &TabItem) -> bool {
-    !(matches!(tab.kind, TabKind::Terminal(_)) && tab.title == "agent")
+    !(matches!(tab.kind, TabKind::Terminal(_)) && tab.title == "agent") && !matches!(tab.kind, TabKind::Chat(_))
 }
 
 /// Close others, to the right and all close without asking: files, pictures,
@@ -2508,6 +2554,6 @@ fn closed_in_bulk(tab: &TabItem, cx: &App) -> bool {
         && match &tab.kind {
             TabKind::File(f) => !f.read(cx).dirty && f.read(cx).saving.is_none(),
             TabKind::Binary(_) | TabKind::Browser(_) | TabKind::Diff(_) | TabKind::Changes | TabKind::History => true,
-            TabKind::Terminal(_) => false,
+            TabKind::Terminal(_) | TabKind::Chat(_) => false,
         }
 }

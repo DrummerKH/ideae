@@ -10,7 +10,8 @@
 //! - `sessions/<n>/<file>`: the files of the task's n-th agent session,
 //!   relative to where its adapter keeps them (`Adapter::session_base`);
 //! - `work/unpushed.bundle`: commits on no remote and no other branch;
-//! - `work/uncommitted.patch`: changes not committed, new files too, binary-safe.
+//! - `work/uncommitted.patch`: changes not committed, new files too, binary-safe;
+//! - `chat.jsonl`: a chat agent's conversation as the app kept it (src/acp).
 //!
 //! gzip and not zstd: `flate2` (pure Rust) is in the build already, through
 //! the image crates, where zstd would add a C library to every target; an
@@ -31,6 +32,7 @@ const EXT: &str = ".tar.gz";
 const META: &str = "task.json";
 const BUNDLE: &str = "work/unpushed.bundle";
 const PATCH: &str = "work/uncommitted.patch";
+const CHAT: &str = "chat.jsonl";
 
 /// What an archive says of its task.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -277,6 +279,10 @@ pub fn write(job: Job) -> Result<Meta, String> {
     meta.uncommitted = uncommitted_patch(&root, &scratch.0.join("index"), &patch).map_err(|e| format!("the uncommitted changes: {e}"))?;
     if !meta.uncommitted.is_empty() {
         work.push((patch, PATCH));
+    }
+    let chat = crate::acp::journal_path(&root);
+    if chat.is_file() {
+        work.push((chat, CHAT));
     }
 
     // The agents' sessions, through their adapters.
@@ -623,6 +629,7 @@ pub fn restore(repo: &Path, archive: &Path, meta: &Meta, plan: &Plan) -> Result<
             let target = match name.as_str() {
                 BUNDLE if plan.commits => Some(bundle.clone()),
                 PATCH if plan.changes => Some(patch.clone()),
+                CHAT => Some(crate::acp::journal_path(&path)),
                 _ => name.strip_prefix("sessions/").and_then(|rest| {
                     let (n, rel) = rest.split_once('/')?;
                     let base = bases.get(n.parse::<usize>().ok()?)?.as_ref()?;
@@ -776,7 +783,7 @@ mod tests {
     use crate::pr::PrState;
 
     fn profile(id: &str, kind: Kind) -> Profile {
-        Profile { id: id.into(), name: id.into(), kind, command: kind.program().into(), env: Default::default() }
+        Profile { id: id.into(), name: id.into(), kind, command: kind.program().into(), env: Default::default(), ..Default::default() }
     }
 
     #[test]
@@ -891,9 +898,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_task_goes_into_an_archive_and_comes_back() {
+        let _one = crate::workspace::variants::tests::ONE_WINDOW.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("ideae-archive-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        // SAFETY: under the lock the tests share; the chat's journal goes next to this state.
+        unsafe { std::env::set_var("IDEAE_STATE", dir.join("state.json")) };
         sh(&dir, "git init -q --bare remote.git; git init -q -b main repo; cd repo; git config user.email t@t; git config user.name t
             echo one > f.txt; git add f.txt; git commit -qm base; git remote add origin ../remote.git; git push -q origin main
             git fetch -q origin; git worktree add -q -b fix ../fix origin/main
@@ -911,6 +921,9 @@ mod tests {
         std::fs::create_dir_all(projects.join("s-1/subagents")).unwrap();
         std::fs::write(projects.join("s-1.jsonl"), "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Done with the form.\"}]}}\n").unwrap();
         std::fs::write(projects.join("s-1/subagents/agent-a.jsonl"), "{}\n").unwrap();
+        let chat = crate::acp::journal_path(&task);
+        std::fs::create_dir_all(chat.parent().unwrap()).unwrap();
+        std::fs::write(&chat, "{\"op\":\"Title\",\"title\":\"login\"}\n").unwrap();
 
         let base = git(&task, &["merge-base", "HEAD", "origin/main"]).unwrap().trim().to_string();
         let meta = Meta {
@@ -935,13 +948,14 @@ mod tests {
         assert_eq!(written.uncommitted, ["f.txt", "new.bin"]);
         assert_eq!(written.commits.len(), 2);
         let names: Vec<String> = entries(&dest).unwrap().into_iter().map(|(n, _)| n).collect();
-        assert_eq!(names, ["task.json", "sessions/0/s-1.jsonl", "sessions/0/s-1/subagents/agent-a.jsonl", BUNDLE, PATCH]);
+        assert_eq!(names, ["task.json", "sessions/0/s-1.jsonl", "sessions/0/s-1/subagents/agent-a.jsonl", BUNDLE, PATCH, CHAT]);
         let listed = list(&archives);
         assert_eq!((listed.len(), listed[0].meta.title.as_str(), listed[0].key()), (1, "Fix login", "fix-1".to_string()));
 
         // Gone, as an archive leaves it.
         crate::git::remove_task_worktree(&repo, &task, "fix", false).unwrap();
         assert!(!task.exists() && !crate::git::branch_exists(&repo, "fix"));
+        assert!(!chat.exists(), "the chat went with its task");
 
         let plan = Plan { start: Start::Origin, branch: crate::git::free_branch_name(&repo, "fix"), commits: true, changes: true, profiles: vec![Some(claude)], copy_env: false };
         assert_eq!(plan.branch, "fix-2", "origin has a fix");
@@ -957,6 +971,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(at.join("f.txt")).unwrap(), "one\ntwo\nchanged\n");
         assert_eq!(std::fs::read(at.join("new.bin")).unwrap(), b"bin\0ary");
         assert!(!at.join("p.txt").exists(), "from origin's main, not the old branch");
+        assert!(std::fs::read_to_string(crate::acp::journal_path(at)).unwrap().contains("login"), "the chat back, for the new worktree");
         let moved = config.join("projects").join(crate::agents::claude::project_dir(at));
         assert!(moved.join("s-1.jsonl").is_file() && moved.join("s-1/subagents/agent-a.jsonl").is_file(), "the session under the new folder, by its id");
         let claude = Profile { env: [("CLAUDE_CONFIG_DIR".to_string(), config.display().to_string())].into(), ..Profile::claude_code() };

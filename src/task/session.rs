@@ -22,6 +22,7 @@ impl TaskView {
                 match &tab.kind {
                     // The task's first terminal: the agent, or the shell without one.
                     TabKind::Terminal(_) if tab.title == "agent" || tab.title == "shell" => s.kind = "agent".into(),
+                    TabKind::Chat(_) => s.kind = "agent".into(),
                     TabKind::Terminal(view) if view.read(cx).service.is_some() => {
                         s.kind = "service".into();
                         s.path = view.read(cx).service.clone();
@@ -149,6 +150,7 @@ impl TaskView {
             .iter()
             .filter_map(|t| match &t.kind {
                 TabKind::Terminal(view) => view.read(cx).session().map(str::to_string),
+                TabKind::Chat(chat) => chat.read(cx).session().map(str::to_string),
                 _ => None,
             })
             .collect()
@@ -174,6 +176,9 @@ impl TaskView {
     pub(super) fn end(&mut self, strays: bool, cx: &mut Context<Self>) {
         self.save_all_now(cx);
         self.auto.stop();
+        if let Some(chat) = self.agent_chat() {
+            chat.update(cx, |c, _| c.end());
+        }
         let task = self.root.display().to_string();
         let socket = self.hook_socket.clone().filter(|_| strays);
         let terminals: Vec<Entity<TermView>> = self.tabs.iter().filter_map(|tab| if let TabKind::Terminal(view) = &tab.kind { Some(view.clone()) } else { None }).collect();

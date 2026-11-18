@@ -81,6 +81,12 @@ pub struct Settings {
     pub lsp_off: Vec<String>,
     /// Minutes a task out of view keeps its language servers.
     pub lsp_idle_minutes: u32,
+    /// Minutes a chat agent with nothing to do keeps running in a task out
+    /// of view; 0: no end.
+    pub agent_idle_minutes: u32,
+    /// Minutes a chat agent's question waits before it is declined; 0: it
+    /// waits for you.
+    pub agent_unanswered_minutes: u32,
     pub notifications: bool,
     /// A notification has the agent's words (its answer, its question);
     /// off, only "Finished" or "Needs your answer".
@@ -207,6 +213,8 @@ impl Default for Settings {
             quick_agent: String::new(),
             lsp_off: Vec::new(),
             lsp_idle_minutes: 15,
+            agent_idle_minutes: 30,
+            agent_unanswered_minutes: 0,
             notifications: true,
             notify_said: true,
             copy_env: true,
@@ -333,6 +341,16 @@ pub fn init_settings(settings: &Settings) {
     }
 }
 
+/// Changes one agent profile in the settings in force, when `change` says
+/// it changed anything.
+pub fn update_profile(id: &str, change: impl FnOnce(&mut crate::agents::Profile) -> bool) {
+    let mut settings = settings();
+    let changed = settings.agents.iter_mut().find(|p| p.id == id).is_some_and(change);
+    if changed {
+        set_settings(settings);
+    }
+}
+
 pub fn set_settings(mut settings: Settings) {
     settings.normalize();
     *SETTINGS.write().unwrap() = Some(settings);
@@ -422,6 +440,9 @@ pub struct TaskState {
     /// The agent chosen when it was made, by profile id.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub agent: String,
+    /// A chat agent's choices for this task alone (a variant's model).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<(String, String)>,
     /// Its agents' sessions, the one it runs last.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sessions: Vec<AgentSession>,
