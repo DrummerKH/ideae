@@ -124,12 +124,34 @@ fn paths_of(tool: &Tool, raw: &Value) -> Vec<PathBuf> {
     paths
 }
 
+/// A path with the part of it that exists taken where its links lead; what
+/// does not exist yet follows as it is written.
+fn where_it_leads(path: &Path) -> PathBuf {
+    let mut existing = path;
+    let mut rest = Vec::new();
+    while !existing.exists() {
+        let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else { break };
+        rest.push(name.to_os_string());
+        existing = parent;
+    }
+    match existing.canonicalize() {
+        Ok(mut resolved) => {
+            resolved.extend(rest.iter().rev());
+            resolved
+        }
+        Err(_) => path.to_path_buf(),
+    }
+}
+
 /// `path` is in the worktree `root`, and not in its git folder. A path
 /// need not exist yet: what exists of it is taken where its links lead,
 /// before a `..` goes up from it, as the system would.
 pub fn inside(root: &Path, path: &Path) -> bool {
     let joined = if path.is_absolute() { path.to_path_buf() } else { root.join(path) };
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    // The root as the path is taken below: one that is not there (yet, or in
+    // a test) by what exists of it, or the two are told apart by a drive
+    // letter only one of them was given.
+    let root = where_it_leads(root);
     let mut real = PathBuf::new();
     for part in joined.components() {
         match part {
@@ -143,18 +165,7 @@ pub fn inside(root: &Path, path: &Path) -> bool {
             other => real.push(other),
         }
     }
-    // The part that exists, where its links lead.
-    let mut existing = real.as_path();
-    let mut rest = Vec::new();
-    while !existing.exists() {
-        let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else { break };
-        rest.push(name.to_os_string());
-        existing = parent;
-    }
-    if let Ok(mut resolved) = existing.canonicalize() {
-        resolved.extend(rest.iter().rev());
-        real = resolved;
-    }
+    let real = where_it_leads(&real);
     // On a system whose names ignore case, `.GIT` is `.git` too.
     real.starts_with(&root) && !real.strip_prefix(&root).is_ok_and(|rest| rest.components().next().is_some_and(|c| c.as_os_str().eq_ignore_ascii_case(".git")))
 }

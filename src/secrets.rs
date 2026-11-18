@@ -309,7 +309,10 @@ mod tests {
         p.set_env_text("CLAUDE_CONFIG_DIR=/c");
         assert!(p.secrets.is_empty() && super::get("cc/ANTHROPIC_API_KEY").is_none(), "taken out, forgotten");
         let launch = crate::agents::Launch { profile: crate::agents::Profile { env: [("GH_TOKEN".into(), "$(echo t)".into())].into(), ..p }, start: crate::agents::Start::New(None), unasked: false, options: Vec::new() };
-        assert!(launch.command().starts_with("GH_TOKEN=\"$(echo t)\" "), "{}", launch.command());
+        // In a shell the command makes the value itself; Windows has no such line, and the app runs it.
+        if cfg!(unix) {
+            assert!(launch.command().starts_with("GH_TOKEN=\"$(echo t)\" "), "{}", launch.command());
+        }
         assert!(!launch.env().iter().any(|(k, _)| k == "GH_TOKEN"));
         assert_eq!(crate::agents::run_made(vec![("GH_TOKEN".into(), "$(echo t)".into())]), vec![("GH_TOKEN".to_string(), "t".to_string())]);
         super::flush();

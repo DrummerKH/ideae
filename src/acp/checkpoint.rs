@@ -14,7 +14,9 @@ const UNTRACKED_MOST: u64 = 16 << 20;
 
 fn git(cwd: &Path) -> std::process::Command {
     let mut c = crate::procs::command("git");
-    c.current_dir(cwd).stdin(Stdio::null()).stderr(Stdio::null());
+    // A file goes back byte for byte as it was kept: not with the line ends
+    // git would give it where it is set to change them (Windows' default).
+    c.args(["-c", "core.autocrlf=false", "-c", "core.eol=lf"]).current_dir(cwd).stdin(Stdio::null()).stderr(Stdio::null());
     c
 }
 
