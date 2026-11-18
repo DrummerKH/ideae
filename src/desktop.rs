@@ -73,8 +73,17 @@ pub fn notify(title: &str, body: &str) {
         );
         crate::procs::command("powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command", &script]).spawn()
     };
+    // As the app's own where it can be; else by AppleScript, as Script Editor's.
     #[cfg(target_os = "macos")]
-    let child = osascript_notification(title, body).spawn();
+    let child = {
+        let (again_title, again_body) = (title.to_string(), body.to_string());
+        if crate::mac_notify::send(title, body, None, move || {
+            let _ = osascript_notification(&again_title, &again_body).spawn().map(|mut child| child.wait());
+        }) {
+            return;
+        }
+        osascript_notification(title, body).spawn()
+    };
     #[cfg(all(unix, not(target_os = "macos")))]
     let child = crate::procs::command("notify-send").args(["-a", APP_ID, title, body]).spawn();
     // Waited for off the UI thread, or each one stays a zombie.
@@ -87,11 +96,23 @@ pub fn notify(title: &str, body: &str) {
 /// notify-send's default action, waited for on a thread of its own; a
 /// Windows balloon reports no clicks, so there it is a plain one.
 pub fn notify_with(title: &str, body: &str, on_click: impl FnOnce() + Send + 'static) {
-    // Neither a Windows balloon nor an AppleScript notification reports clicks.
-    #[cfg(any(windows, target_os = "macos"))]
+    // A Windows balloon reports no clicks.
+    #[cfg(windows)]
     {
         drop(on_click);
         notify(title, body);
+    }
+    // The app's own notification comes back when clicked; one sent by
+    // AppleScript (from a process that is no app: the daemon) does not.
+    #[cfg(target_os = "macos")]
+    {
+        let (again_title, again_body) = (title.to_string(), body.to_string());
+        let refused = move || {
+            let _ = osascript_notification(&again_title, &again_body).spawn().map(|mut child| child.wait());
+        };
+        if !crate::mac_notify::send(title, body, Some(Box::new(on_click)), refused) {
+            notify(title, body);
+        }
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {

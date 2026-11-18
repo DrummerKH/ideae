@@ -320,6 +320,15 @@ impl Workspace {
         if let Some(width) = saved.side_panel_width {
             cx.set_global(SidePanelWidth(px(width)));
         }
+        #[cfg(target_os = "macos")]
+        crate::mac_notify::of_the_window();
+        // `IDEAE_NOTIFY="title\nbody"`: a notification at the start, for a run nobody can make one in.
+        if let Ok(text) = std::env::var("IDEAE_NOTIFY") {
+            let (title, body) = text.split_once('\n').unwrap_or((text.as_str(), ""));
+            #[cfg(target_os = "macos")]
+            eprintln!("notifications: bundle {:?}, as the app {}", crate::mac_notify::bundle(), crate::mac_notify::as_the_app());
+            crate::desktop::notify_with(title, body, || eprintln!("notifications: clicked"));
+        }
         // A task's Chrome can be started by its agent before any web tab is drawn.
         crate::browser::note_screen(window.scale_factor());
         let side = crate::task::SideLayout::default();

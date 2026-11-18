@@ -91,7 +91,12 @@ do. The sidebar shows working / needs input / done, and a desktop notification f
 A question Claude Code asks (AskUserQuestion) or a plan it waits to have
 approved counts as needing you. Notifications carry the agent's last answer
 or its question; Settings → General → "Show what the agent said in
-notifications" off, they say only Finished or Needs your answer.
+notifications" off, they say only Finished or Needs your answer. On macOS a
+notification is the app's own (its icon, and a click goes to the task) when
+the app is installed in a folder of applications and its window is open;
+the system asks once whether it may. Raised while the window is closed, or
+by a binary run from a build folder, it is AppleScript's, and a click on it
+opens Script Editor.
 The Changes and Files panels mark the file the agent is writing to and those
 it wrote to since your last prompt.
 

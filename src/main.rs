@@ -23,6 +23,8 @@ mod ide;
 mod keymap;
 mod keys;
 mod lsp;
+#[cfg(target_os = "macos")]
+mod mac_notify;
 mod lsp_install;
 mod merged_branches;
 mod commands;
