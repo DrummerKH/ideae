@@ -411,7 +411,16 @@ impl Archived {
 }
 
 /// Every archive under `root`, newest first.
+/// Each with its meta read once: Recent tasks lists them at every opening.
+/// Kept by file, size and time written; what is gone from disk leaves it.
 pub fn list(root: &Path) -> Vec<Archived> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    type Seen = HashMap<PathBuf, (u64, Option<std::time::SystemTime>, Arc<Meta>)>;
+    static READ: Mutex<Option<Seen>> = Mutex::new(None);
+    let mut read = READ.lock().unwrap_or_else(|e| e.into_inner());
+    let before = read.take().unwrap_or_default();
+    let mut now: Seen = HashMap::new();
     let mut all = Vec::new();
     for dir in std::fs::read_dir(root).into_iter().flatten().flatten() {
         for entry in std::fs::read_dir(dir.path()).into_iter().flatten().flatten() {
@@ -420,11 +429,21 @@ pub fn list(root: &Path) -> Vec<Archived> {
             if name.starts_with('.') || !name.ends_with(EXT) {
                 continue;
             }
-            let Ok(meta) = read_meta(&file) else { continue };
-            let size = entry.metadata().map_or(0, |m| m.len());
-            all.push(Archived { file, size, meta: std::sync::Arc::new(meta) });
+            let stat = entry.metadata().ok();
+            let size = stat.as_ref().map_or(0, |m| m.len());
+            let written = stat.and_then(|m| m.modified().ok());
+            let meta = match before.get(&file) {
+                Some((s, w, meta)) if *s == size && *w == written => meta.clone(),
+                _ => match read_meta(&file) {
+                    Ok(meta) => Arc::new(meta),
+                    Err(_) => continue,
+                },
+            };
+            now.insert(file.clone(), (size, written, meta.clone()));
+            all.push(Archived { file, size, meta });
         }
     }
+    *read = Some(now);
     all.sort_by(|a, b| b.meta.archived.cmp(&a.meta.archived));
     all
 }

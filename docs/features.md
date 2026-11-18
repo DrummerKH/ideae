@@ -56,7 +56,8 @@ not offered again. The merged PRs stay on GitHub. Looked for in the
 background with `gh` every half hour, and when a task's PR is merged.
 
 **From an archived task…** (a project's + and menu; "Archived tasks…" in the
-command palette for all projects in the window) lists them, newest first,
+command palette for all projects in the window; Recent tasks, Ctrl+E, once
+something is typed, after the tasks there are) lists them, newest first,
 searched by title, prompt, branch, PR and date. Restore takes the goal up
 again: a new worktree from origin, as a new task is made, on a branch named
 from the title that you can change, or, when its PR is
@@ -254,3 +255,8 @@ picture of it go into the prompt.
   larger, and hides what git ignores (keys, local settings) until asked for.
 - Focus mode (Shift+Esc) puts one pane over the whole window.
 - Dragged narrow, the sidebar becomes a rail of tasks that opens on hover.
+- Recent tasks (Ctrl+E) marks each with its agent's status, as the sidebar
+  does, and says which are paused and how many files changed. Lists of this
+  kind go a page at a time with Page Up and Page Down.
+- A task dragged down in the sidebar goes after the one it is dropped on,
+  dragged up before it, where the line shows.

@@ -13,7 +13,7 @@ use rust_i18n::t;
 use crate::{
     ActiveTheme as _, ElementExt as _, Icon, IconName, IndexPath, StyledExt as _,
     VirtualListScrollHandle,
-    actions::{Cancel, Confirm, SelectDown, SelectUp},
+    actions::{Cancel, Confirm, SelectDown, SelectPageDown, SelectPageUp, SelectUp},
     command::{
         command::CommandOptions,
         item::{CommandEntry, CommandItem},
@@ -66,6 +66,9 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("enter", Confirm { secondary: false }, context),
         KeyBinding::new("up", SelectUp, context),
         KeyBinding::new("down", SelectDown, context),
+        // ideae patch: Page Up and Down go by what the list shows.
+        KeyBinding::new("pageup", SelectPageUp, context),
+        KeyBinding::new("pagedown", SelectPageDown, context),
     ]);
 }
 
@@ -591,6 +594,53 @@ impl CommandState {
         self.select_by(1, window, cx);
     }
 
+    /// ideae patch: as many items as the list shows, less one, to the first
+    /// or last enabled one that far, without wrapping around.
+    fn select_page(&mut self, down: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let len = self.matched.len();
+        if len == 0 {
+            return;
+        }
+        let rem = window.rem_size();
+        let view = match self.options.max_h {
+            gpui::DefiniteLength::Absolute(length) => length.to_pixels(rem),
+            gpui::DefiniteLength::Fraction(_) => px(360.),
+        };
+        let heights: Vec<Pixels> = self
+            .matched
+            .iter()
+            .filter_map(|m| self.row_sizes.get(m.row_ix).map(|s| s.height))
+            .collect();
+        let row = if heights.is_empty() {
+            px(32.)
+        } else {
+            heights.iter().fold(px(0.), |a, h| a + *h) / heights.len() as f32
+        };
+        let page = ((view / row.max(px(1.))).floor() as usize).saturating_sub(1).max(1);
+        let from = self.selected_index.unwrap_or(0);
+        let target = if down { (from + page).min(len - 1) } else { from.saturating_sub(page) };
+        let enabled = |ix: &usize| !self.matched[*ix].disabled;
+        let next = if down {
+            (from..=target).rev().find(enabled)
+        } else {
+            (target..=from).find(enabled)
+        };
+        if let Some(next) = next
+            && self.selected_index != Some(next)
+        {
+            self.pending_scroll = self.matched.get(next).map(|matched| matched.row_ix);
+            self.select(next, window, cx);
+        }
+    }
+
+    fn on_action_page_up(&mut self, _: &SelectPageUp, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_page(false, window, cx);
+    }
+
+    fn on_action_page_down(&mut self, _: &SelectPageDown, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_page(true, window, cx);
+    }
+
     fn on_action_confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(selected_index) = self.selected_index {
             self.confirm(selected_index, window, cx);
@@ -925,6 +975,8 @@ impl Render for CommandState {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::on_action_select_up))
             .on_action(cx.listener(Self::on_action_select_down))
+            .on_action(cx.listener(Self::on_action_page_up))
+            .on_action(cx.listener(Self::on_action_page_down))
             .on_action(cx.listener(Self::on_action_confirm))
             .on_action(cx.listener(Self::on_action_cancel))
             .w_full()

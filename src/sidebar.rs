@@ -17,7 +17,8 @@ use crate::{agent::AgentStatus, task, workspace::Workspace};
 #[derive(Clone)]
 pub enum DraggedRow {
     Project { ix: usize, name: SharedString },
-    Task { project: usize, path: PathBuf, name: SharedString },
+    /// `at`: its place in its project when the drag began.
+    Task { project: usize, at: usize, path: PathBuf, name: SharedString },
 }
 
 impl Render for DraggedRow {
@@ -1053,18 +1054,21 @@ impl Workspace {
         // A variant keeps its place in its group.
         if !in_active && !grouped {
             row = row
-                .on_drag(DraggedRow::Task { project: pi, path: path.clone(), name: label }, |row, _, _, cx| {
+                .on_drag(DraggedRow::Task { project: pi, at: ti, path: path.clone(), name: label }, |row, _, _, cx| {
                     cx.new(|_| row.clone())
                 })
+                // Dragged down, a task goes after the one it is dropped on;
+                // up, before it: either way to where the line shows.
                 .drag_over::<DraggedRow>(move |s, row, _, cx| match row {
+                    DraggedRow::Task { project, at, .. } if *project == pi && *at < ti => s.border_b_2().border_color(cx.theme().primary),
                     DraggedRow::Task { project, .. } if *project == pi => s.border_t_2().border_color(cx.theme().primary),
                     _ => s,
                 })
                 .on_drop(cx.listener(move |this, row: &DraggedRow, _, cx| {
-                    if let DraggedRow::Task { project, path, .. } = row {
-                        if let Some((_, to)) = this.find(&drop_path) {
-                            this.move_task(path, *project, Some(to), cx);
-                        }
+                    if let DraggedRow::Task { project, path, .. } = row
+                        && let (Some((_, from)), Some((_, to))) = (this.find(path), this.find(&drop_path))
+                    {
+                        this.move_task(path, *project, Some(if from < to { to + 1 } else { to }), cx);
                     }
                 }));
         }
