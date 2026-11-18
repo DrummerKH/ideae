@@ -505,7 +505,7 @@ fn agents_page(draft: &Draft, lsp_switch: SettingItem, token_warn: SettingField<
                     .gap_2()
                     .py_1()
                     .items_center()
-                    .child(div().w(px(18.)).text_xs().text_color(muted).child(p.letter()))
+                    .child(div().w(px(28.)).flex().justify_center().child(crate::workspace::spaces::agent_chip(&p.letter(), p.color, cx.theme().border, muted)))
                     .child(
                         gpui_kit::component::v_flex()
                             .flex_1()
@@ -819,6 +819,9 @@ fn profile_dialog(draft: Draft, at: Option<usize>, template: Option<crate::agent
     let env = cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 6).placeholder("KEY=value, one a line: CLAUDE_CONFIG_DIR=~/.claude-work"));
     let key = cx.new(|cx| InputState::new(window, cx).placeholder("Paste a key"));
     let limit = cx.new(|cx| InputState::new(window, cx).placeholder("No limit"));
+    let mark = cx.new(|cx| InputState::new(window, cx).placeholder("Its letter"));
+    mark.update(cx, |i, cx| i.set_value(editing.mark.clone(), window, cx));
+    let color = Rc::new(Cell::new(editing.color));
     limit.update(cx, |i, cx| i.set_value(editing.daily_limit.map(|l| format!("{l}")).unwrap_or_default(), window, cx));
     key.update(cx, |i, cx| i.set_masked(true, window, cx));
     name.update(cx, |i, cx| i.set_value(editing.name.clone(), window, cx));
@@ -840,7 +843,8 @@ fn profile_dialog(draft: Draft, at: Option<usize>, template: Option<crate::agent
     let forget = Rc::new(Cell::new(false));
     window.open_dialog(cx, move |dialog, _, cx| {
         let muted = cx.theme().muted_foreground;
-        let (name, command, env, kind, chat, draft, editing, key, limit) = (name.clone(), command.clone(), env.clone(), kind.clone(), chat.clone(), draft.clone(), editing.clone(), key.clone(), limit.clone());
+        let (name, command, env, kind, chat, draft, editing, key, limit, mark, color) = (name.clone(), command.clone(), env.clone(), kind.clone(), chat.clone(), draft.clone(), editing.clone(), key.clone(), limit.clone(), mark.clone(), color.clone());
+        let (save_mark, save_color) = (mark.clone(), color.clone());
         let spent = crate::acp::spend::spent_today(&editing.id);
         let (save_name, save_command, save_env, save_kind, save_chat, save_forget, save_key, save_limit) = (name.clone(), command.clone(), env.clone(), kind.clone(), chat.clone(), forget.clone(), key.clone(), limit.clone());
         let (remembered, forget) = (remembered.clone(), forget.clone());
@@ -904,6 +908,32 @@ fn profile_dialog(draft: Draft, at: Option<usize>, template: Option<crate::agent
                             ))
                         })
                         .child(h_flex().gap_2().items_center().child(label("Name")).child(div().flex_1().child(Input::new(&name))))
+                        .child({
+                            // As it will show on the tasks: what is typed, else the agent's letter;
+                            // a click gives it the next color, the last being none.
+                            let shown = crate::agents::Profile { kind: current, name: name.read(cx).value().to_string(), mark: mark.read(cx).value().to_string(), ..Default::default() }.letter();
+                            let next = color.clone();
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(label("Mark"))
+                                .child(
+                                    div()
+                                        .id("agent-mark-color")
+                                        .w(px(36.))
+                                        .flex()
+                                        .justify_center()
+                                        .cursor_pointer()
+                                        .child(crate::workspace::spaces::agent_chip(&shown, color.get(), cx.theme().border, muted))
+                                        .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Click for another color").build(window, cx))
+                                        .on_click(move |_, window, _| {
+                                            next.set((next.get() + 1) % (crate::workspace::spaces::COLORS.len() as u8 + 1));
+                                            window.refresh();
+                                        }),
+                                )
+                                .child(div().w(px(90.)).flex_none().child(Input::new(&mark)))
+                                .child(div().flex_1().min_w_0().text_xs().text_color(muted).child("On its tasks: a letter or a few, and a color (click the mark), to tell two of one agent apart: work, personal."))
+                        })
                         .child(h_flex().gap_2().items_center().child(label("Command")).child(div().flex_1().child(Input::new(&command))))
                         .child(div().text_xs().text_color(muted).child(if as_chat {
                             "What starts its ACP server: opencode acp, gemini --acp, kimi acp, qwen --acp, npx -y <package>. ideae resumes its sessions itself."
@@ -952,7 +982,8 @@ fn profile_dialog(draft: Draft, at: Option<usize>, template: Option<crate::agent
                         };
                         let choices = if save_forget.get() { Default::default() } else { editing.choices.clone() };
                         let daily_limit = save_limit.read(cx).value().trim().trim_start_matches('$').parse::<f64>().ok().filter(|l| *l > 0.0 && acp);
-                        let mut profile = crate::agents::Profile { id, name, kind: k, command, acp, secrets: editing.secrets.clone(), choices, offered: editing.offered.clone(), daily_limit, ..Default::default() };
+                        let mark: String = save_mark.read(cx).value().trim().chars().take(3).collect();
+                        let mut profile = crate::agents::Profile { id, name, kind: k, command, acp, secrets: editing.secrets.clone(), choices, offered: editing.offered.clone(), daily_limit, mark, color: save_color.get(), ..Default::default() };
                         profile.set_env_text(&env_text);
                         match at.filter(|ix| *ix < d.agents.len()) {
                             Some(ix) => d.agents[ix] = profile,

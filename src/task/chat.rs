@@ -126,6 +126,12 @@ fn blocks_with_fences(text: &str) -> Vec<Block> {
     out
 }
 
+/// The conversation's column at most this wide, and its text: lines a
+/// wide window's width long, in a small font, read worse than a terminal.
+const COLUMN: f32 = 860.;
+const TEXT: f32 = 15.;
+const TEXT_LINE: f32 = 23.;
+
 /// A file's change as lines to show: what was there and what is now, the
 /// lines both have left out.
 struct DiffLines {
@@ -641,7 +647,14 @@ impl ChatView {
 
     // ------------------------------------------------------------ rendering
 
+    /// A row of the conversation, in a column of a width that reads well
+    /// (lines as long as a wide window are hard to follow), centered.
     fn render_row(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let inner = self.render_row_inner(row, window, cx);
+        div().w_full().flex().justify_center().child(div().w_full().max_w(px(COLUMN)).child(inner)).into_any_element()
+    }
+
+    fn render_row_inner(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(row) = self.rows.get(row).cloned() else { return div().into_any_element() };
         match row.text {
             // A block of a message: its own markdown, cached while it does not change.
@@ -656,7 +669,9 @@ impl ChatView {
                     .px_4()
                     .when(row.start == 0, |d| d.pt_1p5())
                     .w_full()
-                    .text_sm()
+                    .text_size(px(TEXT))
+                    .line_height(px(TEXT_LINE))
+                    .text_color(theme.foreground)
                     .when(self.found(entry), |d| d.border_l_2().border_color(theme.primary))
                     .child(gpui_kit::component::text::TextView::markdown(SharedString::from(format!("chat-agent-{}-{}", row.entry, row.start)), text).selectable(true))
                     .when(last, |d| {
@@ -791,8 +806,9 @@ impl ChatView {
         match entry {
             Entry::User { .. } => {
                 let group = SharedString::from(format!("chat-user-row-{ix}"));
+                // Beside the prompt, in the room its bubble leaves, on hover.
                 let back = self.can_restore(ix).then(|| {
-                    div().absolute().top_1().right_1().opacity(0.).group_hover(group.clone(), |s| s.opacity(1.)).child(
+                    div().flex_none().opacity(0.).group_hover(group.clone(), |s| s.opacity(1.)).child(
                         Button::new(("chat-restore", ix))
                             .xsmall()
                             .ghost()
@@ -801,22 +817,33 @@ impl ChatView {
                             .on_click(cx.listener(move |this, _, _, cx| this.ask_restore(ix, cx))),
                     )
                 });
+                // Yours on the right, as wide as it needs up to most of the
+                // column; the agent's on the left, the whole width.
                 row.group(group)
                     .child(
-                        div()
-                            .relative()
-                            .px_3()
-                            .py_2()
-                            .rounded_md()
-                            .bg(theme.muted)
-                            .text_sm()
-                            .child(gpui_kit::component::text::TextView::markdown(SharedString::from(format!("chat-user-{ix}")), text.clone()).selectable(true))
-                            .children(back),
+                        h_flex()
+                            .w_full()
+                            .justify_end()
+                            .items_start()
+                            .gap_2()
+                            .children(back)
+                            .child(
+                                div()
+                                    .max_w(relative(0.8))
+                                    .px_3()
+                                    .py_2()
+                                    .rounded_lg()
+                                    .bg(theme.muted)
+                                    .text_size(px(TEXT))
+                                    .line_height(px(TEXT_LINE))
+                                    .child(gpui_kit::component::text::TextView::markdown(SharedString::from(format!("chat-user-{ix}")), text.clone()).selectable(true)),
+                            ),
                     )
                     .into_any_element()
             }
             Entry::Agent { .. } => row
-                .text_sm()
+                .text_size(px(TEXT))
+                .line_height(px(TEXT_LINE))
                 .child(gpui_kit::component::text::TextView::markdown(SharedString::from(format!("chat-agent-{ix}")), text.clone()).selectable(true))
                 .into_any_element(),
             Entry::Thought { .. } => {
@@ -873,11 +900,15 @@ impl ChatView {
     fn render_tool(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
         let Some(Entry::Tool(tool)) = self.thread.entries.get(ix) else { return div().into_any_element() };
         let status = tool.status.clone();
-        let title: SharedString = if tool.title.is_empty() { tool.kind.clone().into() } else { tool.title.clone().into() };
+        let whole: SharedString = if tool.title.is_empty() { tool.kind.clone().into() } else { tool.title.clone().into() };
+        // A command of many lines (a script in a heredoc) is its first line
+        // here, and all of it when the card is opened.
+        let many = whole.trim_end().contains('\n');
+        let title: SharedString = if many { format!("{} …", whole.lines().next().unwrap_or_default()).into() } else { whole.clone() };
         let decided = tool.decided.clone();
         let permission = tool.permission.clone();
         let has_output = !tool.output.is_empty();
-        let has_more = !tool.diffs.is_empty() || has_output || tool.terminal.is_some();
+        let has_more = !tool.diffs.is_empty() || has_output || tool.terminal.is_some() || many;
         let running = tool.terminal.is_some() && !matches!(status.as_str(), "completed" | "failed");
         let theme = cx.theme();
         let (muted, border) = (theme.muted_foreground, theme.border);
@@ -912,6 +943,10 @@ impl ChatView {
                     .when_some(decided, |this, decided| this.child(div().text_color(muted).child(decided)))
                     .when(has_more && permission.is_none(), |this| this.child(div().text_color(muted).child(if open { "▾" } else { "▸" }))),
             );
+        if open && many {
+            let theme = cx.theme();
+            card = card.child(div().px_2().py_1().rounded_sm().bg(theme.muted).font_family(theme.mono_font_family.clone()).child(whole.clone()));
+        }
         if open {
             match self.diffs_of(ix, cx) {
                 Some(diffs) => {
@@ -1333,6 +1368,13 @@ impl ChatView {
         };
         let downloads = matches!(self.spec.command.split_whitespace().find(|w| !w.contains('=')), Some("npx" | "uvx" | "bunx" | "pnpx"));
         let first = (self.thread.status == Status::Starting && downloads).then(|| "Its first start downloads it, which can take a minute.".to_string());
+        // A mode of its own that asks nothing, kept from last time: said
+        // before the first prompt, not found out from what it did.
+        let auto = self.thread.option("mode").filter(|m| {
+            let (value, name) = (m.current.to_lowercase(), m.current_name().to_lowercase());
+            (value.contains("auto") || name.contains("auto") || value.contains("bypass") || value == "yolo") && !value.contains("edit")
+        });
+        let auto = auto.map(|m| format!("It starts in {}: it runs its commands and changes files without asking. The {} menu below changes that.", m.current_name(), m.name));
         let hints = first.into_iter().chain([
             "Enter sends; Shift+Enter starts a new line. What you send while it works waits its turn; ↑ brings back your last prompt.".to_string(),
             format!("@ mentions a file of the task; / lists the agent's commands; {} pastes an image, for agents that take them.", crate::keys::label("Ctrl+V")),
@@ -1347,6 +1389,7 @@ impl ChatView {
             .gap_2()
             .px_6()
             .child(div().text_sm().child(who))
+            .children(auto.map(|a| div().max_w(px(460.)).text_center().text_xs().text_color(theme.warning).child(a)))
             .children(hints.map(|h| div().max_w(px(460.)).text_center().text_xs().text_color(theme.muted_foreground).child(h)))
             .into_any_element()
     }
@@ -1546,16 +1589,20 @@ impl Render for ChatView {
             .children(self.render_restore(cx))
             .children(commands)
             .child(
+                // The prompt in the conversation's column.
                 v_flex()
                     .flex_none()
+                    .items_center()
                     .gap_1()
                     .p_2()
                     .border_t_1()
                     .border_color(border)
-                    .when(!images.is_empty(), |this| this.child(h_flex().gap_1().children(images)))
-                    .child(gpui_kit::component::input::Textarea::new(&self.input))
+                    .when(!images.is_empty(), |this| this.child(h_flex().w_full().max_w(px(COLUMN)).gap_1().children(images)))
+                    .child(div().w_full().max_w(px(COLUMN)).child(gpui_kit::component::input::Textarea::new(&self.input)))
                     .child(
                         h_flex()
+                            .w_full()
+                            .max_w(px(COLUMN))
                             .gap_1()
                             .items_center()
                             .child(

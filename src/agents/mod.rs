@@ -120,6 +120,14 @@ pub struct Profile {
     /// today (USD, as the agent reports its cost).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daily_limit: Option<f64>,
+    /// Its mark on the tasks, a letter or a few (W, Me): two of one agent
+    /// told apart. Empty: the agent's own letter.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mark: String,
+    /// The mark's color, one of the spaces' (counted from 1), drawn faint;
+    /// 0: none.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub color: u8,
 }
 
 /// What a secret's value shows as in the profile editor.
@@ -152,8 +160,12 @@ impl Profile {
         self.kind.adapter()
     }
 
-    /// The mark of the agent on a task: C, X, O, or the name's first letter.
+    /// The mark of the agent on a task: its own, else C, X, O, or the
+    /// name's first letter.
     pub fn letter(&self) -> String {
+        if let Some(mark) = Some(self.mark.trim()).filter(|m| !m.is_empty()) {
+            return mark.chars().take(3).collect();
+        }
         match self.kind {
             Kind::Claude if self.name.is_empty() || self.name.starts_with("Claude") => "C".into(),
             Kind::Codex if self.name.is_empty() || self.name.starts_with("Codex") => "X".into(),
@@ -258,6 +270,10 @@ pub fn shares_sessions(from: &Profile, to: &Profile) -> bool {
         _ => return false,
     };
     from.var(store) == to.var(store)
+}
+
+fn is_zero(n: &u8) -> bool {
+    *n == 0
 }
 
 /// A new id for a profile: not one of `taken`.
@@ -699,6 +715,13 @@ mod tests {
         let mut work = profile("w", Kind::Claude, "claude");
         work.name = "Work account".into();
         assert_eq!(work.letter(), "W");
+        // A mark of its own over the agent's letter, and kept with the profile.
+        let personal = Profile { kind: Kind::Claude, name: "Claude Code".into(), mark: " Me ".into(), color: 2, ..Default::default() };
+        assert_eq!(personal.letter(), "Me");
+        let saved = serde_json::to_string(&personal).unwrap();
+        let back: Profile = serde_json::from_str(&saved).unwrap();
+        assert_eq!((back.mark.as_str(), back.color), (" Me ", 2));
+        assert!(!serde_json::to_string(&Profile::default()).unwrap().contains("mark"), "none written when unset");
         assert_eq!(profile("c", Kind::Claude, "claude").letter(), "c".to_uppercase());
         let env = Profile::parse_env("CLAUDE_CONFIG_DIR=~/.claude-work\n# a note\nexport CODEX_HOME=\"/x/y\"\n\nbroken");
         assert_eq!(env.get("CODEX_HOME").map(String::as_str), Some("/x/y"));

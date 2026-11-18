@@ -41,7 +41,10 @@ dialog picks the project's, and lets you choose another; each variant of a
 task can have its own, next to its own line of the prompt.
 
 With more than one profile, a task's row and its agent tab show the agent's
-letter (C, X, O, or the first letter of the profile's name).
+letter (C, X, O, or the first letter of the profile's name). A profile can
+have a mark of its own instead (a letter or a few: W, Me) and a faint color
+(the profile editor's Mark; a click on it changes the color), so two
+accounts of one agent tell apart at a glance.
 
 ## Sessions
 

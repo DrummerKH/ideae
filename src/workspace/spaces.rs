@@ -50,6 +50,16 @@ pub fn chip(mark: &str, color: u8) -> Div {
     }
 }
 
+/// An agent's mark on a task: faint, so it does not shout over the task's
+/// own state; on a tint of its color when it has one, else in an outline.
+pub fn agent_chip(mark: &str, color: u8, border: Hsla, muted: Hsla) -> Div {
+    let chip = div().flex_none().text_size(px(10.)).px(px(3.)).rounded_sm().child(mark.to_string());
+    match COLORS.get(usize::from(color).wrapping_sub(1)) {
+        Some(color) => chip.bg(color.opacity(0.18)).text_color(color.opacity(0.9)).border_1().border_color(color.opacity(0.35)),
+        None => chip.border_1().border_color(border).text_color(muted),
+    }
+}
+
 /// The mark of all the spaces together.
 pub const ALL: &str = "◎";
 

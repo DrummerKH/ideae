@@ -413,6 +413,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// An agent run by npx whose download an earlier start cut short: npm
+    /// fails on it at every start; the host clears that copy and starts it
+    /// again, once.
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn an_acp_agent_whose_npx_copy_was_cut_short() {
+        let dir = std::env::temp_dir().join(format!("ideae-acp-npx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let broken = dir.join("cache/_npx/0123abcd");
+        std::fs::create_dir_all(broken.join("node_modules")).unwrap();
+        // npx as npm is then: the error while the copy is there, the agent once it is gone.
+        let script = dir.join("npx.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "if [ -d '{b}' ]; then echo \"npm error enoent Could not read package.json: Error: ENOENT: no such file or directory, open '{b}/package.json'\" >&2; exit 254; fi\nexec {agent}\n",
+                b = broken.display(),
+                agent = super::fake::command()
+            ),
+        )
+        .unwrap();
+        let spec = HostSpec { command: format!("sh {}", script.display()), cwd: dir.clone(), env: vec![(super::fake::ENV.into(), "1".into())], ..Default::default() };
+        let mut w = Window::open(spec);
+        w.until("started after the copy was cleared", |t, _| t.status == Status::Idle);
+        assert!(!broken.exists(), "the copy cut short is gone");
+        assert!(w.thread.entries.iter().any(|e| matches!(e, Entry::Notice { text } if text.contains("cut short"))));
+        w.send(ToHost::prompt("hi"));
+        w.until("an answer", |t, _| t.last_said() == Some("Hello there."));
+        w.send(ToHost::Stop);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An agent that ends itself with a command of its own: told so, not by
+    /// its last debug lines, and started again with its session.
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn an_acp_agent_that_ends_itself() {
+        let dir = std::env::temp_dir().join(format!("ideae-acp-self-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let spec = HostSpec { command: super::fake::command(), cwd: dir.clone(), env: vec![(super::fake::ENV.into(), "1".into())], journal: Some(dir.join("j.jsonl")), ..Default::default() };
+        let mut w = Window::open(spec);
+        w.until("a session", |t, _| t.status == Status::Idle);
+        w.send(ToHost::prompt("hi"));
+        w.until("an answer", |t, _| t.status == Status::Done);
+        w.send(ToHost::prompt("clean up"));
+        w.until("started again", |t, _| t.status == Status::Done && t.entries.iter().any(|e| matches!(e, Entry::Notice { text } if text.contains("started again"))));
+        let notice = w.thread.entries.iter().rev().find_map(|e| match e { Entry::Notice { text } => Some(text.clone()), _ => None }).unwrap();
+        assert!(notice.contains("by its own command `kill"), "{notice}");
+        w.send(ToHost::prompt("hi"));
+        w.until("it answers again", |t, _| t.last_said() == Some("Hello there."));
+        w.send(ToHost::Stop);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Many tool calls and a command that prints a lot: few changes, a
     /// journal that does not grow with every look at the output.
     #[test]

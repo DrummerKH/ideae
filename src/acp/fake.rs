@@ -182,6 +182,19 @@ pub fn serve() {
                     io.ask("terminal/create", json!({ "sessionId": session, "command": "sh", "args": ["-c", "sleep 300 & echo $! > bg.pid; sleep 300"] }), &mut waiting);
                     std::thread::sleep(std::time::Duration::from_millis(300));
                     io.update(&session, json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "Serving." } }));
+                } else if text.contains("script") {
+                    // A command of many lines, as an agent writes a file with a heredoc.
+                    let title = "mkdir -p /tmp/x && cat > /tmp/x/a.mjs <<'EOF'\nimport { spawn } from 'node:child_process';\nconst child = spawn('node', []);\nEOF\ncd /tmp/x && node a.mjs";
+                    io.update(&session, json!({ "sessionUpdate": "tool_call", "toolCallId": "s1", "title": title, "kind": "execute", "status": "completed" }));
+                    io.update(&session, json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "Ran the script. ".repeat(40) } }));
+                } else if text.contains("clean up") {
+                    // An agent tidying up that takes its own process for a stray one.
+                    let me = std::process::id();
+                    io.update(&session, json!({ "sessionUpdate": "tool_call", "toolCallId": "k1", "title": format!("kill {me}"), "kind": "execute", "status": "in_progress" }));
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    // SAFETY: signals this process itself, as `kill` would.
+                    unsafe { libc::kill(me as i32, libc::SIGTERM) };
+                    std::thread::sleep(std::time::Duration::from_secs(5));
                 } else if text.contains("crash") {
                     io.update(&session, json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "Start" } }));
                     eprintln!("fake: out of memory");

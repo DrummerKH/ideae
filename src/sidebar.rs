@@ -916,17 +916,9 @@ impl Workspace {
                     .when_some(agent_mark.as_ref(), |s, profile| {
                         let name = profile.name.clone();
                         s.child(
-                            div()
+                            crate::workspace::spaces::agent_chip(&profile.letter(), profile.color, cx.theme().border, muted)
                                 .id(SharedString::from(format!("agent-mark-{}", path.display())))
                                 .test_support()
-                                .flex_none()
-                                .text_size(px(10.))
-                                .px(px(3.))
-                                .rounded_sm()
-                                .border_1()
-                                .border_color(cx.theme().border)
-                                .text_color(muted)
-                                .child(profile.letter())
                                 .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(format!("Runs {name}")).build(window, cx)),
                         )
                     })
@@ -1096,9 +1088,15 @@ impl Workspace {
                 crate::usage::tokens(usage.recent)
             ));
         }
+        // Its last words, the start of them: a whole answer would cover the window.
         if let Some(said) = said {
             told.push_str("\n\n");
-            told.push_str(&said);
+            let lines: Vec<&str> = said.lines().filter(|l| !l.trim().is_empty()).take(8).collect();
+            let mut short: String = lines.join("\n").chars().take(400).collect();
+            if short.len() < said.trim().len() {
+                short.push('…');
+            }
+            told.push_str(&short);
         }
         let (pressed, left) = (path.clone(), path.clone());
         row = row

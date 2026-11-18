@@ -116,6 +116,8 @@ pub struct Host {
     window_here: bool,
     /// When each question waiting was asked.
     asked_at: HashMap<u64, Instant>,
+    /// npx's broken cache was cleared once this run: not again.
+    npx_mended: bool,
     /// The session's cost when this run began (USD), and whether its
     /// budget is spent: then no prompt goes.
     cost_base: f64,
@@ -159,6 +161,7 @@ impl Host {
             window_here: true,
             asked_at: HashMap::new(),
             cost_base: 0.0,
+            npx_mended: false,
             over_budget: false,
         };
         host.cost_base = host.thread.usage.as_ref().and_then(|u| u.cost.as_deref()).and_then(super::spend::usd).unwrap_or(0.0);
@@ -1073,10 +1076,16 @@ impl Host {
         let mid_turn = std::mem::take(&mut self.prompting);
         self.starting = None;
         let Some(mut agent) = self.agent.take() else { return };
-        let mut code = None;
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let (mut code, mut signal): (Option<Option<i32>>, Option<i32>) = (None, None);
         for _ in 0..20 {
             if let Ok(Some(status)) = agent.child.try_wait() {
                 code = Some(status.code());
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt as _;
+                    signal = status.signal();
+                }
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -1087,14 +1096,31 @@ impl Host {
         }
         // Its error stream may hold the reason a moment after.
         std::thread::sleep(Duration::from_millis(50));
-        let said = last_lines(&agent.stderr.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
-        let words = match code.flatten() {
-            Some(0) => None,
-            // The shell that started it found no such program.
-            Some(127) => Some(missing_program(&self.spec.command)),
-            Some(code) => Some(said.unwrap_or_else(|| format!("exit code {code}"))),
-            None => said,
+        let (said, broken_npx) = {
+            let stderr = agent.stderr.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            (last_lines(&stderr), half_installed_npx(&String::from_utf8_lossy(&stderr.iter().copied().collect::<Vec<u8>>())))
         };
+        // A command of its own that ended processes: likely what ended it
+        // (an agent cleaning up may take its own adapter for a stray one).
+        let own_kill = self.thread.entries.iter().rev().take(8).find_map(|e| match e {
+            Entry::Tool(t) if t.kind == "execute" && !matches!(t.status.as_str(), "completed") && ends_processes(&t.title) => Some(t.title.chars().take(80).collect::<String>()),
+            _ => None,
+        });
+        // What it said last, when it reads as an error: an agent's own
+        // debug lines say nothing of why it ended.
+        let error_said = said.clone().filter(|s| s.to_lowercase().contains("error") || s.contains("panic") || s.contains("Traceback"));
+        let words = match (code.flatten(), signal) {
+            (Some(0), _) => None,
+            // The shell that started it found no such program.
+            (Some(127), _) => Some(missing_program(&self.spec.command)),
+            (Some(code), _) => Some(error_said.or(said).unwrap_or_else(|| format!("exit code {code}"))),
+            (None, Some(signal)) => Some(match &own_kill {
+                Some(command) => format!("its process was ended (signal {signal}), it seems by its own command `{command}`"),
+                None => format!("its process was ended by signal {signal}, not by the app"),
+            }),
+            (None, None) => said,
+        };
+        let abnormal = signal.is_some() || code.flatten().is_some_and(|c| c != 0);
         let asked: Vec<u64> = self.asks.keys().copied().collect();
         for request in asked {
             self.asks.remove(&request);
@@ -1122,13 +1148,26 @@ impl Host {
         for term in self.terminals.values() {
             term.kill();
         }
+        // npx's copy of it cut short at an earlier start (npm never mends
+        // that): cleared, and started again, once.
+        if let (Some(dir), Some(tx), false) = (broken_npx, self.tx.clone(), self.npx_mended) {
+            self.npx_mended = true;
+            if std::fs::remove_dir_all(&dir).is_ok() {
+                self.notice("npx kept a copy of this agent whose download was cut short at an earlier start, which npm does not mend: it was cleared, and the agent is downloaded and started again.".into());
+                self.emit(Op::Status { status: Status::Starting });
+                return self.start(tx);
+            }
+        }
         // Ended in the middle of its work, and not a moment ago: once more,
         // going on with its session.
-        let again = mid_turn && self.thread.session.is_some() && self.restarted.is_none_or(|at| at.elapsed() > RESTART_EVERY);
+        // Or ended by something it did not choose (a signal, a failure), its
+        // turn closed in time or not.
+        let again = (mid_turn || abnormal) && self.thread.session.is_some() && self.restarted.is_none_or(|at| at.elapsed() > RESTART_EVERY);
         if let (true, Some(tx)) = (again, self.tx.clone()) {
             self.restarted = Some(Instant::now());
             let why = words.map(|w| format!(" ({})", w.lines().last().unwrap_or_default())).unwrap_or_default();
-            self.notice(format!("The agent stopped in the middle of its turn{why}; it was started again and goes on with its session. Its last turn may need to be asked again."));
+            let when = if mid_turn { "in the middle of its turn" } else { "unexpectedly" };
+            self.notice(format!("The agent stopped {when}{why}; it was started again and goes on with its session. Its last turn may need to be asked again."));
             self.emit(Op::Status { status: Status::Starting });
             return self.start(tx);
         }
@@ -1451,6 +1490,25 @@ fn private_file(path: &Path) -> std::io::Result<std::fs::File> {
         let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
     }
     Ok(file)
+}
+
+/// A command line that ends processes.
+fn ends_processes(command: &str) -> bool {
+    command.split(|c: char| c.is_whitespace() || c == ';' || c == '&' || c == '|').any(|w| matches!(w, "kill" | "pkill" | "killall" | "taskkill"))
+}
+
+/// The folder of npx's cache an agent's start failed on, when it is a
+/// download cut short: `_npx/<hash>` with packages but no package.json,
+/// which npm reports as ENOENT at every start after and never mends.
+fn half_installed_npx(stderr: &str) -> Option<PathBuf> {
+    // "… ENOENT: no such file or directory, open '<cache>/_npx/<hash>/package.json'"
+    let at = stderr.find("ENOENT")?;
+    let line = stderr[at..].lines().find(|l| l.contains("_npx") && l.contains("package.json") && l.contains("open '"))?;
+    let path = line.split("open '").nth(1)?.split('\'').next()?;
+    let dir = Path::new(path).parent()?.to_path_buf();
+    // Only that: a folder of npx's own cache, without what would make it whole.
+    let in_npx = dir.parent().and_then(|p| p.file_name()).is_some_and(|n| n == "_npx");
+    (in_npx && dir.is_dir() && !dir.join("package.json").exists()).then_some(dir)
 }
 
 /// What a missing program needs, said for the programs agents are run by.
@@ -1783,6 +1841,25 @@ pub fn spawn_in_process(spec: HostSpec) -> (mpsc::Sender<Event>, async_channel::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// npx's cache left half-installed by a start cut short: found from what
+    /// npm says, and only that folder.
+    #[test]
+    fn a_download_cut_short_in_npx_s_cache_is_found() {
+        let cache = std::env::temp_dir().join(format!("ideae-npx-{}", std::process::id())).join("_npx");
+        let broken = cache.join("51a65f6ed666c7d8");
+        std::fs::create_dir_all(broken.join("node_modules")).unwrap();
+        let said = format!(
+            "npm error code ENOENT\nnpm error syscall open\nnpm error path {p}\nnpm error enoent Could not read package.json: Error: ENOENT: no such file or directory, open '{p}'\n",
+            p = broken.join("package.json").display()
+        );
+        assert_eq!(half_installed_npx(&said), Some(broken.clone()));
+        // Whole after all, or another error: left alone.
+        std::fs::write(broken.join("package.json"), "{}").unwrap();
+        assert_eq!(half_installed_npx(&said), None);
+        assert_eq!(half_installed_npx("npm error code E404\nnpm error 404 Not Found"), None);
+        let _ = std::fs::remove_dir_all(cache.parent().unwrap());
+    }
 
     /// A journal it cannot read whole is kept aside, never written over.
     #[test]
