@@ -19,6 +19,8 @@ enum Scope {
     /// The Changes tab's diff, while it has the keyboard: single letters, as
     /// nothing is typed there.
     Review,
+    /// A Web tab: a browser's keys, over the window's where they clash.
+    Browser,
 }
 
 pub struct Shortcut {
@@ -109,6 +111,16 @@ pub static SHORTCUTS: &[Shortcut] = &[
     shortcut!("parameter_info", "Parameter info", "ctrl-p", Editor, task::ParameterInfo),
     // Ctrl+Y is the line's: the editor's own Redo moves here.
     shortcut!("redo", "Redo", "ctrl-shift-z", Editor, gpui_kit::component::input::Redo),
+    shortcut!("web_address", "Address bar", "ctrl-l", Browser, crate::browser::BrowserFocusAddress),
+    shortcut!("web_reload", "Reload", "ctrl-r", Browser, crate::browser::BrowserReload),
+    shortcut!("web_hard_reload", "Reload, not from the cache", "ctrl-shift-r", Browser, crate::browser::BrowserHardReload),
+    shortcut!("web_back", "Page back", "alt-left", Browser, crate::browser::BrowserBack),
+    shortcut!("web_forward", "Page forward", "alt-right", Browser, crate::browser::BrowserForward),
+    shortcut!("web_find", "Find in page", "ctrl-f", Browser, crate::browser::BrowserFind),
+    shortcut!("web_zoom_in", "Zoom in", "ctrl-=", Browser, crate::browser::BrowserZoomIn),
+    shortcut!("web_zoom_out", "Zoom out", "ctrl--", Browser, crate::browser::BrowserZoomOut),
+    shortcut!("web_zoom_reset", "Actual size", "ctrl-0", Browser, crate::browser::BrowserZoomReset),
+    shortcut!("web_devtools", "DevTools", "f12", Browser, crate::browser::BrowserDevTools),
     // No keys of its own: a theme is seldom changed, and the menu has it.
     shortcut!("theme", "Switch theme", "", Everywhere, SwitchTheme),
     shortcut!("settings", "Settings", "ctrl-,", Everywhere, OpenSettings),
@@ -130,6 +142,7 @@ impl Shortcut {
             Scope::Editor => "Editor",
             Scope::Terminal => "Terminal",
             Scope::Review => "Changes",
+            Scope::Browser => "Web",
             _ => "Window",
         }
     }
@@ -161,6 +174,7 @@ impl Shortcut {
             Scope::Editor => vec![bind(Some("Input"), action())],
             Scope::Terminal => vec![bind(terminal, action())],
             Scope::Review => vec![bind(Some("Changes > Diff"), action())],
+            Scope::Browser => vec![bind(Some(crate::browser::KEY_CONTEXT), action())],
         };
         made.into_iter().filter_map(Result::ok).collect()
     }

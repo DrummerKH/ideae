@@ -530,6 +530,26 @@ pub struct TabSession {
     pub preview: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pinned: bool,
+    /// How a Web tab shows its page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web: Option<WebLook>,
+}
+
+/// A Web tab's screen, colors and DevTools, kept with the session.
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq, Debug)]
+#[serde(default)]
+pub struct WebLook {
+    /// A screen's name, as the tab's menu lists it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub turned: bool,
+    /// "light", "dark", or empty for the IDE's.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub colors: String,
+    /// "bottom" or "right" where DevTools is open.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub devtools: String,
 }
 
 /// Debug builds are a separate app: their own data, sockets, window class

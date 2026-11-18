@@ -175,7 +175,29 @@ pub fn spawn_tied(command: &mut Command) -> std::io::Result<Child> {
                 Ok(())
             });
         }
-        command.spawn()
+        // The signal comes when the thread that started the child ends, not
+        // the app: started from a page's or a picture's thread, Chrome died
+        // with it. A thread that lasts as long as the app starts them all.
+        struct Job(*mut Command, std::sync::mpsc::Sender<std::io::Result<Child>>);
+        // SAFETY: the command is used only while its owner waits for the reply.
+        unsafe impl Send for Job {}
+        static SPAWNER: std::sync::OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<Job>>> = std::sync::OnceLock::new();
+        let spawner = SPAWNER.get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<Job>();
+            std::thread::Builder::new()
+                .name("spawner".into())
+                .spawn(move || {
+                    for Job(command, reply) in rx {
+                        // SAFETY: see `Job`.
+                        let _ = reply.send(unsafe { (*command).spawn() });
+                    }
+                })
+                .expect("spawn the spawner thread");
+            std::sync::Mutex::new(tx)
+        });
+        let (reply, child) = std::sync::mpsc::channel();
+        spawner.lock().unwrap_or_else(|e| e.into_inner()).send(Job(command, reply)).map_err(|_| std::io::Error::other("the spawner thread ended"))?;
+        child.recv().map_err(std::io::Error::other)?
     }
     // macOS has no parent-death signal: these end with their task or on
     // quit, not when the app is killed.

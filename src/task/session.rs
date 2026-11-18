@@ -48,6 +48,7 @@ impl TaskView {
                     TabKind::Browser(view) => {
                         s.kind = "browser".into();
                         s.url = Some(view.read(cx).url());
+                        s.web = view.read(cx).look();
                     }
                 }
                 s
@@ -107,7 +108,12 @@ impl TaskView {
                         }
                     }
                 }
-                "browser" => self.open_browser(saved.url.as_deref().unwrap_or("about:blank"), window, cx),
+                "browser" => {
+                    self.open_browser(saved.url.as_deref().unwrap_or("about:blank"), window, cx);
+                    if let (Some(look), Some(TabKind::Browser(view))) = (&saved.web, self.tabs.last().map(|t| &t.kind)) {
+                        view.update(cx, |v, cx| v.set_look(look, window, cx));
+                    }
+                }
                 _ => {}
             }
             let new = self.tabs.iter_mut().find(|t| !before.contains(&t.id));

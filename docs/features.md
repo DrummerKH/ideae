@@ -234,8 +234,56 @@ and function names opens them in the editor. They live in a daemon, so the
 agents keep running when the window restarts.
 
 Browser tabs are headless Chrome streamed into a tab. ⌖ in the toolbar picks
-an element for the agent: its selector, markup, text, React components and a
-picture of it go into the prompt.
+for the agent: click elements (each with its selector, markup, text, React
+components, the styles it is made of and a picture), drag over an area, or
+take the whole page; say what to do with them and send them all in one prompt.
+
+- Each task has a Chrome of its own: its profile is kept between runs, so
+  logins stay, and a new task starts with the cookies of the project's last
+  one; tasks share no cookies, so variants on other ports of localhost do not
+  log each other out.
+- The page's errors (exceptions, `console.error`, requests that failed) are
+  counted in the toolbar: ⚠ lists them, and Send to agent puts them into its
+  prompt.
+- A page of this machine that could not be loaded (a dev server still
+  starting) is loaded again once something listens at its port.
+- Dialogs (`alert`, `confirm`, `prompt`, leaving a page), the list of a
+  `<select>` (by click or keys), the pickers of date, time and color fields
+  and the file picker of `<input type=file>` show in the tab; a page opened
+  with `target=_blank` or `window.open` comes up as a tab of its own and
+  closes with `window.close()`. Downloads go to the Downloads folder, a
+  notice saying where.
+- ▭ in the toolbar shows the page at a phone's, tablet's or desktop's size
+  (made smaller to fit, touches from the mouse on a phone), turned or not,
+  and asks it for light or dark colors, or the IDE's.
+- Addresses of this machine Ctrl+clicked in a terminal open in a Web tab of
+  the task; others in the system's browser.
+- A task out of view as long as its language servers stay (Settings) closes
+  its pages, unless its agent is at work: its Chrome ends, and each tab opens
+  its page again when shown.
+- Input methods (Chinese, Japanese…) compose in the page, their window at
+  the caret.
+- `{ }` or F12 opens Chrome's DevTools in a panel of the tab, below the page
+  or right of it; the page gives it room, and the divider moves.
+- A tab keeps its screen, colors and DevTools across restarts; a phone's or
+  tablet's screen sends that device's user agent.
+- Keys: Ctrl+L address bar, Ctrl+R / F5 reload (Shift: not from the cache),
+  Alt+←/→ back and forward (also the mouse's side buttons), Ctrl+F find in
+  page, Ctrl+= / Ctrl+- / Ctrl+0 zoom; Settings → Keys → Web rebinds them.
+- The task's terminals, the agent's included, have the task's DevTools
+  endpoint as `IDEAE_BROWSER_CDP` (a port that stays the task's), so
+  Playwright MCP drives the pages you see. In a project's `.mcp.json` for
+  Claude Code:
+
+  ```json
+  { "mcpServers": { "playwright": { "command": "npx",
+      "args": ["@playwright/mcp@latest", "--cdp-endpoint", "${IDEAE_BROWSER_CDP}"] } } }
+  ```
+
+  Chrome runs while the task has a Web tab, and a minute after the last
+  closes; a call at the task's port starts it again, so the agent finds it.
+  Playwright drives the tab you see; a page it opens shows as a tab behind
+  the one you look at.
 
 ## Window
 

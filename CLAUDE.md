@@ -72,6 +72,7 @@ src/git.rs         git CLI wrappers, worktrees
 src/lsp.rs         language server client
 src/lsp_install.rs language servers installed on request, ~/.local/share/ideae/lsp
 src/trash.rs       files to the system's trash and back (Undo of Delete in the Files panel)
+src/browser.rs     Web tabs: a headless Chrome per task (its profile kept, IDEAE_BROWSER_CDP), CDP screencast, pages it opens as tabs
 src/procs.rs       starting helper programs (no console on Windows), ending child sessions on quit
 src/daemon/        terminals and agents' hosts (pipe.rs) in a daemon (`ideae --daemon`, unix): they outlive the window (×, Restart); Exit/Ctrl+Q ends them;
                    a window of another build makes the daemon hand its ptys to a new one (SCM_RIGHTS), agents keep running
@@ -99,6 +100,7 @@ scripts/           Xvfb driver for UI checks, wayland.sh (the same in a headless
 - And chat agents (ACP): `cargo build && cargo test -- --ignored an_acp_agent` after changing the host, the chat's link or the daemon's pipes (a stand-in agent, the real daemon, an upgrade of it).
 - And the daemon's terminals: `cargo test -- --ignored a_window_that_does_not_read` after changing how output goes from a session to a window (it floods one that reads nothing).
 - And a project's setup, check and teardown: `cargo test -- --ignored a_task_is_set_up_checked_and_torn_down` after changing them.
+- And Web tabs (needs Chrome): `cargo test -- --ignored a_page_tells_the_tab a_task_s_browser_wakes_when_called` after changing browser.rs: a page's dialog, select, pickers, cursor, errors, title, user agent, DevTools and the pages it opens; a task's Chrome started again by a call at its port.
 - `scripts/check.sh` runs all of these and the Windows check: before every push, and again after merging main. A new end-to-end test goes into it; none of them waits on real time except for a timeout it is about, and together they stay under a minute.
 - UI can be tested without a display: `#[gpui_kit::test]` with `gpui_kit::test` (find, click, scroll by element id; mark elements with `.test_support()`), as `settings_ui.rs` does.
 - A debug build is the separate app `ideae-dev`: own state, sockets, window class, launcher. Keep that split for anything new that has an identity on the system.

@@ -1,53 +1,144 @@
-//! A browser tab: a page in a shared headless Chrome, shown through CDP
-//! screencast frames, with mouse and keyboard sent back over CDP.
+//! A browser tab: a page in headless Chrome, shown through CDP screencast
+//! frames, with mouse and keyboard sent back over CDP.
 //!
-//! Chrome listens on a local DevTools port, so Playwright MCP can drive the
-//! very page you see: `--cdp-endpoint http://127.0.0.1:<port>`.
+//! Every task has a Chrome of its own: a profile kept between runs (logins
+//! stay), apart from other tasks' (variants on other ports of localhost
+//! share no cookies), and a DevTools port that stays the task's. Its
+//! terminals get it as IDEAE_BROWSER_CDP, so Playwright MCP
+//! (`--cdp-endpoint`) drives the pages you see; a page opened there, or by
+//! `window.open` and `target=_blank`, comes up as a tab of the task.
 
 use std::{
+    collections::{HashMap, HashSet, VecDeque},
     io::ErrorKind,
-    net::TcpStream,
-    path::PathBuf,
+    net::{TcpListener, TcpStream, ToSocketAddrs as _},
+    path::{Path, PathBuf},
     process::{Child, Stdio},
-    sync::{Arc, Mutex, OnceLock, mpsc},
+    sync::{
+        Arc, Mutex, OnceLock, Weak,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result, anyhow};
 use base64::Engine as _;
 use gpui_kit::component::{
-    ActiveTheme as _, Selectable as _, Sizable as _,
+    ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
-    menu::ContextMenuExt as _,
+    menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem},
     v_flex,
 };
 use gpui_kit::{prelude::FluentBuilder as _, *};
 use serde_json::{Value, json};
-use tungstenite::{Message, WebSocket, stream::MaybeTlsStream};
+use tungstenite::{Message, WebSocket, protocol::Role, protocol::WebSocketConfig};
 
 // ---------------------------------------------------------------- chrome
+
+/// Whom a Chrome runs for: a task, by its worktree, or the pictures of
+/// variants' sites, which want no profile kept.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum Owner {
+    Task(PathBuf),
+    Pictures,
+}
 
 struct Chrome {
     port: u16,
     ws_path: String,
-    child: Child,
+    child: Mutex<Child>,
     profile: PathBuf,
+    temporary: bool,
+    /// Pages a tab opened or took: the others are offered to the task.
+    claimed: Mutex<HashSet<String>>,
+    /// Its major version, for a phone's user agent.
+    major: String,
+    /// The pages it opened as it started, before any tab's: no tab's own.
+    first: Mutex<Vec<String>>,
+}
+
+impl Chrome {
+    fn alive(&self) -> bool {
+        self.child.lock().is_ok_and(|mut child| matches!(child.try_wait(), Ok(None)))
+    }
+
+    fn claim(&self, target: &str) {
+        self.claimed.lock().unwrap().insert(target.to_string());
+    }
+}
+
+impl Chrome {
+    /// Asked to close, so it writes its profile out (its cookies are in an
+    /// open transaction a while): killed, the last logins are lost. Killed
+    /// when it takes too long.
+    fn close(&self) {
+        if !self.temporary && self.alive() {
+            if let Ok((mut socket, _)) = connect(self) {
+                let _ = socket.send("Browser.close", json!({}));
+            }
+            let started = Instant::now();
+            while self.alive() && started.elapsed() < Duration::from_secs(3) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 impl Drop for Chrome {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.profile);
+        self.close();
+        if self.temporary {
+            let _ = std::fs::remove_dir_all(&self.profile);
+        } else {
+            let _ = std::fs::remove_file(self.profile.join("DevToolsActivePort"));
+        }
     }
+}
+
+/// One owner's Chrome, the pages open in it, and where the pages nobody
+/// asked for go.
+#[derive(Default)]
+struct Slot {
+    chrome: Mutex<Option<Arc<Chrome>>>,
+    pages: AtomicUsize,
+    /// Counts closings, so only the last one's idle time ends Chrome.
+    closed: AtomicU64,
+    adopt: Mutex<Option<async_channel::Sender<PageEvent>>>,
+    /// Listening at the task's port while its Chrome is ended: told to stop
+    /// when a tab starts one.
+    waker: Mutex<Option<Arc<AtomicBool>>>,
+}
+
+/// What the task's Chrome tells the task, beside what its tabs show.
+pub enum PageEvent {
+    /// A page no tab opened: by a page of the task's (`window.open`, a link
+    /// to a new window) when `by_page`, else from outside, as an agent's
+    /// Playwright makes one, to show without taking the user's eyes.
+    Opened { target: String, by_page: bool },
+    /// A download done, where it is.
+    Downloaded(PathBuf),
+    DownloadFailed(String),
+}
+
+static SLOTS: OnceLock<Mutex<HashMap<Owner, Arc<Slot>>>> = OnceLock::new();
+
+fn slot(owner: &Owner) -> Arc<Slot> {
+    SLOTS.get_or_init(Default::default).lock().unwrap().entry(owner.clone()).or_default().clone()
 }
 
 #[cfg(unix)]
 fn find_chrome() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
-    for app in ["Google Chrome.app/Contents/MacOS/Google Chrome", "Chromium.app/Contents/MacOS/Chromium", "Microsoft Edge.app/Contents/MacOS/Microsoft Edge"] {
+    for app in
+        ["Google Chrome.app/Contents/MacOS/Google Chrome", "Chromium.app/Contents/MacOS/Chromium", "Microsoft Edge.app/Contents/MacOS/Microsoft Edge"]
+    {
         let path = PathBuf::from("/Applications").join(app);
         if path.is_file() {
             return Some(path);
@@ -64,8 +155,7 @@ fn find_chrome() -> Option<PathBuf> {
 /// Chromium too.
 #[cfg(windows)]
 fn find_chrome() -> Option<PathBuf> {
-    let roots: Vec<PathBuf> =
-        ["LOCALAPPDATA", "ProgramFiles", "ProgramFiles(x86)"].iter().filter_map(std::env::var_os).map(PathBuf::from).collect();
+    let roots: Vec<PathBuf> = ["LOCALAPPDATA", "ProgramFiles", "ProgramFiles(x86)"].iter().filter_map(std::env::var_os).map(PathBuf::from).collect();
     let in_roots = |rel: &str| roots.iter().map(|r| r.join(rel)).find(|p| p.is_file());
     in_roots(r"Google\Chrome\Application\chrome.exe")
         .or_else(|| crate::procs::which("chrome.exe"))
@@ -73,42 +163,179 @@ fn find_chrome() -> Option<PathBuf> {
         .or_else(|| in_roots(r"Microsoft\Edge\Application\msedge.exe"))
 }
 
-static CHROME: OnceLock<Mutex<Option<Arc<Chrome>>>> = OnceLock::new();
+/// FNV-1a: the same in every build, as a port given to a running agent
+/// must stay right for the window of the next build.
+fn fnv(text: &str) -> u64 {
+    text.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
+}
 
-/// The app's Chrome, started on first use.
-fn chrome() -> Result<Arc<Chrome>> {
-    let slot = CHROME.get_or_init(|| Mutex::new(None));
-    let mut slot = slot.lock().unwrap();
-    if let Some(chrome) = slot.as_ref() {
+fn task_key(root: &Path) -> String {
+    format!("{}\0{}", crate::state::state_dir().display(), root.display())
+}
+
+/// The task's DevTools port: below the ephemeral range, where the system
+/// gives no program one of its own choosing.
+fn task_port(root: &Path) -> u16 {
+    21000 + (fnv(&task_key(root)) % 9000) as u16
+}
+
+/// What a task's terminals are told: where its browser is, once a Web tab
+/// opened it.
+pub fn task_env(root: &Path) -> (String, String) {
+    ("IDEAE_BROWSER_CDP".to_string(), format!("http://127.0.0.1:{}", task_port(root)))
+}
+
+/// The repository a worktree belongs to: tasks of one share their first
+/// logins.
+fn project_of(root: &Path) -> String {
+    let git = root.join(".git");
+    let common = match std::fs::read_to_string(&git) {
+        // A worktree: `gitdir: <repo>/.git/worktrees/<name>`.
+        Ok(text) => text
+            .trim()
+            .strip_prefix("gitdir:")
+            .map(|dir| PathBuf::from(dir.trim()))
+            .and_then(|dir| dir.parent()?.parent().map(Path::to_path_buf))
+            .unwrap_or(git),
+        Err(_) => git,
+    };
+    common.canonicalize().unwrap_or(common).display().to_string()
+}
+
+/// What of a profile holds who you are on a site: copied into a new task's
+/// from the project's last, so it starts logged in where that one was.
+const LOGINS: [&str; 4] = ["Local State", "Default/Network", "Default/Cookies", "Default/Local Storage"];
+
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    if from.is_dir() {
+        std::fs::create_dir_all(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            copy_tree(&entry.path(), &to.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else {
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(from, to).map(|_| ())
+    }
+}
+
+/// The task's profile, made when it has none; profiles of worktrees gone
+/// are removed on the way.
+fn task_profile(root: &Path) -> Result<PathBuf> {
+    // Tests keep theirs out of the state of the app that runs them.
+    let all = if cfg!(test) {
+        std::env::temp_dir().join(format!("ideae-web-test-profiles-{}", std::process::id()))
+    } else {
+        crate::state::state_dir().join("web")
+    };
+    let dir = all.join(format!("{:016x}", fnv(&task_key(root))));
+    let project = project_of(root);
+    let mut seed: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(&all).into_iter().flatten().flatten() {
+        let other = entry.path();
+        if other == dir {
+            continue;
+        }
+        let of = std::fs::read_to_string(other.join("root")).unwrap_or_default();
+        if of.is_empty() || !Path::new(&of).exists() {
+            let _ = std::fs::remove_dir_all(&other);
+            continue;
+        }
+        if std::fs::read_to_string(other.join("project")).ok().as_deref() != Some(project.as_str()) {
+            continue;
+        }
+        let used = ["Default/Network/Cookies", "Default/Cookies"]
+            .iter()
+            .filter_map(|f| std::fs::metadata(other.join(f)).and_then(|m| m.modified()).ok())
+            .max();
+        if let Some(used) = used.filter(|used| seed.as_ref().is_none_or(|(at, _)| used > at)) {
+            seed = Some((used, other));
+        }
+    }
+    if !dir.join("root").exists() {
+        std::fs::create_dir_all(&dir)?;
+        if let Some((_, from)) = seed {
+            for part in LOGINS {
+                if from.join(part).exists() {
+                    let _ = copy_tree(&from.join(part), &dir.join(part));
+                }
+            }
+        }
+        std::fs::write(dir.join("project"), &project)?;
+        std::fs::write(dir.join("root"), root.display().to_string())?;
+    }
+    Ok(dir)
+}
+
+/// The owner's Chrome, started on first use, or again when it ended.
+fn chrome(owner: &Owner) -> Result<Arc<Chrome>> {
+    let slot = slot(owner);
+    let mut held = slot.chrome.lock().unwrap();
+    if let Some(chrome) = held.as_ref().filter(|c| c.alive()) {
         return Ok(chrome.clone());
     }
-    let program =
-        std::env::var_os("IDEAE_CHROME").map(PathBuf::from).or_else(find_chrome).ok_or_else(|| anyhow!("no Chrome or Chromium found"))?;
+    *held = None;
+    // The port is the waker's while Chrome sleeps: it lets go of it.
+    if let Some(stop) = slot.waker.lock().unwrap().take() {
+        stop.store(true, Ordering::SeqCst);
+        if let Owner::Task(root) = owner {
+            let port = task_port(root);
+            let _ = TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), Duration::from_millis(200));
+            let started = Instant::now();
+            while TcpListener::bind(("127.0.0.1", port)).is_err() && started.elapsed() < Duration::from_secs(1) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+    let program = std::env::var_os("IDEAE_CHROME")
+        .map(PathBuf::from)
+        .or_else(find_chrome)
+        .ok_or_else(|| anyhow!("No Chrome or Chromium found: install one, or name it in IDEAE_CHROME"))?;
     let program = program.as_path();
-    let profile = crate::state::runtime_dir().join(format!("chrome-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&profile);
+    let (profile, temporary, port) = match owner {
+        Owner::Task(root) => (task_profile(root)?, false, task_port(root)),
+        Owner::Pictures => (crate::state::runtime_dir().join(format!("chrome-{}", std::process::id())), true, 0),
+    };
+    if temporary {
+        let _ = std::fs::remove_dir_all(&profile);
+    }
     std::fs::create_dir_all(&profile)?;
+    let port_file = profile.join("DevToolsActivePort");
+    let _ = std::fs::remove_file(&port_file);
+    // The task's port when it is free; else any, and its terminals' is wrong.
+    let port = if port != 0 && TcpListener::bind(("127.0.0.1", port)).is_ok() { port } else { 0 };
     let mut command = crate::procs::command(program);
     command
         .args([
             "--headless=new",
-            "--remote-debugging-port=0",
             "--no-first-run",
             "--no-default-browser-check",
             "--hide-scrollbars",
-            "about:blank",
+            "--password-store=basic",
+            "--use-mock-keychain",
         ])
+        .arg(format!("--remote-debugging-port={port}"))
+        // Its own DevTools, served from that port, connects back to it.
+        .args((port != 0).then(|| format!("--remote-allow-origins=http://127.0.0.1:{port}")))
         .arg(format!("--user-data-dir={}", profile.display()))
+        .arg("about:blank")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let child = crate::procs::spawn_tied(&mut command).with_context(|| format!("starting {}", program.display()))?;
+    let mut child = crate::procs::spawn_tied(&mut command).with_context(|| format!("starting {}", program.display()))?;
 
-    // Chrome writes the port it picked and the browser socket path here.
-    let port_file = profile.join("DevToolsActivePort");
+    // Chrome writes the port it took and the browser socket path here.
     let started = Instant::now();
     let (port, ws_path) = loop {
-        if let Ok(text) = std::fs::read_to_string(&port_file) {
+        // A port given is not written to the file: Chrome tells it over HTTP.
+        if port != 0 {
+            if let Some(path) = devtools_version(port).and_then(|v| browser_path(&v)) {
+                break (port, path);
+            }
+        } else if let Ok(text) = std::fs::read_to_string(&port_file) {
             let mut lines = text.lines();
             if let (Some(port), Some(path)) = (lines.next(), lines.next()) {
                 if let Ok(port) = port.trim().parse() {
@@ -116,69 +343,372 @@ fn chrome() -> Result<Arc<Chrome>> {
                 }
             }
         }
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(anyhow!("Chrome ended as it started ({status}): is another one using {}?", profile.display()));
+        }
         if started.elapsed() > Duration::from_secs(15) {
+            let _ = child.kill();
+            let _ = child.wait();
             return Err(anyhow!("Chrome did not open its DevTools port"));
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    PORT.store(u32::from(port), std::sync::atomic::Ordering::Relaxed);
-    let chrome = Arc::new(Chrome { port, ws_path, child, profile });
-    *slot = Some(chrome.clone());
+    let product = devtools_version(port).and_then(|v| v["Browser"].as_str().map(str::to_string)).unwrap_or_default();
+    let major = product.split_once('/').map(|(_, v)| v.split('.').next().unwrap_or_default().to_string()).unwrap_or_else(|| "130".into());
+    let chrome = Arc::new(Chrome { port, ws_path, child: Mutex::new(child), profile, temporary, claimed: Default::default(), major, first: Default::default() });
+    // Taken now, under the lock a tab waits for: a tab's page made at the same time is not taken for one of them.
+    if let Ok((mut socket, _)) = connect(&chrome) {
+        if let Ok(open) = socket.call("Target.getTargets", json!({}), &mut Vec::new()) {
+            for info in open["targetInfos"].as_array().into_iter().flatten().filter(|i| i["type"] == "page") {
+                let id = info["targetId"].as_str().unwrap_or_default().to_string();
+                chrome.claim(&id);
+                chrome.first.lock().unwrap().push(id);
+            }
+        }
+    }
+    if matches!(owner, Owner::Task(_)) {
+        watch(Arc::downgrade(&chrome), slot.clone());
+    }
+    *held = Some(chrome.clone());
     Ok(chrome)
 }
 
-/// Ends Chrome as the app quits: nothing else does where a child is not
-/// told of its parent's end (macOS), and its idle time is a minute.
-pub fn quit() {
-    if let Some(chrome) = CHROME.get().and_then(|slot| slot.lock().ok()?.take()) {
-        PORT.store(0, std::sync::atomic::Ordering::Relaxed);
+/// The browser's socket path, from what its DevTools endpoint says of it.
+fn browser_path(version: &Value) -> Option<String> {
+    let url = version["webSocketDebuggerUrl"].as_str()?;
+    url.split_once("://")?.1.split_once('/').map(|(_, path)| format!("/{path}"))
+}
+
+/// What the DevTools HTTP endpoint at `port` says of the browser.
+fn devtools_version(port: u16) -> Option<Value> {
+    use std::io::{Read as _, Write as _};
+    let mut stream = TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), Duration::from_millis(200)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    stream.write_all(b"GET /json/version HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").ok()?;
+    // Read until the body is whole: Chrome keeps the connection open.
+    let (mut answer, mut chunk) = (Vec::new(), [0u8; 4096]);
+    let body: Value = loop {
+        let n = stream.read(&mut chunk).ok().filter(|n| *n > 0)?;
+        answer.extend_from_slice(&chunk[..n]);
+        let text = String::from_utf8_lossy(&answer);
+        if let Some(body) = text.split_once("\r\n\r\n").and_then(|(_, body)| serde_json::from_str(body).ok()) {
+            break body;
+        }
+    };
+    Some(body)
+}
+
+/// While a task's Chrome is ended, its port waits for a call (an agent's
+/// Playwright, given IDEAE_BROWSER_CDP): one starts it again, and the call
+/// is carried to it.
+fn wake_on_call(root: PathBuf, slot: Arc<Slot>) {
+    let Ok(listener) = TcpListener::bind(("127.0.0.1", task_port(&root))) else { return };
+    let stop = Arc::new(AtomicBool::new(false));
+    *slot.waker.lock().unwrap() = Some(stop.clone());
+    let _ = std::thread::Builder::new().name("cdp-waker".into()).spawn(move || {
+        let Ok((client, _)) = listener.accept() else { return };
+        drop(listener);
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        slot.waker.lock().unwrap().take();
+        let owner = Owner::Task(root);
+        // Counted and let go: Chrome ends a minute on unless a tab takes a page of it.
+        let open = OpenPage::new(&owner);
+        let Ok(chrome) = chrome(&owner) else { return };
+        drop(open);
+        let Ok(server) = TcpStream::connect(("127.0.0.1", chrome.port)) else { return };
+        let (Ok(client_back), Ok(server_back)) = (client.try_clone(), server.try_clone()) else { return };
+        let carry = |mut from: TcpStream, mut to: TcpStream| {
+            let _ = std::io::copy(&mut from, &mut to);
+            let _ = to.shutdown(std::net::Shutdown::Write);
+        };
+        let back = std::thread::spawn(move || carry(server_back, client_back));
+        carry(client, server);
+        let _ = back.join();
         drop(chrome);
+    });
+}
+
+/// Ends every Chrome as the app quits: nothing else does where a child is
+/// not told of its parent's end (macOS), and its idle time is a minute.
+pub fn quit() {
+    let Some(slots) = SLOTS.get() else { return };
+    let slots: Vec<Arc<Slot>> = slots.lock().map(|s| s.values().cloned().collect()).unwrap_or_default();
+    // Each closes on its own thread, whoever else holds it (a page's thread):
+    // they write their profiles out at once.
+    let closing: Vec<_> = slots
+        .into_iter()
+        .filter_map(|slot| slot.chrome.lock().ok().and_then(|mut c| c.take()))
+        .map(|chrome| std::thread::spawn(move || chrome.close()))
+        .collect();
+    for closed in closing {
+        let _ = closed.join();
     }
 }
 
-/// The DevTools endpoint for Playwright MCP (`--cdp-endpoint`), once Chrome runs.
-pub fn endpoint() -> Option<String> {
-    // Not through `CHROME`: it is locked for as long as Chrome takes to
-    // start, and this is asked on every frame.
-    Some(PORT.load(std::sync::atomic::Ordering::Relaxed)).filter(|port| *port > 0).map(|port| format!("http://127.0.0.1:{port}"))
+/// What the task's Chrome has for the task: pages no tab opened, downloads.
+pub fn page_events(root: &Path) -> async_channel::Receiver<PageEvent> {
+    let (tx, rx) = async_channel::unbounded();
+    *slot(&Owner::Task(root.to_path_buf())).adopt.lock().unwrap() = Some(tx);
+    rx
 }
 
-/// The DevTools port of the Chrome that runs, 0 when none does.
-static PORT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+fn ws_config() -> WebSocketConfig {
+    // A picture of a large page at twice its size is tens of megabytes of text.
+    WebSocketConfig::default().max_message_size(Some(512 << 20)).max_frame_size(Some(512 << 20))
+}
+
+/// A browser-level DevTools connection, and the stream under it for a
+/// writer of its own.
+fn connect(chrome: &Chrome) -> Result<(Socket, TcpStream)> {
+    let stream = TcpStream::connect(("127.0.0.1", chrome.port))?;
+    stream.set_nodelay(true)?;
+    let raw = stream.try_clone()?;
+    let url = format!("ws://127.0.0.1:{}{}", chrome.port, chrome.ws_path);
+    let (ws, _) =
+        tungstenite::client::client_with_config(url.as_str(), stream, Some(ws_config())).map_err(|e| anyhow!("Unable to connect to {url}: {e}"))?;
+    Ok((Socket { ws, next_id: 0, session: None }, raw))
+}
+
+/// Offers the task the pages nobody claims: one is claimed by its tab
+/// within moments of being made, so a page is offered once that long
+/// unclaimed.
+fn watch(chrome: Weak<Chrome>, slot: Arc<Slot>) {
+    let _ = std::thread::Builder::new().name("cdp-targets".into()).spawn(move || {
+        let Some((mut socket, _)) = chrome.upgrade().and_then(|c| connect(&c).ok()) else {
+            return;
+        };
+        let mut aside = Vec::new();
+        // What is open already is Chrome's own first page: no tab's. Closed
+        // once a tab has its page, so an agent's Playwright, taking the first
+        // page it finds, drives one you see; shown as a tab when no tab came,
+        // as when the agent's call started Chrome.
+        let Some(mut first) = chrome.upgrade().map(|c| std::mem::take(&mut *c.first.lock().unwrap())) else { return };
+        let started = Instant::now();
+        if socket.call("Target.setDiscoverTargets", json!({ "discover": true }), &mut aside).is_err() {
+            return;
+        }
+        // Downloads go to the Downloads folder under a name of their own, and
+        // are named as the site asked once done: a second of a name overwrites nothing.
+        let folder = downloads_dir();
+        let _ = socket.call(
+            "Browser.setDownloadBehavior",
+            json!({ "behavior": "allowAndName", "downloadPath": folder.display().to_string(), "eventsEnabled": true }),
+            &mut aside,
+        );
+        let tell = |event: PageEvent| {
+            if let Some(tx) = slot.adopt.lock().unwrap().as_ref() {
+                let _ = tx.try_send(event);
+            }
+        };
+        let _ = socket.ws.get_mut().set_read_timeout(Some(Duration::from_millis(200)));
+        let mut waiting: Vec<(String, bool, Instant)> = Vec::new();
+        let mut downloads: HashMap<String, String> = HashMap::new();
+        let mut handle = |msg: Value, waiting: &mut Vec<(String, bool, Instant)>| {
+            let params = &msg["params"];
+            match msg["method"].as_str() {
+                Some("Target.targetCreated") if params["targetInfo"]["type"] == "page" => {
+                    let info = &params["targetInfo"];
+                    let id = info["targetId"].as_str().unwrap_or_default().to_string();
+                    waiting.push((id, info["openerId"].is_string(), Instant::now()));
+                }
+                Some("Target.targetDestroyed") => {
+                    let id = params["targetId"].as_str().unwrap_or_default();
+                    waiting.retain(|(w, _, _)| w != id);
+                }
+                Some("Browser.downloadWillBegin") => {
+                    let name = params["suggestedFilename"].as_str().unwrap_or("download").to_string();
+                    downloads.insert(params["guid"].as_str().unwrap_or_default().to_string(), name);
+                }
+                Some("Browser.downloadProgress") => {
+                    let guid = params["guid"].as_str().unwrap_or_default();
+                    match params["state"].as_str() {
+                        Some("completed") => {
+                            let name = downloads.remove(guid).unwrap_or_else(|| "download".into());
+                            let to = free_name(&folder, &name);
+                            let from = params["filePath"].as_str().map(PathBuf::from).unwrap_or_else(|| folder.join(guid));
+                            tell(match std::fs::rename(&from, &to) {
+                                Ok(()) => PageEvent::Downloaded(to),
+                                Err(_) => PageEvent::Downloaded(from),
+                            });
+                        }
+                        Some("canceled") => {
+                            let name = downloads.remove(guid).unwrap_or_default();
+                            tell(PageEvent::DownloadFailed(name));
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        };
+        for msg in aside.drain(..) {
+            handle(msg, &mut waiting);
+        }
+        loop {
+            match socket.read() {
+                Ok(Some(msg)) => handle(msg, &mut waiting),
+                Ok(None) => {}
+                Err(_) => return,
+            }
+            let Some(chrome) = chrome.upgrade() else {
+                return;
+            };
+            if !first.is_empty() {
+                let tabs = chrome.claimed.lock().unwrap().len() > first.len();
+                if tabs {
+                    for target in first.drain(..) {
+                        let _ = socket.send("Target.closeTarget", json!({ "targetId": target }));
+                    }
+                } else if started.elapsed() > Duration::from_secs(3) {
+                    for target in first.drain(..) {
+                        chrome.claimed.lock().unwrap().remove(&target);
+                        if let Some(tx) = slot.adopt.lock().unwrap().as_ref() {
+                            let _ = tx.try_send(PageEvent::Opened { target, by_page: false });
+                        }
+                    }
+                }
+            }
+            let due = Duration::from_millis(500);
+            while let Some(ix) = waiting.iter().position(|(_, _, at)| at.elapsed() > due) {
+                let (target, by_page, _) = waiting.remove(ix);
+                if chrome.claimed.lock().unwrap().contains(&target) {
+                    continue;
+                }
+                if let Some(tx) = slot.adopt.lock().unwrap().as_ref() {
+                    let _ = tx.try_send(PageEvent::Opened { target, by_page });
+                }
+            }
+        }
+    });
+}
+
+/// The user's Downloads folder.
+fn downloads_dir() -> PathBuf {
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    // XDG's own name for it, where a desktop set one.
+    let named = std::fs::read_to_string(home.join(".config/user-dirs.dirs")).ok().and_then(|text| {
+        let line = text.lines().find(|l| l.starts_with("XDG_DOWNLOAD_DIR="))?;
+        let value = line.split_once('=')?.1.trim().trim_matches('"');
+        Some(PathBuf::from(value.replace("$HOME", &home.display().to_string())))
+    });
+    let dir = named.unwrap_or_else(|| home.join("Downloads"));
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// `name` in `folder`, or `name (2)`… where that is taken.
+fn free_name(folder: &Path, name: &str) -> PathBuf {
+    let name = Path::new(name).file_name().map(|n| n.to_string_lossy().to_string()).filter(|n| !n.is_empty()).unwrap_or_else(|| "download".into());
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => (stem.to_string(), format!(".{ext}")),
+        _ => (name.clone(), String::new()),
+    };
+    (1..).map(|n| folder.join(if n == 1 { name.clone() } else { format!("{stem} ({n}){ext}") })).find(|p| !p.exists()).expect("a free name")
+}
 
 // ---------------------------------------------------------------- page session
 
+/// What a tab shows: a page to open, or one open already.
+pub enum Source {
+    Url(String),
+    Target(String),
+}
+
 enum Out {
     Command(&'static str, Value),
-    /// A command whose result the UI waits for.
+    /// The page's title, asked once it loaded: what a new document tells
+    /// as it starts can be lost while Chrome moves it to a process of its own.
+    AskTitle,
+    /// A command whose result is waited for.
     Call(&'static str, Value, mpsc::Sender<Value>),
+    /// The pointer moved: the latest of several waiting is enough.
+    Move(Value),
+    /// The page's viewport in CSS pixels, device pixels to each, whether
+    /// it is a phone's or a tablet's, and the user agent it says it is
+    /// (Chrome's own when none), with the page's address to load again
+    /// when that changes.
+    Resize(u32, u32, f32, bool, Option<Value>, String),
+    /// A frame is drawn: Chrome sends the next only then.
+    Ack(i64),
     /// The tab came into view or left it.
     Visible(bool),
     Close,
 }
 
+#[derive(Clone)]
+struct Dialog {
+    kind: String,
+    message: String,
+}
+
+/// A date, time or color field's picker asked for: headless Chrome draws
+/// none, so the tab asks for the value.
+#[derive(Clone)]
+struct Picker {
+    kind: String,
+    value: String,
+    bounds: Bounds<Pixels>,
+    context: i64,
+}
+
+#[derive(Clone)]
+struct Choice {
+    label: String,
+    disabled: bool,
+    group: Option<String>,
+}
+
+/// A `<select>` clicked: headless Chrome draws its list nowhere, so the
+/// tab does.
+#[derive(Clone)]
+struct SelectMenu {
+    bounds: Bounds<Pixels>,
+    choices: Vec<Choice>,
+    selected: Option<usize>,
+    /// The frame the select is in, to answer there.
+    context: i64,
+}
+
 enum In {
-    Frame(Vec<u8>),
+    /// The DevTools port, the page's id there and Chrome's major version, once connected.
+    Ready { port: u16, target: String, major: String },
+    /// Where text is put in the page, for an input method's window.
+    Caret(Bounds<Pixels>),
+    Frame(Vec<u8>, i64),
+    /// A new document; `failed` when it is Chrome's error page for it.
+    Navigated {
+        url: String,
+        failed: bool,
+    },
     Url(String),
+    Title(String),
+    Loading(bool),
+    Dialog(Dialog),
+    DialogClosed,
+    FileChooser {
+        node: i64,
+        multiple: bool,
+    },
+    Cursor(String),
+    Select(SelectMenu),
+    Picker(Picker),
+    Problem(String),
+    Closed,
     Error(String),
 }
 
-/// One page: a thread owning the CDP socket.
-fn spawn_page(url: String, in_tx: async_channel::Sender<In>) -> mpsc::Sender<Out> {
-    let (out_tx, out_rx) = mpsc::channel::<Out>();
-    std::thread::Builder::new()
-        .name("cdp-page".into())
-        .spawn(move || {
-            if let Err(e) = run_page(&url, &in_tx, out_rx) {
-                let _ = in_tx.send_blocking(In::Error(format!("{e:#}")));
-            }
-        })
-        .expect("spawn cdp thread");
-    out_tx
+/// Who waits for the reply to a command.
+enum Reply {
+    Caller(mpsc::Sender<Value>),
+    Title,
 }
 
+type Replies = Mutex<HashMap<u64, Reply>>;
+
 struct Socket {
-    ws: WebSocket<MaybeTlsStream<TcpStream>>,
+    ws: WebSocket<TcpStream>,
     next_id: u64,
     session: Option<String>,
 }
@@ -198,7 +728,9 @@ impl Socket {
     fn call(&mut self, method: &str, params: Value, aside: &mut Vec<Value>) -> Result<Value> {
         let id = self.send(method, params)?;
         loop {
-            let Some(mut msg) = self.read()? else { continue };
+            let Some(mut msg) = self.read()? else {
+                continue;
+            };
             if msg["id"].as_u64() == Some(id) {
                 if let Some(error) = msg.get("error") {
                     return Err(anyhow!("{method}: {}", error["message"]));
@@ -214,126 +746,598 @@ impl Socket {
         match self.ws.read() {
             Ok(Message::Text(text)) => Ok(serde_json::from_str(text.as_str()).ok()),
             Ok(_) => Ok(None),
-            Err(tungstenite::Error::Io(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                Ok(None)
-            }
+            Err(tungstenite::Error::Io(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
 }
 
-/// The pages open now. Chrome ends a while after the last one closes: it
-/// is a browser's worth of processes kept for nothing.
-static PAGES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-const CHROME_IDLE: Duration = Duration::from_secs(60);
-
-struct OpenPage;
+/// A tab's page counted among its owner's, for Chrome to end a while after
+/// the last one closes: it is a browser's worth of processes kept for nothing.
+struct OpenPage(Arc<Slot>, Owner);
+const CHROME_IDLE: Duration = if cfg!(test) { Duration::from_millis(500) } else { Duration::from_secs(60) };
 
 impl OpenPage {
-    fn new() -> Self {
-        PAGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Self
+    fn new(owner: &Owner) -> Self {
+        let slot = slot(owner);
+        slot.pages.fetch_add(1, Ordering::SeqCst);
+        Self(slot, owner.clone())
     }
 }
 
 impl Drop for OpenPage {
     fn drop(&mut self) {
-        if PAGES.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) != 1 {
+        let slot = self.0.clone();
+        if slot.pages.fetch_sub(1, Ordering::SeqCst) != 1 {
             return;
         }
-        // The idle time counts from the last page closed, not an earlier last one.
-        static CLOSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let this = CLOSED.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let this = slot.closed.fetch_add(1, Ordering::SeqCst) + 1;
+        let owner = self.1.clone();
         std::thread::spawn(move || {
             std::thread::sleep(CHROME_IDLE);
-            let Some(slot) = CHROME.get() else { return };
-            let mut slot = slot.lock().unwrap();
+            let mut held = slot.chrome.lock().unwrap();
             // Under the lock a new page waits for: it finds Chrome there, or starts one.
-            if PAGES.load(std::sync::atomic::Ordering::SeqCst) == 0 && CLOSED.load(std::sync::atomic::Ordering::SeqCst) == this {
-                PORT.store(0, std::sync::atomic::Ordering::Relaxed);
-                *slot = None;
+            if slot.pages.load(Ordering::SeqCst) == 0 && slot.closed.load(Ordering::SeqCst) == this {
+                if let Some(chrome) = held.take() {
+                    // Ended now, so its port is free for the waker.
+                    drop(chrome);
+                    if let Owner::Task(root) = owner {
+                        let started = Instant::now();
+                        while TcpListener::bind(("127.0.0.1", task_port(&root))).is_err() && started.elapsed() < Duration::from_secs(2) {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        wake_on_call(root, slot.clone());
+                    }
+                }
             }
         });
     }
 }
 
-fn run_page(url: &str, in_tx: &async_channel::Sender<In>, out_rx: mpsc::Receiver<Out>) -> Result<()> {
-    let _open = OpenPage::new();
-    let chrome = chrome()?;
-    let (ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{}{}", chrome.port, chrome.ws_path))?;
-    let mut socket = Socket { ws, next_id: 0, session: None };
+/// One page: this thread reads what Chrome sends, one of its own writes.
+fn spawn_page(owner: Owner, source: Source, in_tx: async_channel::Sender<In>) -> mpsc::Sender<Out> {
+    let (out_tx, out_rx) = mpsc::channel::<Out>();
+    std::thread::Builder::new()
+        .name("cdp-page".into())
+        .spawn({
+            // The reader's own questions, through the writer.
+            let ask = out_tx.clone();
+            move || {
+                if let Err(e) = run_page(owner, source, &in_tx, out_rx, ask) {
+                    let _ = in_tx.send_blocking(In::Error(format!("{e:#}")));
+                }
+            }
+        })
+        .expect("spawn cdp thread");
+    out_tx
+}
+
+/// Run in every document of the page: tells the tab its title and the
+/// pointer's cursor as they change, and takes what would open a list or a
+/// picker headless Chrome draws nowhere: a `<select>`'s, a date's, a color's.
+const PAGE_SCRIPT: &str = r##"(() => {
+  if (window.__ideaeOn) return;
+  window.__ideaeOn = true;
+  // Chrome's DevTools in its panel: the page is in the tab beside it, not
+  // in a picture of its own, which would set the page's size and scale.
+  if (location.hostname === "127.0.0.1" && location.pathname === "/devtools/inspector.html") {
+    try { for (const key of ["screencast-enabled", "screencastEnabled"]) localStorage.setItem(key, "false"); } catch (_) {}
+  }
+  const send = (m) => { try { window.__ideae(JSON.stringify(m)); } catch (_) {} };
+  const typing = (e) => e.isContentEditable || e.localName === "textarea" ||
+    (e.localName === "input" && !/^(button|submit|reset|checkbox|radio|range|color|file|image)$/.test(e.type));
+  const cursorAt = (el, x, y) => {
+    for (let n = el; n && n.nodeType === 1; n = n.parentElement || n.getRootNode().host || null) {
+      const c = getComputedStyle(n).cursor;
+      if (c && c !== "auto") return c.split(",").pop().trim();
+      if (typing(n)) return "text";
+      if ((n.localName === "a" && n.hasAttribute("href")) || n.localName === "summary") return "pointer";
+    }
+    const at = document.caretRangeFromPoint && document.caretRangeFromPoint(x, y);
+    if (at && at.startContainer.nodeType === 3) {
+      const text = document.createRange();
+      text.selectNodeContents(at.startContainer);
+      for (const b of text.getClientRects()) if (x >= b.left && x <= b.right && y >= b.top && y <= b.bottom) return "text";
+    }
+    return "default";
+  };
+  if (window === window.top) {
+    let title = null;
+    const tell = () => { if (document.title !== title) { title = document.title; send({ title }); } };
+    const watch = () => {
+      tell();
+      if (document.head) new MutationObserver(tell).observe(document.head, { subtree: true, childList: true, characterData: true });
+    };
+    if (document.readyState === "loading") addEventListener("DOMContentLoaded", watch, { once: true }); else watch();
+  }
+  let last = "", moved = null;
+  addEventListener("mousemove", (ev) => {
+    const first = !moved;
+    // Its path is empty once the event is over: taken now.
+    moved = { target: ev.composedPath()[0], x: ev.clientX, y: ev.clientY };
+    if (!first) return;
+    setTimeout(() => {
+      const m = moved;
+      moved = null;
+      let t = m.target;
+      if (t && t.nodeType !== 1) t = t.parentElement;
+      if (!t) return;
+      const c = cursorAt(t, m.x, m.y);
+      if (c !== last) { last = c; send({ cursor: c }); }
+    }, 16);
+  }, { capture: true, passive: true });
+  // Where an element is in the top page, through same-origin frames.
+  const place = (el) => {
+    const r = el.getBoundingClientRect();
+    let x = r.left, y = r.top;
+    try {
+      for (let w = window; w !== w.top && w.frameElement; w = w.parent) {
+        const f = w.frameElement.getBoundingClientRect();
+        x += f.left + w.frameElement.clientLeft;
+        y += f.top + w.frameElement.clientTop;
+      }
+    } catch (_) {}
+    return { x, y, width: r.width, height: r.height };
+  };
+  const openSelect = (s) => {
+    if (s.multiple || s.size > 1 || s.disabled) return false;
+    s.focus();
+    window.__ideaeSelect = s;
+    const options = [...s.options].map((o) => {
+      const g = o.parentElement.localName === "optgroup" ? o.parentElement : null;
+      return { label: o.label || o.text, disabled: o.disabled || !!(g && g.disabled), group: g ? g.label : null };
+    });
+    send({ select: Object.assign(place(s), { options, selected: s.selectedIndex }) });
+    return true;
+  };
+  const PICKED = /^(date|time|datetime-local|month|week|color)$/;
+  const openPicker = (i) => {
+    if (i.disabled || i.readOnly) return false;
+    i.focus();
+    window.__ideaePicker = i;
+    send({ picker: Object.assign(place(i), { type: i.type, value: i.value }) });
+    return true;
+  };
+  const target = (ev) => { const t = ev.composedPath()[0]; return t && t.nodeType === 1 ? t : null; };
+  // Where the caret is, for an input method's window, as it moves.
+  const caretOf = () => {
+    let e = document.activeElement;
+    while (e && e.shadowRoot && e.shadowRoot.activeElement) e = e.shadowRoot.activeElement;
+    if (!e || e === document.body) return null;
+    let r = null;
+    if ((e.localName === "input" || e.localName === "textarea") && typeof e.selectionStart === "number") {
+      const b = e.getBoundingClientRect(), cs = getComputedStyle(e);
+      let x = b.left + parseFloat(cs.paddingLeft) + parseFloat(cs.borderLeftWidth);
+      if (e.localName === "input") {
+        const c = document.createElement("canvas").getContext("2d");
+        c.font = cs.font;
+        x += c.measureText(e.value.slice(0, e.selectionStart)).width - e.scrollLeft;
+      }
+      r = { x: Math.min(x, b.right), y: b.top + parseFloat(cs.paddingTop) + parseFloat(cs.borderTopWidth), height: parseFloat(cs.lineHeight) || parseFloat(cs.fontSize) * 1.2 };
+    } else if (e.isContentEditable) {
+      const s = getSelection();
+      const b = s.rangeCount ? s.getRangeAt(0).getBoundingClientRect() : null;
+      if (b && b.height) r = { x: b.left, y: b.top, height: b.height };
+    }
+    if (!r) return null;
+    try {
+      for (let w = window; w !== w.top && w.frameElement; w = w.parent) {
+        const f = w.frameElement.getBoundingClientRect();
+        r.x += f.left;
+        r.y += f.top;
+      }
+    } catch (_) {}
+    return r;
+  };
+  let caretTold = "", caretTimer = 0;
+  const tellCaret = () => {
+    if (caretTimer) return;
+    caretTimer = setTimeout(() => {
+      caretTimer = 0;
+      const r = caretOf();
+      if (!r) return;
+      const k = Math.round(r.x) + "," + Math.round(r.y) + "," + Math.round(r.height);
+      if (k !== caretTold) { caretTold = k; send({ caret: r }); }
+    }, 50);
+  };
+  document.addEventListener("selectionchange", tellCaret, true);
+  addEventListener("focusin", tellCaret, true);
+  addEventListener("mousedown", (ev) => {
+    const t = target(ev);
+    if (!t || ev.button !== 0) return;
+    const s = t.closest("select");
+    if (s && openSelect(s)) return ev.preventDefault();
+    if (t.localName === "input" && PICKED.test(t.type)) {
+      // A date's own fields take a click; its calendar mark, at the right end, opens the picker.
+      const r = t.getBoundingClientRect();
+      if ((t.type === "color" || ev.clientX > r.right - 28) && openPicker(t)) ev.preventDefault();
+    }
+  }, true);
+  // The keys that open a list or a picker in Chrome.
+  addEventListener("keydown", (ev) => {
+    const t = target(ev);
+    if (!t) return;
+    const opens = ev.key === "F4" || (ev.altKey && (ev.key === "ArrowDown" || ev.key === "ArrowUp"));
+    if (t.localName === "select" && (opens || ev.key === " ") && openSelect(t)) ev.preventDefault();
+    else if (t.localName === "input" && PICKED.test(t.type) && (opens || (t.type === "color" && (ev.key === " " || ev.key === "Enter"))) && openPicker(t)) ev.preventDefault();
+  }, true);
+  // A page's own button for them.
+  try {
+    const own = HTMLInputElement.prototype.showPicker;
+    HTMLInputElement.prototype.showPicker = function () { if (!(PICKED.test(this.type) && openPicker(this)) && own) own.call(this); };
+    HTMLSelectElement.prototype.showPicker = function () { openSelect(this); };
+  } catch (_) {}
+})()"##;
+
+const BINDING: &str = "__ideae";
+
+/// The text selected, in a field too, where the page's selection has none;
+/// in the frame or shadow root that has the focus.
+const SELECTED: &str = r##"(() => {
+  let d = document, e = d.activeElement;
+  for (;;) {
+    while (e && e.shadowRoot && e.shadowRoot.activeElement) e = e.shadowRoot.activeElement;
+    if (e && e.localName === "iframe" && e.contentDocument) { d = e.contentDocument; e = d.activeElement; continue; }
+    break;
+  }
+  try {
+    if (e && typeof e.selectionStart === "number" && e.selectionEnd > e.selectionStart) return e.value.slice(e.selectionStart, e.selectionEnd);
+  } catch (_) {}
+  return String((d.defaultView || window).getSelection());
+})()"##;
+
+/// A message of the page about something wrong: an exception, an error
+/// logged, a request that failed.
+fn problem(method: &str, params: &Value) -> Option<String> {
+    let place = |url: &Value, line: &Value| {
+        let url = url.as_str().filter(|u| !u.is_empty())?;
+        Some(match line.as_i64() {
+            Some(line) => format!(" ({url}:{})", line + 1),
+            None => format!(" ({url})"),
+        })
+    };
+    let text = match method {
+        "Runtime.exceptionThrown" => {
+            let d = &params["exceptionDetails"];
+            match d["exception"]["description"].as_str() {
+                Some(description) => description.to_string(),
+                None => format!("{}{}", d["text"].as_str().unwrap_or("Uncaught"), place(&d["url"], &d["lineNumber"]).unwrap_or_default()),
+            }
+        }
+        "Runtime.consoleAPICalled" if matches!(params["type"].as_str(), Some("error" | "assert")) => {
+            let args: Vec<String> = params["args"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|a| match &a["value"] {
+                    Value::String(s) => s.clone(),
+                    Value::Null => a["description"].as_str().unwrap_or("").to_string(),
+                    other => other.to_string(),
+                })
+                .collect();
+            let top = &params["stackTrace"]["callFrames"][0];
+            format!("console.error: {}{}", args.join(" "), place(&top["url"], &top["lineNumber"]).unwrap_or_default())
+        }
+        // A missing favicon is Chrome's asking, not the page's.
+        "Log.entryAdded" if params["entry"]["level"] == "error" && !params["entry"]["url"].as_str().is_some_and(|u| u.ends_with("/favicon.ico")) => {
+            let entry = &params["entry"];
+            format!("{}{}", entry["text"].as_str().unwrap_or_default(), place(&entry["url"], &Value::Null).unwrap_or_default())
+        }
+        _ => return None,
+    };
+    let mut text = text.trim().to_string();
+    if text.len() > 2000 {
+        let cut = (0..=2000).rev().find(|i| text.is_char_boundary(*i)).unwrap_or(0);
+        text.truncate(cut);
+        text.push('…');
+    }
+    Some(text)
+}
+
+fn run_page(owner: Owner, source: Source, in_tx: &async_channel::Sender<In>, out_rx: mpsc::Receiver<Out>, ask: mpsc::Sender<Out>) -> Result<()> {
+    let open = OpenPage::new(&owner);
+    let chrome = chrome(&owner)?;
+    let (mut socket, raw) = connect(&chrome)?;
     let mut aside = Vec::new();
 
-    let target = socket.call("Target.createTarget", json!({ "url": url }), &mut aside)?;
-    let target_id = target["targetId"].as_str().unwrap_or_default().to_string();
+    let target_id = match &source {
+        Source::Url(_) => {
+            // A window of its own: Chrome draws only the tab in front of a window,
+            // and a page behind another sends no frames.
+            let target = socket.call("Target.createTarget", json!({ "url": "about:blank", "newWindow": true }), &mut aside)?;
+            target["targetId"].as_str().unwrap_or_default().to_string()
+        }
+        Source::Target(id) => id.clone(),
+    };
+    chrome.claim(&target_id);
+    let _ = in_tx.send_blocking(In::Ready { port: chrome.port, target: target_id.clone(), major: chrome.major.clone() });
+    // The page's closing is told to the browser's connection.
+    socket.call("Target.setDiscoverTargets", json!({ "discover": true }), &mut aside)?;
     let attached = socket.call("Target.attachToTarget", json!({ "targetId": target_id, "flatten": true }), &mut aside)?;
     socket.session = attached["sessionId"].as_str().map(str::to_string);
     socket.call("Page.enable", json!({}), &mut aside)?;
-
-    // Short reads so commands from the UI go out promptly.
-    if let MaybeTlsStream::Plain(stream) = socket.ws.get_mut() {
-        stream.set_read_timeout(Some(Duration::from_millis(10)))?;
+    socket.call("Runtime.enable", json!({}), &mut aside)?;
+    let _ = socket.call("Log.enable", json!({}), &mut aside);
+    // Focused as the tab in view is, wherever its window is.
+    let _ = socket.call("Emulation.setFocusEmulationEnabled", json!({ "enabled": true }), &mut aside);
+    let _ = socket.call("Page.setInterceptFileChooserDialog", json!({ "enabled": true }), &mut aside);
+    socket.call("Runtime.addBinding", json!({ "name": BINDING }), &mut aside)?;
+    socket.call("Page.addScriptToEvaluateOnNewDocument", json!({ "source": PAGE_SCRIPT }), &mut aside)?;
+    let _ = socket.call("Runtime.evaluate", json!({ "expression": PAGE_SCRIPT }), &mut aside);
+    if let Source::Url(url) = &source {
+        socket.send("Page.navigate", json!({ "url": url }))?;
+    } else {
+        // A page made elsewhere: what it shows now.
+        if let Ok(info) = socket.call("Target.getTargetInfo", json!({ "targetId": target_id }), &mut aside) {
+            let info = &info["targetInfo"];
+            let _ = in_tx.send_blocking(In::Navigated { url: info["url"].as_str().unwrap_or_default().to_string(), failed: false });
+            let _ = in_tx.send_blocking(In::Title(info["title"].as_str().unwrap_or_default().to_string()));
+        }
     }
 
-    let mut replies: std::collections::HashMap<u64, mpsc::Sender<Value>> = Default::default();
-    let handle = |mut msg: Value, socket: &mut Socket, replies: &mut std::collections::HashMap<u64, mpsc::Sender<Value>>| -> Result<()> {
-        if let Some(reply) = msg["id"].as_u64().and_then(|id| replies.remove(&id)) {
-            let _ = reply.send(msg["result"].take());
-            return Ok(());
-        }
-        match msg["method"].as_str() {
-            Some("Page.screencastFrame") => {
-                let params = &msg["params"];
-                socket.send("Page.screencastFrameAck", json!({ "sessionId": params["sessionId"] }))?;
-                if let Some(data) = params["data"].as_str() {
-                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) {
-                        let _ = in_tx.try_send(In::Frame(bytes));
-                    }
-                }
-            }
-            Some("Page.frameNavigated") if msg["params"]["frame"]["parentId"].is_null() => {
-                if let Some(url) = msg["params"]["frame"]["url"].as_str() {
-                    let _ = in_tx.try_send(In::Url(url.to_string()));
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    };
+    let replies: Arc<Replies> = Default::default();
+    let closing = Arc::new(AtomicBool::new(false));
+    {
+        let writer = WebSocket::from_raw_socket(raw.try_clone()?, Role::Client, Some(ws_config()));
+        let (replies, closing, target_id) = (replies.clone(), closing.clone(), target_id.clone());
+        let session = socket.session.clone().unwrap_or_default();
+        let first_id = socket.next_id + 1;
+        std::thread::Builder::new().name("cdp-write".into()).spawn(move || {
+            // Chrome stays while the page is written to.
+            let _keep = (open, chrome);
+            write_page(writer, raw, first_id, session, &target_id, out_rx, &replies, &closing);
+        })?;
+    }
+
+    let mut main_frame = target_id.clone();
     for msg in aside.drain(..) {
-        handle(msg, &mut socket, &mut replies)?;
+        read_message(msg, &target_id, &mut main_frame, in_tx, &replies, &ask);
     }
-
+    // Blocking reads: the writer shuts the stream to end them.
+    let _ = socket.ws.get_mut().set_read_timeout(None);
     loop {
-        loop {
-            match out_rx.try_recv() {
-                Ok(Out::Command(method, params)) => {
-                    socket.send(method, params)?;
-                }
-                Ok(Out::Call(method, params, reply)) => {
-                    let id = socket.send(method, params)?;
-                    replies.insert(id, reply);
-                }
-                Ok(Out::Visible(visible)) => {
-                    // Out of view the page sends no frames, and this thread
-                    // looks for commands four times a second, not a hundred.
-                    if !visible {
-                        socket.send("Page.stopScreencast", json!({}))?;
-                    }
-                    if let MaybeTlsStream::Plain(stream) = socket.ws.get_mut() {
-                        stream.set_read_timeout(Some(Duration::from_millis(if visible { 10 } else { 250 })))?;
-                    }
-                }
-                Ok(Out::Close) | Err(mpsc::TryRecvError::Disconnected) => {
-                    socket.session = None;
-                    let _ = socket.send("Target.closeTarget", json!({ "targetId": target_id }));
+        match socket.read() {
+            Ok(Some(msg)) => {
+                if !read_message(msg, &target_id, &mut main_frame, in_tx, &replies, &ask) {
                     return Ok(());
                 }
-                Err(mpsc::TryRecvError::Empty) => break,
+            }
+            Ok(None) => {}
+            Err(e) if closing.load(Ordering::SeqCst) => {
+                let _ = e;
+                return Ok(());
+            }
+            Err(e) => return Err(anyhow!("the connection to Chrome ended: {e}")),
+        }
+    }
+}
+
+/// One message from Chrome to what the tab is told; false once the tab is gone.
+fn read_message(mut msg: Value, target: &str, main_frame: &mut String, in_tx: &async_channel::Sender<In>, replies: &Replies, ask: &mpsc::Sender<Out>) -> bool {
+    if let Some(id) = msg["id"].as_u64() {
+        return match replies.lock().unwrap().remove(&id) {
+            Some(Reply::Caller(reply)) => {
+                let _ = reply.send(msg["result"].take());
+                true
+            }
+            Some(Reply::Title) => {
+                let title = msg["result"]["result"]["value"].as_str().unwrap_or_default().to_string();
+                in_tx.send_blocking(In::Title(title)).is_ok()
+            }
+            None => true,
+        };
+    }
+    let method = msg["method"].as_str().unwrap_or_default().to_string();
+    let params = &msg["params"];
+    let main = params["frameId"].as_str().is_some_and(|f| f == main_frame.as_str());
+    let told = match method.as_str() {
+        "Page.screencastFrame" => {
+            let ack = params["sessionId"].as_i64().unwrap_or_default();
+            let bytes = params["data"].as_str().and_then(|d| base64::engine::general_purpose::STANDARD.decode(d).ok()).unwrap_or_default();
+            In::Frame(bytes, ack)
+        }
+        "Page.frameNavigated" if params["frame"]["parentId"].is_null() => {
+            let frame = &params["frame"];
+            *main_frame = frame["id"].as_str().unwrap_or(target).to_string();
+            match frame["unreachableUrl"].as_str() {
+                Some(url) => In::Navigated { url: url.to_string(), failed: true },
+                None => In::Navigated { url: frame["url"].as_str().unwrap_or_default().to_string(), failed: false },
             }
         }
-        if let Some(msg) = socket.read()? {
-            handle(msg, &mut socket, &mut replies)?;
+        "Page.navigatedWithinDocument" if main => In::Url(params["url"].as_str().unwrap_or_default().to_string()),
+        "Page.loadEventFired" => {
+            let _ = ask.send(Out::AskTitle);
+            In::Loading(false)
+        }
+        "Page.frameStartedLoading" if main => In::Loading(true),
+        "Page.frameStoppedLoading" if main => In::Loading(false),
+        "Target.targetDestroyed" | "Target.detachedFromTarget" if params["targetId"].as_str() == Some(target) => In::Closed,
+        "Inspector.targetCrashed" => In::Error("The page crashed: Reload starts it again".into()),
+        "Page.javascriptDialogOpening" => In::Dialog(Dialog {
+            kind: params["type"].as_str().unwrap_or("alert").to_string(),
+            message: params["message"].as_str().unwrap_or_default().to_string(),
+        }),
+        "Page.javascriptDialogClosed" => In::DialogClosed,
+        "Page.fileChooserOpened" => {
+            In::FileChooser { node: params["backendNodeId"].as_i64().unwrap_or_default(), multiple: params["mode"] == "selectMultiple" }
+        }
+        "Runtime.bindingCalled" if params["name"] == BINDING => {
+            let Ok(payload) = serde_json::from_str::<Value>(params["payload"].as_str().unwrap_or_default()) else {
+                return true;
+            };
+            if let Some(title) = payload["title"].as_str() {
+                In::Title(title.to_string())
+            } else if payload["caret"].is_object() {
+                let c = &payload["caret"];
+                let n = |v: &Value| px(v.as_f64().unwrap_or(0.) as f32);
+                In::Caret(Bounds { origin: point(n(&c["x"]), n(&c["y"])), size: size(px(2.), n(&c["height"])) })
+            } else if let Some(cursor) = payload["cursor"].as_str() {
+                In::Cursor(cursor.to_string())
+            } else if payload["picker"].is_object() {
+                let p = &payload["picker"];
+                let n = |v: &Value| px(v.as_f64().unwrap_or(0.) as f32);
+                In::Picker(Picker {
+                    kind: p["type"].as_str().unwrap_or_default().to_string(),
+                    value: p["value"].as_str().unwrap_or_default().to_string(),
+                    bounds: Bounds { origin: point(n(&p["x"]), n(&p["y"])), size: size(n(&p["width"]), n(&p["height"])) },
+                    context: params["executionContextId"].as_i64().unwrap_or_default(),
+                })
+            } else if payload["select"].is_object() {
+                let s = &payload["select"];
+                let n = |v: &Value| px(v.as_f64().unwrap_or(0.) as f32);
+                In::Select(SelectMenu {
+                    bounds: Bounds { origin: point(n(&s["x"]), n(&s["y"])), size: size(n(&s["width"]), n(&s["height"])) },
+                    choices: s["options"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|o| Choice {
+                            label: o["label"].as_str().unwrap_or_default().to_string(),
+                            disabled: o["disabled"].as_bool().unwrap_or(false),
+                            group: o["group"].as_str().map(str::to_string),
+                        })
+                        .collect(),
+                    selected: s["selected"].as_i64().and_then(|i| usize::try_from(i).ok()),
+                    context: params["executionContextId"].as_i64().unwrap_or_default(),
+                })
+            } else {
+                return true;
+            }
+        }
+        _ => match problem(&method, params) {
+            Some(text) => In::Problem(text),
+            None => return true,
+        },
+    };
+    in_tx.send_blocking(told).is_ok()
+}
+
+/// Writes what the tab asks for. The pointer's moves waiting are sent as
+/// the last of them; a resize while frames come waits for the size to settle.
+#[allow(clippy::too_many_arguments)]
+fn write_page(
+    mut ws: WebSocket<TcpStream>,
+    raw: TcpStream,
+    first_id: u64,
+    session: String,
+    target: &str,
+    out_rx: mpsc::Receiver<Out>,
+    replies: &Replies,
+    closing: &AtomicBool,
+) {
+    let mut next_id = first_id;
+    let mut send = |method: &str, params: Value, in_page: bool, reply: Option<Reply>| -> bool {
+        next_id += 1;
+        let mut msg = json!({ "id": next_id, "method": method, "params": params });
+        if in_page {
+            msg["sessionId"] = json!(session);
+        }
+        if let Some(reply) = reply {
+            replies.lock().unwrap().insert(next_id, reply);
+        }
+        ws.send(Message::text(msg.to_string())).is_ok()
+    };
+    let mut waiting: VecDeque<Out> = VecDeque::new();
+    let mut resize: Option<((u32, u32, f32, bool, Option<Value>, String), Instant)> = None;
+    let mut touch = false;
+    let mut agent: Option<Value> = None;
+    let mut casting = false;
+    loop {
+        let next = match waiting.pop_front() {
+            Some(out) => Some(out),
+            None => match resize {
+                Some((_, at)) => match out_rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
+                    Ok(out) => Some(out),
+                    Err(mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => Some(Out::Close),
+                },
+                None => Some(out_rx.recv().unwrap_or(Out::Close)),
+            },
+        };
+        let ok = match next {
+            None => {
+                let ((width, height, scale, mobile, new_agent, url), _) = resize.take().expect("a resize waits");
+                // Another device: its user agent, and the page loaded again to see it;
+                // by its address, as a first load may not be done (a reload would load what is).
+                if new_agent != agent {
+                    let told = new_agent.clone().unwrap_or_else(|| json!({ "userAgent": "" }));
+                    send("Emulation.setUserAgentOverride", told, true, None);
+                    if url.is_empty() || url == "about:blank" {
+                        send("Page.reload", json!({}), true, None);
+                    } else {
+                        send("Page.navigate", json!({ "url": url }), true, None);
+                    }
+                    agent = new_agent;
+                }
+                if casting {
+                    send("Page.stopScreencast", json!({}), true, None);
+                }
+                casting = true;
+                // A phone's page is touched: the mouse's presses come to it as touches.
+                if mobile != touch {
+                    touch = mobile;
+                    send("Emulation.setTouchEmulationEnabled", json!({ "enabled": mobile, "maxTouchPoints": 5 }), true, None);
+                    send("Emulation.setEmitTouchEventsForMouse", json!({ "enabled": mobile, "configuration": "mobile" }), true, None);
+                }
+                send(
+                    "Emulation.setDeviceMetricsOverride",
+                    json!({ "width": width, "height": height, "deviceScaleFactor": scale, "mobile": mobile }),
+                    true,
+                    None,
+                ) && send(
+                    "Page.startScreencast",
+                    json!({ "format": "jpeg", "quality": 90, "maxWidth": (width as f32 * scale).round() as u32, "maxHeight": (height as f32 * scale).round() as u32 }),
+                    true,
+                    None,
+                )
+            }
+            Some(Out::Command(method, params)) => send(method, params, true, None),
+            Some(Out::Call(method, params, reply)) => send(method, params, true, Some(Reply::Caller(reply))),
+            Some(Out::AskTitle) => {
+                send("Runtime.evaluate", json!({ "expression": "document.title", "returnByValue": true }), true, Some(Reply::Title))
+            }
+            Some(Out::Move(mut params)) => {
+                while let Ok(out) = out_rx.try_recv() {
+                    match out {
+                        Out::Move(later) => params = later,
+                        other => {
+                            waiting.push_back(other);
+                            break;
+                        }
+                    }
+                }
+                send("Input.dispatchMouseEvent", params, true, None)
+            }
+            Some(Out::Resize(width, height, scale, mobile, agent, url)) => {
+                // The first size at once; later ones once a drag of the divider ends.
+                let wait = if casting { Duration::from_millis(120) } else { Duration::ZERO };
+                resize = Some(((width, height, scale, mobile, agent, url), Instant::now() + wait));
+                true
+            }
+            Some(Out::Ack(id)) => send("Page.screencastFrameAck", json!({ "sessionId": id }), true, None),
+            Some(Out::Visible(visible)) => {
+                if !visible && casting {
+                    casting = false;
+                    resize = None;
+                    send("Page.stopScreencast", json!({}), true, None)
+                } else if visible {
+                    // In front of its window, where a page opened from it may have been.
+                    send("Target.activateTarget", json!({ "targetId": target }), false, None)
+                } else {
+                    true
+                }
+            }
+            Some(Out::Close) => {
+                closing.store(true, Ordering::SeqCst);
+                send("Target.closeTarget", json!({ "targetId": target }), false, None);
+                let _ = raw.shutdown(std::net::Shutdown::Both);
+                return;
+            }
+        };
+        if !ok {
+            closing.store(true, Ordering::SeqCst);
+            let _ = raw.shutdown(std::net::Shutdown::Both);
+            return;
         }
     }
 }
@@ -345,10 +1349,9 @@ fn run_page(url: &str, in_tx: &async_channel::Sender<In>, out_rx: mpsc::Receiver
 /// load and a moment more, for what it draws once loaded. Not for the UI
 /// thread.
 pub fn shot(url: &str, width: u32, height: u32, out: &std::path::Path) -> Result<()> {
-    let _open = OpenPage::new();
-    let chrome = chrome()?;
-    let (ws, _) = tungstenite::connect(format!("ws://127.0.0.1:{}{}", chrome.port, chrome.ws_path))?;
-    let mut socket = Socket { ws, next_id: 0, session: None };
+    let _open = OpenPage::new(&Owner::Pictures);
+    let chrome = chrome(&Owner::Pictures)?;
+    let (mut socket, _) = connect(&chrome)?;
     let mut aside = Vec::new();
     let target = socket.call("Target.createTarget", json!({ "url": "about:blank" }), &mut aside)?;
     let target_id = target["targetId"].as_str().unwrap_or_default().to_string();
@@ -356,10 +1359,12 @@ pub fn shot(url: &str, width: u32, height: u32, out: &std::path::Path) -> Result
         let attached = socket.call("Target.attachToTarget", json!({ "targetId": target_id, "flatten": true }), &mut aside)?;
         socket.session = attached["sessionId"].as_str().map(str::to_string);
         socket.call("Page.enable", json!({}), &mut aside)?;
-        socket.call("Emulation.setDeviceMetricsOverride", json!({ "width": width, "height": height, "deviceScaleFactor": 1, "mobile": false }), &mut aside)?;
-        if let MaybeTlsStream::Plain(stream) = socket.ws.get_mut() {
-            stream.set_read_timeout(Some(Duration::from_millis(100)))?;
-        }
+        socket.call(
+            "Emulation.setDeviceMetricsOverride",
+            json!({ "width": width, "height": height, "deviceScaleFactor": 1, "mobile": false }),
+            &mut aside,
+        )?;
+        socket.ws.get_mut().set_read_timeout(Some(Duration::from_millis(100)))?;
         aside.clear();
         let gone = socket.call("Page.navigate", json!({ "url": url }), &mut aside)?;
         if let Some(error) = gone["errorText"].as_str().filter(|e| !e.is_empty()) {
@@ -433,6 +1438,16 @@ const ELEMENT_AT: &str = r##"(function (x, y, full) {
     }
   } catch (_) {}
   const text = (el.innerText || el.value || el.alt || "").trim().replace(/\s+/g, " ");
+  // What its look is made of, leaving out what every element has.
+  const cs = getComputedStyle(el);
+  const dull = new Set(["none", "normal", "auto", "0px", "rgba(0, 0, 0, 0)", "static", "visible", "0", "1", "start", "stretch", "content-box", "0px none rgb(0, 0, 0)"]);
+  const styles = [];
+  for (const k of ["display", "position", "width", "height", "margin", "padding", "font-family", "font-size", "font-weight", "line-height", "color",
+    "background-color", "background-image", "border", "border-radius", "box-shadow", "opacity", "z-index", "overflow", "flex-direction",
+    "justify-content", "align-items", "gap", "grid-template-columns", "text-align", "transform"]) {
+    const v = cs.getPropertyValue(k);
+    if (v && !dull.has(v)) styles.push(k + ": " + v);
+  }
   return JSON.stringify({
     box,
     scroll: { x: window.scrollX, y: window.scrollY },
@@ -442,6 +1457,7 @@ const ELEMENT_AT: &str = r##"(function (x, y, full) {
     text: text.slice(0, 200),
     components,
     source,
+    styles: styles.join("; "),
   });
 })"##;
 
@@ -465,9 +1481,38 @@ fn element_box(out: &mpsc::Sender<Out>, x: f32, y: f32) -> Option<Bounds<Pixels>
     Some(Bounds { origin: point(side("x")?, side("y")?), size: size(side("width")?, side("height")?) })
 }
 
+/// Old pictures go when a new one comes: the agent has long seen them.
+fn picture_path(dir: &std::path::Path, name: &str) -> Option<PathBuf> {
+    std::fs::create_dir_all(dir).ok()?;
+    for old in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let age = old.metadata().and_then(|m| m.modified()).ok().and_then(|at| at.elapsed().ok());
+        if age.is_some_and(|age| age > Duration::from_secs(24 * 3600)) {
+            let _ = std::fs::remove_file(old.path());
+        }
+    }
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    Some(dir.join(format!("{name}-{stamp}.png")))
+}
+
+/// What was picked for the agent: an element, an area, the whole page.
+#[derive(Clone)]
+struct Picked {
+    /// Short, for its chip.
+    label: String,
+    /// What the agent is told of it.
+    text: String,
+}
+
+fn save_picture(shot: Option<Value>, dir: &Path, name: &str) -> Option<PathBuf> {
+    let png = base64::engine::general_purpose::STANDARD.decode(shot?["data"].as_str()?).ok()?;
+    let path = picture_path(dir, name)?;
+    std::fs::write(&path, png).ok()?;
+    Some(path)
+}
+
 /// The element at a point, written out for an agent, with a picture of it
 /// saved under `dir`.
-fn pick(out: &mpsc::Sender<Out>, x: f32, y: f32, dir: &std::path::Path) -> Option<String> {
+fn pick(out: &mpsc::Sender<Out>, x: f32, y: f32, dir: &Path) -> Option<Picked> {
     let element = element_at(out, x, y, true)?;
     let text = |name: &str| element[name].as_str().unwrap_or_default();
     let number = |value: &Value| value.as_f64().unwrap_or(0.);
@@ -480,23 +1525,9 @@ fn pick(out: &mpsc::Sender<Out>, x: f32, y: f32, dir: &std::path::Path) -> Optio
         "height": number(&bounds["height"]).max(1.),
         "scale": 1,
     });
-    let picture = call(out, "Page.captureScreenshot", json!({ "format": "png", "clip": clip })).and_then(|shot| {
-        let png = base64::engine::general_purpose::STANDARD.decode(shot["data"].as_str()?).ok()?;
-        std::fs::create_dir_all(dir).ok()?;
-        // Old pictures go when a new one comes: the agent has long seen them.
-        for old in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-            let age = old.metadata().and_then(|m| m.modified()).ok().and_then(|at| at.elapsed().ok());
-            if age.is_some_and(|age| age > Duration::from_secs(24 * 3600)) {
-                let _ = std::fs::remove_file(old.path());
-            }
-        }
-        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
-        let path = dir.join(format!("element-{stamp}.png"));
-        std::fs::write(&path, png).ok()?;
-        Some(path)
-    });
+    let picture = save_picture(call(out, "Page.captureScreenshot", json!({ "format": "png", "clip": clip })), dir, "element");
 
-    let mut message = format!("On {} the element `{}`:\n{}\n", text("url"), text("selector"), text("html"));
+    let mut message = format!("the element `{}`:\n{}\n", text("selector"), text("html"));
     if !text("text").is_empty() {
         message.push_str(&format!("text: {:?}\n", text("text")));
     }
@@ -508,47 +1539,278 @@ fn pick(out: &mpsc::Sender<Out>, x: f32, y: f32, dir: &std::path::Path) -> Optio
         }
         message.push('\n');
     }
+    if !text("styles").is_empty() {
+        message.push_str(&format!("styles: {}\n", text("styles")));
+    }
     if let Some(path) = picture {
         message.push_str(&format!("picture: {}\n", path.display()));
     }
-    Some(message)
+    let short: String = text("selector").rsplit(" > ").next().unwrap_or_default().chars().take(40).collect();
+    Some(Picked { label: short, text: message })
 }
+
+/// A part of the page in view, by its corners in CSS pixels, as a picture.
+fn pick_area(out: &mpsc::Sender<Out>, from: (f32, f32), to: (f32, f32), dir: &Path) -> Option<Picked> {
+    let scroll = call(out, "Runtime.evaluate", json!({ "expression": "[scrollX, scrollY]", "returnByValue": true }))?;
+    let scroll = &scroll["result"]["value"];
+    let (x, y) = (from.0.min(to.0), from.1.min(to.1));
+    let (w, h) = ((from.0 - to.0).abs().max(1.), (from.1 - to.1).abs().max(1.));
+    let clip = json!({ "x": f64::from(x) + scroll[0].as_f64().unwrap_or(0.), "y": f64::from(y) + scroll[1].as_f64().unwrap_or(0.), "width": w, "height": h, "scale": 1 });
+    let path = save_picture(call(out, "Page.captureScreenshot", json!({ "format": "png", "clip": clip })), dir, "area")?;
+    Some(Picked {
+        label: format!("area {}×{}", w.round(), h.round()),
+        text: format!("an area of the page in view, {}×{} CSS pixels at {},{}:\npicture: {}\n", w.round(), h.round(), x.round(), y.round(), path.display()),
+    })
+}
+
+/// The whole page, scrolled out of view too, as a picture: up to a height
+/// an agent can still read.
+fn pick_page(out: &mpsc::Sender<Out>, dir: &Path) -> Option<Picked> {
+    let metrics = call(out, "Page.getLayoutMetrics", json!({}))?;
+    let content = &metrics["cssContentSize"];
+    let (w, h) = (content["width"].as_f64().unwrap_or(1.).max(1.), content["height"].as_f64().unwrap_or(1.).clamp(1., 12000.));
+    let clip = json!({ "x": 0, "y": 0, "width": w, "height": h, "scale": 1 });
+    let path = save_picture(call(out, "Page.captureScreenshot", json!({ "format": "png", "clip": clip, "captureBeyondViewport": true })), dir, "page")?;
+    Some(Picked { label: "whole page".into(), text: format!("the whole page, {}×{} CSS pixels:\npicture: {}\n", w.round(), h.round(), path.display()) })
+}
+
+/// Whether `url` is of this machine: a dev server's, for a Web tab.
+pub fn is_local(url: &str) -> bool {
+    local_address(url).is_some()
+}
+
+/// `host:port` of an address on this machine, for waiting until something
+/// listens there.
+fn local_address(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, a)| a);
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) if !port.contains(']') => (host, port.parse::<u16>().ok()?),
+        _ => (authority, if scheme == "https" { 443 } else { 80 }),
+    };
+    let host = match host {
+        "localhost" | "127.0.0.1" | "[::1]" => host,
+        "0.0.0.0" => "127.0.0.1",
+        h if h.ends_with(".localhost") => "localhost",
+        _ => return None,
+    };
+    Some(format!("{host}:{port}"))
+}
+
+/// What CSS calls a cursor, as the window draws it.
+fn cursor_style(css: &str) -> CursorStyle {
+    match css {
+        "pointer" => CursorStyle::PointingHand,
+        "text" => CursorStyle::IBeam,
+        "vertical-text" => CursorStyle::IBeamCursorForVerticalLayout,
+        "crosshair" | "cell" => CursorStyle::Crosshair,
+        "grab" | "move" | "all-scroll" => CursorStyle::OpenHand,
+        "grabbing" => CursorStyle::ClosedHand,
+        "not-allowed" | "no-drop" => CursorStyle::OperationNotAllowed,
+        "col-resize" => CursorStyle::ResizeColumn,
+        "row-resize" => CursorStyle::ResizeRow,
+        "ew-resize" => CursorStyle::ResizeLeftRight,
+        "e-resize" => CursorStyle::ResizeRight,
+        "w-resize" => CursorStyle::ResizeLeft,
+        "ns-resize" => CursorStyle::ResizeUpDown,
+        "n-resize" => CursorStyle::ResizeUp,
+        "s-resize" => CursorStyle::ResizeDown,
+        "nwse-resize" | "nw-resize" | "se-resize" => CursorStyle::ResizeUpLeftDownRight,
+        "nesw-resize" | "ne-resize" | "sw-resize" => CursorStyle::ResizeUpRightDownLeft,
+        "context-menu" => CursorStyle::ContextualMenu,
+        "copy" => CursorStyle::DragCopy,
+        "alias" => CursorStyle::DragLink,
+        _ => CursorStyle::Arrow,
+    }
+}
+
+/// The DOM's `code` and Windows key code of a key that types `c`, as on a
+/// US keyboard: pages that look at either see the key they expect.
+fn key_code(c: char) -> (String, u32) {
+    let c = c.to_ascii_lowercase();
+    match c {
+        'a'..='z' => (format!("Key{}", c.to_ascii_uppercase()), c.to_ascii_uppercase() as u32),
+        '0'..='9' => (format!("Digit{c}"), c as u32),
+        ' ' => ("Space".into(), 32),
+        ';' | ':' => ("Semicolon".into(), 186),
+        '=' | '+' => ("Equal".into(), 187),
+        ',' | '<' => ("Comma".into(), 188),
+        '-' | '_' => ("Minus".into(), 189),
+        '.' | '>' => ("Period".into(), 190),
+        '/' | '?' => ("Slash".into(), 191),
+        '`' | '~' => ("Backquote".into(), 192),
+        '[' | '{' => ("BracketLeft".into(), 219),
+        '\\' | '|' => ("Backslash".into(), 220),
+        ']' | '}' => ("BracketRight".into(), 221),
+        '\'' | '"' => ("Quote".into(), 222),
+        _ => (String::new(), 0),
+    }
+}
+
+/// Screens a page can be shown at: name, CSS size, a phone's or tablet's.
+const DEVICES: [(&str, u32, u32, bool); 5] =
+    [("iPhone 15", 393, 852, true), ("Pixel 8", 412, 915, true), ("iPad", 820, 1180, true), ("Laptop", 1366, 768, false), ("Desktop", 1920, 1080, false)];
+
+/// What the device's browser says it is, for sites that tell phones by it:
+/// `Emulation.setUserAgentOverride`'s parameters. Chrome's own on a desktop.
+fn user_agent(device: &str, major: &str) -> Option<Value> {
+    let safari = |what: &str| format!("Mozilla/5.0 ({what} like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1");
+    match device {
+        "iPhone 15" => Some(json!({ "userAgent": safari("iPhone; CPU iPhone OS 17_5"), "platform": "iPhone" })),
+        "iPad" => Some(json!({ "userAgent": safari("iPad; CPU OS 17_5"), "platform": "iPad" })),
+        "Pixel 8" => Some(json!({
+            "userAgent": format!("Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Mobile Safari/537.36"),
+            "platform": "Linux armv8l",
+            "userAgentMetadata": {
+                "brands": [{ "brand": "Chromium", "version": major }, { "brand": "Google Chrome", "version": major }, { "brand": "Not.A/Brand", "version": "99" }],
+                "platform": "Android", "platformVersion": "14.0.0", "architecture": "", "model": "Pixel 8", "mobile": true,
+            },
+        })),
+        _ => None,
+    }
+}
+
+/// The colors a page is asked for (`prefers-color-scheme`).
+#[derive(Clone, Copy, PartialEq)]
+enum Scheme {
+    AsTheIde,
+    Light,
+    Dark,
+}
+
+/// A date's or color's value as a field of that type writes it.
+fn picker_format(kind: &str) -> &'static str {
+    match kind {
+        "date" => "YYYY-MM-DD",
+        "time" => "HH:MM",
+        "datetime-local" => "YYYY-MM-DDTHH:MM",
+        "month" => "YYYY-MM",
+        "week" => "YYYY-W01",
+        "color" => "#rrggbb",
+        _ => "",
+    }
+}
+
+const ZOOMS: [f32; 13] = [0.5, 0.67, 0.75, 0.8, 0.9, 1., 1.1, 1.25, 1.5, 1.75, 2., 2.5, 3.];
 
 // ---------------------------------------------------------------- view
 
 actions!(
     ideae_browser,
-    [BrowserBack, BrowserForward, BrowserReload, BrowserCopy, BrowserPaste, BrowserCopyUrl, BrowserOpenExternal]
+    [
+        BrowserBack,
+        BrowserForward,
+        BrowserReload,
+        BrowserHardReload,
+        BrowserCopy,
+        BrowserPaste,
+        BrowserCopyUrl,
+        BrowserOpenExternal,
+        BrowserFocusAddress,
+        BrowserFind,
+        BrowserZoomIn,
+        BrowserZoomOut,
+        BrowserZoomReset,
+        BrowserDevTools
+    ]
 );
 
+pub const KEY_CONTEXT: &str = "Browser";
+
 pub enum BrowserEvent {
-    /// The page's URL changed, so the tab title should too.
+    /// The page's address or title changed, so the tab's label should too.
     Navigated,
-    /// An element was picked: what to tell the agent about it.
-    Picked(String),
+    /// Text for the agent's prompt: an element picked, the page's errors.
+    ToAgent(String),
+    /// The page closed itself, or was closed from elsewhere.
+    Closed,
 }
 
 impl EventEmitter<BrowserEvent> for BrowserView {}
 
 pub struct BrowserView {
+    owner: Owner,
+    /// The page alone, no toolbar: DevTools in its panel.
+    bare: bool,
+    /// The page's id in Chrome and Chrome's major version, once connected.
+    target: Option<String>,
+    major: String,
+    devtools: Option<Entity<BrowserView>>,
+    /// DevTools is to be shown: kept while the page is asleep or not yet connected.
+    devtools_wanted: bool,
+    dock_right: bool,
+    /// The panel's share of the page area.
+    dock_size: f32,
+    dock_area: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
+    resizing: bool,
+    /// Where text goes in the page (CSS pixels), for an input method's window.
+    caret: Option<Bounds<Pixels>>,
     out: mpsc::Sender<Out>,
+    /// Its page closed while the task was long out of view: opened again,
+    /// at its address, when the tab is next drawn.
+    asleep: bool,
     url_input: Entity<InputState>,
     url: SharedString,
+    page_title: SharedString,
+    loading: bool,
+    port: Option<u16>,
     frame: Option<Arc<RenderImage>>,
     error: Option<String>,
     focus: FocusHandle,
     /// Where the page is drawn, for mapping the pointer, and the size the
     /// page was last told, to resize it only on change.
     bounds: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
-    sent_size: std::rc::Rc<std::cell::Cell<(u32, u32, u32)>>,
+    sent_size: std::rc::Rc<std::cell::Cell<(u32, u32, u32, u32)>>,
+    /// Window pixels to each CSS pixel of the page, and how far right of the
+    /// area's edge the page is drawn (a screen narrower than the area is centered).
+    layout: std::rc::Rc<std::cell::Cell<(f32, f32)>>,
+    /// The screen the page is shown at, from `DEVICES`, turned or not; none
+    /// for the tab's own size.
+    device: Option<usize>,
+    turned: bool,
+    scheme: Scheme,
+    /// Dark or not, as the page was last told.
+    sent_dark: Option<bool>,
+    /// Text an input method is composing.
+    marked: Option<String>,
     /// In a tab that is shown, of a task in view.
     visible: bool,
+    zoom: f32,
+    cursor: CursorStyle,
+    /// The mouse buttons held since a press on the page, as CDP counts them:
+    /// their moves and release go to the page wherever the pointer is.
+    pressed: u32,
     /// A click picks an element for the agent instead of going to the page.
     picking: bool,
     /// The element under the pointer while picking, in the page area, and
     /// whether the page is being asked for it.
     hover: Option<Bounds<Pixels>>,
     asking: bool,
+    /// What is picked for the agent so far, what the user says of it, and
+    /// an area being dragged over (window points), with picks under way.
+    picked: Vec<Picked>,
+    pick_note: Entity<InputState>,
+    drag: Option<(Point<Pixels>, Point<Pixels>)>,
+    picks_waiting: usize,
+    picker: Option<Picker>,
+    picker_input: Entity<InputState>,
+    picker_wrong: bool,
+    dialog: Option<Dialog>,
+    prompt_input: Entity<InputState>,
+    select: Option<SelectMenu>,
+    select_ix: Option<usize>,
+    problems: Vec<String>,
+    problems_open: bool,
+    find_input: Entity<InputState>,
+    finding: bool,
+    /// The address of a page that could not be had: tried again once
+    /// something listens there.
+    failed: Option<String>,
+    _wait: Task<()>,
+    /// Frames of the latest run of them, close together.
+    burst: u32,
+    last_frame: Option<Instant>,
     _frames: Task<()>,
     /// A sharp PNG of the page once screencast frames stop coming: the JPEG
     /// frames are for motion.
@@ -571,54 +1833,23 @@ impl BrowserView {
         self.command("Page.navigate", json!({ "url": url }));
     }
 
-    pub fn new(url: &str, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let (in_tx, in_rx) = async_channel::bounded::<In>(4);
-        let out = spawn_page(url.to_string(), in_tx);
-        // The last frame's pixels go with the tab.
-        cx.on_release(|this, cx| {
-            if let Some(old) = this.frame.take() {
-                cx.drop_image(old, None);
-            }
-        })
-        .detach();
-        let url_input = cx.new(|cx| InputState::new(window, cx).placeholder("http://localhost:3000"));
-        url_input.update(cx, |input, cx| input.set_value(url.to_string(), window, cx));
-        cx.subscribe_in(&url_input, window, |this, input, event: &InputEvent, _, cx| {
-            if matches!(event, InputEvent::PressEnter { .. }) {
-                let mut url = input.read(cx).value().trim().to_string();
-                if !url.contains("://") && !url.is_empty() {
-                    url = format!("http://{url}");
-                }
-                this.command("Page.navigate", json!({ "url": url }));
-            }
-        })
-        .detach();
-
-        let frames = cx.spawn(async move |this, cx| {
+    /// A page's connection, and the task that takes what it tells.
+    fn attach(source: Source, owner: Owner, window: &mut Window, cx: &mut Context<Self>) -> (mpsc::Sender<Out>, Task<()>) {
+        let (in_tx, in_rx) = async_channel::bounded::<In>(64);
+        let out = spawn_page(owner, source, in_tx);
+        let frames = cx.spawn_in(window, async move |this, cx| {
             while let Ok(message) = in_rx.recv().await {
-                let update = match message {
-                    In::Frame(jpeg) => {
+                let message = match message {
+                    In::Frame(jpeg, ack) => {
                         let image = cx.background_spawn(async move { decode(&jpeg, image::ImageFormat::Jpeg) }).await;
-                        let Some(image) = image else { continue };
-                        Some(Ok(image))
+                        Ok((image, ack))
                     }
-                    In::Url(url) => Some(Err(Ok(url))),
-                    In::Error(e) => Some(Err(Err(e))),
+                    other => Err(other),
                 };
-                let ok = this.update(cx, |this, cx| {
-                    match update {
-                        // One sent before the page was told to stop.
-                        Some(Ok(image)) if !this.visible => cx.drop_image(image, None),
-                        Some(Ok(image)) => {
-                            this.show_frame(image, cx);
-                            this.sharpen_later(cx);
-                        }
-                        Some(Err(Ok(url))) => {
-                            this.url = url.into();
-                            cx.emit(BrowserEvent::Navigated);
-                        }
-                        Some(Err(Err(e))) => this.error = Some(e),
-                        None => {}
+                let ok = this.update_in(cx, |this, window, cx| {
+                    match message {
+                        Ok((image, ack)) => this.take_frame(image, ack, cx),
+                        Err(other) => this.take(other, window, cx),
                     }
                     cx.notify();
                 });
@@ -627,28 +1858,272 @@ impl BrowserView {
                 }
             }
         });
+        (out, frames)
+    }
+
+    pub fn new(source: Source, owner: Owner, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let (url, loading) = match &source {
+            Source::Url(url) => (url.clone(), true),
+            Source::Target(_) => (String::new(), false),
+        };
+        let (out, frames) = Self::attach(source, owner.clone(), window, cx);
+        // The last frame's pixels go with the tab.
+        cx.on_release(|this, cx| {
+            if let Some(old) = this.frame.take() {
+                cx.drop_image(old, None);
+            }
+        })
+        .detach();
+        let url_input = cx.new(|cx| InputState::new(window, cx).placeholder("http://localhost:3000"));
+        url_input.update(cx, |input, cx| input.set_value(url.clone(), window, cx));
+        cx.subscribe_in(&url_input, window, |this, input, event: &InputEvent, window, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                let mut url = input.read(cx).value().trim().to_string();
+                if !url.contains("://") && !url.is_empty() && !url.starts_with("about:") {
+                    url = format!("http://{url}");
+                }
+                this.go(&url);
+                this.focus.focus(window, cx);
+            }
+        })
+        .detach();
+        let prompt_input = cx.new(|cx| InputState::new(window, cx));
+        cx.subscribe_in(&prompt_input, window, |this, _, event: &InputEvent, window, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.answer(true, window, cx);
+            }
+        })
+        .detach();
+        let find_input = cx.new(|cx| InputState::new(window, cx).placeholder("Find in page"));
+        cx.subscribe_in(&find_input, window, |this, _, event: &InputEvent, _, cx| {
+            if let InputEvent::PressEnter { shift, .. } = event {
+                this.find_next(*shift, cx);
+            }
+        })
+        .detach();
+        let pick_note = cx.new(|cx| InputState::new(window, cx).placeholder("What to do with them (Enter sends to the agent)"));
+        cx.subscribe_in(&pick_note, window, |this, _, event: &InputEvent, window, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.send_picked(window, cx);
+            }
+        })
+        .detach();
+        let picker_input = cx.new(|cx| InputState::new(window, cx));
+        cx.subscribe_in(&picker_input, window, |this, _, event: &InputEvent, window, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.apply_picker(window, cx);
+            }
+        })
+        .detach();
 
         Self {
+            owner,
+            bare: false,
+            target: None,
+            major: String::new(),
+            devtools: None,
+            devtools_wanted: false,
+            dock_right: false,
+            dock_size: 0.4,
+            dock_area: Default::default(),
+            resizing: false,
+            caret: None,
             out,
+            asleep: false,
             url_input,
-            url: url.to_string().into(),
+            url: url.into(),
+            page_title: SharedString::default(),
+            loading,
+            port: None,
             frame: None,
             error: None,
             focus: cx.focus_handle(),
             bounds: Default::default(),
             sent_size: Default::default(),
+            layout: std::rc::Rc::new(std::cell::Cell::new((1., 0.))),
+            device: None,
+            turned: false,
+            scheme: Scheme::AsTheIde,
+            sent_dark: None,
+            marked: None,
             visible: true,
+            zoom: 1.,
+            cursor: CursorStyle::Arrow,
+            pressed: 0,
             picking: false,
             hover: None,
             asking: false,
+            picked: Vec::new(),
+            pick_note,
+            drag: None,
+            picks_waiting: 0,
+            picker: None,
+            picker_input,
+            picker_wrong: false,
+            dialog: None,
+            prompt_input,
+            select: None,
+            select_ix: None,
+            problems: Vec::new(),
+            problems_open: false,
+            find_input,
+            finding: false,
+            failed: None,
+            _wait: Task::ready(()),
+            burst: 0,
+            last_frame: None,
             _frames: frames,
             _sharpen: Task::ready(()),
         }
     }
 
+    /// Closes the page, keeping its address: a task long out of view keeps
+    /// no browser running for it. Drawn again, the tab opens it anew.
+    pub fn sleep(&mut self, cx: &mut Context<Self>) {
+        if self.asleep {
+            return;
+        }
+        let _ = self.out.send(Out::Close);
+        // What is sent until it wakes goes nowhere.
+        self.out = mpsc::channel().0;
+        self._frames = Task::ready(());
+        self._sharpen = Task::ready(());
+        self._wait = Task::ready(());
+        self.asleep = true;
+        self.loading = false;
+        // Its DevTools was of a page that is gone; it opens again with the page.
+        self.devtools = None;
+        (self.dialog, self.select, self.picker, self.hover, self.drag) = (None, None, None, None, None);
+        self.pressed = 0;
+        if let Some(old) = self.frame.take() {
+            cx.defer(move |cx| cx.drop_image(old, None));
+        }
+        cx.notify();
+    }
+
+    fn wake(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.asleep = false;
+        let url = if self.url.is_empty() { "about:blank".to_string() } else { self.url.to_string() };
+        let (out, frames) = Self::attach(Source::Url(url), self.owner.clone(), window, cx);
+        (self.out, self._frames) = (out, frames);
+        self.sent_size.set((0, 0, 0, 0));
+        self.sent_dark = None;
+        self.loading = true;
+    }
+
+    fn take_frame(&mut self, image: Option<Arc<RenderImage>>, ack: i64, cx: &mut Context<Self>) {
+        let _ = self.out.send(Out::Ack(ack));
+        let Some(image) = image else { return };
+        // One sent before the page was told to stop.
+        if !self.visible {
+            return cx.drop_image(image, None);
+        }
+        let close = self.last_frame.is_some_and(|at| at.elapsed() < Duration::from_millis(300));
+        self.burst = if close { self.burst + 1 } else { 1 };
+        self.last_frame = Some(Instant::now());
+        self.error = None;
+        self.show_frame(image, cx);
+        self.sharpen_later(cx);
+    }
+
+    fn take(&mut self, message: In, window: &mut Window, cx: &mut Context<Self>) {
+        match message {
+            In::Frame(..) => {}
+            In::Ready { port, target, major } => {
+                (self.port, self.target, self.major) = (Some(port), Some(target), major);
+                // A device's user agent is told with the size.
+                self.sent_size.set((0, 0, 0, 0));
+                if self.devtools_wanted {
+                    self.open_devtools(window, cx);
+                }
+            }
+            In::Caret(at) => self.caret = Some(at),
+            In::Navigated { url, failed } => {
+                self.problems.clear();
+                (self.select, self.picker) = (None, None);
+                self.error = None;
+                self.failed = failed.then(|| url.clone());
+                self.wait_for_server(cx);
+                self.set_url(url, window, cx);
+            }
+            In::Url(url) => self.set_url(url, window, cx),
+            In::Title(title) => {
+                self.page_title = title.into();
+                cx.emit(BrowserEvent::Navigated);
+            }
+            In::Loading(loading) => self.loading = loading,
+            In::Dialog(dialog) => {
+                if dialog.kind == "prompt" {
+                    self.prompt_input.update(cx, |input, cx| {
+                        input.set_value(String::new(), window, cx);
+                        input.focus(window, cx);
+                    });
+                } else if self.visible {
+                    self.focus.focus(window, cx);
+                }
+                self.dialog = Some(dialog);
+            }
+            In::DialogClosed => self.dialog = None,
+            In::FileChooser { node, multiple } => {
+                let picked = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple, prompt: None });
+                let out = self.out.clone();
+                cx.spawn(async move |_, _| {
+                    if let Ok(Ok(Some(paths))) = picked.await {
+                        let files: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+                        let _ = out.send(Out::Command("DOM.setFileInputFiles", json!({ "files": files, "backendNodeId": node })));
+                    }
+                })
+                .detach();
+            }
+            In::Cursor(css) => self.cursor = cursor_style(&css),
+            In::Select(menu) => {
+                self.select_ix = menu.selected;
+                self.select = Some(menu);
+                self.focus.focus(window, cx);
+            }
+            In::Picker(picker) => {
+                self.picker_wrong = false;
+                self.picker_input.update(cx, |input, cx| {
+                    input.set_placeholder(picker_format(&picker.kind), window, cx);
+                    input.set_value(picker.value.clone(), window, cx);
+                    input.focus(window, cx);
+                    input.select_all(window, cx);
+                });
+                self.picker = Some(picker);
+            }
+            In::Problem(text) => {
+                // The latest hundred: a page that throws on every frame says nothing new after.
+                if self.problems.len() >= 100 {
+                    self.problems.remove(0);
+                }
+                self.problems.push(text);
+            }
+            In::Closed => cx.emit(BrowserEvent::Closed),
+            In::Error(e) => self.error = Some(e),
+        }
+    }
+
+    fn set_url(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
+        if url == self.url.as_ref() {
+            return;
+        }
+        self.url = url.clone().into();
+        // Not while you type there.
+        if !self.url_input.focus_handle(cx).is_focused(window) {
+            self.url_input.update(cx, |input, cx| input.set_value(url, window, cx));
+        }
+        cx.emit(BrowserEvent::Navigated);
+    }
+
+    /// The page's title, else its address without the scheme.
     pub fn title(&self) -> SharedString {
         let url = self.url.as_ref();
-        url.split_once("://").map_or(url, |(_, rest)| rest).trim_end_matches('/').to_string().into()
+        let bare = url.split_once("://").map_or(url, |(_, rest)| rest).trim_end_matches('/');
+        let title = self.page_title.trim();
+        if !title.is_empty() && title != url && title != bare && self.failed.is_none() {
+            return title.to_string().into();
+        }
+        bare.to_string().into()
     }
 
     /// Out of view the page stops sending frames and the last one is let
@@ -659,9 +2134,14 @@ impl BrowserView {
             return;
         }
         let _ = self.out.send(Out::Visible(visible));
+        if let Some(devtools) = &self.devtools {
+            devtools.update(cx, |d, cx| d.set_visible(visible, cx));
+        }
+        self.wait_for_server(cx);
         if !visible {
-            self.sent_size.set((0, 0, 0));
+            self.sent_size.set((0, 0, 0, 0));
             self._sharpen = Task::ready(());
+            self.last_frame = None;
             if let Some(old) = self.frame.take() {
                 // Once this update is over: a window in the middle of one is
                 // passed over, and its texture of the frame would stay.
@@ -669,6 +2149,37 @@ impl BrowserView {
             }
         }
         cx.notify();
+    }
+
+    /// A page of this machine that could not be had is loaded again once
+    /// something listens at its port: a dev server that was still starting.
+    fn wait_for_server(&mut self, cx: &mut Context<Self>) {
+        self._wait = Task::ready(());
+        let Some(url) = self.failed.clone().filter(|_| self.visible) else {
+            return;
+        };
+        let Some(address) = local_address(&url) else {
+            return;
+        };
+        self._wait = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                let address = address.clone();
+                let up = cx
+                    .background_spawn(async move {
+                        address.to_socket_addrs().into_iter().flatten().any(|a| TcpStream::connect_timeout(&a, Duration::from_millis(300)).is_ok())
+                    })
+                    .await;
+                if up {
+                    let _ = this.update(cx, |this, _| {
+                        if this.failed.as_deref() == Some(url.as_str()) {
+                            this.go(&url);
+                        }
+                    });
+                    return;
+                }
+            }
+        });
     }
 
     fn show_frame(&mut self, image: Arc<RenderImage>, cx: &mut Context<Self>) {
@@ -679,21 +2190,24 @@ impl BrowserView {
     }
 
     /// After 300 ms without new frames, replace the last JPEG with a PNG.
+    /// Not after a frame alone: a caret blinking sends one twice a second.
     fn sharpen_later(&mut self, cx: &mut Context<Self>) {
+        if self.burst < 2 {
+            self._sharpen = Task::ready(());
+            return;
+        }
         let out = self.out.clone();
         self._sharpen = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_millis(300)).await;
             let image = cx
                 .background_spawn(async move {
-                    let (tx, rx) = mpsc::channel();
-                    out.send(Out::Call("Page.captureScreenshot", json!({ "format": "png" }), tx)).ok()?;
-                    let result = rx.recv_timeout(Duration::from_secs(5)).ok()?;
+                    let result = call(&out, "Page.captureScreenshot", json!({ "format": "png" }))?;
                     let png = base64::engine::general_purpose::STANDARD.decode(result["data"].as_str()?).ok()?;
                     decode(&png, image::ImageFormat::Png)
                 })
                 .await;
             if let Some(image) = image {
-                let _ = this.update(cx, |this, cx| this.show_frame(image, cx));
+                let _ = this.update(cx, |this, cx| if this.visible { this.show_frame(image, cx) } else { cx.drop_image(image, None) });
             }
         });
     }
@@ -738,21 +2252,234 @@ impl BrowserView {
     }
 
     fn pick_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
-        self.set_picking(false, cx);
         let (x, y) = self.pointer(position);
+        self.run_pick(cx, move |out, dir| pick(&out, x, y, &dir));
+    }
+
+    /// One pick, made off the UI thread and added to the others.
+    fn run_pick(&mut self, cx: &mut Context<Self>, job: impl FnOnce(mpsc::Sender<Out>, PathBuf) -> Option<Picked> + Send + 'static) {
+        self.picks_waiting += 1;
         let out = self.out.clone();
         let dir = crate::state::runtime_dir().join("picked");
         cx.spawn(async move |this, cx| {
-            let message = cx.background_spawn(async move { pick(&out, x, y, &dir) }).await;
-            if let Some(message) = message {
-                let _ = this.update(cx, |_, cx| cx.emit(BrowserEvent::Picked(message)));
+            let picked = cx.background_spawn(async move { job(out, dir) }).await;
+            let _ = this.update(cx, |this, cx| {
+                this.picks_waiting -= 1;
+                this.picked.extend(picked);
+                // A picture of the whole page lays it out at its full height for a moment, the tab's size forgotten.
+                this.sent_size.set((0, 0, 0, 0));
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// What is picked, with what the user says of it, into the agent's prompt.
+    fn send_picked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.picked.is_empty() {
+            return;
+        }
+        let note = self.pick_note.read(cx).value().trim().to_string();
+        let mut message = String::new();
+        if !note.is_empty() {
+            message.push_str(&note);
+            message.push_str("\n\n");
+        }
+        message.push_str(&format!("On {}:\n", self.url));
+        let many = self.picked.len() > 1;
+        for (i, picked) in self.picked.drain(..).enumerate() {
+            if many {
+                message.push_str(&format!("{}. ", i + 1));
+            }
+            message.push_str(&picked.text);
+        }
+        self.drop_picks(window, cx);
+        cx.emit(BrowserEvent::ToAgent(message));
+    }
+
+    fn drop_picks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.picked.clear();
+        self.drag = None;
+        self.pick_note.update(cx, |input, cx| input.set_value(String::new(), window, cx));
+        self.set_picking(false, cx);
+        self.focus.focus(window, cx);
+    }
+
+    /// The value typed for a date or color field, into it as the page would
+    /// have it from its picker.
+    fn apply_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(picker) = self.picker.clone() else { return };
+        let value = self.picker_input.read(cx).value().trim().to_string();
+        let expression = format!(
+            "((v) => {{ const e = window.__ideaePicker; if (!e) return 'gone'; \
+             Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(e, v); \
+             if (v !== '' && e.value.toLowerCase() !== v.toLowerCase()) return 'wrong'; \
+             e.dispatchEvent(new Event('input', {{ bubbles: true }})); e.dispatchEvent(new Event('change', {{ bubbles: true }})); return 'ok'; }})({})",
+            json!(value)
+        );
+        let (tx, rx) = mpsc::channel();
+        let _ = self.out.send(Out::Call("Runtime.evaluate", json!({ "expression": expression, "contextId": picker.context, "returnByValue": true }), tx));
+        cx.spawn_in(window, async move |this, cx| {
+            let answer = cx.background_spawn(async move { rx.recv_timeout(Duration::from_secs(2)).ok() }).await;
+            let answer = answer.and_then(|a| a["result"]["value"].as_str().map(str::to_string)).unwrap_or_default();
+            let _ = this.update_in(cx, |this, window, cx| {
+                if answer == "wrong" {
+                    this.picker_wrong = true;
+                } else {
+                    this.picker = None;
+                    this.focus.focus(window, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Today, or now, as the field's type writes it, in the page's time.
+    fn picker_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(picker) = &self.picker else { return };
+        let expression = format!(
+            r#"((k) => {{ const d = new Date(), p = (n) => String(n).padStart(2, "0");
+              const date = d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()), time = p(d.getHours()) + ":" + p(d.getMinutes());
+              if (k === "date") return date; if (k === "time") return time; if (k === "datetime-local") return date + "T" + time;
+              if (k === "month") return date.slice(0, 7);
+              const t = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate())); t.setUTCDate(t.getUTCDate() + 4 - (t.getUTCDay() || 7));
+              return t.getUTCFullYear() + "-W" + p(Math.ceil(((t - Date.UTC(t.getUTCFullYear(), 0, 1)) / 86400000 + 1) / 7)); }})({})"#,
+            json!(picker.kind)
+        );
+        let now = self.eval_string(&expression, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            if let Some(now) = now.await {
+                let _ = this.update_in(cx, |this, window, cx| this.picker_input.update(cx, |input, cx| input.set_value(now, window, cx)));
             }
         })
         .detach();
     }
 
+    fn toggle_devtools(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.devtools.take().is_some() {
+            self.devtools_wanted = false;
+            self.focus.focus(window, cx);
+        } else {
+            self.devtools_wanted = true;
+            self.open_devtools(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Chrome's own DevTools for the page, served by the task's Chrome and
+    /// shown in a panel of the tab; the page gives it room.
+    fn open_devtools(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(port), Some(target)) = (self.port, self.target.clone()) else { return };
+        if self.devtools.is_some() {
+            return;
+        }
+        let url = format!("http://127.0.0.1:{port}/devtools/inspector.html?ws=127.0.0.1:{port}/devtools/page/{target}");
+        let owner = self.owner.clone();
+        let scheme = self.scheme;
+        let view = cx.new(|cx| {
+            let mut view = BrowserView::new(Source::Url(url), owner, window, cx);
+            view.bare = true;
+            view.scheme = scheme;
+            view
+        });
+        cx.subscribe(&view, |this, _, event: &BrowserEvent, cx| {
+            if matches!(event, BrowserEvent::Closed) {
+                this.devtools = None;
+                cx.notify();
+            }
+        })
+        .detach();
+        self.devtools = Some(view);
+    }
+
+    /// How the tab shows its page, for the session: none when as it starts.
+    pub fn look(&self) -> Option<crate::state::WebLook> {
+        let look = crate::state::WebLook {
+            device: self.device.map(|i| DEVICES[i].0.to_string()),
+            turned: self.turned,
+            colors: match self.scheme {
+                Scheme::AsTheIde => String::new(),
+                Scheme::Light => "light".into(),
+                Scheme::Dark => "dark".into(),
+            },
+            devtools: match (self.devtools_wanted, self.dock_right) {
+                (false, _) => String::new(),
+                (true, false) => "bottom".into(),
+                (true, true) => "right".into(),
+            },
+        };
+        (look != crate::state::WebLook::default()).then_some(look)
+    }
+
+    pub fn set_look(&mut self, look: &crate::state::WebLook, window: &mut Window, cx: &mut Context<Self>) {
+        self.device = look.device.as_deref().and_then(|name| DEVICES.iter().position(|d| d.0 == name));
+        self.turned = look.turned && self.device.is_some();
+        self.scheme = match look.colors.as_str() {
+            "light" => Scheme::Light,
+            "dark" => Scheme::Dark,
+            _ => Scheme::AsTheIde,
+        };
+        self.dock_right = look.devtools == "right";
+        if !look.devtools.is_empty() {
+            self.devtools_wanted = true;
+            self.open_devtools(window, cx);
+        }
+        self.relayout(cx);
+    }
+
+    /// The divider dragged to `at`: the panel takes what is right of or below it.
+    fn resize_dock(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        let area = self.dock_area.get();
+        let share = if self.dock_right {
+            f32::from(area.right() - at.x) / f32::from(area.size.width).max(1.)
+        } else {
+            f32::from(area.bottom() - at.y) / f32::from(area.size.height).max(1.)
+        };
+        self.dock_size = share.clamp(0.15, 0.85);
+        cx.notify();
+    }
+
+    fn device_size(&self) -> Option<(u32, u32, bool)> {
+        self.device.map(|i| {
+            let (_, w, h, mobile) = DEVICES[i];
+            if self.turned { (h, w, mobile) } else { (w, h, mobile) }
+        })
+    }
+
+    fn set_device(&mut self, device: Option<usize>, cx: &mut Context<Self>) {
+        self.device = device;
+        self.turned = false;
+        self.relayout(cx);
+    }
+
+    /// The page is told its new size at the next frame; what was placed
+    /// over it goes.
+    fn relayout(&mut self, cx: &mut Context<Self>) {
+        self.sent_size.set((0, 0, 0, 0));
+        (self.hover, self.select, self.picker, self.drag) = (None, None, None, None);
+        cx.notify();
+    }
+
+    /// The page's errors into the agent's prompt.
+    fn problems_to_agent(&mut self, cx: &mut Context<Self>) {
+        let mut message = format!("Errors on {}:\n", self.url);
+        for problem in &self.problems {
+            let lines: Vec<&str> = problem.lines().take(12).collect();
+            let entry = format!("- {}\n", lines.join("\n  "));
+            if message.len() + entry.len() > 8000 {
+                message.push_str("- …\n");
+                break;
+            }
+            message.push_str(&entry);
+        }
+        self.problems_open = false;
+        cx.emit(BrowserEvent::ToAgent(message));
+    }
+
     fn copy(&mut self, cx: &mut Context<Self>) {
-        let selected = self.eval_string("window.getSelection().toString()", cx);
+        let selected = self.eval_string(SELECTED, cx);
         cx.spawn(async move |_, cx| {
             if let Some(text) = selected.await.filter(|t| !t.is_empty()) {
                 let _ = cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string(text)));
@@ -773,7 +2500,8 @@ impl BrowserView {
         let c = letter.to_ascii_uppercase();
         let key = if shift { c.to_string() } else { letter.to_string() };
         let modifiers = 4 | if shift { 8 } else { 0 };
-        let event = |kind: &str| json!({ "type": kind, "key": key, "code": format!("Key{c}"), "windowsVirtualKeyCode": c as u32, "modifiers": modifiers });
+        let event =
+            |kind: &str| json!({ "type": kind, "key": key, "code": format!("Key{c}"), "windowsVirtualKeyCode": c as u32, "modifiers": modifiers });
         let mut down = event("rawKeyDown");
         down["commands"] = json!([command]);
         self.command("Input.dispatchKeyEvent", down);
@@ -781,9 +2509,9 @@ impl BrowserView {
     }
 
     /// Copies the selection, and takes it out of the page only once it is
-    /// on the clipboard: one in a frame is not seen from the page's top.
+    /// on the clipboard.
     fn cut(&mut self, cx: &mut Context<Self>) {
-        let selected = self.eval_string("window.getSelection().toString()", cx);
+        let selected = self.eval_string(SELECTED, cx);
         cx.spawn(async move |this, cx| {
             if let Some(text) = selected.await.filter(|t| !t.is_empty()) {
                 let _ = this.update(cx, |this, cx| {
@@ -799,9 +2527,95 @@ impl BrowserView {
         let _ = self.out.send(Out::Command(method, params));
     }
 
+    fn back(&self) {
+        self.command("Runtime.evaluate", json!({ "expression": "history.back()" }));
+    }
+
+    fn forward(&self) {
+        self.command("Runtime.evaluate", json!({ "expression": "history.forward()" }));
+    }
+
+    fn reload(&mut self, hard: bool) {
+        // An error page reloads what it could not show.
+        match self.failed.clone() {
+            Some(url) => self.go(&url),
+            None => self.command("Page.reload", json!({ "ignoreCache": hard })),
+        }
+    }
+
+    fn set_zoom(&mut self, zoom: f32, cx: &mut Context<Self>) {
+        self.zoom = zoom.clamp(ZOOMS[0], ZOOMS[ZOOMS.len() - 1]);
+        self.relayout(cx);
+    }
+
+    fn zoom_step(&mut self, up: bool, cx: &mut Context<Self>) {
+        let next =
+            if up { ZOOMS.iter().copied().find(|z| *z > self.zoom + 0.001) } else { ZOOMS.iter().rev().copied().find(|z| *z < self.zoom - 0.001) };
+        if let Some(zoom) = next {
+            self.set_zoom(zoom, cx);
+        }
+    }
+
+    fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.finding = true;
+        self.find_input.update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.finding = false;
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn find_next(&mut self, backwards: bool, cx: &mut Context<Self>) {
+        let text = self.find_input.read(cx).value().to_string();
+        if text.is_empty() {
+            return;
+        }
+        let expression = format!("window.find({}, false, {backwards}, true, false, false, false)", json!(text));
+        self.command("Runtime.evaluate", json!({ "expression": expression }));
+    }
+
+    /// The page's dialog answered: OK (with the prompt's text) or Cancel.
+    fn answer(&mut self, accept: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dialog) = self.dialog.take() else {
+            return;
+        };
+        let mut params = json!({ "accept": accept });
+        if dialog.kind == "prompt" {
+            params["promptText"] = json!(self.prompt_input.read(cx).value().to_string());
+        }
+        self.command("Page.handleJavaScriptDialog", params);
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn choose(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(menu) = self.select.take() else {
+            return;
+        };
+        if menu.choices.get(ix).is_some_and(|c| !c.disabled) {
+            let expression = format!(
+                "((i) => {{ const s = window.__ideaeSelect; if (!s || s.selectedIndex === i) return; s.selectedIndex = i; \
+                 s.dispatchEvent(new Event('input', {{ bubbles: true }})); s.dispatchEvent(new Event('change', {{ bubbles: true }})); }})({ix})"
+            );
+            self.command("Runtime.evaluate", json!({ "expression": expression, "contextId": menu.context }));
+        }
+        cx.notify();
+    }
+
+    /// The page's coordinates of a point of the window.
     fn pointer(&self, position: Point<Pixels>) -> (f32, f32) {
         let b = self.bounds.get();
-        (f32::from(position.x - b.origin.x), f32::from(position.y - b.origin.y))
+        let (factor, offset) = self.layout.get();
+        ((f32::from(position.x - b.origin.x) - offset) / factor, f32::from(position.y - b.origin.y) / factor)
+    }
+
+    /// A box of the page's, in CSS pixels, where it is drawn in the page area.
+    fn on_screen(&self, b: Bounds<Pixels>) -> Bounds<Pixels> {
+        let (factor, offset) = fit(self.bounds.get().size, self.device_size(), self.zoom);
+        Bounds { origin: point(b.origin.x * factor + px(offset), b.origin.y * factor), size: size(b.size.width * factor, b.size.height * factor) }
     }
 
     fn mouse(&self, kind: &str, position: Point<Pixels>, button: Option<MouseButton>, clicks: usize, modifiers: &Modifiers) {
@@ -812,21 +2626,71 @@ impl BrowserView {
             Some(MouseButton::Middle) => "middle",
             _ => "none",
         };
-        self.command(
-            "Input.dispatchMouseEvent",
-            json!({ "type": kind, "x": x, "y": y, "button": button, "clickCount": clicks, "modifiers": cdp_modifiers(modifiers) }),
-        );
+        let params = json!({
+            "type": kind, "x": x, "y": y, "button": button, "buttons": self.pressed,
+            "clickCount": clicks, "modifiers": cdp_modifiers(modifiers),
+        });
+        let _ = self.out.send(if kind == "mouseMoved" { Out::Move(params) } else { Out::Command("Input.dispatchMouseEvent", params) });
     }
 
-    fn key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+    fn press(&mut self, e: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus.focus(window, cx);
+        // A click beside the list closes it, as a browser's would.
+        if self.select.take().is_some() || self.picker.take().is_some() {
+            return cx.notify();
+        }
+        if self.picking && e.button == MouseButton::Left {
+            // An element where it is let go near here, else the area dragged over.
+            self.drag = Some((e.position, e.position));
+            return;
+        }
+        self.pressed |= button_bit(e.button);
+        self.mouse("mousePressed", e.position, Some(e.button), e.click_count, &e.modifiers);
+    }
+
+    fn release(&mut self, e: &MouseUpEvent) {
+        let bit = button_bit(e.button);
+        if self.pressed & bit == 0 {
+            return;
+        }
+        self.pressed &= !bit;
+        self.mouse("mouseReleased", e.position, Some(e.button), e.click_count, &e.modifiers);
+    }
+
+    fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
         let m = &keystroke.modifiers;
-        if self.picking && keystroke.key == "escape" {
+        let key = keystroke.key.as_str();
+        if self.picking && key == "escape" {
             return self.set_picking(false, cx);
+        }
+        if self.dialog.is_some() {
+            match key {
+                "enter" => self.answer(true, window, cx),
+                "escape" => self.answer(false, window, cx),
+                _ => {}
+            }
+            return;
+        }
+        if let Some(menu) = &self.select {
+            let enabled: Vec<usize> = (0..menu.choices.len()).filter(|i| !menu.choices[*i].disabled).collect();
+            let at = self.select_ix.and_then(|ix| enabled.iter().position(|i| *i == ix));
+            match key {
+                "escape" => self.select = None,
+                "enter" | "space" => {
+                    if let Some(ix) = self.select_ix {
+                        self.choose(ix, cx);
+                    }
+                }
+                "down" => self.select_ix = enabled.get(at.map_or(0, |a| (a + 1).min(enabled.len().saturating_sub(1)))).copied(),
+                "up" => self.select_ix = enabled.get(at.map_or(0, |a| a.saturating_sub(1))).copied(),
+                _ => {}
+            }
+            return cx.notify();
         }
         let cmd = cfg!(target_os = "macos") && m.platform;
         if (m.control || cmd) && !m.alt && !m.shift {
-            match keystroke.key.as_str() {
+            match key {
                 "c" => return self.copy(cx),
                 "v" => return self.paste(cx),
                 _ => {}
@@ -834,7 +2698,7 @@ impl BrowserView {
         }
         // Cmd on a Mac: Chrome is told what to do, it does not know the key.
         if cmd && !m.alt && !m.control {
-            match (keystroke.key.as_str(), m.shift) {
+            match (key, m.shift) {
                 ("x", false) => return self.cut(cx),
                 ("a", false) => return self.edit("selectAll", 'a', false),
                 ("z", false) => return self.edit("undo", 'z', false),
@@ -842,49 +2706,579 @@ impl BrowserView {
                 _ => {}
             }
         }
-        let modifiers = cdp_modifiers(&keystroke.modifiers);
-        let shortcut = keystroke.modifiers.control || keystroke.modifiers.alt || keystroke.modifiers.platform;
-        if let (Some(text), false) = (&keystroke.key_char, shortcut) {
-            self.command("Input.insertText", json!({ "text": text }));
+        if key == "f5" && !m.control && !m.alt && !m.platform {
+            return self.reload(m.shift);
+        }
+        let modifiers = cdp_modifiers(m);
+        let shortcut = m.control || m.platform || (m.alt && !event.prefer_character_input);
+        let send = |kind: &str, key: &str, code: &str, vk: u32, text: Option<&str>| {
+            let mut e =
+                json!({ "type": kind, "key": key, "code": code, "windowsVirtualKeyCode": vk, "modifiers": modifiers, "autoRepeat": event.is_held });
+            if let Some(text) = text {
+                e["text"] = json!(text);
+                e["unmodifiedText"] = json!(text);
+            }
+            self.command("Input.dispatchKeyEvent", e);
+        };
+        // A key that types: the page sees it pressed, typed and let go.
+        if let (Some(text), false) = (keystroke.key_char.as_deref(), shortcut) {
+            let (code, vk) = key_code(key.chars().next().filter(|_| key.chars().count() == 1).unwrap_or_else(|| text.chars().next().unwrap_or(' ')));
+            send("keyDown", text, &code, vk, Some(text));
+            send("keyUp", text, &code, vk, None);
             return;
         }
-        let (key, code, vk) = match keystroke.key.as_str() {
-            "enter" => ("Enter", "Enter", 13),
-            "backspace" => ("Backspace", "Backspace", 8),
-            "tab" => ("Tab", "Tab", 9),
-            "escape" => ("Escape", "Escape", 27),
-            "delete" => ("Delete", "Delete", 46),
-            "left" => ("ArrowLeft", "ArrowLeft", 37),
-            "up" => ("ArrowUp", "ArrowUp", 38),
-            "right" => ("ArrowRight", "ArrowRight", 39),
-            "down" => ("ArrowDown", "ArrowDown", 40),
-            "home" => ("Home", "Home", 36),
-            "end" => ("End", "End", 35),
-            "pageup" => ("PageUp", "PageUp", 33),
-            "pagedown" => ("PageDown", "PageDown", 34),
-            other if other.chars().count() == 1 => {
-                // A shortcut such as Ctrl+A: send the key with its modifiers.
-                let c = other.chars().next().unwrap().to_ascii_uppercase();
-                let code = format!("Key{c}");
-                for kind in ["rawKeyDown", "keyUp"] {
-                    self.command(
-                        "Input.dispatchKeyEvent",
-                        json!({ "type": kind, "key": other, "code": code, "windowsVirtualKeyCode": c as u32, "modifiers": modifiers }),
+        let named = match key {
+            "enter" => Some(("Enter", 13)),
+            "backspace" => Some(("Backspace", 8)),
+            "tab" => Some(("Tab", 9)),
+            "escape" => Some(("Escape", 27)),
+            "delete" => Some(("Delete", 46)),
+            "insert" => Some(("Insert", 45)),
+            "left" => Some(("ArrowLeft", 37)),
+            "up" => Some(("ArrowUp", 38)),
+            "right" => Some(("ArrowRight", 39)),
+            "down" => Some(("ArrowDown", 40)),
+            "home" => Some(("Home", 36)),
+            "end" => Some(("End", 35)),
+            "pageup" => Some(("PageUp", 33)),
+            "pagedown" => Some(("PageDown", 34)),
+            "space" => Some(("Space", 32)),
+            _ => None,
+        };
+        if let Some((name, vk)) = named {
+            // Enter types a line break and sends a form, as the key does.
+            let text = (name == "Enter" && !shortcut).then_some("\r");
+            let (dom_key, code) = if name == "Space" { (" ", "Space") } else { (name, name) };
+            send(if text.is_some() { "keyDown" } else { "rawKeyDown" }, dom_key, code, vk, text);
+            send("keyUp", dom_key, code, vk, None);
+            return;
+        }
+        if let Some(n) = key.strip_prefix('f').and_then(|n| n.parse::<u32>().ok()).filter(|n| (1..=12).contains(n)) {
+            let name = format!("F{n}");
+            send("rawKeyDown", &name, &name, 111 + n, None);
+            send("keyUp", &name, &name, 111 + n, None);
+            return;
+        }
+        if let Some(c) = key.chars().next().filter(|_| key.chars().count() == 1) {
+            // A shortcut such as Ctrl+A: the key with its modifiers.
+            let (code, vk) = key_code(c);
+            send("rawKeyDown", key, &code, vk, None);
+            send("keyUp", key, &code, vk, None);
+        }
+    }
+
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
+        let problems = self.problems.len();
+        h_flex()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(Button::new("back").xsmall().ghost().label("←").tooltip("Back").on_click(cx.listener(|this, _, _, _| this.back())))
+            .child(Button::new("forward").xsmall().ghost().label("→").tooltip("Forward").on_click(cx.listener(|this, _, _, _| this.forward())))
+            .child(if self.loading {
+                Button::new("stop")
+                    .xsmall()
+                    .ghost()
+                    .label("✕")
+                    .tooltip("Stop")
+                    .on_click(cx.listener(|this, _, _, _| this.command("Page.stopLoading", json!({}))))
+            } else {
+                Button::new("reload").xsmall().ghost().label("⟳").tooltip("Reload").on_click(cx.listener(|this, _, _, _| this.reload(false)))
+            })
+            .child(div().flex_1().child(Input::new(&self.url_input).small()))
+            .when_some(self.failed.as_ref().and_then(|url| local_address(url)), |this, address| {
+                this.child(div().text_xs().text_color(muted).child(format!("waiting for {address}…")))
+            })
+            .child(self.render_device_button(cx))
+            .when((self.zoom - 1.).abs() > 0.001, |this| {
+                this.child(
+                    Button::new("zoom")
+                        .xsmall()
+                        .ghost()
+                        .label(format!("{:.0}%", self.zoom * 100.))
+                        .tooltip("Back to 100%")
+                        .on_click(cx.listener(|this, _, _, cx| this.set_zoom(1., cx))),
+                )
+            })
+            .when(problems > 0, |this| {
+                this.child(
+                    Button::new("problems")
+                        .xsmall()
+                        .ghost()
+                        .text_color(gpui_kit::red())
+                        .label(format!("⚠ {problems}"))
+                        .selected(self.problems_open)
+                        .tooltip("The page's errors: exceptions, console.error, failed requests")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.problems_open = !this.problems_open;
+                            cx.notify();
+                        })),
+                )
+            })
+            .child(
+                Button::new("pick")
+                    .xsmall()
+                    .ghost()
+                    .label("⌖")
+                    .selected(self.picking)
+                    .tooltip("Pick an element for the agent: its selector, markup and picture go into the prompt")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        // Focused, so Esc gets here to leave picking.
+                        this.focus.focus(window, cx);
+                        this.set_picking(!this.picking, cx);
+                    })),
+            )
+            .child(
+                Button::new("devtools")
+                    .xsmall()
+                    .ghost()
+                    .label("{ }")
+                    .selected(self.devtools.is_some())
+                    .tooltip("DevTools (F12): in a panel of the tab, the page beside it")
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_devtools(window, cx))),
+            )
+            .when_some(self.port, |this, port| {
+                let endpoint = format!("http://127.0.0.1:{port}");
+                this.child(
+                    Button::new("cdp")
+                        .xsmall()
+                        .ghost()
+                        .text_color(muted)
+                        .label("CDP")
+                        .tooltip(format!(
+                            "{endpoint}: the task's terminals have it as IDEAE_BROWSER_CDP, for Playwright MCP's --cdp-endpoint. Click to copy"
+                        ))
+                        .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(endpoint.clone()))),
+                )
+            })
+    }
+
+    /// The page, and DevTools beside or below it when open: the page gives
+    /// it room, as in a browser, rather than lying under it.
+    fn with_devtools(&self, page: impl IntoElement, cx: &mut Context<Self>) -> AnyElement {
+        let Some(devtools) = self.devtools.clone() else { return page.into_any_element() };
+        let right = self.dock_right;
+        let area = self.dock_area.clone();
+        let handle = div()
+            .id("devtools-divider")
+            .flex_none()
+            .bg(cx.theme().border)
+            .when(right, |d| d.w(px(4.)).h_full().cursor(CursorStyle::ResizeLeftRight))
+            .when(!right, |d| d.h(px(4.)).w_full().cursor(CursorStyle::ResizeUpDown))
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                this.resizing = true;
+                cx.stop_propagation();
+            }));
+        let header = h_flex()
+            .flex_none()
+            .px_2()
+            .gap_1()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(div().flex_1().text_xs().text_color(cx.theme().muted_foreground).child("DevTools"))
+            .child(Button::new("devtools-dock").xsmall().ghost().label(if right { "Dock below" } else { "Dock right" }).on_click(cx.listener(|this, _, _, cx| {
+                this.dock_right = !this.dock_right;
+                cx.notify();
+            })))
+            .child(Button::new("devtools-close").xsmall().ghost().label("×").tooltip("Close DevTools (F12)").on_click(cx.listener(|this, _, window, cx| this.toggle_devtools(window, cx))));
+        let panel = v_flex()
+            .flex_none()
+            .min_w_0()
+            .min_h_0()
+            .when(right, |d| d.w(relative(self.dock_size)).h_full())
+            .when(!right, |d| d.h(relative(self.dock_size)).w_full())
+            .child(header)
+            .child(div().flex_1().min_h_0().child(devtools));
+        // Stretched across, not centered as h_flex would have the page.
+        if right { div().flex().flex_row() } else { div().flex().flex_col() }
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .relative()
+            .child(canvas(move |b, _, _| area.set(b), |_, _, _, _| {}).absolute().size_full())
+            .child(page)
+            .child(handle)
+            .child(panel)
+            .into_any_element()
+    }
+
+    fn render_device_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let this = cx.entity().downgrade();
+        let (device, turned, scheme) = (self.device, self.turned, self.scheme);
+        let label = match self.device_size() {
+            Some((w, h, _)) => format!("{} {w}×{h}", DEVICES[device.unwrap_or_default()].0),
+            None => "▭".to_string(),
+        };
+        let dark = match scheme {
+            Scheme::AsTheIde => "",
+            Scheme::Light => " ☀",
+            Scheme::Dark => " ☾",
+        };
+        Button::new("device").xsmall().ghost().label(format!("{label}{dark}")).tooltip("The screen and colors the page is shown with").dropdown_menu_with_anchor(
+            Anchor::TopRight,
+            move |mut menu, _, _| {
+                let to = |d: Option<usize>| {
+                    let this = this.clone();
+                    move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                        let _ = this.update(cx, |v, cx| v.set_device(d, cx));
+                    }
+                };
+                menu = menu.item(PopupMenuItem::new("The tab's size").checked(device.is_none()).on_click(to(None)));
+                for (i, (name, w, h, _)) in DEVICES.iter().enumerate() {
+                    menu = menu.item(PopupMenuItem::new(format!("{name}  {w}×{h}")).checked(device == Some(i)).on_click(to(Some(i))));
+                }
+                if device.is_some() {
+                    let this = this.clone();
+                    menu = menu.separator().item(PopupMenuItem::new("Turned").checked(turned).on_click(move |_, _, cx| {
+                        let _ = this.update(cx, |v, cx| {
+                            v.turned = !v.turned;
+                            v.relayout(cx);
+                        });
+                    }));
+                }
+                menu = menu.separator();
+                for (label, s) in [("Colors as the IDE's", Scheme::AsTheIde), ("Light colors", Scheme::Light), ("Dark colors", Scheme::Dark)] {
+                    let this = this.clone();
+                    menu = menu.item(PopupMenuItem::new(label).checked(scheme == s).on_click(move |_, _, cx| {
+                        let _ = this.update(cx, |v, cx| {
+                            v.scheme = s;
+                            cx.notify();
+                        });
+                    }));
+                }
+                menu
+            },
+        )
+    }
+
+    /// What is picked for the agent, a note to it, and sending.
+    fn render_picked(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
+        h_flex()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .flex_wrap()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .when(self.picking && self.picked.is_empty(), |d| d.child(div().text_xs().text_color(muted).child("Click elements, or drag over an area")))
+            .children(self.picked.iter().enumerate().map(|(i, picked)| {
+                h_flex()
+                    .pl_1()
+                    .rounded_sm()
+                    .bg(cx.theme().secondary)
+                    .text_xs()
+                    .child(format!("{} {}", i + 1, picked.label))
+                    .child(Button::new(("unpick", i)).xsmall().ghost().label("×").on_click(cx.listener(move |this, _, _, cx| {
+                        if i < this.picked.len() {
+                            this.picked.remove(i);
+                        }
+                        cx.notify();
+                    })))
+            }))
+            .when(self.picks_waiting > 0, |d| d.child(div().text_xs().text_color(muted).child("…")))
+            .child(
+                Button::new("pick-page")
+                    .xsmall()
+                    .ghost()
+                    .label("Whole page")
+                    .tooltip("A picture of the whole page, what is scrolled out of view too")
+                    .on_click(cx.listener(|this, _, _, cx| this.run_pick(cx, |out, dir| pick_page(&out, &dir)))),
+            )
+            .child(div().flex_1().min_w(px(180.)).child(Input::new(&self.pick_note).small()))
+            .child(
+                Button::new("pick-send")
+                    .xsmall()
+                    .primary()
+                    .label("Send to agent")
+                    .disabled(self.picked.is_empty())
+                    .on_click(cx.listener(|this, _, window, cx| this.send_picked(window, cx))),
+            )
+            .child(
+                Button::new("pick-cancel")
+                    .xsmall()
+                    .ghost()
+                    .label("×")
+                    .tooltip("Stop picking and drop what is picked")
+                    .on_click(cx.listener(|this, _, window, cx| this.drop_picks(window, cx))),
+            )
+    }
+
+    /// A date's, time's or color's value asked for where its picker would open.
+    fn render_picker(&self, picker: &Picker, cx: &mut Context<Self>) -> impl IntoElement {
+        let at = self.on_screen(picker.bounds);
+        let area = self.bounds.get().size;
+        let height = px(110.);
+        let top = if at.bottom() + height > area.height && at.top() > height { at.top() - height } else { at.bottom() };
+        let left = at.left().min((area.width - px(280.)).max(px(0.)));
+        let color = picker.kind == "color";
+        let typed = self.picker_input.read(cx).value();
+        let swatch = u32::from_str_radix(typed.trim_start_matches('#'), 16).ok().filter(|_| color && typed.len() == 7);
+        v_flex()
+            .id("page-picker")
+            .absolute()
+            .left(left)
+            .top(top)
+            .w(px(280.))
+            .p_2()
+            .gap_1()
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().popover)
+            .text_color(cx.theme().popover_foreground)
+            .shadow_lg()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
+                if e.keystroke.key == "escape" {
+                    this.picker = None;
+                    this.focus.focus(window, cx);
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(format!("{}: {}", picker.kind, picker_format(&picker.kind))))
+            .child(
+                h_flex()
+                    .gap_1()
+                    .when_some(swatch, |d, rgb| d.child(div().size(px(20.)).rounded_sm().border_1().border_color(cx.theme().border).bg(gpui_kit::rgb(rgb))))
+                    .child(div().flex_1().child(Input::new(&self.picker_input).small())),
+            )
+            .when(self.picker_wrong, |d| {
+                d.child(div().text_xs().text_color(gpui_kit::red()).child(format!("The field takes {}", picker_format(&picker.kind))))
+            })
+            .child(
+                h_flex()
+                    .gap_1()
+                    .when(!color, |d| {
+                        d.child(
+                            Button::new("picker-now")
+                                .xsmall()
+                                .ghost()
+                                .label(if picker.kind == "time" { "Now" } else { "Today" })
+                                .on_click(cx.listener(|this, _, window, cx| this.picker_now(window, cx))),
+                        )
+                    })
+                    .child(Button::new("picker-clear").xsmall().ghost().label("Clear").on_click(cx.listener(|this, _, window, cx| {
+                        this.picker_input.update(cx, |input, cx| input.set_value(String::new(), window, cx));
+                        this.apply_picker(window, cx);
+                    })))
+                    .child(div().flex_1())
+                    .child(Button::new("picker-ok").xsmall().primary().label("OK").on_click(cx.listener(|this, _, window, cx| this.apply_picker(window, cx)))),
+            )
+    }
+
+    fn render_problems(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(
+                h_flex()
+                    .gap_1()
+                    .px_2()
+                    .py_1()
+                    .child(div().flex_1().text_xs().text_color(cx.theme().muted_foreground).child("The page's errors since it loaded"))
+                    .child(
+                        Button::new("problems-agent")
+                            .xsmall()
+                            .outline()
+                            .label("Send to agent")
+                            .on_click(cx.listener(|this, _, _, cx| this.problems_to_agent(cx))),
+                    )
+                    .child(Button::new("problems-clear").xsmall().ghost().label("Clear").on_click(cx.listener(|this, _, _, cx| {
+                        this.problems.clear();
+                        this.problems_open = false;
+                        cx.notify();
+                    }))),
+            )
+            .child(
+                v_flex()
+                    .id("problems")
+                    .max_h(px(180.))
+                    .overflow_y_scroll()
+                    .px_2()
+                    .pb_1()
+                    .gap_1()
+                    .text_xs()
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .children(self.problems.iter().map(|p| {
+                        let shown: String = p.lines().take(6).collect::<Vec<_>>().join("\n");
+                        div().text_color(gpui_kit::red()).child(shown)
+                    })),
+            )
+    }
+
+    fn render_find(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .on_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
+                if e.keystroke.key == "escape" {
+                    this.close_find(window, cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .child(div().w(px(260.)).child(Input::new(&self.find_input).small()))
+            .child(
+                Button::new("find-prev")
+                    .xsmall()
+                    .ghost()
+                    .label("↑")
+                    .tooltip("Previous (Shift+Enter)")
+                    .on_click(cx.listener(|this, _, _, cx| this.find_next(true, cx))),
+            )
+            .child(
+                Button::new("find-next")
+                    .xsmall()
+                    .ghost()
+                    .label("↓")
+                    .tooltip("Next (Enter)")
+                    .on_click(cx.listener(|this, _, _, cx| this.find_next(false, cx))),
+            )
+            .child(Button::new("find-close").xsmall().ghost().label("×").on_click(cx.listener(|this, _, window, cx| this.close_find(window, cx))))
+    }
+
+    fn render_dialog(&self, dialog: &Dialog, cx: &mut Context<Self>) -> impl IntoElement {
+        let leave = dialog.kind == "beforeunload";
+        let (ok, cancel) = if leave {
+            ("Leave", Some("Stay"))
+        } else if dialog.kind == "alert" {
+            ("OK", None)
+        } else {
+            ("OK", Some("Cancel"))
+        };
+        let message = if leave && dialog.message.is_empty() {
+            "Leave this page? What you changed may not be saved.".to_string()
+        } else {
+            dialog.message.clone()
+        };
+        div().absolute().inset_0().bg(gpui_kit::black().opacity(0.25)).flex().items_start().justify_center().pt_8().child(
+            v_flex()
+                .id("page-dialog")
+                .w(px(420.))
+                .max_w_full()
+                .p_3()
+                .gap_2()
+                .rounded_md()
+                .border_1()
+                .border_color(cx.theme().border)
+                .bg(cx.theme().popover)
+                .text_color(cx.theme().popover_foreground)
+                .shadow_lg()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(div().text_xs().text_color(cx.theme().muted_foreground).child(format!("{} says", self.title())))
+                .child(div().id("page-dialog-text").max_h(px(240.)).overflow_y_scroll().text_sm().child(message))
+                .when(dialog.kind == "prompt", |this| this.child(Input::new(&self.prompt_input).small()))
+                .child(
+                    h_flex()
+                        .justify_end()
+                        .gap_1()
+                        .when_some(cancel, |this, cancel| {
+                            this.child(
+                                Button::new("dialog-cancel")
+                                    .small()
+                                    .ghost()
+                                    .label(cancel)
+                                    .on_click(cx.listener(|this, _, window, cx| this.answer(false, window, cx))),
+                            )
+                        })
+                        .child(
+                            Button::new("dialog-ok")
+                                .small()
+                                .primary()
+                                .label(ok)
+                                .on_click(cx.listener(|this, _, window, cx| this.answer(true, window, cx))),
+                        ),
+                ),
+        )
+    }
+
+    fn render_select(&self, menu: &SelectMenu, cx: &mut Context<Self>) -> impl IntoElement {
+        let at = self.on_screen(menu.bounds);
+        let area = self.bounds.get().size;
+        let (left, top, width) = (at.left(), at.bottom(), at.size.width);
+        let rows = menu.choices.len() + menu.choices.iter().filter_map(|c| c.group.as_ref()).collect::<HashSet<_>>().len();
+        let height = px(26. * rows.min(12) as f32 + 8.);
+        // Above the select when there is no room under it.
+        let top = if top + height > area.height && at.top() > height { at.top() - height } else { top };
+        let mut list = v_flex()
+            .id("page-select")
+            .absolute()
+            .left(left)
+            .top(top)
+            .min_w(width.max(px(120.)))
+            .max_h(height)
+            .overflow_y_scroll()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().popover)
+            .text_color(cx.theme().popover_foreground)
+            .shadow_lg()
+            .text_sm()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_scroll(|_, _, cx| cx.stop_propagation());
+        let mut group: Option<&String> = None;
+        for (ix, choice) in menu.choices.iter().enumerate() {
+            if choice.group.as_ref() != group {
+                group = choice.group.as_ref();
+                if let Some(label) = group {
+                    list = list.child(
+                        div().px_2().pt_1().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(cx.theme().muted_foreground).child(label.clone()),
                     );
                 }
-                return;
             }
-            _ => return,
-        };
-        for kind in ["rawKeyDown", "keyUp"] {
-            self.command(
-                "Input.dispatchKeyEvent",
-                json!({ "type": kind, "key": key, "code": code, "windowsVirtualKeyCode": vk, "modifiers": modifiers }),
+            let current = self.select_ix == Some(ix);
+            list = list.child(
+                div()
+                    .id(("page-select-choice", ix))
+                    .px_2()
+                    .when(group.is_some(), |d| d.pl_4())
+                    .py(px(3.))
+                    .whitespace_nowrap()
+                    .when(current, |d| d.bg(cx.theme().accent).text_color(cx.theme().accent_foreground))
+                    .when(choice.disabled, |d| d.text_color(cx.theme().muted_foreground))
+                    .when(!choice.disabled, |d| d.hover(|d| d.bg(cx.theme().accent)).on_click(cx.listener(move |this, _, _, cx| this.choose(ix, cx))))
+                    .child(if choice.label.is_empty() { "\u{a0}".to_string() } else { choice.label.clone() }),
             );
         }
-        if key == "Enter" {
-            self.command("Input.dispatchKeyEvent", json!({ "type": "char", "text": "\r", "modifiers": modifiers }));
+        list
+    }
+}
+
+/// How the page sits in an area: its viewport in CSS pixels, window pixels
+/// to each, how far right it is drawn, and whether it is a phone's. The
+/// tab's own size scaled by the zoom; or a screen's, made smaller to fit
+/// and centered.
+fn fit(area: Size<Pixels>, device: Option<(u32, u32, bool)>, zoom: f32) -> (f32, f32) {
+    let (_, _, factor, offset, _) = fit_all(area, device, zoom);
+    (factor, offset)
+}
+
+fn fit_all(area: Size<Pixels>, device: Option<(u32, u32, bool)>, zoom: f32) -> (u32, u32, f32, f32, bool) {
+    let (aw, ah) = (f32::from(area.width).max(1.), f32::from(area.height).max(1.));
+    match device {
+        None => ((aw / zoom).round() as u32, (ah / zoom).round() as u32, zoom, 0., false),
+        Some((w, h, mobile)) => {
+            let factor = zoom.min(aw / w as f32).min(ah / h as f32);
+            (w, h, factor, ((aw - w as f32 * factor) / 2.).max(0.), mobile)
         }
+    }
+}
+
+fn button_bit(button: MouseButton) -> u32 {
+    match button {
+        MouseButton::Left => 1,
+        MouseButton::Right => 2,
+        MouseButton::Middle => 4,
+        _ => 0,
     }
 }
 
@@ -903,144 +3297,131 @@ fn decode(bytes: &[u8], format: image::ImageFormat) -> Option<Arc<RenderImage>> 
 
 impl Render for BrowserView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.asleep && self.visible {
+            self.wake(window, cx);
+        }
+        let dark = match self.scheme {
+            Scheme::AsTheIde => cx.theme().mode.is_dark(),
+            Scheme::Light => false,
+            Scheme::Dark => true,
+        };
+        if self.sent_dark != Some(dark) {
+            self.sent_dark = Some(dark);
+            let value = if dark { "dark" } else { "light" };
+            self.command("Emulation.setEmulatedMedia", json!({ "features": [{ "name": "prefers-color-scheme", "value": value }] }));
+        }
         let bounds = self.bounds.clone();
         let sent = self.sent_size.clone();
+        let layout = self.layout.clone();
         let out = self.out.clone();
         let scale = window.scale_factor();
-        v_flex()
-            .size_full()
-            .on_action(cx.listener(|this, _: &BrowserBack, _, _| {
-                this.command("Runtime.evaluate", json!({ "expression": "history.back()" }))
-            }))
-            .on_action(cx.listener(|this, _: &BrowserForward, _, _| {
-                this.command("Runtime.evaluate", json!({ "expression": "history.forward()" }))
-            }))
-            .on_action(cx.listener(|this, _: &BrowserReload, _, _| this.command("Page.reload", json!({}))))
-            .on_action(cx.listener(|this, _: &BrowserCopy, _, cx| this.copy(cx)))
-            .on_action(cx.listener(|this, _: &BrowserPaste, _, cx| this.paste(cx)))
-            // The menu bar's Edit items are the editor's actions: here they are the page's.
-            .on_action(cx.listener(|this, _: &gpui_kit::component::input::Copy, _, cx| this.copy(cx)))
-            .on_action(cx.listener(|this, _: &gpui_kit::component::input::Paste, _, cx| this.paste(cx)))
-            .on_action(cx.listener(|this, _: &gpui_kit::component::input::Cut, _, cx| this.cut(cx)))
-            .on_action(cx.listener(|this, _: &gpui_kit::component::input::SelectAll, _, _| this.edit("selectAll", 'a', false)))
-            .on_action(cx.listener(|this, _: &gpui_kit::component::input::Undo, _, _| this.edit("undo", 'z', false)))
-            .on_action(cx.listener(|this, _: &gpui_kit::component::input::Redo, _, _| this.edit("redo", 'z', true)))
-            .on_action(cx.listener(|this, _: &BrowserCopyUrl, _, cx| {
-                cx.write_to_clipboard(ClipboardItem::new_string(this.url.to_string()))
-            }))
-            .on_action(cx.listener(|this, _: &BrowserOpenExternal, _, cx| cx.open_url(&this.url)))
-            .child(
-                h_flex()
-                    .gap_1()
-                    .px_2()
-                    .py_1()
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    .child(Button::new("back").xsmall().ghost().label("←").on_click(cx.listener(|this, _, _, _| {
-                        this.command("Runtime.evaluate", json!({ "expression": "history.back()" }))
-                    })))
-                    .child(Button::new("forward").xsmall().ghost().label("→").on_click(cx.listener(|this, _, _, _| {
-                        this.command("Runtime.evaluate", json!({ "expression": "history.forward()" }))
-                    })))
-                    .child(Button::new("reload").xsmall().ghost().label("⟳").on_click(cx.listener(|this, _, _, _| {
-                        this.command("Page.reload", json!({}))
-                    })))
-                    .child(div().flex_1().child(Input::new(&self.url_input).small()))
-                    .child(
-                        Button::new("pick")
-                            .xsmall()
-                            .ghost()
-                            .label("⌖")
-                            .selected(self.picking)
-                            .tooltip("Pick an element for the agent: its selector, markup and picture go into the prompt")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                // Focused, so Esc gets here to leave picking.
-                                this.focus.focus(window, cx);
-                                this.set_picking(!this.picking, cx);
-                            })),
-                    )
-                    .when_some(endpoint(), |this, endpoint| {
-                        this.child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(format!("CDP {endpoint}")),
-                        )
-                    }),
-            )
-            .when_some(self.error.clone(), |this, error| {
-                this.child(div().px_3().py_1().text_xs().text_color(gpui_kit::red()).child(error))
-            })
-            .child(
-                div()
+        let zoom = self.zoom;
+        let device = self.device_size();
+        let (_, offset) = fit(self.bounds.get().size, device, zoom);
+        let agent = self.device.and_then(|i| user_agent(DEVICES[i].0, &self.major));
+        let which = self.device.map_or(0, |i| i as u32 + 1);
+        let address = self.url.to_string();
+        let weak = cx.entity().downgrade();
+        let (entity, focus) = (cx.entity(), self.focus.clone());
+        let page = div()
                     .id("page")
                     .flex_1()
                     .min_h_0()
+                    .min_w_0()
                     .relative()
-                    .bg(gpui_kit::white())
+                    .overflow_hidden()
+                    // A screen narrower than the tab sits on the panel's color.
+                    .bg(if device.is_some() { cx.theme().muted } else { gpui_kit::white() })
                     .track_focus(&self.focus)
-                    .when(self.picking, |page| page.cursor(CursorStyle::Crosshair))
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, e: &MouseDownEvent, window, cx| {
-                        this.focus.focus(window, cx);
-                        if !this.picking {
-                            this.mouse("mousePressed", e.position, Some(e.button), e.click_count, &e.modifiers)
-                        }
-                    }))
-                    .on_mouse_down(MouseButton::Right, cx.listener(|this, e: &MouseDownEvent, window, cx| {
-                        // Focus first, so the context menu's actions reach this view.
-                        this.focus.focus(window, cx);
-                        this.mouse("mousePressed", e.position, Some(e.button), e.click_count, &e.modifiers)
-                    }))
+                    .cursor(if self.picking { CursorStyle::Crosshair } else { self.cursor })
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, e: &MouseDownEvent, window, cx| this.press(e, window, cx)))
+                    .on_mouse_down(MouseButton::Middle, cx.listener(|this, e: &MouseDownEvent, window, cx| this.press(e, window, cx)))
+                    .on_mouse_down(MouseButton::Right, cx.listener(|this, e: &MouseDownEvent, window, cx| this.press(e, window, cx)))
+                    .on_mouse_down(MouseButton::Navigate(NavigationDirection::Back), cx.listener(|this, _, _, _| this.back()))
+                    .on_mouse_down(MouseButton::Navigate(NavigationDirection::Forward), cx.listener(|this, _, _, _| this.forward()))
                     .on_mouse_up(MouseButton::Left, cx.listener(|this, e: &MouseUpEvent, _, cx| {
-                        if this.picking {
-                            return this.pick_at(e.position, cx);
+                        if !this.picking {
+                            return;
                         }
-                        this.mouse("mouseReleased", e.position, Some(e.button), e.click_count, &e.modifiers)
-                    }))
-                    .on_mouse_up(MouseButton::Right, cx.listener(|this, e: &MouseUpEvent, _, _| {
-                        this.mouse("mouseReleased", e.position, Some(e.button), e.click_count, &e.modifiers)
+                        match this.drag.take() {
+                            Some((from, _)) if (from.x - e.position.x).abs() > px(6.) || (from.y - e.position.y).abs() > px(6.) => {
+                                let (from, to) = (this.pointer(from), this.pointer(e.position));
+                                this.run_pick(cx, move |out, dir| pick_area(&out, from, to, &dir));
+                            }
+                            _ => this.pick_at(e.position, cx),
+                        }
                     }))
                     .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, cx| {
-                        // The page still sees the pointer, so what shows on hover can be picked.
-                        this.mouse("mouseMoved", e.position, e.pressed_button, 0, &e.modifiers);
-                        if this.picking {
+                        // Held, the window's listener sends it.
+                        if this.pressed == 0 && this.dialog.is_none() {
+                            // The page still sees the pointer, so what shows on hover can be picked.
+                            this.mouse("mouseMoved", e.position, None, 0, &e.modifiers);
+                        }
+                        if let Some((_, to)) = this.drag.as_mut() {
+                            *to = e.position;
+                            this.hover = None;
+                            cx.notify();
+                        } else if this.picking {
                             this.hover_at(e.position, cx);
                         }
                     }))
-                    .on_scroll(cx.listener(|this, e: &ScrollEvent, window, _| {
+                    .on_scroll(cx.listener(|this, e: &ScrollEvent, window, cx| {
+                        if this.select.take().is_some() {
+                            cx.notify();
+                        }
                         let delta = e.delta.pixel_delta(window.line_height());
                         let (x, y) = this.pointer(e.position);
+                        let factor = this.layout.get().0;
                         this.command(
                             "Input.dispatchMouseEvent",
-                            json!({ "type": "mouseWheel", "x": x, "y": y, "deltaX": -f32::from(delta.x), "deltaY": -f32::from(delta.y) }),
+                            json!({ "type": "mouseWheel", "x": x, "y": y, "deltaX": -f32::from(delta.x) / factor, "deltaY": -f32::from(delta.y) / factor }),
                         );
                     }))
-                    .on_key_down(cx.listener(|this, e: &KeyDownEvent, _, cx| {
-                        this.key(e, cx);
+                    .on_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
+                        this.key(e, window, cx);
                         cx.stop_propagation();
                     }))
                     .child(
                         // Tracks the page area: Chrome renders at exactly this
-                        // size and the window's scale, so frames are 1:1.
+                        // size and the window's scale, so frames are 1:1. A
+                        // button held on the page has its moves and release go
+                        // there wherever the pointer is, as in a browser.
                         canvas(
                             move |b, _, _| {
                                 bounds.set(b);
-                                let size = (f32::from(b.size.width) as u32, f32::from(b.size.height) as u32, (scale * 100.) as u32);
-                                if size != sent.get() && size.0 > 0 && size.1 > 0 {
-                                    sent.set(size);
-                                    // A running screencast keeps its old size: restart it.
-                                    let _ = out.send(Out::Command("Page.stopScreencast", json!({})));
-                                    let _ = out.send(Out::Command(
-                                        "Emulation.setDeviceMetricsOverride",
-                                        json!({ "width": size.0, "height": size.1, "deviceScaleFactor": scale, "mobile": false }),
-                                    ));
-                                    let _ = out.send(Out::Command(
-                                        "Page.startScreencast",
-                                        json!({ "format": "jpeg", "quality": 85, "maxWidth": (size.0 as f32 * scale) as u32, "maxHeight": (size.1 as f32 * scale) as u32 }),
-                                    ));
+                                let (width, height, factor, offset, mobile) = fit_all(b.size, device, zoom);
+                                layout.set((factor, offset));
+                                let told = (width, height, (scale * factor * 1000.) as u32, u32::from(mobile) | which << 1);
+                                if told != sent.get() && width > 0 && height > 0 && f32::from(b.size.width) > 0. {
+                                    sent.set(told);
+                                    let _ = out.send(Out::Resize(width, height, scale * factor, mobile, agent.clone(), address.clone()));
                                 }
                             },
-                            |_, _, _, _| {},
+                            move |b, _, window, cx| {
+                                // Text an input method composes goes to the page.
+                                window.handle_input(&focus, ElementInputHandler::new(b, entity.clone()), cx);
+                                let moved = weak.clone();
+                                window.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
+                                    if phase == DispatchPhase::Bubble {
+                                        let _ = moved.update(cx, |this, cx| {
+                                            if this.resizing {
+                                                this.resize_dock(e.position, cx);
+                                            } else if this.pressed != 0 {
+                                                this.mouse("mouseMoved", e.position, e.pressed_button, 0, &e.modifiers);
+                                            }
+                                        });
+                                    }
+                                });
+                                let released = weak.clone();
+                                window.on_mouse_event(move |e: &MouseUpEvent, phase, _, cx| {
+                                    if phase == DispatchPhase::Bubble {
+                                        let _ = released.update(cx, |this, _| {
+                                            this.resizing = false;
+                                            this.release(e)
+                                        });
+                                    }
+                                });
+                            },
                         )
                         .absolute()
                         .size_full(),
@@ -1050,22 +3431,30 @@ impl Render for BrowserView {
                         // of the new size, the old one stays sharp at its size.
                         let size = frame.size(0);
                         let (w, h) = (size.width.0 as f32 / scale, size.height.0 as f32 / scale);
-                        this.child(img(frame).absolute().top_0().left_0().w(px(w)).h(px(h)))
+                        this.child(img(frame).absolute().top_0().left(px(offset)).w(px(w)).h(px(h)))
                     })
-                    .when_some(self.hover.filter(|_| self.picking), |this, hover| {
+                    .when_some(self.hover.filter(|_| self.picking).map(|b| self.on_screen(b)), |this, hover| {
+                        let color = cx.theme().primary;
+                        this.child(div().absolute().left(hover.left()).top(hover.top()).w(hover.size.width).h(hover.size.height).border_1().border_color(color).bg(color.opacity(0.2)))
+                    })
+                    .when_some(self.drag.filter(|_| self.picking), |this, (from, to)| {
+                        let origin = self.bounds.get().origin;
                         let color = cx.theme().primary;
                         this.child(
                             div()
                                 .absolute()
-                                .left(hover.origin.x)
-                                .top(hover.origin.y)
-                                .w(hover.size.width)
-                                .h(hover.size.height)
+                                .left(from.x.min(to.x) - origin.x)
+                                .top(from.y.min(to.y) - origin.y)
+                                .w((from.x - to.x).abs())
+                                .h((from.y - to.y).abs())
                                 .border_1()
                                 .border_color(color)
-                                .bg(color.opacity(0.2)),
+                                .bg(color.opacity(0.15)),
                         )
                     })
+                    .when_some(self.picker.clone(), |this, picker| this.child(self.render_picker(&picker, cx)))
+                    .when_some(self.select.clone(), |this, menu| this.child(self.render_select(&menu, cx)))
+                    .when_some(self.dialog.clone(), |this, dialog| this.child(self.render_dialog(&dialog, cx)))
                     // Headless Chrome has no menu of its own: that is browser UI.
                     .context_menu(|menu, _, _| {
                         menu.menu("Back", Box::new(BrowserBack))
@@ -1074,11 +3463,129 @@ impl Render for BrowserView {
                             .separator()
                             .menu("Copy", Box::new(BrowserCopy))
                             .menu("Paste", Box::new(BrowserPaste))
+                            .menu("Find…", Box::new(BrowserFind))
                             .separator()
                             .menu("Copy page address", Box::new(BrowserCopyUrl))
                             .menu("Open in system browser", Box::new(BrowserOpenExternal))
-                    })
-            )
+                    });
+        if self.bare {
+            return v_flex()
+                .size_full()
+                .key_context(KEY_CONTEXT)
+                .on_action(cx.listener(|this, _: &BrowserCopy, _, cx| this.copy(cx)))
+                .on_action(cx.listener(|this, _: &BrowserPaste, _, cx| this.paste(cx)))
+                .on_action(cx.listener(|this, _: &gpui_kit::component::input::Copy, _, cx| this.copy(cx)))
+                .on_action(cx.listener(|this, _: &gpui_kit::component::input::Paste, _, cx| this.paste(cx)))
+                .on_action(cx.listener(|this, _: &gpui_kit::component::input::Cut, _, cx| this.cut(cx)))
+                .on_action(cx.listener(|this, _: &gpui_kit::component::input::SelectAll, _, _| this.edit("selectAll", 'a', false)))
+                .child(page)
+                .into_any_element();
+        }
+        let page = self.with_devtools(page, cx);
+        v_flex()
+            .size_full()
+            .key_context(KEY_CONTEXT)
+            .on_action(cx.listener(|this, _: &BrowserBack, _, _| this.back()))
+            .on_action(cx.listener(|this, _: &BrowserForward, _, _| this.forward()))
+            .on_action(cx.listener(|this, _: &BrowserReload, _, _| this.reload(false)))
+            .on_action(cx.listener(|this, _: &BrowserHardReload, _, _| this.reload(true)))
+            .on_action(cx.listener(|this, _: &BrowserCopy, _, cx| this.copy(cx)))
+            .on_action(cx.listener(|this, _: &BrowserPaste, _, cx| this.paste(cx)))
+            .on_action(cx.listener(|this, _: &BrowserFocusAddress, window, cx| {
+                this.url_input.update(cx, |input, cx| {
+                    input.focus(window, cx);
+                    input.select_all(window, cx);
+                })
+            }))
+            .on_action(cx.listener(|this, _: &BrowserFind, window, cx| this.open_find(window, cx)))
+            .on_action(cx.listener(|this, _: &BrowserZoomIn, _, cx| this.zoom_step(true, cx)))
+            .on_action(cx.listener(|this, _: &BrowserZoomOut, _, cx| this.zoom_step(false, cx)))
+            .on_action(cx.listener(|this, _: &BrowserZoomReset, _, cx| this.set_zoom(1., cx)))
+            .on_action(cx.listener(|this, _: &BrowserCopyUrl, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(this.url.to_string()))
+            }))
+            .on_action(cx.listener(|this, _: &BrowserOpenExternal, _, cx| cx.open_url(&this.url)))
+            .child(self.render_toolbar(cx))
+            .when(self.finding, |this| this.child(self.render_find(cx)))
+            .when(self.problems_open && !self.problems.is_empty(), |this| this.child(self.render_problems(cx)))
+            .when(self.picking || !self.picked.is_empty(), |this| this.child(self.render_picked(cx)))
+            .when_some(self.error.clone(), |this, error| {
+                this.child(
+                    h_flex()
+                        .px_3()
+                        .py_1()
+                        .gap_2()
+                        .child(div().flex_1().text_xs().text_color(gpui_kit::red()).child(error))
+                        .child(Button::new("error-reload").xsmall().ghost().label("Reload").on_click(cx.listener(|this, _, _, cx| {
+                            this.error = None;
+                            this.reload(false);
+                            cx.notify();
+                        })))
+                        .child(Button::new("error-close").xsmall().ghost().label("×").on_click(cx.listener(|this, _, _, cx| {
+                            this.error = None;
+                            cx.notify();
+                        }))),
+                )
+            })
+            .on_action(cx.listener(|this, _: &BrowserDevTools, window, cx| this.toggle_devtools(window, cx)))
+            .child(page)
+            .into_any_element()
+    }
+}
+
+/// An input method's text: composed in the page as it is typed, put in when done.
+impl EntityInputHandler for BrowserView {
+    fn text_for_range(&mut self, range: std::ops::Range<usize>, adjusted: &mut Option<std::ops::Range<usize>>, _: &mut Window, _: &mut Context<Self>) -> Option<String> {
+        let utf16: Vec<u16> = self.marked.as_deref().unwrap_or_default().encode_utf16().collect();
+        let (start, end) = (range.start.min(utf16.len()), range.end.min(utf16.len()));
+        let start = start.min(end);
+        if start != range.start || end != range.end {
+            *adjusted = Some(start..end);
+        }
+        Some(String::from_utf16_lossy(&utf16[start..end]))
+    }
+
+    fn selected_text_range(&mut self, _: bool, _: &mut Window, _: &mut Context<Self>) -> Option<UTF16Selection> {
+        let length = self.marked.as_deref().map_or(0, |m| m.encode_utf16().count());
+        Some(UTF16Selection { range: length..length, reversed: false })
+    }
+
+    fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<std::ops::Range<usize>> {
+        self.marked.as_ref().map(|m| 0..m.encode_utf16().count())
+    }
+
+    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
+        if let Some(text) = self.marked.take().filter(|t| !t.is_empty()) {
+            self.command("Input.insertText", json!({ "text": text }));
+        }
+    }
+
+    fn replace_text_in_range(&mut self, _: Option<std::ops::Range<usize>>, text: &str, _: &mut Window, _: &mut Context<Self>) {
+        self.marked = None;
+        self.command("Input.insertText", json!({ "text": text }));
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _: Option<std::ops::Range<usize>>,
+        text: &str,
+        _: Option<std::ops::Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+        let length = text.encode_utf16().count();
+        self.marked = (!text.is_empty()).then(|| text.to_string());
+        self.command("Input.imeSetComposition", json!({ "text": text, "selectionStart": length, "selectionEnd": length }));
+    }
+
+    /// The candidate window opens at the caret, as the page last told it.
+    fn bounds_for_range(&mut self, _: std::ops::Range<usize>, element_bounds: Bounds<Pixels>, _: &mut Window, _: &mut Context<Self>) -> Option<Bounds<Pixels>> {
+        let at = self.caret.map(|c| self.on_screen(c)).unwrap_or(Bounds { origin: point(px(24.), px(24.)), size: size(px(2.), px(20.)) });
+        Some(Bounds { origin: element_bounds.origin + at.origin, size: at.size })
+    }
+
+    fn character_index_for_point(&mut self, _: Point<Pixels>, _: &mut Window, _: &mut Context<Self>) -> Option<usize> {
+        None
     }
 }
 
@@ -1092,10 +3599,60 @@ impl Focusable for BrowserView {
 mod tests {
     use super::*;
 
+    /// Ends the pictures' Chrome however a test ends: on macOS nothing else does.
+    struct Quit(Owner);
+    impl Drop for Quit {
+        fn drop(&mut self) {
+            let Some(mut chrome) = slot(&self.0).chrome.lock().ok().and_then(|mut c| c.take()) else {
+                return;
+            };
+            let started = Instant::now();
+            // A page's writer lets go of it once the page is closed.
+            while started.elapsed() < Duration::from_secs(10) {
+                match Arc::try_unwrap(chrome) {
+                    Ok(owned) => return drop(owned),
+                    Err(shared) => chrome = shared,
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    #[core::prelude::v1::test]
+    fn addresses_of_this_machine() {
+        assert_eq!(local_address("http://localhost:3000/a?b").as_deref(), Some("localhost:3000"));
+        assert_eq!(local_address("http://0.0.0.0:8080").as_deref(), Some("127.0.0.1:8080"));
+        assert_eq!(local_address("http://app.localhost/").as_deref(), Some("localhost:80"));
+        assert_eq!(local_address("https://[::1]:8443/").as_deref(), Some("[::1]:8443"));
+        assert_eq!(local_address("https://example.com/"), None);
+    }
+
+    #[core::prelude::v1::test]
+    fn a_task_keeps_its_port() {
+        let port = task_port(Path::new("/w/a"));
+        assert_eq!(port, task_port(Path::new("/w/a")));
+        assert!((21000..30000).contains(&port));
+        assert_ne!(port, task_port(Path::new("/w/b")));
+    }
+
+    #[core::prelude::v1::test]
+    fn problems_of_a_page() {
+        let thrown =
+            json!({ "exceptionDetails": { "text": "Uncaught", "exception": { "description": "TypeError: x is undefined\n    at f (app.js:3:5)" } } });
+        assert_eq!(problem("Runtime.exceptionThrown", &thrown).unwrap(), "TypeError: x is undefined\n    at f (app.js:3:5)");
+        let logged = json!({ "type": "error", "args": [{ "type": "string", "value": "bad" }, { "type": "number", "value": 3 }],
+            "stackTrace": { "callFrames": [{ "url": "http://x/app.js", "lineNumber": 9 }] } });
+        assert_eq!(problem("Runtime.consoleAPICalled", &logged).unwrap(), "console.error: bad 3 (http://x/app.js:10)");
+        assert!(problem("Runtime.consoleAPICalled", &json!({ "type": "log", "args": [] })).is_none());
+        let failed = json!({ "entry": { "level": "error", "text": "Failed to load resource: 500", "url": "http://x/api" } });
+        assert_eq!(problem("Log.entryAdded", &failed).unwrap(), "Failed to load resource: 500 (http://x/api)");
+    }
+
     /// Needs Chrome (or `IDEAE_CHROME`): `cargo test -- --ignored pictures`.
     #[core::prelude::v1::test]
     #[ignore]
     fn pictures_a_page_at_the_size_asked() {
+        let _quit = Quit(Owner::Pictures);
         let out = std::env::temp_dir().join(format!("ideae-shot-test-{}.png", std::process::id()));
         shot("data:text/html,<body style='margin:0;background:rgb(0,128,0)'>", 640, 400, &out).unwrap();
         let image = image::open(&out).unwrap().into_rgba8();
@@ -1103,14 +3660,9 @@ mod tests {
         assert!(image.pixels().all(|p| p.0 == [0, 128, 0, 255]), "the page, all of the picture");
         assert!(shot("http://127.0.0.1:9/", 640, 400, &out).is_err(), "nothing serves there");
         let _ = std::fs::remove_file(&out);
-        // The picture's Chrome ends with the test: on macOS nothing else ends it.
-        if let Some(chrome) = CHROME.get().and_then(|slot| slot.lock().ok()?.take()) {
-            drop(Arc::try_unwrap(chrome));
-        }
     }
 
     /// Needs Chrome (or `IDEAE_CHROME`): `cargo test -- --ignored picks`.
-    /// Rust's own `test`: the glob above brings in the kit's.
     #[core::prelude::v1::test]
     #[ignore]
     fn picks_an_element_out_of_a_scrolled_page() {
@@ -1118,25 +3670,9 @@ mod tests {
             <ul id='users'><li class='row'>Ada</li><li class='row'>\
             <a class='name' href='/b' style='display:inline-block;width:120px;height:30px;background:rgb(255,0,0);color:rgb(255,0,0)'>Grace Hopper</a>\
             </li></ul><div style='height:1500px'></div>";
-        /// Ends the test's Chrome, however the test ends: on macOS nothing else does.
-        struct Quit;
-        impl Drop for Quit {
-            fn drop(&mut self) {
-                let Some(mut chrome) = CHROME.get().and_then(|slot| slot.lock().ok()?.take()) else { return };
-                let started = Instant::now();
-                // The page's thread lets go of it once the page is closed.
-                while started.elapsed() < Duration::from_secs(10) {
-                    match Arc::try_unwrap(chrome) {
-                        Ok(owned) => return drop(owned),
-                        Err(shared) => chrome = shared,
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-            }
-        }
-        let _quit = Quit;
-        let (frames, _kept) = async_channel::bounded(4);
-        let out = spawn_page(page.into(), frames);
+        let _quit = Quit(Owner::Pictures);
+        let (frames, _kept) = async_channel::bounded(64);
+        let out = spawn_page(Owner::Pictures, Source::Url(page.into()), frames);
         let eval = |expression: &str| {
             call(&out, "Runtime.evaluate", json!({ "expression": expression, "returnByValue": true })).map(|r| r["result"]["value"].clone())
         };
@@ -1156,7 +3692,7 @@ mod tests {
         assert_eq!((hover.origin.x + px(5.), hover.origin.y + px(5.)), (px(x), px(y)));
 
         let dir = std::env::temp_dir().join(format!("ideae-pick-test-{}", std::process::id()));
-        let message = pick(&out, x, y, &dir).expect("the element, described");
+        let message = pick(&out, x, y, &dir).expect("the element, described").text;
         assert!(message.contains("the element `a.name`:"), "the shortest selector that finds it alone: {message}");
         assert!(message.contains("<a class=\"name\" href=\"/b\"") && message.contains("text: \"Grace Hopper\""), "{message}");
         let picture = message.lines().find_map(|l| l.strip_prefix("picture: ")).expect("a picture");
@@ -1165,8 +3701,234 @@ mod tests {
         assert!(image.pixels().all(|p| p.0 == [255, 0, 0, 255]), "the picture is the link and nothing around it");
 
         let at = eval("(() => { const r = document.querySelector('li').getBoundingClientRect(); return [r.right - 5, r.top + 5] })()").unwrap();
-        let message = pick(&out, at[0].as_f64().unwrap() as f32, at[1].as_f64().unwrap() as f32, &dir).expect("the first row");
+        let message = pick(&out, at[0].as_f64().unwrap() as f32, at[1].as_f64().unwrap() as f32, &dir).expect("the first row").text;
         assert!(message.contains("the element `li.row:nth-of-type(1)`:"), "one of two alike: {message}");
         let _ = std::fs::remove_dir_all(&dir);
+        drop(out);
     }
+
+    /// What headless Chrome would show nowhere or keep to itself comes to
+    /// the tab: a dialog, a select's list, the cursor, the page's errors, a
+    /// page it opens, its title and the address of a page of an app.
+    /// Needs Chrome: `cargo test -- --ignored a_page_tells_the_tab`.
+    #[core::prelude::v1::test]
+    #[ignore]
+    fn a_page_tells_the_tab() {
+        let root = std::env::temp_dir().join(format!("ideae-web-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let owner = Owner::Task(root.clone());
+        let _quit = Quit(owner.clone());
+        let adopted = page_events(&root);
+        let html = "<title>Shop</title><body style='margin:0'>\
+            <select id='s' style='position:absolute;left:10px;top:10px;width:100px;height:20px'>\
+            <optgroup label='Fruit'><option>Apple</option><option disabled>Pear</option></optgroup><option>Other</option></select>\
+            <a href='#x' id='l' style='position:absolute;left:10px;top:100px;width:100px;height:20px;display:block'>link</a>\
+            <input id='d' type='date' value='2026-01-02' style='position:absolute;left:10px;top:200px;width:160px;height:24px'>\
+            <script>document.getElementById('s').onchange = (e) => console.error('chose', e.target.value); \
+            document.getElementById('d').onchange = (e) => console.error('dated', e.target.value)</script>";
+        // A server of its own: a data: page may not go anywhere, not even to its #fragment.
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let page = format!("http://127.0.0.1:{}/", server.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for mut stream in server.incoming().flatten() {
+                let mut asked = [0u8; 2048];
+                let _ = stream.read(&mut asked);
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}", html.len());
+            }
+        });
+        let (tx, rx) = async_channel::bounded(64);
+        let out = spawn_page(owner, Source::Url(page.clone()), tx);
+        let started = Instant::now();
+        let wait = |what: &str, found: &mut dyn FnMut(&In) -> bool| loop {
+            assert!(started.elapsed() < Duration::from_secs(30), "waited for {what}");
+            match rx.try_recv() {
+                Ok(message) if found(&message) => return message,
+                Ok(In::Error(e)) => panic!("waiting for {what}: {e}"),
+                Ok(_) => {}
+                Err(async_channel::TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(10)),
+                Err(_) => panic!("the page ended waiting for {what}"),
+            }
+        };
+        wait("the title", &mut |m| matches!(m, In::Title(t) if t == "Shop"));
+        let mouse = |kind: &str, x: f32, y: f32| {
+            let _ = out.send(Out::Command(
+                "Input.dispatchMouseEvent",
+                json!({ "type": kind, "x": x, "y": y, "button": "left", "buttons": u32::from(kind == "mousePressed"), "clickCount": 1 }),
+            ));
+        };
+        let _ = out.send(Out::Move(json!({ "type": "mouseMoved", "x": 20., "y": 110. })));
+        wait("the link's cursor", &mut |m| matches!(m, In::Cursor(c) if c == "pointer"));
+
+        mouse("mousePressed", 20., 15.);
+        mouse("mouseReleased", 20., 15.);
+        let In::Select(menu) = wait("the select's list", &mut |m| matches!(m, In::Select(_))) else { unreachable!() };
+        let labels: Vec<(&str, bool, Option<&str>)> = menu.choices.iter().map(|c| (c.label.as_str(), c.disabled, c.group.as_deref())).collect();
+        assert_eq!(labels, [("Apple", false, Some("Fruit")), ("Pear", true, Some("Fruit")), ("Other", false, None)]);
+        assert_eq!((menu.bounds.origin.x, menu.bounds.size.width), (px(10.), px(100.)));
+        let choose = "((i) => { const s = window.__ideaeSelect; s.selectedIndex = i; s.dispatchEvent(new Event('change', { bubbles: true })); })(2)";
+        let _ = out.send(Out::Command("Runtime.evaluate", json!({ "expression": choose, "contextId": menu.context })));
+        wait("the error the page logs", &mut |m| matches!(m, In::Problem(p) if p.starts_with("console.error: chose Other")));
+
+        // Keys open the list too: Alt+Down on the select, which has the focus.
+        let key = |kind: &str, key: &str, code: &str, vk: u32, modifiers: u32| {
+            let _ = out.send(Out::Command("Input.dispatchKeyEvent", json!({ "type": kind, "key": key, "code": code, "windowsVirtualKeyCode": vk, "modifiers": modifiers })));
+        };
+        key("rawKeyDown", "ArrowDown", "ArrowDown", 40, 1);
+        key("keyUp", "ArrowDown", "ArrowDown", 40, 1);
+        let In::Select(menu) = wait("the list from the keyboard", &mut |m| matches!(m, In::Select(_))) else { unreachable!() };
+        assert_eq!(menu.selected, Some(2), "the choice made is the list's");
+
+        // A date's calendar mark opens a picker the tab draws, and the value comes back into the field.
+        mouse("mousePressed", 160., 212.);
+        mouse("mouseReleased", 160., 212.);
+        let In::Picker(picker) = wait("the date's picker", &mut |m| matches!(m, In::Picker(_))) else { unreachable!() };
+        assert_eq!((picker.kind.as_str(), picker.value.as_str()), ("date", "2026-01-02"));
+        let set = "((v) => { const e = window.__ideaePicker; Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(e, v); \
+            e.dispatchEvent(new Event('change', { bubbles: true })); })('2026-03-04')";
+        let _ = out.send(Out::Command("Runtime.evaluate", json!({ "expression": set, "contextId": picker.context })));
+        wait("the date set", &mut |m| matches!(m, In::Problem(p) if p.starts_with("console.error: dated 2026-03-04")));
+        // Its own fields still take a click.
+        mouse("mousePressed", 20., 212.);
+        mouse("mouseReleased", 20., 212.);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(|m| matches!(m, In::Picker(_))), "a click on the day is the field's");
+
+        // An area of the page, as a picture.
+        let dir = std::env::temp_dir().join(format!("ideae-area-test-{}", std::process::id()));
+        let area = pick_area(&out, (10., 10.), (110., 30.), &dir).expect("the area");
+        assert_eq!(area.label, "area 100×20");
+        let picture = area.text.lines().find_map(|l| l.strip_prefix("picture: ")).expect("a picture");
+        assert_eq!(image::open(picture).unwrap().into_rgba8().dimensions(), (100, 20));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        mouse("mousePressed", 20., 110.);
+        mouse("mouseReleased", 20., 110.);
+        wait("the address within the page", &mut |m| matches!(m, In::Url(u) if *u == format!("{page}#x")));
+
+        let _ = out.send(Out::Command("Runtime.evaluate", json!({ "expression": "setTimeout(() => window.__answer = confirm('Sure?'))" })));
+        let In::Dialog(dialog) = wait("the dialog", &mut |m| matches!(m, In::Dialog(_))) else { unreachable!() };
+        assert_eq!((dialog.kind.as_str(), dialog.message.as_str()), ("confirm", "Sure?"));
+        let _ = out.send(Out::Command("Page.handleJavaScriptDialog", json!({ "accept": true })));
+        let answered = call(&out, "Runtime.evaluate", json!({ "expression": "window.__answer", "returnByValue": true })).unwrap();
+        assert_eq!(answered["result"]["value"], json!(true), "the page has the answer and goes on");
+
+        // A phone's size says it is a phone, to the page's scripts too.
+        let pixel = user_agent("Pixel 8", "130");
+        let _ = out.send(Out::Resize(412, 915, 1., true, pixel, String::new()));
+        let started_ua = Instant::now();
+        loop {
+            let said = call(&out, "Runtime.evaluate", json!({ "expression": "navigator.userAgent + ' ' + screen.width + ' ' + (navigator.userAgentData || {}).mobile", "returnByValue": true }));
+            let said = said.and_then(|r| r["result"]["value"].as_str().map(str::to_string)).unwrap_or_default();
+            if said.contains("Android 14; Pixel 8") && said.ends_with(" 412 true") {
+                break;
+            }
+            assert!(started_ua.elapsed() < Duration::from_secs(10), "the page as a phone's: {said}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = out.send(Out::Resize(800, 600, 1., false, None, String::new()));
+        let ready_target = loop {
+            // The DevTools of the page connects to it.
+            let port = slot(&Owner::Task(root.clone())).chrome.lock().unwrap().as_ref().map(|c| c.port).unwrap();
+            let id = call(&out, "Target.getTargetInfo", json!({})).and_then(|r| r["targetInfo"]["targetId"].as_str().map(str::to_string));
+            if let Some(id) = id {
+                break (port, id);
+            }
+        };
+        let (devtools_tx, devtools_rx) = async_channel::bounded(64);
+        let devtools_url = format!("http://127.0.0.1:{0}/devtools/inspector.html?ws=127.0.0.1:{0}/devtools/page/{1}", ready_target.0, ready_target.1);
+        let devtools = spawn_page(Owner::Task(root.clone()), Source::Url(devtools_url), devtools_tx);
+        let started_dt = Instant::now();
+        loop {
+            // Its Elements panel shows the page's select once connected.
+            let shown = call(&devtools, "Runtime.evaluate", json!({ "expression": "document.deepText ? 0 : (() => { const walk = (n) => n.shadowRoot ? walk(n.shadowRoot) + [...n.shadowRoot.querySelectorAll('*')].map(walk).join('') : ''; return [...document.querySelectorAll('*')].map((e) => (e.shadowRoot ? walk(e) : '') + (e.textContent || '')).join('').includes('optgroup') })()", "returnByValue": true }));
+            if shown.is_some_and(|r| r["result"]["value"] == json!(true)) {
+                break;
+            }
+            assert!(started_dt.elapsed() < Duration::from_secs(20), "DevTools shows the page's elements");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        // The page still draws with DevTools open: its window is its own.
+        let frames = || {
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(5) {
+                match rx.try_recv() {
+                    Ok(In::Frame(..)) => return true,
+                    Ok(_) => {}
+                    Err(_) => std::thread::sleep(Duration::from_millis(20)),
+                }
+            }
+            false
+        };
+        let _ = out.send(Out::Resize(700, 500, 1., false, None, String::new()));
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = out.send(Out::Command("Runtime.evaluate", json!({ "expression": "document.body.style.background = 'red'" })));
+        assert!(frames(), "frames with DevTools open");
+        drop((devtools, devtools_rx));
+
+        let _ = out.send(Out::Command("Runtime.evaluate", json!({ "expression": "window.open('about:blank#opened')", "userGesture": true })));
+        let asked = Instant::now();
+        let opened = loop {
+            assert!(asked.elapsed() < Duration::from_secs(15), "the page it opened, offered to the task");
+            match adopted.try_recv() {
+                Ok(PageEvent::Opened { target, by_page }) => {
+                    assert!(by_page, "opened by the page, so shown in front");
+                    break target;
+                }
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        };
+        let (tx2, rx2) = async_channel::bounded(64);
+        let other = spawn_page(Owner::Task(root.clone()), Source::Target(opened), tx2);
+        let started = Instant::now();
+        let wait2 = |what: &str, found: &dyn Fn(&In) -> bool| loop {
+            assert!(started.elapsed() < Duration::from_secs(10), "waited for {what}");
+            match rx2.try_recv() {
+                Ok(message) if found(&message) => return,
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        };
+        wait2("the opened page's address", &|m| matches!(m, In::Navigated { url, .. } if url.ends_with("#opened")));
+        let _ = other.send(Out::Command("Runtime.evaluate", json!({ "expression": "window.close()" })));
+        wait2("the opened page to close itself", &|m| matches!(m, In::Closed));
+        drop((out, other));
+        let profile = task_profile(&root).unwrap();
+        let _ = std::fs::remove_dir_all(&profile);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A task's Chrome ended a while after its last page; a call at the
+    /// task's port, as an agent's Playwright makes one, starts it again.
+    /// Needs Chrome: `cargo test -- --ignored a_task_s_browser_wakes`.
+    #[core::prelude::v1::test]
+    #[ignore]
+    fn a_task_s_browser_wakes_when_called() {
+        let root = std::env::temp_dir().join(format!("ideae-wake-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let owner = Owner::Task(root.clone());
+        let _quit = Quit(owner.clone());
+        let (tx, rx) = async_channel::bounded(64);
+        let out = spawn_page(owner.clone(), Source::Url("about:blank".into()), tx);
+        let started = Instant::now();
+        while !matches!(rx.try_recv(), Ok(In::Ready { .. })) {
+            assert!(started.elapsed() < Duration::from_secs(20), "the page connects");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let first = slot(&owner).chrome.lock().unwrap().as_ref().map(|c| c.child.lock().unwrap().id()).unwrap();
+        drop((out, rx));
+        while slot(&owner).waker.lock().unwrap().is_none() {
+            assert!(started.elapsed() < Duration::from_secs(20), "Chrome ends and the port waits");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(slot(&owner).chrome.lock().unwrap().is_none(), "no Chrome while the port waits");
+        let version = devtools_version(task_port(&root)).expect("the call answered, by a Chrome started for it");
+        assert!(version["webSocketDebuggerUrl"].is_string(), "{version}");
+        let second = slot(&owner).chrome.lock().unwrap().as_ref().map(|c| c.child.lock().unwrap().id()).expect("a Chrome again");
+        assert_ne!(first, second);
+        let _ = std::fs::remove_dir_all(task_profile(&root).unwrap());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
 }

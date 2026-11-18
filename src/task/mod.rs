@@ -550,6 +550,8 @@ pub struct TaskView {
     nav_forward: Vec<NavPoint>,
     navigating: bool,
     visible: bool,
+    /// Pages of the task's Chrome no tab opened, to show as tabs.
+    _new_pages: Option<Task<()>>,
     _poll: Task<()>,
 }
 
@@ -564,7 +566,8 @@ impl TaskView {
         cx: &mut Context<Self>,
     ) -> Self {
         let services = crate::services::load(&root).unwrap_or_default();
-        let task_env = crate::services::task_env(&services, port_slot);
+        let mut task_env = crate::services::task_env(&services, port_slot);
+        task_env.push(crate::browser::task_env(&root));
         let weak = cx.weak_entity();
         let changes = cx.new(|cx| ChangesView::new(root.clone(), weak.clone(), cx));
         let history = cx.new(|cx| HistoryView::new(root.clone(), weak, cx));
@@ -842,6 +845,7 @@ impl TaskView {
             nav_forward: Vec::new(),
             navigating: false,
             visible: false,
+            _new_pages: None,
             _poll: poll,
         };
         // Debug aid for headless screenshots: start on a given tab.
@@ -921,6 +925,7 @@ impl TaskView {
                 (cx.new(|cx| TerminalState::local(options, config, window, cx)), None)
             }
         };
+        state.update(cx, |state, _| state.urls_to_app = true);
         cx.subscribe_in(&state, window, |this: &mut Self, state, event: &TerminalEvent, window, cx| match event {
             // A shell that exits (Ctrl+D, `exit`) takes its tab with it, as in a
             // terminal app; the agent's tab stays and shows the exit.
@@ -977,6 +982,9 @@ impl TaskView {
                 let cwd = state.read(cx).cwd().map(|p| p.to_path_buf());
                 this.open_terminal_path(target, cwd, window, cx);
             }
+            // A dev server's address opens in the task's Web tab, the rest in the system's browser.
+            TerminalEvent::OpenUrl(url) if crate::browser::is_local(url) => this.show_url(url, window, cx),
+            TerminalEvent::OpenUrl(url) => cx.open_url(url),
             _ => {}
         })
         .detach();
@@ -1067,7 +1075,49 @@ impl TaskView {
     }
 
     pub fn open_browser(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let view = cx.new(|cx| crate::browser::BrowserView::new(url, window, cx));
+        self.add_browser(crate::browser::Source::Url(url.to_string()), true, window, cx);
+    }
+
+    /// The pages of a task long out of view close, their addresses kept:
+    /// its Chrome ends a minute after, and a tab opens its page again when shown.
+    pub fn put_pages_to_sleep(&mut self, cx: &mut Context<Self>) {
+        for tab in &self.tabs {
+            if let TabKind::Browser(view) = &tab.kind {
+                view.update(cx, |v, cx| v.sleep(cx));
+            }
+        }
+    }
+
+    /// A tab for a page of the task's Chrome, opened in it or not: one a
+    /// page opened comes up as a tab in front, one an agent's Playwright
+    /// opened as a tab behind, not to take the user's eyes from their work.
+    fn add_browser(&mut self, source: crate::browser::Source, activate: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self._new_pages.is_none() {
+            let events = crate::browser::page_events(&self.root);
+            self._new_pages = Some(cx.spawn_in(window, async move |this, cx| {
+                while let Ok(event) = events.recv().await {
+                    let done = this.update_in(cx, |t, window, cx| match event {
+                        crate::browser::PageEvent::Opened { target, by_page } => {
+                            t.add_browser(crate::browser::Source::Target(target), by_page, window, cx)
+                        }
+                        crate::browser::PageEvent::Downloaded(path) => {
+                            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                            let told = format!("{name} is in {}", path.parent().map(|p| p.display().to_string()).unwrap_or_default());
+                            window.push_notification(gpui_kit::component::notification::Notification::success(told).title("Downloaded"), cx);
+                        }
+                        crate::browser::PageEvent::DownloadFailed(name) => {
+                            let told = format!("{name} did not download");
+                            window.push_notification(gpui_kit::component::notification::Notification::warning(told).title("Download"), cx);
+                        }
+                    });
+                    if done.is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+        let owner = crate::browser::Owner::Task(self.root.clone());
+        let view = cx.new(|cx| crate::browser::BrowserView::new(source, owner, window, cx));
         cx.subscribe_in(&view, window, |this, view, event: &crate::browser::BrowserEvent, window, cx| match event {
             crate::browser::BrowserEvent::Navigated => {
                 let title = view.read(cx).title();
@@ -1076,14 +1126,32 @@ impl TaskView {
                 }
                 cx.notify()
             }
-            crate::browser::BrowserEvent::Picked(message) => this.paste_to_agent(message.clone(), window, cx),
+            crate::browser::BrowserEvent::ToAgent(message) => this.paste_to_agent(message.clone(), window, cx),
+            crate::browser::BrowserEvent::Closed => {
+                if let Some(ix) = this.tabs.iter().position(|t| matches!(&t.kind, TabKind::Browser(v) if v == view)) {
+                    this.remove_tab(ix, window, cx);
+                    cx.emit(TaskEvent::Changed);
+                }
+            }
         })
         .detach();
         let shown = view.read(cx).title();
         let mut tab = TabItem { shown, ..TabItem::new("web", TabKind::Browser(view)) };
         tab.pane = self.current;
         self.tabs.push(tab);
-        self.activate(self.tabs.len() - 1, window, cx);
+        if activate {
+            self.activate(self.tabs.len() - 1, window, cx);
+        } else {
+            self.sync_visibility(cx);
+            cx.notify();
+        }
+    }
+
+    /// The task's ports, and where its browser is, for what runs in it.
+    fn terminal_env(&self) -> Vec<(String, String)> {
+        let mut env = crate::services::task_env(&self.services, self.port_slot);
+        env.push(crate::browser::task_env(&self.root));
+        env
     }
 
     /// A Ctrl+clicked `path[:line]` from terminal output: relative to the
@@ -1182,7 +1250,7 @@ impl TaskView {
 
     fn terminal_tab_in(&mut self, seq: usize, cwd: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> usize {
         self.terminal_seq = self.terminal_seq.max(seq);
-        let env = crate::services::task_env(&self.services, self.port_slot);
+        let env = self.terminal_env();
         let tab = Self::make_terminal(&self.root, self.hook_socket.as_ref(), &format!("shell {seq}"), seq, None, env, None, cwd, window, cx);
         // After the last terminal, so terminals stay together left of the views.
         let at = self.tabs.iter().rposition(|t| matches!(t.kind, TabKind::Terminal(_))).map_or(0, |ix| ix + 1);

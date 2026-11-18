@@ -1202,7 +1202,7 @@ fn key_groups(
             });
             SettingItem::new(shortcut.name, field).keywords([shown])
         };
-        ["Window", "Editor", "Changes", "Terminal"]
+        ["Window", "Editor", "Changes", "Terminal", "Web"]
             .into_iter()
             .map(|area| SettingGroup::new().title(area).items(SHORTCUTS.iter().filter(|s| s.area() == area).map(&item)))
             .collect()

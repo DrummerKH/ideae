@@ -17,6 +17,8 @@ cargo test -- --ignored \
   a_window_that_does_not_read \
   a_task_is_set_up_checked_and_torn_down \
   an_archived_task \
+  a_page_tells_the_tab \
+  a_task_s_browser_wakes_when_called \
   a_local_model_predicts_at_the_cursor \
   a_local_model_predicts_the_next_edits
 

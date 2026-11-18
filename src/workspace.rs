@@ -1304,6 +1304,10 @@ impl Workspace {
                     if view.read(cx).has_language_servers() {
                         view.update(cx, |t, cx| t.put_language_servers_to_sleep(cx));
                     }
+                    // Its browser too, unless its agent may be driving a page right now.
+                    if !view.read(cx).agent_busy() {
+                        view.update(cx, |t, cx| t.put_pages_to_sleep(cx));
+                    }
                 }
                 let agent_idle = Self::agent_idle();
                 if !agent_idle.is_zero() && self.active.as_deref() != Some(t.path.as_path()) && left.elapsed() >= agent_idle {

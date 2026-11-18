@@ -31,7 +31,7 @@ impl TaskView {
         let state = view.read(cx).state.clone();
         if TermView::gone(state.read(cx)) {
             TermView::end(&view, cx);
-            let mut env = crate::services::task_env(&self.services, self.port_slot);
+            let mut env = self.terminal_env();
             env.extend(launch.env());
             let tab = Self::make_terminal(&self.root, self.hook_socket.as_ref(), "agent", 0, Some(command), env, None, None, window, cx);
             (self.tabs[ix].kind, self.tabs[ix].shown) = (tab.kind, tab.shown);
@@ -52,7 +52,7 @@ impl TaskView {
     /// terminal, the new one starts in a terminal of its own, with its
     /// own environment.
     pub fn switch_agent(&mut self, launch: crate::agents::Launch, window: &mut Window, cx: &mut Context<Self>) {
-        let task_env = crate::services::task_env(&self.services, self.port_slot);
+        let task_env = self.terminal_env();
         // The conversation before was another agent's: not the new one's to go on with.
         if let Some(chat) = self.agent_chat() {
             chat.update(cx, |c, _| c.end());
@@ -471,7 +471,7 @@ impl TaskView {
     pub(super) fn run_in_terminal(&mut self, line: String, env: Vec<(String, String)>, window: &mut Window, cx: &mut Context<Self>) {
         self.terminal_seq += 1;
         let seq = self.terminal_seq;
-        let mut all = crate::services::task_env(&self.services, self.port_slot);
+        let mut all = self.terminal_env();
         all.extend(env);
         let tab = Self::make_terminal(&self.root, self.hook_socket.as_ref(), &format!("shell {seq}"), seq, Some(line), all, None, None, window, cx);
         let at = self.tabs.iter().rposition(|t| matches!(t.kind, TabKind::Terminal(_) | TabKind::Chat(_))).map_or(0, |ix| ix + 1);

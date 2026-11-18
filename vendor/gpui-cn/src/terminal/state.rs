@@ -34,6 +34,9 @@ pub enum TerminalEvent {
     /// ideae patch: a file location in the output was Ctrl+clicked;
     /// `path` or `path:line`, as printed.
     OpenPath(SharedString),
+    /// ideae patch: a URL was Ctrl+clicked while [`TerminalState::urls_to_app`]
+    /// is set: the app opens it, not the system's browser.
+    OpenUrl(SharedString),
     /// The program changed the title; read it with `title`.
     TitleChanged,
     /// The program reported a new working directory; read it with `cwd`.
@@ -100,6 +103,8 @@ impl TerminalConfig {
 /// element needs to draw and to send input.
 #[non_exhaustive]
 pub struct TerminalState {
+    /// ideae patch: Ctrl+clicked URLs go to the app as [`TerminalEvent::OpenUrl`].
+    pub urls_to_app: bool,
     handle: Option<Box<dyn FrameHandle>>,
     closed: bool,
     frame: Arc<TerminalFrame>,
@@ -155,6 +160,7 @@ impl TerminalState {
             cwd: None,
             foreground: None,
             bell_count: 0,
+            urls_to_app: false,
             clipboard_sequence: 0,
             notification_sequence: 0,
             at_prompt: false,
@@ -986,6 +992,7 @@ impl TerminalState {
                 self.selection = None;
                 match link.url.strip_prefix(super::links::PATH_SCHEME) {
                     Some(target) => cx.emit(TerminalEvent::OpenPath(target.to_string().into())),
+                    None if self.urls_to_app => cx.emit(TerminalEvent::OpenUrl(link.url.clone().into())),
                     None => cx.open_url(&link.url),
                 }
                 cx.stop_propagation();

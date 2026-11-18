@@ -149,6 +149,23 @@ impl TaskView {
         }
     }
 
+    /// `url` in the Web tab that shows its site already, or a new one.
+    pub(super) fn show_url(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let open = self.tabs.iter().position(|t| match &t.kind {
+            TabKind::Browser(view) => view.read(cx).url().starts_with(origin(url)),
+            _ => false,
+        });
+        match open {
+            Some(ix) => {
+                if let TabKind::Browser(view) = &self.tabs[ix].kind {
+                    view.update(cx, |v, _| v.go(url));
+                }
+                self.activate(ix, window, cx);
+            }
+            None => self.open_browser(url, window, cx),
+        }
+    }
+
     pub(super) fn stop_service(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.service_ix(name, cx) else { return };
         if let TabKind::Terminal(view) = &self.tabs[ix].kind {
