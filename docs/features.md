@@ -243,8 +243,11 @@ picture of it go into the prompt.
   behind ☰ in the title bar, or Alt pressed alone (Settings → Title bar can
   keep it shown). Items show the keys in force and are grey where they would
   do nothing.
-- Themes: Ayu, Catppuccin, Gruvbox, Solarized, Everforest and Flexoki, each
-  light and dark (Theme… in the menu shows each as you go through the list).
+- Themes: Ayu, Catppuccin, Gruvbox, Solarized, Everforest, Flexoki, GitHub, One,
+  Rosé Pine, Tokyo Night and JetBrains' Islands, each light and dark. Settings has
+  the light one and the dark one apart, and whether the window is light, dark or
+  follows the system (Theme… in the menu shows each as you go through the list,
+  for the side drawn now).
 - Spaces sort projects into sets (work, personal, a client); the window shows
   one at a time, and the agents of the others keep working unseen.
 - Presentation mode (View → Presentation Mode…) leaves only the tasks you pick in the window, draws code

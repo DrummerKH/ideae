@@ -301,7 +301,7 @@ impl Workspace {
         let appearance = appearance
             .or_else(|| saved.appearance.as_deref().and_then(Appearance::parse))
             .unwrap_or(Appearance::Auto);
-        theme::choose(&saved.settings.theme, cx);
+        theme::choose(&saved.settings.theme, saved.settings.dark_theme(), cx);
         theme::apply(appearance, window, cx);
         crate::lsp::POWER_SAVING.store(saved.power_saving, std::sync::atomic::Ordering::Relaxed);
         // A global: tests running alongside would flip it under edit.rs's test of it.
@@ -2290,8 +2290,8 @@ impl Workspace {
         if !cfg!(test) {
             gpui_kit::base::input::HUMP_WORDS.store(new.hump_words, std::sync::atomic::Ordering::Relaxed);
         }
-        if old.theme != new.theme {
-            theme::choose(&new.theme, cx);
+        if (old.theme.as_str(), old.dark_theme()) != (new.theme.as_str(), new.dark_theme()) {
+            theme::choose(&new.theme, new.dark_theme(), cx);
             theme::apply_everywhere(self.appearance, cx);
         }
         if old.inlay_hints != new.inlay_hints || old.blame_at_line_end != new.blame_at_line_end {
@@ -2455,14 +2455,19 @@ impl Workspace {
         }
     }
 
-    /// Draws with a theme at once, and keeps it as the one set: for the
-    /// list that shows each as it is gone through.
+    /// Draws with a theme at once, and keeps it as the one set for the side
+    /// drawn now, light or dark: for the list that shows each as it is gone
+    /// through.
     pub fn use_theme(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
-        theme::choose(name, cx);
-        theme::apply(self.appearance, window, cx);
         let mut settings = state::settings();
-        if settings.theme != theme::family(cx) {
-            settings.theme = theme::family(cx).to_string();
+        let dark = cx.theme().mode.is_dark();
+        let (mut light_side, mut dark_side) = (settings.theme.clone(), settings.dark_theme().to_string());
+        *if dark { &mut dark_side } else { &mut light_side } = name.to_string();
+        theme::choose(&light_side, &dark_side, cx);
+        theme::apply(self.appearance, window, cx);
+        if (settings.theme.as_str(), settings.dark_theme()) != (light_side.as_str(), dark_side.as_str()) {
+            settings.dark_theme = if dark_side == light_side { String::new() } else { dark_side };
+            settings.theme = light_side;
             state::set_settings(settings);
             self.save_later(cx);
         }
@@ -2508,6 +2513,7 @@ impl Workspace {
     pub fn set_appearance(&mut self, appearance: Appearance, window: &mut Window, cx: &mut Context<Self>) {
         self.appearance = appearance;
         theme::apply(appearance, window, cx);
+        self.save(cx);
         cx.notify();
     }
 }

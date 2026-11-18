@@ -112,8 +112,11 @@ pub struct Settings {
     /// Milliseconds the pointer rests on the sidebar's rail before the
     /// whole sidebar opens; 0 for never.
     pub rail_open_ms: u32,
-    /// The theme, by the name of its family: "Ayu", "Gruvbox"…
+    /// The theme drawn while light, by the name of its family: "Ayu", "Gruvbox"…
     pub theme: String,
+    /// The one drawn while dark; empty for the same family as [`Self::theme`].
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub dark_theme: String,
     /// The title bar shows the machine's load, and what the agents took.
     pub show_load: bool,
     pub show_tokens: bool,
@@ -221,6 +224,7 @@ impl Default for Settings {
             present_zoom: 125,
             rail_open_ms: 750,
             theme: "Ayu".into(),
+            dark_theme: String::new(),
             show_load: true,
             show_tokens: false,
             context_dial: true,
@@ -276,6 +280,10 @@ impl Settings {
             self.quick_agent.clear();
         }
         self.agent = self.default_profile().map(|p| p.command.clone()).unwrap_or_default();
+    }
+
+    pub fn dark_theme(&self) -> &str {
+        if self.dark_theme.is_empty() { &self.theme } else { &self.dark_theme }
     }
 
     pub fn profile(&self, id: &str) -> Option<&crate::agents::Profile> {

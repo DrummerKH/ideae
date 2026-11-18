@@ -15,7 +15,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::{TestSupportExt as _, prelude::FluentBuilder as _, *};
 
-use crate::{lsp, state, workspace::Workspace};
+use crate::{lsp, state, theme::Appearance, workspace::Workspace};
 
 type Draft = Rc<RefCell<state::Settings>>;
 
@@ -35,7 +35,13 @@ fn switch(
     SettingItem::new(title, field).description(hint)
 }
 
-fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc<RefCell<Option<Subscription>>>) -> Vec<SettingPage> {
+fn pages(
+    draft: &Draft,
+    look: &Rc<Cell<Appearance>>,
+    dark_now: bool,
+    recording: &Rc<Cell<Option<&'static str>>>,
+    catcher: &Rc<RefCell<Option<Subscription>>>,
+) -> Vec<SettingPage> {
     let default = state::Settings::default();
     let idle = {
         let (read, write) = (draft.clone(), draft.clone());
@@ -136,12 +142,38 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
         })
         .default_value(SharedString::from(default.rail_open_ms.to_string()))
     };
-    let theme = {
+    let side = |dark: bool| {
         let (read, write) = (draft.clone(), draft.clone());
-        let options = crate::theme::FAMILIES.iter().map(|family| (SharedString::from(family.name), SharedString::from(family.name))).collect();
-        SettingField::dropdown(options, move |_| read.borrow().theme.clone().into(), move |value, _| write.borrow_mut().theme = value.to_string())
-            .default_value(SharedString::from(default.theme.clone()))
+        let options = crate::theme::FAMILIES
+            .iter()
+            .map(|family| (SharedString::from(family.name), SharedString::from(if dark { family.dark } else { family.light })))
+            .collect();
+        SettingField::dropdown(
+            options,
+            move |_| SharedString::from(if dark { read.borrow().dark_theme().to_string() } else { read.borrow().theme.clone() }),
+            move |value, _| {
+                let mut d = write.borrow_mut();
+                if dark {
+                    d.dark_theme = value.to_string();
+                } else {
+                    d.theme = value.to_string();
+                }
+            },
+        )
+        .default_value(SharedString::from(default.theme.clone()))
     };
+    let (light_theme, dark_theme) = (side(false), side(true));
+    let appearance = {
+        let (read, write) = (look.clone(), look.clone());
+        let options = Appearance::ALL.into_iter().map(|a| (SharedString::from(a.label()), SharedString::from(a.label()))).collect();
+        SettingField::dropdown(options, move |_| read.get().label().into(), move |value, _| {
+            if let Some(a) = Appearance::parse(&value) {
+                write.set(a)
+            }
+        })
+        .default_value(SharedString::from(Appearance::Auto.label()))
+    };
+    let now = if dark_now { "dark" } else { "light" };
     let servers = lsp::SERVERS.iter().map(|def| {
         let program = def.program;
         let (read, write) = (draft.clone(), draft.clone());
@@ -187,10 +219,14 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
                     |s, v| s.check_updates = v,
                 )),
         ).group(
-            SettingGroup::new().title("Look").item(
-                SettingItem::new("Theme", theme)
-                    .description("Each has a light and a dark side: which of the two is drawn is the switch in the title bar. Theme… in the menu shows them one after another as you go through the list."),
-            ),
+            SettingGroup::new().title("Look")
+                .item(SettingItem::new("Light theme", light_theme).description(
+                    "Theme… in the menu shows them one after another as you go through the list, for the side drawn now.",
+                ))
+                .item(SettingItem::new("Dark theme", dark_theme))
+                .item(SettingItem::new("Light or dark", appearance).description(format!(
+                    "Auto follows the system and changes with it; the system is {now} now. Light and Dark stay as they are.",
+                ))),
         ).group(
             SettingGroup::new().title("Title bar")
                 .item(switch(
@@ -666,15 +702,28 @@ impl Workspace {
                 let _ = spaces.update(cx, |w, cx| w.spaces_dialog(window, cx));
             }))
         });
-        open(state::settings(), page, window, cx, move |settings, cx| {
-            let _ = this.update(cx, |w, cx| w.apply_settings(settings, cx));
+        open(state::settings(), self.appearance, page, window, cx, move |settings, appearance, window, cx| {
+            let _ = this.update(cx, |w, cx| {
+                w.apply_settings(settings, cx);
+                if appearance != w.appearance {
+                    w.set_appearance(appearance, window, cx);
+                }
+            });
         });
     }
 }
 
 /// The dialog over `current`, at the page `first`; Save hands `save` the result.
-fn open(current: state::Settings, first: usize, window: &mut Window, cx: &mut App, save: impl Fn(state::Settings, &mut App) + 'static) {
+fn open(
+    current: state::Settings,
+    appearance: Appearance,
+    first: usize,
+    window: &mut Window,
+    cx: &mut App,
+    save: impl Fn(state::Settings, Appearance, &mut Window, &mut App) + 'static,
+) {
     let draft: Draft = Rc::new(RefCell::new(current));
+    let look = Rc::new(Cell::new(appearance));
     INSTALLED.with(|known| known.borrow_mut().clear());
     crate::workspace::welcome::forget_find();
     // The shortcut waiting for keys, and what catches them before any
@@ -683,14 +732,14 @@ fn open(current: state::Settings, first: usize, window: &mut Window, cx: &mut Ap
     let catcher: Rc<RefCell<Option<Subscription>>> = Rc::default();
     let save = Rc::new(save);
     window.open_dialog(cx, move |dialog, _, _| {
-        let (draft, recording, catcher) = (draft.clone(), recording.clone(), catcher.clone());
+        let (draft, look, recording, catcher) = (draft.clone(), look.clone(), recording.clone(), catcher.clone());
         let save = {
-            let (draft, save) = (draft.clone(), save.clone());
+            let (draft, look, save) = (draft.clone(), look.clone(), save.clone());
             move |window: &mut Window, cx: &mut App| {
                 let mut settings = draft.borrow().clone();
                 settings.normalize();
                 settings.lsp_idle_minutes = settings.lsp_idle_minutes.max(1);
-                save(settings, cx);
+                save(settings, look.get(), window, cx);
                 window.close_dialog(cx);
             }
         };
@@ -698,6 +747,7 @@ fn open(current: state::Settings, first: usize, window: &mut Window, cx: &mut Ap
             .title("Settings")
             .w(px(900.))
             .content(move |content, window, cx| {
+                let dark_now = matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark);
                 // The dialog is as tall as the window lets it; the pages scroll inside.
                 let height = (window.viewport_size().height - px(220.)).clamp(px(200.), px(620.));
                 content.child(
@@ -711,7 +761,7 @@ fn open(current: state::Settings, first: usize, window: &mut Window, cx: &mut Ap
                             Settings::new("settings")
                                 .sidebar_width(px(200.))
                                 .default_selected_index(SelectIndex { page_ix: first, group_ix: None })
-                                .pages(pages(&draft, &recording, &catcher)),
+                                .pages(pages(&draft, &look, dark_now, &recording, &catcher)),
                         ),
                 )
             })
@@ -843,6 +893,7 @@ fn key_groups(
 
 #[cfg(test)]
 mod tests {
+    use crate::theme::Appearance;
     use gpui_kit::test::TestWindowExt as _;
     use gpui_kit::{AppContext as _, Bounds, Empty, Point, ScrollDelta, TestAppContext, WindowBounds, WindowOptions, point, px, size};
 
@@ -862,7 +913,7 @@ mod tests {
         for page in 0..8 {
             let handle = window(cx);
             cx.update_window(handle, |_, window, cx| {
-                open(state::Settings::default(), page, window, cx, |_, _| {});
+                open(state::Settings::default(), Appearance::Auto, page, window, cx, |_, _, _, _| {});
                 window.render_frame(cx);
                 assert_eq!(window.try_find("key-row-quit").is_some(), page == super::KEYS_PAGE, "page {page}");
             })
@@ -879,7 +930,7 @@ mod tests {
             let mut current = state::Settings::default();
             current.agents[0].command = "mine".into();
             let saved = saved.clone();
-            open(current, 5, window, cx, move |settings, _| *saved.borrow_mut() = Some(settings));
+            open(current, Appearance::Auto, 5, window, cx, move |settings, _, _, _| *saved.borrow_mut() = Some(settings));
             window.render_frame(cx);
             let before = window.find("key-row-recent").bounds();
             assert!(window.try_find("key-row-comment").is_none_or(|row| !row.visible()), "the last keys start below the fold");
@@ -903,7 +954,7 @@ mod tests {
             let mut current = state::Settings::default();
             current.agents.push(crate::agents::Profile { id: "codex".into(), name: "Codex".into(), kind: crate::agents::Kind::Codex, command: "codex".into(), ..Default::default() });
             let saved = saved.clone();
-            open(current, super::AGENTS_PAGE, window, cx, move |settings, _| *saved.borrow_mut() = Some(settings));
+            open(current, Appearance::Auto, super::AGENTS_PAGE, window, cx, move |settings, _, _, _| *saved.borrow_mut() = Some(settings));
             window.render_frame(cx);
             assert!(window.try_find("agent-profile-1").is_some(), "both listed");
             window.click("agent-remove-0", cx);

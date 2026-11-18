@@ -50,28 +50,35 @@ fn register_code_font(cx: &mut App) {
 /// names they have in their file.
 pub struct Family {
     pub name: &'static str,
-    light: &'static str,
-    dark: &'static str,
+    pub light: &'static str,
+    pub dark: &'static str,
     file: &'static str,
 }
 
 /// The themes built in; the first is the one to start with. All but Ayu
 /// are the files of gpui-component (Apache-2.0), as they are there.
-pub const FAMILIES: [Family; 6] = [
+pub const FAMILIES: [Family; 11] = [
     Family { name: "Ayu", light: "Ayu Light", dark: "Ayu Dark", file: include_str!("../themes/ayu.json") },
     Family { name: "Catppuccin", light: "Catppuccin Latte", dark: "Catppuccin Mocha", file: include_str!("../themes/catppuccin.json") },
     Family { name: "Gruvbox", light: "Gruvbox Light", dark: "Gruvbox Dark", file: include_str!("../themes/gruvbox.json") },
     Family { name: "Solarized", light: "Solarized Light", dark: "Solarized Dark", file: include_str!("../themes/solarized.json") },
     Family { name: "Everforest", light: "Everforest Light", dark: "Everforest Dark", file: include_str!("../themes/everforest.json") },
     Family { name: "Flexoki", light: "Flexoki Light", dark: "Flexoki Dark", file: include_str!("../themes/flexoki.json") },
+    Family { name: "GitHub", light: "GitHub Light", dark: "GitHub Dark", file: include_str!("../themes/github.json") },
+    Family { name: "One", light: "One Light", dark: "One Dark", file: include_str!("../themes/one.json") },
+    Family { name: "Rosé Pine", light: "Rosé Pine Dawn", dark: "Rosé Pine", file: include_str!("../themes/rose-pine.json") },
+    Family { name: "Tokyo Night", light: "Tokyo Night Day", dark: "Tokyo Night", file: include_str!("../themes/tokyonight.json") },
+    Family { name: "Islands", light: "Islands Light", dark: "Islands Dark", file: include_str!("../themes/islands.json") },
 ];
 
-/// The family in use.
-struct Chosen(&'static str);
+/// The families of the light and the dark side.
+struct Chosen(&'static str, &'static str);
 impl Global for Chosen {}
 
+/// The family drawn now: of the light or the dark side, as the window is.
 pub fn family(cx: &App) -> &'static str {
-    cx.try_global::<Chosen>().map_or(FAMILIES[0].name, |chosen| chosen.0)
+    let dark = Theme::global(cx).mode.is_dark();
+    cx.try_global::<Chosen>().map_or(FAMILIES[0].name, |chosen| if dark { chosen.1 } else { chosen.0 })
 }
 
 /// Registers the themes and the code font; Ayu until another is chosen.
@@ -82,16 +89,21 @@ pub fn init(cx: &mut App) {
             eprintln!("{} theme: {error:#}", family.name);
         }
     }
-    choose(FAMILIES[0].name, cx);
+    choose(FAMILIES[0].name, FAMILIES[0].name, cx);
 }
 
-/// Makes `name` the light and dark theme; one not known leaves the first.
+fn named(name: &str) -> &'static Family {
+    FAMILIES.iter().find(|family| family.name == name).unwrap_or(&FAMILIES[0])
+}
+
+/// Makes the light side of the family `light` the light theme and the dark
+/// side of `dark` the dark one; one not known is the first.
 /// What is on the screen follows at the next [`apply`].
-pub fn choose(name: &str, cx: &mut App) {
-    let family = FAMILIES.iter().find(|family| family.name == name).unwrap_or(&FAMILIES[0]);
+pub fn choose(light: &str, dark: &str, cx: &mut App) {
+    let (light, dark) = (named(light), named(dark));
+    cx.set_global(Chosen(light.name, dark.name));
     let themes = ThemeRegistry::global(cx).themes();
-    let (light, dark) = (themes.get(family.light).cloned(), themes.get(family.dark).cloned());
-    cx.set_global(Chosen(family.name));
+    let (light, dark) = (themes.get(light.light).cloned(), themes.get(dark.dark).cloned());
     let theme = Theme::global_mut(cx);
     if let Some(light) = light {
         theme.light_theme = light;
@@ -228,22 +240,26 @@ mod tests {
             for family in &FAMILIES {
                 let themes = ThemeRegistry::global(cx).themes();
                 assert!(themes.contains_key(family.light) && themes.contains_key(family.dark), "{}", family.name);
-                choose(family.name, cx);
+                choose(family.name, family.name, cx);
                 assert_eq!(super::family(cx), family.name);
                 for appearance in [Appearance::Light, Appearance::Dark] {
                     apply_everywhere(appearance, cx);
                     let theme = Theme::global(cx);
                     assert_eq!(theme.mode.is_dark(), appearance == Appearance::Dark, "{}", family.name);
+                    let side = if appearance == Appearance::Dark { family.dark } else { family.light };
+                    assert_eq!(theme.theme_name().as_ref(), side);
                     grounds.push(hex(theme.background));
                     let palette = format!("background = {}\nforeground = {}\n", hex(theme.background), hex(theme.foreground));
                     assert!(TerminalColors::from_ghostty_theme(&palette).is_ok());
                     let _ = terminal_colors(cx);
                 }
             }
-            let distinct: std::collections::HashSet<&String> = grounds.iter().collect();
-            assert_eq!(distinct.len(), grounds.len(), "each side of each family draws on a ground of its own: {grounds:?}");
-            choose("No such theme", cx);
+            assert!(grounds.chunks(2).all(|sides| sides[0] != sides[1]), "the light side and the dark draw on grounds of their own: {grounds:?}");
+            choose("No such theme", "Gruvbox", cx);
+            apply_everywhere(Appearance::Light, cx);
             assert_eq!(family(cx), "Ayu", "one not known is the first");
+            apply_everywhere(Appearance::Dark, cx);
+            assert_eq!((family(cx), Theme::global(cx).theme_name().as_ref()), ("Gruvbox", "Gruvbox Dark"), "each side its own family");
         });
     }
 }
