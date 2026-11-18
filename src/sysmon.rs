@@ -25,6 +25,13 @@ pub enum Kind {
     Other,
 }
 
+/// A Chrome, by its program's name as each system has it: `chromium`,
+/// `chrome.exe`, `Google Chrome`, `Microsoft Edge`, `msedge`.
+fn is_browser(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.contains("chrom") || name.contains("edge")
+}
+
 impl Kind {
     fn label(self) -> &'static str {
         match self {
@@ -441,7 +448,7 @@ impl Sampler {
                 } else if matches!(raw.name.as_str(), "conhost" | "OpenConsole") {
                     // Windows: what a terminal draws through.
                     Kind::Terminal
-                } else if raw.name.contains("chrom") {
+                } else if is_browser(&raw.name) {
                     Kind::Browser
                 } else if raw.name == "git" || raw.name == "notify-send" {
                     Kind::Other
@@ -762,6 +769,14 @@ impl Render for SysTooltip {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_chrome_is_a_browser_by_whatever_name_the_system_gives_it() {
+        for name in ["chromium", "chrome.exe", "Google Chrome", "Google Chrome Helper (Renderer)", "Microsoft Edge", "msedge.exe"] {
+            assert!(super::is_browser(name), "{name}");
+        }
+        assert!(!super::is_browser("rust-analyzer") && !super::is_browser("gopls"));
+    }
+
     use super::{Kind, Sampler};
 
     /// Stands in for what runs in a terminal: started again by the test below.

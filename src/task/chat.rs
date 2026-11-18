@@ -29,6 +29,9 @@ pub struct ChatView {
     /// Files the agent reads or changes open beside the chat as it goes.
     follow: bool,
     followed: Option<(String, String)>,
+    /// When each tool call still running was first seen: one that names no
+    /// file (a script run in the shell) is followed by what changed since.
+    began: std::collections::HashMap<String, std::time::SystemTime>,
     /// Pasted images for the next prompt: what they are, and their size.
     images: Vec<(crate::acp::wire::Image, usize)>,
     /// The current plan opened in full.
@@ -153,6 +156,9 @@ pub enum ChatEvent {
     Offered,
     /// A file it reads or changes, to show beside the chat.
     Follow { path: PathBuf, line: u32 },
+    /// It ran something that named no file: the file of the task changed
+    /// since then is the one to show.
+    FollowChanged { since: std::time::SystemTime },
 }
 
 impl EventEmitter<ChatEvent> for ChatView {}
@@ -205,6 +211,7 @@ impl ChatView {
             diffs: HashMap::new(),
             follow: false,
             followed: None,
+            began: Default::default(),
             images: Vec::new(),
             plan_open: false,
             asleep: false,
@@ -280,8 +287,26 @@ impl ChatView {
                     if offered {
                         cx.emit(ChatEvent::Offered);
                     }
+                    if reset {
+                        self.began.clear();
+                    }
                     if let Some(Entry::Tool(tool)) = touched.and_then(|ix| self.thread.entries.get(ix)) {
                         let place = tool.locations.first().cloned();
+                        // A command or an edit that says no file: an agent changing files by a script of its own.
+                        let over = matches!(tool.status.as_str(), "completed" | "failed");
+                        if !over {
+                            self.began.entry(tool.id.clone()).or_insert_with(std::time::SystemTime::now);
+                        } else {
+                            // Told of only when it was over: it began a little before, by a guess.
+                            let since = self.began.remove(&tool.id).or_else(|| std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(10)));
+                            // Once for a call: what it gives back comes in more than one message after it is over.
+                            let fresh = self.followed.as_ref().is_none_or(|(id, _)| *id != tool.id);
+                            let unnamed = place.is_none() && tool.status == "completed" && matches!(tool.kind.as_str(), "execute" | "edit" | "move" | "other");
+                            if let (true, Some(since)) = (self.follow && fresh && unnamed, since) {
+                                self.followed = Some((tool.id.clone(), String::new()));
+                                cx.emit(ChatEvent::FollowChanged { since });
+                            }
+                        }
                         // Once it is done: a file read or changed, not one it only meant to.
                         if let (true, Some(place)) = (self.follow && tool.status == "completed", place) {
                             let key = (tool.id.clone(), place.path.clone());

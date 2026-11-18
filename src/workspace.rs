@@ -320,6 +320,8 @@ impl Workspace {
         if let Some(width) = saved.side_panel_width {
             cx.set_global(SidePanelWidth(px(width)));
         }
+        // A task's Chrome can be started by its agent before any web tab is drawn.
+        crate::browser::note_screen(window.scale_factor());
         let side = crate::task::SideLayout::default();
         cx.set_global(crate::task::SideLayout { below: saved.side_lower.unwrap_or(side.below), split: saved.side_split.map(px) });
         crate::zoom::init(saved.zoom, cx);
@@ -2086,6 +2088,7 @@ impl Workspace {
             }
             if turn_over && event.replayed.is_none() {
                 t.deliver_queued(window, cx);
+                t.reload_own_pages(cx);
             }
             said != (t.agent_said.clone(), t.agent_asks.clone())
         });

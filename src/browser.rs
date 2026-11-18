@@ -163,6 +163,43 @@ fn find_chrome() -> Option<PathBuf> {
         .or_else(|| in_roots(r"Microsoft\Edge\Application\msedge.exe"))
 }
 
+/// An address of the task's own site: a service of it, or a port one of
+/// its processes listens on.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Place {
+    pub label: String,
+    pub port: u16,
+    /// Something listens there now.
+    pub up: bool,
+}
+
+impl Place {
+    pub fn address(&self) -> String {
+        format!("http://localhost:{}", self.port)
+    }
+}
+
+/// The task's own addresses, as the task finds them: asked off the UI thread.
+pub type Places = Arc<dyn Fn() -> Vec<Place> + Send + Sync>;
+
+/// The port of an address of this machine.
+pub fn local_port(url: &str) -> Option<u16> {
+    local_address(url)?.rsplit_once(':')?.1.parse().ok()
+}
+
+/// The pixels to one of the screen the window is on, in hundredths, as last
+/// drawn: what a Chrome started from here is told its screen has.
+static SCREEN_SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(100);
+
+/// Told by the window when it is made and when a page is put in a tab: a
+/// task's Chrome can be started before any tab draws, by its agent.
+pub fn note_screen(scale: f32) {
+    // Not by the windows the tests make, many at a time: the one test of this sets it itself.
+    if !cfg!(test) {
+        SCREEN_SCALE.store((scale * 100.).round() as u32, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// FNV-1a: the same in every build, as a port given to a running agent
 /// must stay right for the window of the next build.
 fn fnv(text: &str) -> u64 {
@@ -318,6 +355,10 @@ fn chrome(owner: &Owner) -> Result<Arc<Chrome>> {
             "--use-mock-keychain",
         ])
         .arg(format!("--remote-debugging-port={port}"))
+        // As many pixels to one as the window's screen has: the frames of a
+        // page's stream are of the screen Chrome thinks it is on, whatever
+        // the page is told, and on one of two to one they came with half.
+        .args(Some(SCREEN_SCALE.load(std::sync::atomic::Ordering::Relaxed)).filter(|scale| *scale > 100).map(|scale| format!("--force-device-scale-factor={}", scale as f32 / 100.)))
         // Its own DevTools, served from that port, connects back to it.
         .args((port != 0).then(|| format!("--remote-allow-origins=http://127.0.0.1:{port}")))
         .arg(format!("--user-data-dir={}", profile.display()))
@@ -1286,7 +1327,7 @@ fn write_page(
                     None,
                 ) && send(
                     "Page.startScreencast",
-                    json!({ "format": "jpeg", "quality": 90, "maxWidth": (width as f32 * scale).round() as u32, "maxHeight": (height as f32 * scale).round() as u32 }),
+                    json!({ "format": "jpeg", "quality": 95, "maxWidth": (width as f32 * scale).round() as u32, "maxHeight": (height as f32 * scale).round() as u32 }),
                     true,
                     None,
                 )
@@ -1751,6 +1792,13 @@ pub struct BrowserView {
     /// at its address, when the tab is next drawn.
     asleep: bool,
     url_input: Entity<InputState>,
+    /// The press now on the address came while the keyboard was elsewhere.
+    url_cold: bool,
+    /// How the task's own addresses are found, and those found when the address was last gone to: offered under it.
+    places: Option<Places>,
+    offered: Vec<Place>,
+    offering: bool,
+    _offer: Task<()>,
     url: SharedString,
     page_title: SharedString,
     loading: bool,
@@ -1824,6 +1872,76 @@ impl Drop for BrowserView {
 }
 
 impl BrowserView {
+    /// Given by the task: how its own addresses are found.
+    pub fn set_places(&mut self, places: Places) {
+        self.places = Some(places);
+    }
+
+    /// The port the page is at, when it is a page of this machine.
+    pub fn own_port(&self) -> Option<u16> {
+        local_port(&self.url)
+    }
+
+    /// Loaded again, as Reload does.
+    pub fn load_again(&mut self) {
+        self.reload(false);
+    }
+
+    fn offer_places(&mut self, cx: &mut Context<Self>) {
+        let Some(places) = self.places.clone() else { return };
+        self.offering = true;
+        self._offer = cx.spawn(async move |this, cx| {
+            let found = cx.background_spawn(async move { places() }).await;
+            let _ = this.update(cx, |this, cx| {
+                this.offered = found;
+                cx.notify();
+            });
+        });
+        cx.notify();
+    }
+
+    /// The task's own addresses under the address being written: those that
+    /// have what is typed in them, the ones something listens at first.
+    fn render_places(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.offering {
+            return None;
+        }
+        let typed = self.url_input.read(cx).value().trim().to_lowercase();
+        // The address as it stands is not something typed to look for.
+        let typed = if typed == self.url.to_lowercase() { String::new() } else { typed };
+        let mut places: Vec<&Place> = self.offered.iter().filter(|p| typed.is_empty() || p.address().contains(&typed) || p.label.to_lowercase().contains(&typed)).collect();
+        places.sort_by_key(|p| !p.up);
+        if places.is_empty() {
+            return None;
+        }
+        let muted = cx.theme().muted_foreground;
+        let mut list = v_flex().id("web-places").absolute().top_0().left(px(84.)).w(px(420.)).py_1().rounded_md().border_1().border_color(cx.theme().border).bg(cx.theme().popover).shadow_md().occlude().text_sm();
+        for (ix, place) in places.into_iter().take(12).enumerate() {
+            let address = place.address();
+            list = list.child(
+                h_flex()
+                    .id(("web-place", ix))
+                    .px_3()
+                    .py_0p5()
+                    .gap_2()
+                    .cursor_pointer()
+                    .hover(|row| row.bg(cx.theme().accent))
+                    .child(div().w(px(10.)).text_xs().text_color(if place.up { gpui_kit::green() } else { muted }).child(if place.up { "●" } else { "○" }))
+                    .child(div().flex_none().child(address.clone()))
+                    .child(div().flex_1().min_w_0().truncate().text_xs().text_color(muted).child(place.label.clone()))
+                    // On the press: the address loses the keyboard with it, and this list goes before a click is one.
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.offering = false;
+                        this.go(&address);
+                        this.focus.focus(window, cx);
+                        cx.notify();
+                    })),
+            );
+        }
+        Some(list.into_any_element())
+    }
+
     pub fn url(&self) -> String {
         self.url.to_string()
     }
@@ -1836,6 +1954,7 @@ impl BrowserView {
     /// A page's connection, and the task that takes what it tells.
     fn attach(source: Source, owner: Owner, window: &mut Window, cx: &mut Context<Self>) -> (mpsc::Sender<Out>, Task<()>) {
         let (in_tx, in_rx) = async_channel::bounded::<In>(64);
+        note_screen(window.scale_factor());
         let out = spawn_page(owner, source, in_tx);
         let frames = cx.spawn_in(window, async move |this, cx| {
             while let Ok(message) = in_rx.recv().await {
@@ -1870,13 +1989,24 @@ impl BrowserView {
         // The last frame's pixels go with the tab.
         cx.on_release(|this, cx| {
             if let Some(old) = this.frame.take() {
-                cx.drop_image(old, None);
+                // After the update that closed the tab: see `drop_later`.
+                cx.defer(move |cx| cx.drop_image(old, None));
             }
         })
         .detach();
         let url_input = cx.new(|cx| InputState::new(window, cx).placeholder("http://localhost:3000"));
         url_input.update(cx, |input, cx| input.set_value(url.clone(), window, cx));
         cx.subscribe_in(&url_input, window, |this, input, event: &InputEvent, window, cx| {
+            match event {
+                // The task's own addresses are offered while the address is being written.
+                InputEvent::Focus => this.offer_places(cx),
+                InputEvent::Blur => {
+                    this.offering = false;
+                    cx.notify();
+                }
+                InputEvent::Change if this.offering => cx.notify(),
+                _ => {}
+            }
             if matches!(event, InputEvent::PressEnter { .. }) {
                 let mut url = input.read(cx).value().trim().to_string();
                 if !url.contains("://") && !url.is_empty() && !url.starts_with("about:") {
@@ -1931,6 +2061,11 @@ impl BrowserView {
             out,
             asleep: false,
             url_input,
+            url_cold: false,
+            places: None,
+            offered: Vec::new(),
+            offering: false,
+            _offer: Task::ready(()),
             url: url.into(),
             page_title: SharedString::default(),
             loading,
@@ -2016,7 +2151,7 @@ impl BrowserView {
         let Some(image) = image else { return };
         // One sent before the page was told to stop.
         if !self.visible {
-            return cx.drop_image(image, None);
+            return drop_later(image, cx);
         }
         let close = self.last_frame.is_some_and(|at| at.elapsed() < Duration::from_millis(300));
         self.burst = if close { self.burst + 1 } else { 1 };
@@ -2184,7 +2319,7 @@ impl BrowserView {
 
     fn show_frame(&mut self, image: Arc<RenderImage>, cx: &mut Context<Self>) {
         if let Some(old) = self.frame.replace(image) {
-            cx.drop_image(old, None);
+            drop_later(old, cx);
         }
         cx.notify();
     }
@@ -2207,7 +2342,7 @@ impl BrowserView {
                 })
                 .await;
             if let Some(image) = image {
-                let _ = this.update(cx, |this, cx| if this.visible { this.show_frame(image, cx) } else { cx.drop_image(image, None) });
+                let _ = this.update(cx, |this, cx| if this.visible { this.show_frame(image, cx) } else { drop_later(image, cx) });
             }
         });
     }
@@ -2770,25 +2905,46 @@ impl BrowserView {
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
         let problems = self.problems.len();
+        let lit = cx.theme().foreground;
         h_flex()
             .gap_1()
+            .items_center()
             .px_2()
             .py_1()
             .border_b_1()
             .border_color(cx.theme().border)
-            .child(Button::new("back").xsmall().ghost().label("←").tooltip("Back").on_click(cx.listener(|this, _, _, _| this.back())))
-            .child(Button::new("forward").xsmall().ghost().label("→").tooltip("Forward").on_click(cx.listener(|this, _, _, _| this.forward())))
+            .child(Button::new("back").xsmall().ghost().child(drawn("arrow-left", muted)).tooltip("Back").on_click(cx.listener(|this, _, _, _| this.back())))
+            .child(Button::new("forward").xsmall().ghost().child(drawn("arrow-right", muted)).tooltip("Forward").on_click(cx.listener(|this, _, _, _| this.forward())))
             .child(if self.loading {
                 Button::new("stop")
                     .xsmall()
                     .ghost()
-                    .label("✕")
+                    .child(drawn("x", muted))
                     .tooltip("Stop")
                     .on_click(cx.listener(|this, _, _, _| this.command("Page.stopLoading", json!({}))))
             } else {
-                Button::new("reload").xsmall().ghost().label("⟳").tooltip("Reload").on_click(cx.listener(|this, _, _, _| this.reload(false)))
+                Button::new("reload").xsmall().ghost().child(drawn("rotate-cw", muted)).tooltip("Reload").on_click(cx.listener(|this, _, _, _| this.reload(false)))
             })
-            .child(div().flex_1().child(Input::new(&self.url_input).small()))
+            // As a browser's: a click on it while the keyboard is elsewhere takes the whole
+            // address, to type another over; the next click puts the caret where it lands,
+            // and a drag from the first is the selection it made.
+            .child(
+                div()
+                    .flex_1()
+                    .capture_any_mouse_down(cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                        this.url_cold = !this.url_input.focus_handle(cx).is_focused(window);
+                    }))
+                    .capture_any_mouse_up(cx.listener(|this, _: &MouseUpEvent, window, cx| {
+                        if std::mem::take(&mut this.url_cold) {
+                            this.url_input.update(cx, |input, cx| {
+                                if input.selected_range().is_empty() {
+                                    input.select_all(window, cx);
+                                }
+                            });
+                        }
+                    }))
+                    .child(Input::new(&self.url_input).small()),
+            )
             .when_some(self.failed.as_ref().and_then(|url| local_address(url)), |this, address| {
                 this.child(div().text_xs().text_color(muted).child(format!("waiting for {address}…")))
             })
@@ -2809,7 +2965,7 @@ impl BrowserView {
                         .xsmall()
                         .ghost()
                         .text_color(gpui_kit::red())
-                        .label(format!("⚠ {problems}"))
+                        .child(h_flex().gap_1().child(drawn("triangle-alert", gpui_kit::red())).child(problems.to_string()))
                         .selected(self.problems_open)
                         .tooltip("The page's errors: exceptions, console.error, failed requests")
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -2822,7 +2978,7 @@ impl BrowserView {
                 Button::new("pick")
                     .xsmall()
                     .ghost()
-                    .label("⌖")
+                    .child(drawn("square-dashed-mouse-pointer", if self.picking { lit } else { muted }))
                     .selected(self.picking)
                     .tooltip("Pick an element for the agent: its selector, markup and picture go into the prompt")
                     .on_click(cx.listener(|this, _, window, cx| {
@@ -2835,7 +2991,7 @@ impl BrowserView {
                 Button::new("devtools")
                     .xsmall()
                     .ghost()
-                    .label("{ }")
+                    .child(drawn("code-xml", if self.devtools.is_some() { lit } else { muted }))
                     .selected(self.devtools.is_some())
                     .tooltip("DevTools (F12): in a panel of the tab, the page beside it")
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_devtools(window, cx))),
@@ -2908,16 +3064,18 @@ impl BrowserView {
     fn render_device_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let this = cx.entity().downgrade();
         let (device, turned, scheme) = (self.device, self.turned, self.scheme);
+        // The tab's own size has only the drawing; a device chosen is named after it.
         let label = match self.device_size() {
             Some((w, h, _)) => format!("{} {w}×{h}", DEVICES[device.unwrap_or_default()].0),
-            None => "▭".to_string(),
+            None => String::new(),
         };
+        let muted = cx.theme().muted_foreground;
         let dark = match scheme {
             Scheme::AsTheIde => "",
             Scheme::Light => " ☀",
             Scheme::Dark => " ☾",
         };
-        Button::new("device").xsmall().ghost().label(format!("{label}{dark}")).tooltip("The screen and colors the page is shown with").dropdown_menu_with_anchor(
+        Button::new("device").xsmall().ghost().child(h_flex().gap_1().child(drawn("monitor-smartphone", muted)).child(format!("{label}{dark}"))).tooltip("The screen and colors the page is shown with").dropdown_menu_with_anchor(
             Anchor::TopRight,
             move |mut menu, _, _| {
                 let to = |d: Option<usize>| {
@@ -3273,6 +3431,29 @@ fn fit_all(area: Size<Pixels>, device: Option<(u32, u32, bool)>, zoom: f32) -> (
     }
 }
 
+/// Lets go of a frame's texture once the update under way is over. Not at
+/// once: while a window is updated it is out of the app's list, and
+/// `drop_image` passes over it; every frame of a page in motion (they come
+/// in such an update) then kept its texture in the window's atlas for good,
+/// megabytes each.
+fn drop_later<T: 'static>(image: Arc<RenderImage>, cx: &mut Context<T>) {
+    cx.defer(move |cx| cx.drop_image(image, None));
+}
+
+/// One of the toolbar's drawings (Lucide's, assets/side-icons), in a color.
+fn drawn(name: &'static str, color: Hsla) -> Svg {
+    svg().path(SharedString::from(format!("side-icons/{name}.svg"))).size(px(15.)).flex_none().text_color(color)
+}
+
+/// How large a frame is drawn, in window pixels: as wide as the page's
+/// place, and as high as that makes it. A frame always shows the whole
+/// viewport, so its own pixels tell its shape and nothing of its size;
+/// while a resize waits for its first frame the old one is a little larger
+/// or smaller for a moment, never out of shape.
+fn frame_drawn(place_w: f32, pixels: (f32, f32)) -> (f32, f32) {
+    (place_w, pixels.1 * place_w / pixels.0.max(1.))
+}
+
 fn button_bit(button: MouseButton) -> u32 {
     match button {
         MouseButton::Left => 1,
@@ -3317,7 +3498,7 @@ impl Render for BrowserView {
         let scale = window.scale_factor();
         let zoom = self.zoom;
         let device = self.device_size();
-        let (_, offset) = fit(self.bounds.get().size, device, zoom);
+        let (view_w, _, factor, offset, _) = fit_all(self.bounds.get().size, device, zoom);
         let agent = self.device.and_then(|i| user_agent(DEVICES[i].0, &self.major));
         let which = self.device.map_or(0, |i| i as u32 + 1);
         let address = self.url.to_string();
@@ -3429,10 +3610,16 @@ impl Render for BrowserView {
                     .when_some(self.frame.clone(), |this, frame| {
                         // 1:1, never stretched: while a resize waits for frames
                         // of the new size, the old one stays sharp at its size.
+                        // As wide as the page's place, whatever pixels it has: on a screen of
+                        // two pixels to one Chrome sends the frames of a page in motion with
+                        // one to each and the sharp one after them with two, and drawn by
+                        // their pixels the page jumped between half its size and all of it.
                         let size = frame.size(0);
-                        let (w, h) = (size.width.0 as f32 / scale, size.height.0 as f32 / scale);
+                        let (w, h) = frame_drawn(view_w as f32 * factor, (size.width.0 as f32, size.height.0 as f32));
+                        let _ = scale;
                         this.child(img(frame).absolute().top_0().left(px(offset)).w(px(w)).h(px(h)))
                     })
+                    .children(self.render_places(cx))
                     .when_some(self.hover.filter(|_| self.picking).map(|b| self.on_screen(b)), |this, hover| {
                         let color = cx.theme().primary;
                         this.child(div().absolute().left(hover.left()).top(hover.top()).w(hover.size.width).h(hover.size.height).border_1().border_color(color).bg(color.opacity(0.2)))
@@ -3608,13 +3795,16 @@ mod tests {
             };
             let started = Instant::now();
             // A page's writer lets go of it once the page is closed.
-            while started.elapsed() < Duration::from_secs(10) {
+            while started.elapsed() < Duration::from_secs(3) {
                 match Arc::try_unwrap(chrome) {
                     Ok(owned) => return drop(owned),
                     Err(shared) => chrome = shared,
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
+            // Still held by a page's thread: ended all the same, or it is left
+            // running when the test is over, a gigabyte each time.
+            chrome.close();
         }
     }
 
@@ -3710,6 +3900,63 @@ mod tests {
     /// What headless Chrome would show nowhere or keep to itself comes to
     /// the tab: a dialog, a select's list, the cursor, the page's errors, a
     /// page it opens, its title and the address of a page of an app.
+    /// On a screen of two pixels to one Chrome sends the frames of a page in
+    /// motion with one pixel to each CSS pixel and the sharp one after them
+    /// with two: both are drawn as large, and as large as the page's place.
+    #[core::prelude::v1::test]
+    fn a_frame_is_as_wide_as_the_page_s_place_whatever_its_pixels() {
+        let moving = frame_drawn(623., (623., 518.));
+        let sharp = frame_drawn(623., (1246., 1036.));
+        assert_eq!((moving, sharp), ((623., 518.), (623., 518.)));
+        assert_eq!(frame_drawn(934.5, (623., 518.)), (934.5, 777.), "zoomed, by the zoom");
+        // The place made narrower, and the frame of the new size not come yet: smaller, in shape.
+        assert_eq!(frame_drawn(500., (1246., 1036.)).1.round(), 416.);
+    }
+
+    /// On a screen of two pixels to one the frames of a page's stream have
+    /// two to one as well, like the picture taken when it rests: with one
+    /// they were drawn stretched, and the page was soft whenever it moved.
+    /// Needs Chrome: `cargo test -- --ignored a_stream_has_the_screen_s_pixels`.
+    #[core::prelude::v1::test]
+    #[ignore]
+    fn a_stream_has_the_screen_s_pixels() {
+        if no_chrome() {
+            return;
+        }
+        let _one = ONE_CHROME.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("ideae-stream-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let owner = Owner::Task(root.clone());
+        let _quit = Quit(owner.clone());
+        SCREEN_SCALE.store(200, std::sync::atomic::Ordering::Relaxed);
+        let (frames, kept) = async_channel::bounded(64);
+        let out = spawn_page(owner, Source::Url("data:text/html,<body style='margin:0'><h1>Sharp</h1>".into()), frames);
+        let started = Instant::now();
+        while !matches!(kept.try_recv(), Ok(In::Ready { .. })) {
+            assert!(started.elapsed() < Duration::from_secs(20), "the page connects");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        call(&out, "Emulation.setDeviceMetricsOverride", json!({ "width": 800, "height": 600, "deviceScaleFactor": 2, "mobile": false }));
+        call(&out, "Page.startScreencast", json!({ "format": "jpeg", "quality": 95, "maxWidth": 1600, "maxHeight": 1200 }));
+        let size = |bytes: &[u8], format| image::load_from_memory_with_format(bytes, format).map(|picture| (picture.width(), picture.height())).ok();
+        let began = Instant::now();
+        let stream = loop {
+            call(&out, "Runtime.evaluate", json!({ "expression": "document.body.style.background = '#' + Math.floor(Math.random() * 900 + 100)" }));
+            match kept.try_recv() {
+                Ok(In::Frame(bytes, _)) if size(&bytes, image::ImageFormat::Jpeg) != Some((800, 600)) || began.elapsed() > Duration::from_secs(3) => break size(&bytes, image::ImageFormat::Jpeg),
+                _ => assert!(began.elapsed() < Duration::from_secs(10), "a frame comes"),
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        };
+        let shot = call(&out, "Page.captureScreenshot", json!({ "format": "png" })).and_then(|r| base64::engine::general_purpose::STANDARD.decode(r["data"].as_str()?).ok()).unwrap_or_default();
+        assert_eq!((stream, size(&shot, image::ImageFormat::Png)), (Some((1600, 1200)), Some((1600, 1200))));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// One at a time: three Chromes starting at once, beside all the check
+    /// runs then, take longer to answer than a test waits for one.
+    static ONE_CHROME: Mutex<()> = Mutex::new(());
+
     /// A machine with no Chrome cannot run these, and says so: the check
     /// before a push goes on with the rest instead of ending there.
     fn no_chrome() -> bool {
@@ -3727,6 +3974,7 @@ mod tests {
         if no_chrome() {
             return;
         }
+        let _one = ONE_CHROME.lock().unwrap_or_else(|e| e.into_inner());
         let root = std::env::temp_dir().join(format!("ideae-web-test-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let owner = Owner::Task(root.clone());
@@ -3764,6 +4012,10 @@ mod tests {
             }
         };
         wait("the title", &mut |m| matches!(m, In::Title(t) if t == "Shop"));
+        // A size of its own, as a tab gives its page: the window Chrome starts with is as many
+        // pixels whatever its screen, and on one of two to one too low for the date field below.
+        let _ = out.send(Out::Resize(800, 600, 1., false, None, String::new()));
+        std::thread::sleep(Duration::from_millis(300));
         let mouse = |kind: &str, x: f32, y: f32| {
             let _ = out.send(Out::Command(
                 "Input.dispatchMouseEvent",
@@ -3921,6 +4173,7 @@ mod tests {
         if no_chrome() {
             return;
         }
+        let _one = ONE_CHROME.lock().unwrap_or_else(|e| e.into_inner());
         let root = std::env::temp_dir().join(format!("ideae-wake-test-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let owner = Owner::Task(root.clone());

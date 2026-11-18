@@ -292,6 +292,7 @@ impl TaskView {
         let profile = launch.profile.id.clone();
         cx.subscribe_in(&chat, window, move |this: &mut Self, chat, event: &ChatEvent, window, cx| match event {
             ChatEvent::Follow { path, line } => this.follow_file(chat.clone(), path.clone(), *line, window, cx),
+            ChatEvent::FollowChanged { since } => this.follow_changed(chat.clone(), *since, window, cx),
             ChatEvent::Changed => this.chat_changed(chat, cx),
             ChatEvent::Chose { id, value } => crate::state::update_profile(&profile, |p| p.choices.insert(id.clone(), value.clone()).as_ref() != Some(value)),
             ChatEvent::Offered => {
@@ -426,6 +427,31 @@ impl TaskView {
         }
     }
 
+    /// The agent ran a command that named no file: of the files the task
+    /// has changed, the one written last since the command began is shown,
+    /// at its first change. Asked of the disk after the refresh the change
+    /// brought, and off the UI thread.
+    fn follow_changed(&mut self, chat: Entity<ChatView>, since: std::time::SystemTime, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = self.refresh_tx.try_send(());
+        let root = self.root.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(600)).await;
+            let Ok(changed) = this.update(cx, |this, _| this.files.iter().take(500).map(|file| file.path.to_string()).collect::<Vec<_>>()) else { return };
+            let newest = cx
+                .background_spawn({
+                    let root = root.clone();
+                    async move { last_written(&root, &changed, since) }
+                })
+                .await;
+            let Some(path) = newest else { return };
+            let _ = this.update_in(cx, |this, window, cx| {
+                let line = this.uncommitted_lines.get(&path).copied().unwrap_or(1);
+                this.follow_file(chat, root.join(&path), line, window, cx);
+            });
+        })
+        .detach();
+    }
+
     /// Tab `ix` in the other column than the chat's (made if need be), the
     /// chat in front in its own pane, keeping the keyboard.
     pub(super) fn beside_chat(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -477,5 +503,43 @@ impl TaskView {
         let at = self.tabs.iter().rposition(|t| matches!(t.kind, TabKind::Terminal(_) | TabKind::Chat(_))).map_or(0, |ix| ix + 1);
         self.tabs.insert(at, tab);
         self.activate(at, window, cx);
+    }
+}
+
+/// Of `files` (relative to `root`), the one written last at or after
+/// `since`; a second off, for file systems that keep times that coarse.
+pub(super) fn last_written(root: &std::path::Path, files: &[String], since: std::time::SystemTime) -> Option<String> {
+    let since = since.checked_sub(Duration::from_secs(1)).unwrap_or(since);
+    files
+        .iter()
+        .filter_map(|file| Some((std::fs::metadata(root.join(file)).ok()?.modified().ok()?, file)))
+        .filter(|(written, _)| *written >= since)
+        .max_by_key(|(written, _)| *written)
+        .map(|(_, file)| file.clone())
+}
+
+#[cfg(test)]
+mod follow_tests {
+    use super::last_written;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn the_file_a_script_wrote_last_is_the_one_to_follow() {
+        let dir = std::env::temp_dir().join(format!("ideae-follow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let now = SystemTime::now();
+        let at = |name: &str, ago: u64| {
+            std::fs::write(dir.join(name), name).unwrap();
+            std::fs::File::options().write(true).open(dir.join(name)).unwrap().set_modified(now - Duration::from_secs(ago)).unwrap();
+        };
+        at("old.txt", 600);
+        at("src/first.rs", 20);
+        at("src/last.rs", 5);
+        let files: Vec<String> = ["old.txt", "src/first.rs", "src/last.rs", "gone.txt"].map(String::from).to_vec();
+        assert_eq!(last_written(&dir, &files, now - Duration::from_secs(60)).as_deref(), Some("src/last.rs"));
+        assert_eq!(last_written(&dir, &files[..2], now - Duration::from_secs(60)).as_deref(), Some("src/first.rs"));
+        assert_eq!(last_written(&dir, &files, now - Duration::from_secs(2)), None, "nothing written since: nothing to show");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -199,6 +199,49 @@ impl TaskView {
         self.open_file_as(path, 0, 0, OpenAs::Kept, window, cx);
     }
 
+    /// How the task's own addresses are found, for its Web tabs: the ports
+    /// of its services, and those its processes listen on. What it gives is
+    /// to be called off the UI thread: it reads `.ideae.toml` and asks the
+    /// system who listens.
+    pub(super) fn own_places(&self) -> crate::browser::Places {
+        let (root, socket, slot) = (self.root.clone(), self.hook_socket.clone(), self.port_slot);
+        Arc::new(move || {
+            let listening = socket.as_ref().map(|socket| crate::services::listening(&crate::procs::task_processes(Some(&root.display().to_string()), socket))).unwrap_or_default();
+            let services = crate::project_config::resolve(&root).config.service;
+            own_places(services.iter().filter_map(|service| Some((service.name.clone(), service.port(slot)?))).collect(), listening.into_iter().map(|l| (l.name, l.port)).collect())
+        })
+    }
+
+    /// The agent's turn ended: the Web tabs that show the task's own site
+    /// load it again, when that is set. A page of elsewhere (documentation,
+    /// a site looked at) is not the task's to reload.
+    pub fn reload_own_pages(&mut self, cx: &mut Context<Self>) {
+        if !crate::state::with_settings(|s| s.web_reload_after_turn) {
+            return;
+        }
+        let pages: Vec<(Entity<crate::browser::BrowserView>, u16)> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| match &tab.kind {
+                TabKind::Browser(page) => Some((page.clone(), page.read(cx).own_port()?)),
+                _ => None,
+            })
+            .collect();
+        if pages.is_empty() {
+            return;
+        }
+        let places = self.own_places();
+        cx.spawn(async move |_, cx| {
+            let own: HashSet<u16> = cx.background_spawn(async move { places() }).await.into_iter().map(|place| place.port).collect();
+            for (page, port) in pages {
+                if own.contains(&port) {
+                    let _ = page.update(cx, |page, _| page.load_again());
+                }
+            }
+        })
+        .detach();
+    }
+
     /// Every few seconds while the Run panel is in view: the ports the
     /// task's processes listen on.
     pub(super) fn watch_listening(&mut self, cx: &mut Context<Self>) {
@@ -446,5 +489,34 @@ impl TaskView {
         );
         // With the bar the other panels show while they are scrolled.
         div().relative().flex_1().min_h_0().child(panel).child(gpui_kit::component::scroll::Scrollbar::vertical(&self.run_scroll)).into_any_element()
+    }
+}
+
+/// The task's own addresses: its services by their names, then what else
+/// its processes listen on, by the program that does.
+fn own_places(services: Vec<(String, u16)>, listening: Vec<(String, u16)>) -> Vec<crate::browser::Place> {
+    let up = |port: u16| listening.iter().any(|(_, at)| *at == port);
+    let mut places: Vec<crate::browser::Place> = services.iter().map(|(name, port)| crate::browser::Place { label: name.clone(), port: *port, up: up(*port) }).collect();
+    for (program, port) in &listening {
+        if !places.iter().any(|place| place.port == *port) {
+            places.push(crate::browser::Place { label: program.clone(), port: *port, up: true });
+        }
+    }
+    places
+}
+
+#[cfg(test)]
+mod own_tests {
+    use super::own_places;
+
+    #[test]
+    fn a_task_s_own_addresses_are_its_services_and_what_it_listens_on() {
+        let places = own_places(vec![("web".into(), 3010), ("api".into(), 8090)], vec![("node".into(), 3010), ("vite".into(), 5173)]);
+        let told: Vec<(&str, u16, bool)> = places.iter().map(|p| (p.label.as_str(), p.port, p.up)).collect();
+        assert_eq!(told, [("web", 3010, true), ("api", 8090, false), ("vite", 5173, true)], "a service by its name, up or not; what else listens by its program");
+        assert_eq!(places[0].address(), "http://localhost:3010");
+        // A page is the task's own by its port; one of elsewhere has none of this machine.
+        assert_eq!(crate::browser::local_port("http://127.0.0.1:3010/cart?x=1"), Some(3010));
+        assert_eq!(crate::browser::local_port("https://docs.rs/gpui"), None);
     }
 }

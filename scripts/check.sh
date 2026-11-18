@@ -30,6 +30,7 @@ cargo test -- --ignored \
   an_archived_task \
   a_page_tells_the_tab \
   a_task_s_browser_wakes_when_called \
+  a_stream_has_the_screen_s_pixels \
   a_local_model_predicts_at_the_cursor \
   a_local_model_predicts_the_next_edits
 

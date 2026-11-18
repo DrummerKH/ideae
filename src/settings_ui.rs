@@ -412,6 +412,13 @@ fn pages(
                     "A pull, rebase, cherry-pick or revert that would conflict changes nothing, and the agent's prompt gets the request to do it and resolve the conflicts. Off, you are only told.",
                     |s| s.conflicts_to_agent,
                     |s, v| s.conflicts_to_agent = v,
+                ))
+                .item(switch(
+                    draft,
+                    "Reload the task's site after the agent's turn",
+                    "A Web tab showing the task's own site (a port of its services, or one its processes listen on) loads it again when the agent's turn ends. Other pages are left as they are. Off, when the site reloads by itself and should keep its state.",
+                    |s| s.web_reload_after_turn,
+                    |s, v| s.web_reload_after_turn = v,
                 )),
         ),
         SettingPage::new("Language servers").default_open(true).groups([

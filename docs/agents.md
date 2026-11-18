@@ -122,7 +122,9 @@ end with the agent (killed when one ignores being asked to).
 
 **Around the chat.** **@** mentions a file of the task: it goes to the agent
 as a link to it. **Follow** opens the files the agent read or changed
-beside the chat, at their line. An image pasted (Ctrl+V) goes with the next
+beside the chat, at their line; when it changes files by a command of its
+own that names none (a script), the file of the task written last while
+the command ran. An image pasted (Ctrl+V) goes with the next
 prompt, for agents that take them. The plan of the turn stays above the
 prompt until it is done. `/` lists the agent's own commands (Tab
 completes). A message has **Copy** on hover.

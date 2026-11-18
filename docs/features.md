@@ -233,8 +233,9 @@ Terminals are built on libghostty-vt; Ctrl+click on paths, `file:line`, class
 and function names opens them in the editor. They live in a daemon, so the
 agents keep running when the window restarts.
 
-Browser tabs are headless Chrome streamed into a tab. ⌖ in the toolbar picks
-for the agent: click elements (each with its selector, markup, text, React
+Browser tabs are headless Chrome streamed into a tab, with as many pixels
+as the window's screen has. The dashed square in the toolbar picks for the
+agent: click elements (each with its selector, markup, text, React
 components, the styles it is made of and a picture), drag over an area, or
 take the whole page; say what to do with them and send them all in one prompt.
 
@@ -245,6 +246,13 @@ take the whole page; say what to do with them and send them all in one prompt.
 - The page's errors (exceptions, `console.error`, requests that failed) are
   counted in the toolbar: ⚠ lists them, and Send to agent puts them into its
   prompt.
+- The task's own site is a page of this machine at a port of the task: one
+  of its services', or one its processes listen on. A tab showing it loads
+  it again when the agent's turn ends (Settings → Agent; off for a site that
+  reloads by itself and should keep its state); a page of elsewhere is left
+  alone. The address bar offers the task's own addresses when you go to it,
+  those something listens at first; a first click on it takes the whole
+  address, the next puts the caret.
 - A page of this machine that could not be loaded (a dev server still
   starting) is loaded again once something listens at its port.
 - Dialogs (`alert`, `confirm`, `prompt`, leaving a page), the list of a
@@ -253,7 +261,7 @@ take the whole page; say what to do with them and send them all in one prompt.
   with `target=_blank` or `window.open` comes up as a tab of its own and
   closes with `window.close()`. Downloads go to the Downloads folder, a
   notice saying where.
-- ▭ in the toolbar shows the page at a phone's, tablet's or desktop's size
+- The screens' mark in the toolbar shows the page at a phone's, tablet's or desktop's size
   (made smaller to fit, touches from the mouse on a phone), turned or not,
   and asks it for light or dark colors, or the IDE's.
 - Addresses of this machine Ctrl+clicked in a terminal open in a Web tab of
@@ -263,7 +271,7 @@ take the whole page; say what to do with them and send them all in one prompt.
   its page again when shown.
 - Input methods (Chinese, Japanese…) compose in the page, their window at
   the caret.
-- `{ }` or F12 opens Chrome's DevTools in a panel of the tab, below the page
+- `</>` or F12 opens Chrome's DevTools in a panel of the tab, below the page
   or right of it; the page gives it room, and the divider moves.
 - A tab keeps its screen, colors and DevTools across restarts; a phone's or
   tablet's screen sends that device's user agent.

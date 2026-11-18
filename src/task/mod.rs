@@ -1118,6 +1118,7 @@ impl TaskView {
         }
         let owner = crate::browser::Owner::Task(self.root.clone());
         let view = cx.new(|cx| crate::browser::BrowserView::new(source, owner, window, cx));
+        view.update(cx, |page, _| page.set_places(self.own_places()));
         cx.subscribe_in(&view, window, |this, view, event: &crate::browser::BrowserEvent, window, cx| match event {
             crate::browser::BrowserEvent::Navigated => {
                 let title = view.read(cx).title();

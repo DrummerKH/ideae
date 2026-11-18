@@ -164,6 +164,8 @@ pub struct Settings {
     /// Changed files as a list of paths, not a tree of folders: in the
     /// Changes panel and beside a diff.
     pub changes_flat: bool,
+    /// A page of the task's own site is loaded again when its agent's turn ends.
+    pub web_reload_after_turn: bool,
     /// The Files panel goes to the file in the editor by itself.
     pub tree_follows: bool,
     /// What the Structure panel leaves out, and whether it is in the
@@ -247,6 +249,7 @@ impl Default for Settings {
             diff_ignore_whitespace: false,
             diff_files: false,
             changes_flat: false,
+            web_reload_after_turn: true,
             tree_follows: false,
             structure_public: false,
             structure_no_fields: false,
