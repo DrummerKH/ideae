@@ -23,7 +23,8 @@ cargo test -- --ignored \
   a_local_model_predicts_the_next_edits
 
 if rustup target list --installed 2>/dev/null | grep -q x86_64-pc-windows-gnu; then
-  cargo check --target x86_64-pc-windows-gnu --target-dir target/win
+  # With the tests: CI builds them there too, and code only they have was once left for Unix alone.
+  cargo check --tests --target x86_64-pc-windows-gnu --target-dir target/win
 else
   echo "no x86_64-pc-windows-gnu target: the Windows side is not checked" >&2
 fi

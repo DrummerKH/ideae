@@ -193,7 +193,14 @@ pub fn serve() {
                     io.update(&session, json!({ "sessionUpdate": "tool_call", "toolCallId": "k1", "title": format!("kill {me}"), "kind": "execute", "status": "in_progress" }));
                     std::thread::sleep(std::time::Duration::from_millis(100));
                     // SAFETY: signals this process itself, as `kill` would.
-                    unsafe { libc::kill(me as i32, libc::SIGTERM) };
+                    #[cfg(unix)]
+                    unsafe {
+                        libc::kill(me as i32, libc::SIGTERM)
+                    };
+                    // Windows has no signal to send itself: it ends as one killed would.
+                    #[cfg(not(unix))]
+                    std::process::exit(143);
+                    #[cfg(unix)]
                     std::thread::sleep(std::time::Duration::from_secs(5));
                 } else if text.contains("crash") {
                     io.update(&session, json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "Start" } }));
