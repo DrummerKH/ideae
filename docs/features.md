@@ -91,12 +91,7 @@ do. The sidebar shows working / needs input / done, and a desktop notification f
 A question Claude Code asks (AskUserQuestion) or a plan it waits to have
 approved counts as needing you. Notifications carry the agent's last answer
 or its question; Settings → General → "Show what the agent said in
-notifications" off, they say only Finished or Needs your answer. On macOS a
-notification is the app's own (its icon, and a click goes to the task) when
-the app is installed in a folder of applications and its window is open;
-the system asks once whether it may. Raised while the window is closed, or
-by a binary run from a build folder, it is AppleScript's, and a click on it
-opens Script Editor.
+notifications" off, they say only Finished or Needs your answer.
 The Changes and Files panels mark the file the agent is writing to and those
 it wrote to since your last prompt.
 
@@ -143,45 +138,26 @@ all: what is removed stays under `refs/ideae/variants` for two weeks.
   Dart's, elixir-ls and Metals (Scala) are used when on PATH: they come with
   their language, or need it to install. A server on PATH wins over one ideae
   installed; Settings → Language servers turns each off.
+- A task you have not opened for a while (Settings → Language servers) stops
+  its language servers. The task on screen stops them too when the app has
+  been in the background as long and its agent is not working. They start
+  again when you come back.
 - Types and parameter names from the server are shown in the code where it
   has them (most of the above; intelephense only with a licence).
 - With a language server: completion as you type, problems underlined (F2
   steps through them), fixes (Alt+Enter), rename everywhere (Shift+F6),
   reformat (Ctrl+Alt+L, or on save), parameter info (Ctrl+P), names colored
   by what they are, Ctrl+N for a class or function anywhere in the project.
-- A completion goes in whole: the server's edit or snippet (the caret at
-  its first stop), the import it adds, and its command with the edit and
-  caret that asks for (kotlin-lsp completes that way). Items that are the
-  same in all that is shown and done are listed once; items of one name
-  show what tells them apart (a package, the import).
-- Completion and edit prediction, one at a time, as in Zed:
-  - the menu wins. While it is open or being asked for, no prediction is
-    shown or asked; one shown goes when the menu comes. Tab and Enter take
-    the menu's item, Esc closes it. A prediction is asked again after an
-    item is taken, or when the typed word leaves the menu empty; after Esc,
-    at the next edit.
-  - Ctrl+Space opens only the menu and drops a prediction.
-  - with only a prediction: Tab takes it (and the next is asked), Esc
-    drops it, Enter is a newline (and the next line is asked). Typing what it shows keeps the rest of it,
-    with no menu over it; typing anything else drops it.
-  - a prediction may also change what is around the cursor (the next edit,
-    as in Cursor or Zed): each change is shown where it is, what goes
-    struck through in red, what comes in green, and Tab makes them all,
-    the caret after the last (or where the model puts it). One further
-    than a few lines, out of view, or of whole lines is told at the end of
-    the cursor's line, "⇥ Tab: jump to line N": the first Tab goes there,
-    the next makes them, and the next prediction is asked at once, so a
-    rename or a new field goes on with Tab after Tab. Gray text at the
-    cursor goes in first. Esc, typing anything else, or the menu drop it.
+- Edit prediction by a small model on this computer (downloaded on
+  consent): gray text at the cursor that Tab takes, or the next edit nearby,
+  struck through and green, that Tab makes; one further away is reached
+  with a first Tab.
 - The declarations you are inside of stay at the top as you scroll.
-- File structure (Ctrl+F12), syntax-aware selection, folding, the next
-  occurrence of a selection (Alt+J), lines deleted, duplicated, moved and
-  joined on keys of their own, CamelHumps words (Settings → Editor).
+- File structure (Ctrl+F12), syntax-aware selection, folding, CamelHumps
+  words (Settings → Editor).
 - The gutter marks what differs from the last commit. A right click on the
   line numbers annotates the file with git blame. Bookmarks (F11) follow
   their text and are listed for the whole task (Shift+F11).
-- A file opened to look at (a jump, a search result) takes the preview tab;
-  past a limit the file tabs left longest close. Tabs can be pinned.
 - Replace in files (Ctrl+Shift+R) shows every match with what it becomes.
 - Autosave when you leave a file; Markdown has a Preview.
 
@@ -194,22 +170,6 @@ one, Structure and Run of the lower, and a mark dragged to the other end of
 the strip moves its panel there. With nothing shown the strip is all there
 is of the side, and the pointer resting on a mark brings its panel over the
 task until it leaves.
-
-Each panel's title has what acts on it. Changes: a tree of folders or a
-list of files (beside a diff too), and Stage all. Files: follow the file in
-the editor, show it once, close every folder. Structure: only what is
-public, with or without fields, in the order of the names. Structure is of
-the file in view: with a terminal in front it shows none.
-
-A file's tab has the icon of its kind and its name in the color git gives
-it, as in the Files panel.
-
-## Files panel
-
-File and folder icons as JetBrains' new UI draws them. A name has the color
-of what git says of it: blue changed, green added, red-brown not added, olive
-ignored; a folder, of what is in it. An ignored folder (`target/`,
-`node_modules/`) is read from disk when it is opened.
 
 ## Git
 
@@ -231,6 +191,7 @@ ignored; a folder, of what is in it. An ignored folder (`target/`,
   with no commits of their own (only merges into them) left out; both are
   kept in the repository's git config.
 - Stash, and the stashes listed to look into, bring back or drop.
+- A changed image shows in diffs as it was and as it is.
 
 ## Terminals and browser tabs
 
@@ -255,17 +216,9 @@ take the whole page; say what to do with them and send them all in one prompt.
   of its services', or one its processes listen on. A tab showing it loads
   it again when the agent's turn ends (Settings → Agent; off for a site that
   reloads by itself and should keep its state); a page of elsewhere is left
-  alone. The address bar offers the task's own addresses when you go to it,
-  those something listens at first; a first click on it takes the whole
-  address, the next puts the caret.
+  alone. The address bar offers the task's own addresses.
 - A page of this machine that could not be loaded (a dev server still
   starting) is loaded again once something listens at its port.
-- Dialogs (`alert`, `confirm`, `prompt`, leaving a page), the list of a
-  `<select>` (by click or keys), the pickers of date, time and color fields
-  and the file picker of `<input type=file>` show in the tab; a page opened
-  with `target=_blank` or `window.open` comes up as a tab of its own and
-  closes with `window.close()`. Downloads go to the Downloads folder, a
-  notice saying where.
 - The screens' mark in the toolbar shows the page at a phone's, tablet's or desktop's size
   (made smaller to fit, touches from the mouse on a phone), turned or not,
   and asks it for light or dark colors, or the IDE's.
@@ -274,15 +227,8 @@ take the whole page; say what to do with them and send them all in one prompt.
 - A task out of view as long as its language servers stay (Settings) closes
   its pages, unless its agent is at work: its Chrome ends, and each tab opens
   its page again when shown.
-- Input methods (Chinese, Japanese…) compose in the page, their window at
-  the caret.
 - `</>` or F12 opens Chrome's DevTools in a panel of the tab, below the page
   or right of it; the page gives it room, and the divider moves.
-- A tab keeps its screen, colors and DevTools across restarts; a phone's or
-  tablet's screen sends that device's user agent.
-- Keys: Ctrl+L address bar, Ctrl+R / F5 reload (Shift: not from the cache),
-  Alt+←/→ back and forward (also the mouse's side buttons), Ctrl+F find in
-  page, Ctrl+= / Ctrl+- / Ctrl+0 zoom; Settings → Keys → Web rebinds them.
 - The task's terminals, the agent's included, have the task's DevTools
   endpoint as `IDEAE_BROWSER_CDP` (a port that stays the task's), so
   Playwright MCP drives the pages you see. In a project's `.mcp.json` for
@@ -303,33 +249,17 @@ take the whole page; say what to do with them and send them all in one prompt.
 - One menu bar on every system: File, Edit, View, Navigate, Task, Git, Window
   and Help. macOS has it at the top of the screen; on Linux and Windows it is
   behind ☰ in the title bar, or Alt pressed alone (Settings → Title bar can
-  keep it shown). Items show the keys in force and are grey where they would
-  do nothing.
+  keep it shown).
 - Themes: Ayu, Catppuccin, Gruvbox, Solarized, Everforest, Flexoki, GitHub, One,
   Rosé Pine, Tokyo Night and JetBrains' Islands, each light and dark. Settings has
   the light one and the dark one apart, and whether the window is light, dark or
-  follows the system (Theme… in the menu shows each as you go through the list,
-  for the side drawn now).
+  follows the system.
 - Spaces sort projects into sets (work, personal, a client); the window shows
   one at a time, and the agents of the others keep working unseen.
 - Presentation mode (View → Presentation Mode…) leaves only the tasks you pick in the window, draws code
   larger, and hides what git ignores (keys, local settings) until asked for.
 - Focus mode (Shift+Esc) puts one pane over the whole window.
-- Dragged narrow, the sidebar becomes a rail: Needs you, Starred and the
-  projects' tasks, each with its name, what goes on in it (it asks, its
-  check failed, what its agent does, how long ago) and its figures (files
-  changed, commits not pushed, services, its pull request). A paused task
-  has a sign of its own and one line. A right click has the task's menu,
-  and a project's name under the pointer its archived tasks and its +. The
-  whole sidebar opens over the task once the pointer rests on the rail, not
-  while it moves along it to a task; not from under a menu.
-- A tab's cross shows under the pointer, over the tab's end.
-- A diff's files are in the order of the list beside them: as a tree, a
-  folder's folders before its files; as a list, by name.
-- On a battery that runs down past 30% the app says once that there is a
-  power save mode (Settings → General).
-- Recent tasks (Ctrl+E) marks each with its agent's status, as the sidebar
-  does, and says which are paused and how many files changed. Lists of this
-  kind go a page at a time with Page Up and Page Down.
-- A task dragged down in the sidebar goes after the one it is dropped on,
-  dragged up before it, where the line shows.
+- Dragged narrow, the sidebar becomes a rail that still says what each task
+  is doing and what it holds, and opens whole when the pointer rests on it.
+- Power save mode stops the language servers, the background fetch and the
+  load readout; on a battery running low the app suggests it once.

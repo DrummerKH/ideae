@@ -254,6 +254,8 @@ pub type DiffSource = std::sync::Arc<dyn Fn() -> (String, String) + Send + Sync>
 /// A diff of its own in a tab: the worktree against a commit or a branch, a stash.
 pub struct DiffTab {
     what: SharedString,
+    /// The repository: an image's versions are read from it.
+    root: PathBuf,
     diff: Entity<DiffState>,
     source: DiffSource,
     _reload: Option<Task<()>>,
@@ -264,11 +266,11 @@ impl DiffTab {
         Some(self.diff.clone())
     }
 
-    pub fn new(what: String, files: Vec<DiffFile>, source: DiffSource, cx: &mut Context<Self>) -> Self {
+    pub fn new(what: String, root: PathBuf, files: Vec<DiffFile>, source: DiffSource, cx: &mut Context<Self>) -> Self {
         // As the Changes tab shows diffs: in the mode chosen there.
         let mode = if crate::state::with_settings(|s| s.diff_unified) { DiffMode::Unified } else { DiffMode::Split };
         cx.observe_global::<DiffWhitespace>(|this, cx| this.reload(cx)).detach();
-        Self { what: what.into(), diff: cx.new(|cx| DiffState::new(files, cx).with_mode(mode)), source, _reload: None }
+        Self { what: what.into(), root, diff: cx.new(|cx| DiffState::new(files, cx).with_mode(mode)), source, _reload: None }
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
@@ -320,7 +322,11 @@ impl Render for DiffTab {
             .child(div().flex_1().min_h_0().child(with_file_list(
                 &self.diff,
                 "diff-file-list",
-                Diff::new(&self.diff).line_number(true).soft_wrap(true).code_font_size(crate::zoom::size(crate::zoom::Kind::Changes, cx)),
+                Diff::new(&self.diff).line_number(true).soft_wrap(true).code_font_size(crate::zoom::size(crate::zoom::Kind::Changes, cx)).binary_content({
+                    // Against the working tree: an after side git has no blob of is the file there.
+                    let root = self.root.clone();
+                    move |file, split, window, cx| crate::image_diff::render(file, split, &root, true, window, cx)
+                }),
                 cx,
             )))
     }
@@ -419,7 +425,7 @@ pub(super) fn shown_order(paths: &[String], flat: bool) -> Vec<usize> {
     .collect()
 }
 
-pub(super) fn human_size(bytes: u64) -> String {
+pub(crate) fn human_size(bytes: u64) -> String {
     match bytes {
         b if b >= 1 << 20 => format!("{:.1} MB", b as f64 / (1u64 << 20) as f64),
         b if b >= 1 << 10 => format!("{:.0} KB", b as f64 / 1024.0),

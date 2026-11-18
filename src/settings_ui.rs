@@ -197,56 +197,56 @@ fn pages(
                 .item(switch(
                     draft,
                     "Notifications",
-                    "A desktop notification when an agent out of view needs you or finishes.",
+                    "A desktop notification when an agent in a task you are not looking at finishes or needs your answer.",
                     |s| s.notifications,
                     |s, v| s.notifications = v,
                 ))
                 .item(switch(
                     draft,
                     "Show what the agent said in notifications",
-                    "Its last answer or its question. Off, a notification says only Finished or Needs your answer, with the task's name. Never while presenting.",
+                    "The notification includes the agent's last answer or its question. When off, it says only Finished or Needs your answer, with the task's name. Never while presenting.",
                     |s| s.notify_said,
                     |s, v| s.notify_said = v,
                 ))
                 .item(SettingItem::new("Where notices show", notices_at).description(
-                    "The window's corner for its own notices: a task finished, a check failed, an update.",
+                    "The corner of the window for the app's own notices, such as a finished task, a failed check or an update.",
                 ))
                 .item(switch(
                     draft,
                     "Check for updates",
-                    "Release builds ask GitHub for a newer release now and then.",
+                    "From time to time the app checks GitHub for a newer release. Release builds only.",
                     |s| s.check_updates,
                     |s, v| s.check_updates = v,
                 )),
         ).group(
             SettingGroup::new().title("Look")
                 .item(SettingItem::new("Light theme", light_theme).description(
-                    "Theme… in the menu shows them one after another as you go through the list, for the side drawn now.",
+                    "Theme… in the menu previews each theme as you move through the list.",
                 ))
                 .item(SettingItem::new("Dark theme", dark_theme))
                 .item(SettingItem::new("Light or dark", appearance).description(format!(
-                    "Auto follows the system and changes with it; the system is {now} now. Light and Dark stay as they are.",
+                    "Auto follows the system's setting, which is {now} now. Light and Dark stay fixed.",
                 ))),
         ).group(
             SettingGroup::new().title("Title bar")
                 .item(switch(
                     draft,
                     "Say when the battery runs low",
-                    "Once as it runs down past 30% while in use: that there is a power save mode, with the way to turn it on.",
+                    "Once, when the battery drops to 30% while unplugged: a notice suggesting Power Save Mode, with a button to turn it on.",
                     |s| s.battery_hint,
                     |s, v| s.battery_hint = v,
                 ))
                 .item(switch(
                     draft,
                     "Load",
-                    "CPU, memory, and what the app and its tasks hold; the tooltip has every process.",
+                    "CPU and memory, and how much of it the app and its tasks use. Hover it to see every process.",
                     |s| s.show_load,
                     |s, v| s.show_load = v,
                 ))
                 .item(switch(
                     draft,
                     "Tokens",
-                    "What the agents of the tasks open here took in the last 24 hours.",
+                    "Tokens used in the last 24 hours by the agents of the tasks in this window.",
                     |s| s.show_tokens,
                     |s, v| s.show_tokens = v,
                 ))
@@ -254,7 +254,7 @@ fn pages(
                 .items((!cfg!(target_os = "macos")).then(|| switch(
                     draft,
                     "Menu bar always shown",
-                    "File, Edit, View and the others stay in the title bar. Off, they are behind ☰, or Alt pressed alone.",
+                    "File, Edit, View and the rest always show in the title bar. When off, they are under ☰, or appear when you press Alt.",
                     |s| s.menu_bar_shown,
                     |s, v| s.menu_bar_shown = v,
                 ))),
@@ -263,27 +263,27 @@ fn pages(
                 .item(switch(
                     draft,
                     "Context dial on tasks",
-                    "By a task in the sidebar, how full its agent's context is.",
+                    "A dial next to each task in the sidebar showing how full its agent's context is.",
                     |s| s.context_dial,
                     |s, v| s.context_dial = v,
                 ))
                 .item(switch(
                     draft,
                     "Context dial on the agent's tab",
-                    "On the agent's tab of the task in view, how full its context is.",
+                    "A dial on the agent tab of the open task showing how full its context is.",
                     |s| s.context_on_tab,
                     |s, v| s.context_on_tab = v,
                 ))
                 .item(switch(
                     draft,
-                    "Worktrees agents made",
-                    "Those an agent made for itself (Claude Code's subagents, a try in a temporary folder), folded under the task they came from, opened without an agent. Off, they are not listed.",
+                    "Worktrees made by agents",
+                    "Worktrees an agent creates for itself (Claude Code's subagents, a try in a temporary folder) are listed under the task they came from and open without an agent. When off, they are hidden.",
                     |s| s.show_side_worktrees,
                     |s, v| s.show_side_worktrees = v,
                 ))
                 .item(
                     SettingItem::new("The narrow sidebar opens after", rail_open)
-                        .description("Dragged as narrow as it goes, the sidebar is a rail of tasks to click. The whole of it opens over the task when the pointer rests on the rail this long."),
+                        .description("Dragged to its narrowest, the sidebar becomes a rail of tasks. Rest the pointer on the rail this long and the full sidebar opens over the task."),
                 ),
         ),
         agents_page(
@@ -291,7 +291,7 @@ fn pages(
             switch(
                 draft,
                 "Agents' language servers",
-                "Claude Code's LSP plugins, a rust-analyzer and the like per agent: much memory for every agent that runs, for go-to-definition in what it reads. For agents started after Save.",
+                "Language servers agents run for themselves, such as Claude Code's LSP plugins: one rust-analyzer or the like per agent. They let an agent jump to definitions, but each takes a lot of memory. Applies to agents started after Save.",
                 |s| s.agent_lsp,
                 |s, v| s.agent_lsp = v,
             ),
@@ -302,21 +302,21 @@ fn pages(
                 .item(switch(
                     draft,
                     "CamelHumps words",
-                    "Moving, selecting and deleting by word stops at the humps of camelCase and at the underscores of snake_case.",
+                    "Moving, selecting and deleting by word stop at camelCase humps and snake_case underscores.",
                     |s| s.hump_words,
                     |s, v| s.hump_words = v,
                 ))
                 .item(switch(
                     draft,
                     "Completions as you type",
-                    "The language server's suggestions come up while you type. Off, they come when asked for (Ctrl+Space).",
+                    "The language server's suggestions appear as you type. When off, ask for them with Ctrl+Space.",
                     |s| s.complete_as_typed,
                     |s, v| s.complete_as_typed = v,
                 ))
                 .item(switch(
                     draft,
                     "Reformat on save",
-                    "Ctrl+S has the language server reformat the file first. Not the save made when you leave a file.",
+                    "Ctrl+S asks the language server to reformat the file before saving. The save made when you leave a file does not reformat.",
                     |s| s.format_on_save,
                     |s, v| s.format_on_save = v,
                 )),
@@ -325,36 +325,36 @@ fn pages(
                 .item(switch(
                     draft,
                     "Preview tab",
-                    "A file opened to look at (a jump to a definition or a usage, a search result, a click in Files) opens in one tab, shown in italics, that the next one takes over. Editing it or double-clicking it keeps it.",
+                    "Files opened just to look at (a jump to a definition or usage, a search result, a click in Files) share one tab in italics, which the next such file replaces. Edit the file or double-click the tab to keep it.",
                     |s| s.preview_tabs,
                     |s, v| s.preview_tabs = v,
                 ))
                 .item(SettingItem::new("File tabs open at most", tab_limit).description(
-                    "Past this many, the file tabs left longest close. Files with unsaved edits stay.",
+                    "Beyond this many file tabs, the ones unused longest close. Files with unsaved changes stay open.",
                 )),
         ).group(
             SettingGroup::new().title("Shown in the code")
                 .item(switch(
                     draft,
                     "Colors from the language server",
-                    "Names are colored by what the server knows them to be (a type, a parameter, a method), over the grammar's colors.",
+                    "Names are colored by what the server knows they are (a type, a parameter, a method), on top of the syntax colors.",
                     |s| s.semantic_colors,
                     |s, v| s.semantic_colors = v,
                 ))
                 .item(switch(
                     draft,
                     "Hints from the language server",
-                    "Types the server worked out are shown after names, and the names of parameters before the arguments given them, in the code itself.",
+                    "Inferred types after names, and parameter names before arguments, shown inline in the code.",
                     |s| s.inlay_hints,
                     |s, v| s.inlay_hints = v,
                 ))
                 .item(SettingItem::new("Who changed the line", blame_place).description(
-                    "Who last changed the line the cursor is on, when, and why: at the end of that line, or in the file's header. A click on it opens the commit.",
+                    "Who last changed the line under the cursor, when and why, at the end of that line or in the file's header. Click it to open the commit.",
                 ))
                 .item(switch(
                     draft,
                     "Gutter marks against the base branch",
-                    "The marks beside the line numbers show what the task changed since it left its base branch, not only since the last commit.",
+                    "The marks beside the line numbers show everything the task changed since it branched off, not only since the last commit.",
                     |s| s.gutter_since_base,
                     |s, v| s.gutter_since_base = v,
                 )),
@@ -364,7 +364,7 @@ fn pages(
                 .item(switch(
                     draft,
                     "What the agent said",
-                    "A finished task in Needs you shows the start of its agent's last answer, and one that waits shows what it asks; the task's tooltip and the notification have it too. Never while presenting.",
+                    "In Needs you, a finished task shows the start of its agent's last answer, and a waiting one shows its question. The task's tooltip and the notification show it too. Never while presenting.",
                     |s| s.show_said,
                     |s, v| s.show_said = v,
                 )),
@@ -373,27 +373,27 @@ fn pages(
                 .item(switch(
                     draft,
                     "Copy .env files",
-                    "New worktrees get the main checkout's ignored .env* files, unless the project's settings name the files to copy.",
+                    "New worktrees get copies of the main checkout's ignored .env* files, unless the project's settings list other files to copy.",
                     |s| s.copy_env,
                     |s, v| s.copy_env = v,
                 )),
         ).group(
             SettingGroup::new().title("Archived tasks")
                 .item(SettingItem::new("Restore with", restore_with).description(
-                    "A restored task's agent goes on with its whole conversation, told what changed since; or starts a new session told only the task, what was said last and what changed: a short context.",
+                    "A restored task's agent either continues its whole conversation and is told what changed since, or starts a new session with only the task, the last messages and what changed: a shorter context.",
                 ))
                 .item(SettingItem::new("Delete archived tasks after", archive_keep).description(
-                    "Archives older than this are deleted, with their agent's conversation and any commits or changes in them that were never pushed.",
+                    "Archives older than this are deleted, along with their agent's conversation and any commits or changes in them that were never pushed.",
                 )),
         ).group(
             SettingGroup::new().title("Git in the background")
                 .item(SettingItem::new("Fetch the base branch", fetch).description(
-                    "Brings origin's main branch up to date in the background, so tasks show how far behind they are and what they share.",
+                    "Keeps origin's main branch up to date in the background, so each task can show how far behind it is.",
                 ))
                 .item(switch(
                     draft,
                     "Pull request status",
-                    "Ask gh about each task's PR and show it on the row.",
+                    "Asks gh about each task's pull request and shows its status on the task's row.",
                     |s| s.pr_status,
                     |s, v| s.pr_status = v,
                 )),
@@ -402,28 +402,28 @@ fn pages(
                 .item(switch(
                     draft,
                     "Unified diff",
-                    "The Changes tab starts with the old and the new one under the other, not side by side.",
+                    "The Changes tab opens with old and new lines one above the other instead of side by side.",
                     |s| s.diff_unified,
                     |s, v| s.diff_unified = v,
                 ))
                 .item(switch(
                     draft,
                     "Ignore whitespace",
-                    "Diffs leave out changes of spaces, tabs, line endings and blank lines, as GitHub's \"Hide whitespace\" does. A single change staged or reverted is then what is shown.",
+                    "Diffs hide changes to spaces, tabs, line endings and blank lines, like GitHub's \"Hide whitespace\". Staging or reverting a single change then applies only what you see.",
                     |s| s.diff_ignore_whitespace,
                     |s, v| s.diff_ignore_whitespace = v,
                 ))
                 .item(switch(
                     draft,
                     "Conflicts go to the agent",
-                    "A pull, rebase, cherry-pick or revert that would conflict changes nothing, and the agent's prompt gets the request to do it and resolve the conflicts. Off, you are only told.",
+                    "A pull, rebase, cherry-pick or revert that would conflict is not started; the agent is asked to do it and resolve the conflicts instead. When off, you are only told.",
                     |s| s.conflicts_to_agent,
                     |s, v| s.conflicts_to_agent = v,
                 ))
                 .item(switch(
                     draft,
                     "Reload the task's site after the agent's turn",
-                    "A Web tab showing the task's own site (a port of its services, or one its processes listen on) loads it again when the agent's turn ends. Other pages are left as they are. Off, when the site reloads by itself and should keep its state.",
+                    "A Web tab showing the task's own site (a port of its services, or one its processes listen on) reloads when the agent finishes a turn. Other pages are left alone. Turn it off if the site reloads by itself and should keep its state.",
                     |s| s.web_reload_after_turn,
                     |s, v| s.web_reload_after_turn = v,
                 )),
@@ -432,7 +432,7 @@ fn pages(
             SettingGroup::new().title("Servers").items(servers),
             SettingGroup::new().title("Sleep").item(
                 SettingItem::new("Sleep after (minutes)", idle)
-                    .description("A task out of view this long stops its language servers."),
+                    .description("A task you have not opened for this long stops its language servers. The task on screen stops them too when the app has been in the background this long and its agent is not working. They start again when you come back."),
             ),
         ]),
         SettingPage::new("Keys").default_open(true)
@@ -440,7 +440,7 @@ fn pages(
             .default_open(true)
             .groups(key_groups(draft, recording, catcher)),
         SettingPage::new("Spaces").default_open(true)
-            .description("Projects sorted into sets (work, personal, a client), one of them in the window at a time. The mark at the right of the title bar goes from one to another.")
+            .description("Projects sorted into sets (work, personal, a client); the window shows one set at a time. Switch with the mark at the right of the title bar.")
             .group(SettingGroup::new().item(
                 SettingItem::new(
                     "The spaces",
@@ -453,18 +453,18 @@ fn pages(
                         })
                     }),
                 )
-                .description("Add, name, mark and remove them. Which space a project is of is set from its menu in the sidebar."),
+                .description("Add, rename, mark or remove spaces. To put a project in a space, use the project's menu in the sidebar."),
             )),
         SettingPage::new("Presentation").default_open(true)
             .description(if cfg!(target_os = "macos") {
-                "For showing the window to others: View → Presentation Mode… leaves in it only the tasks you tick."
+                "For showing your screen to others: View → Presentation Mode… keeps only the tasks you tick in the window."
             } else {
-                "For showing the window to others: ☰ → Enter presentation mode leaves in it only the tasks you tick."
+                "For showing your screen to others: ☰ → Enter presentation mode keeps only the tasks you tick in the window."
             })
             .group(
                 SettingGroup::new().title("Shown larger").item(
                     SettingItem::new("Text size", present_zoom)
-                        .description("Files, diffs and terminals are drawn this much larger while presenting; the sizes you chose come back when it ends."),
+                        .description("Files, diffs and terminals are this much larger while presenting; your own sizes return when it ends."),
                 ),
             )
             .group(
@@ -472,21 +472,21 @@ fn pages(
                     .item(switch(
                         draft,
                         "Sidebar as a rail",
-                        "The tasks left in the window show as a narrow rail: the start of their names, the whole list when the pointer rests on it.",
+                        "The remaining tasks show as a narrow rail with the start of their names; rest the pointer on it to see the whole list.",
                         |s| s.present_rail,
                         |s, v| s.present_rail = v,
                     ))
                     .item(switch(
                         draft,
                         "Hide files git ignores",
-                        "A file git ignores (keys, local settings) is left out of the Files tree, and shows a notice in place of what it holds until you ask for it.",
+                        "Files git ignores (keys, local settings) are left out of the Files tree, and their contents are hidden behind a notice until you ask to see them.",
                         |s| s.present_veil,
                         |s, v| s.present_veil = v,
                     ))
                     .item(switch(
                         draft,
                         "Hide load and tokens",
-                        "The title bar's readouts are not shown while presenting.",
+                        "The title bar's load and token readouts are hidden while presenting.",
                         |s| s.present_hide_readouts,
                         |s, v| s.present_hide_readouts = v,
                     )),
@@ -589,45 +589,45 @@ fn agents_page(draft: &Draft, lsp_switch: SettingItem, token_warn: SettingField<
         choose = choose.item(SettingItem::new("Default agent", default_agent).description("New tasks run it, unless their project or the new-task dialog chooses another."));
         choose = choose.item(
             SettingItem::new("Agent for quick questions", quick_agent)
-                .description("Writes commit messages and judges variants: asked one question at a time, it answers and exits."),
+                .description("Writes commit messages and compares variants. It gets one question at a time, answers and exits."),
         );
     }
     SettingPage::new("Agents")
         .default_open(true)
         .description(if several {
-            "Each task runs one of these in its agent tab. A task's menu has Continue with another agent…; a project's menu chooses the agent of its new tasks."
+            "Each task runs one of these in its agent tab. To hand a task to another agent, use Continue with another agent… in its menu; a project's menu sets the agent for its new tasks."
         } else {
-            "The agent each task runs in its agent tab. With more than one, a task can be given any of them when it is made, and carried on by another."
+            "The agent each task runs in its agent tab. With more than one, you choose the agent when making a task, and can hand a task over to another later."
         })
         .group(SettingGroup::new().title("Profiles").item(list))
         .group(choose)
         .group(
             SettingGroup::new().title("Chat agents").item(
-                SettingItem::new("Out of view, an idle one stops after", {
+                SettingItem::new("Stop an idle one out of view after", {
                     let (read, write) = (draft.clone(), draft.clone());
                     SettingField::number_input(NumberFieldOptions { min: 0., max: 24. * 60., step: 5. }, move |_| f64::from(read.borrow().agent_idle_minutes), move |value, _| {
                         write.borrow_mut().agent_idle_minutes = value as u32
                     })
                     .default_value(f64::from(state::Settings::default().agent_idle_minutes))
                 })
-                .description("Minutes; 0 for never. A chat agent that is not working or asking, in a task out of view this long, is stopped to free its memory (hundreds of MB each). Its conversation stays; it starts again, going on with it, when the task is shown. Terminal agents run on."),
+                .description("Minutes; 0 means never. A chat agent that is neither working nor waiting for an answer, in a task you have not opened for this long, is stopped to free its memory (hundreds of MB each). Its conversation is kept, and it resumes when you open the task. Terminal agents keep running."),
             )
             .item(
-                SettingItem::new("A question nobody answers is declined after", {
+                SettingItem::new("Decline an unanswered question after", {
                     let (read, write) = (draft.clone(), draft.clone());
                     SettingField::number_input(NumberFieldOptions { min: 0., max: 24. * 60., step: 5. }, move |_| f64::from(read.borrow().agent_unanswered_minutes), move |value, _| {
                         write.borrow_mut().agent_unanswered_minutes = value as u32
                     })
                     .default_value(f64::from(state::Settings::default().agent_unanswered_minutes))
                 })
-                .description("Minutes; 0 for never. A chat agent goes on working when the window closes: what it asks then shows as a desktop notification, and waits for you. Set, it is declined after this long, and the agent goes on with something else."),
+                .description("Minutes; 0 means never. A chat agent keeps working after the window closes; its questions come as desktop notifications and wait for you. With a limit, a question is declined after this long and the agent moves on."),
             ),
         )
         .group(SettingGroup::new().title("Claude Code").item(lsp_switch))
         .group(
             SettingGroup::new().title("Tokens").item(
                 SettingItem::new("Tell me when a session has used", token_warn)
-                    .description("A notification, once for a session, when its agent has used this much: input not read from the cache, and output. The agent is not stopped."),
+                    .description("A notification, once per session, when its agent has used this many tokens: input not read from the cache, plus output. The agent is not stopped."),
             ),
         )
 }
@@ -639,7 +639,7 @@ fn kind_hint(kind: crate::agents::Kind) -> &'static str {
         Kind::Claude => "Reports through its hooks; each task resumes its own session by id. For a second account, set CLAUDE_CONFIG_DIR.",
         Kind::Codex => "Not tried live: its adapter follows Codex's source. Reports the end of each turn through notify and its approvals as terminal notifications; resumes a task's session by id. For a second account, set CODEX_HOME.",
         Kind::OpenCode => "Not tried live: its adapter follows OpenCode's source. Reports through a plugin ideae adds for the session (OPENCODE_CONFIG_CONTENT); resumes a task's session by id. Separate accounts: XDG_DATA_HOME.",
-        Kind::Generic => "Any program that runs in a terminal. What it does is guessed from its terminal: it works while it writes, and is done once quiet, or when it rings the bell.",
+        Kind::Generic => "Any program that runs in a terminal. Its state is guessed from its output: working while it writes, done when it goes quiet or rings the bell.",
     }
 }
 
@@ -914,11 +914,11 @@ fn profile_dialog(draft: Draft, at: Option<usize>, template: Option<crate::agent
                                         window.refresh();
                                     })),
                             )
-                            .child(div().text_xs().text_color(muted).child("What you chose last in its chat (model, effort, mode): every new session starts with it."))
+                            .child(div().text_xs().text_color(muted).child("The model, effort and mode you last picked in its chat; every new session starts with them."))
                         })
                         .when(as_chat, |this| {
                             this.child(div().text_xs().text_color(muted).child(
-                                "Its conversation shows in a chat, not a terminal: messages, tool calls with their changes, questions with buttons. It goes on working when the window closes.",
+                                "Its conversation shows as a chat instead of a terminal: messages, tool calls with their changes, questions with buttons. It keeps working after the window closes.",
                             ))
                         })
                         .child(h_flex().gap_2().items_center().child(label("Name")).child(div().flex_1().child(Input::new(&name))))
@@ -946,7 +946,7 @@ fn profile_dialog(draft: Draft, at: Option<usize>, template: Option<crate::agent
                                         }),
                                 )
                                 .child(div().w(px(90.)).flex_none().child(Input::new(&mark)))
-                                .child(div().flex_1().min_w_0().text_xs().text_color(muted).child("On its tasks: a letter or a few, and a color (click the mark), to tell two of one agent apart: work, personal."))
+                                .child(div().flex_1().min_w_0().text_xs().text_color(muted).child("A letter or a few and a color (click the mark), shown on its tasks to tell two profiles of one agent apart, such as work and personal."))
                         })
                         .child(h_flex().gap_2().items_center().child(label("Command")).child(div().flex_1().child(Input::new(&command))))
                         .child(div().text_xs().text_color(muted).child(if as_chat {
@@ -964,10 +964,10 @@ fn profile_dialog(draft: Draft, at: Option<usize>, template: Option<crate::agent
                         })
                         .when(as_chat, |this| {
                             this.child(h_flex().gap_2().items_center().child(label("Daily limit, $")).child(div().w(px(120.)).child(Input::new(&limit))).child(div().text_xs().text_color(muted).child(if spent > 0.0 { format!("${spent:.2} today") } else { String::new() })))
-                                .child(div().text_xs().text_color(muted).child("Its turn is stopped once its sessions cost this much today (UTC), by the cost the agent reports: Claude Code's adapter reports it; agents that report none are not held."))
+                                .child(div().text_xs().text_color(muted).child("Its turn is stopped once its sessions cost this much today (UTC), going by the cost the agent reports. Claude Code's adapter reports it; agents that report nothing are not limited."))
                         })
                         .child(h_flex().gap_2().items_start().child(label("Environment")).child(div().flex_1().child(Textarea::new(&env))))
-                        .child(div().text_xs().text_color(muted).child("For the agent alone. Another account of the same agent is another profile with its own config folder here. Keys and tokens (…_KEY, …_TOKEN) are kept sealed for this machine, not in the settings; $(pass show anthropic) takes one from a password manager when the agent starts.")),
+                        .child(div().text_xs().text_color(muted).child("For this agent only. A second account of the same agent is another profile with its own config folder set here. Keys and tokens (…_KEY, …_TOKEN) are kept sealed on this machine, not in the settings; $(pass show anthropic) takes one from a password manager when the agent starts.")),
                 )
             })
             .footer(h_flex().justify_end().gap_2().child(Button::new("agent-cancel").ghost().label("Cancel").on_click(|_, window, cx| window.close_dialog(cx))).child(

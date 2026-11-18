@@ -678,6 +678,11 @@ impl Render for ChangesView {
                         &files,
                         "changes-file-list",
                         Diff::new(&self.diff)
+                            .binary_content({
+                                // Uncommitted or the branch: the after side of a change not staged is the worktree's file.
+                                let root = self.root.clone();
+                                move |file, split, window, cx| crate::image_diff::render(file, split, &root, true, window, cx)
+                            })
                             .annotations(
                                 notes
                                     .iter()

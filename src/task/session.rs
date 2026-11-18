@@ -293,10 +293,11 @@ impl TaskView {
     }
 }
 
-pub(super) const ASLEEP: &str = "language server asleep: task out of view";
+pub(super) const ASLEEP: &str = "language server asleep: the task or the window was left a while ago";
 
 impl TaskView {
-    /// Stops the language servers of a task out of view; they cost
+    /// Stops the language servers of a task out of view, or of the one in
+    /// view in a window left long ago; they cost
     /// gigabytes each, and reindexing on the way back takes a minute or two.
     pub fn put_language_servers_to_sleep(&mut self, cx: &mut Context<Self>) {
         if self.lsp_asleep {

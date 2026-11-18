@@ -189,6 +189,9 @@ impl DiffAnnotation {
 
 type FileRenderer = Rc<dyn Fn(&DiffFile, &mut Window, &mut App) -> AnyElement>;
 type AnnotationRenderer = Rc<dyn Fn(&DiffAnnotation, &mut Window, &mut App) -> AnyElement>;
+/// ideae patch: what a binary file shows in place of the notice, told whether
+/// the diff is side by side; None keeps the notice.
+type BinaryRenderer = Rc<dyn Fn(&DiffFile, bool, &mut Window, &mut App) -> Option<AnyElement>>;
 type RangeHandler = Rc<dyn Fn(&DiffLineRange, &mut Window, &mut App)>;
 type ClickHandler = Rc<dyn Fn(&DiffLinePosition, &ClickEvent, &mut Window, &mut App)>;
 type HoverHandler = Rc<dyn Fn(Option<&DiffLinePosition>, &mut Window, &mut App)>;
@@ -239,6 +242,7 @@ pub struct Diff {
     header: HeaderSlots,
     annotations: Rc<Annotations>,
     annotation_content: Option<AnnotationRenderer>,
+    binary_content: Option<BinaryRenderer>,
     on_add_annotation: Option<RangeHandler>,
     on_line_click: Option<ClickHandler>,
     on_line_hover: Option<HoverHandler>,
@@ -269,6 +273,7 @@ impl Diff {
             header: HeaderSlots::default(),
             annotations: Rc::default(),
             annotation_content: None,
+            binary_content: None,
             on_add_annotation: None,
             on_line_click: None,
             on_line_hover: None,
@@ -383,6 +388,15 @@ impl Diff {
         self
     }
     /// Inserts trailing content after the change statistics in the default header.
+    /// ideae patch: what a binary file shows instead of saying it is binary
+    /// (an image's two versions); told whether the diff is side by side.
+    pub fn binary_content<F>(mut self, render: F) -> Self
+    where
+        F: Fn(&DiffFile, bool, &mut Window, &mut App) -> Option<AnyElement> + 'static,
+    {
+        self.binary_content = Some(Rc::new(render));
+        self
+    }
     pub fn render_header_suffix<F, E>(mut self, render: F) -> Self
     where
         F: Fn(&DiffFile, &mut Window, &mut App) -> E + 'static,
@@ -581,6 +595,7 @@ fn render_diff(
         header: props.header,
         annotations: props.annotations.clone(),
         annotation_content: props.annotation_content,
+        binary_content: props.binary_content,
         on_add_annotation: props.on_add_annotation,
         on_line_click: props.on_line_click,
         on_line_hover: props.on_line_hover,
@@ -859,6 +874,7 @@ struct CodePresentation {
     header: HeaderSlots,
     annotations: Rc<Annotations>,
     annotation_content: Option<AnnotationRenderer>,
+    binary_content: Option<BinaryRenderer>,
     on_add_annotation: Option<RangeHandler>,
     on_line_click: Option<ClickHandler>,
     on_line_hover: Option<HoverHandler>,
@@ -970,7 +986,12 @@ fn render_row(
 ) -> AnyElement {
     match row {
         DisplayRow::File(file) => render_file_header(*file, None, &code, window, cx),
-        DisplayRow::Notice(file) => render_notice(&code.files[*file], cx),
+        DisplayRow::Notice(file) => {
+            // ideae patch: a binary file the application can show.
+            // As wide as the view, not as the widest line: unified rows are wider, and a picture centred in one goes off the right edge.
+            let shown = code.files[*file].is_binary().then(|| code.binary_content.clone()).flatten().and_then(|render| render(&code.files[*file], code.mode == DiffMode::Split, window, cx));
+            shown.map(|shown| div().w(code.viewport_width).child(shown).into_any_element()).unwrap_or_else(|| render_notice(&code.files[*file], cx))
+        }
         DisplayRow::Hunk { file, hunk } => render_hunk_separator(*file, *hunk, &code, window, cx),
         DisplayRow::Fold { file, pairs } => render_fold(*file, pairs.clone(), &code, cx),
         DisplayRow::Conflict {

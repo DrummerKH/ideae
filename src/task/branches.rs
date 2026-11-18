@@ -215,7 +215,8 @@ impl TaskView {
         if files.is_empty() {
             return window.push_notification(Notification::info(format!("{what}: nothing differs.")), cx);
         }
-        let view = cx.new(|cx| DiffTab::new(what, files, source, cx));
+        let root = self.root.clone();
+        let view = cx.new(|cx| DiffTab::new(what, root, files, source, cx));
         if let Some(ix) = self.tabs.iter().position(|t| matches!(t.kind, TabKind::Diff(_)) && t.title.as_ref() == label) {
             self.tabs[ix].kind = TabKind::Diff(view);
             return self.activate(ix, window, cx);

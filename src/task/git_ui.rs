@@ -621,6 +621,9 @@ impl TaskView {
                 let (viewed_view, viewed_path) = (view.clone(), menu_path.clone());
                 let (discard_view, discard_path) = (view.clone(), menu_path.clone());
                 let (absolute, relative) = (open_path.to_string_lossy().to_string(), menu_path.clone());
+                let (system_path, reveal_path) = (open_path.clone(), open_path.clone());
+                let (terminal_view, here) = (view.clone(), open_path.parent().map(PathBuf::from).unwrap_or_default());
+                let (compare_view, compare_path) = (view.clone(), menu_path.clone());
                 menu.item(PopupMenuItem::new(if in_staged { "Unstage" } else { "Stage" }).on_click(move |_, window, cx| {
                     let path = stage_path.clone();
                     stage_view.update(cx, |this, cx| this.stage_paths(vec![path], !in_staged, window, cx)).ok();
@@ -632,6 +635,17 @@ impl TaskView {
                     menu.item(PopupMenuItem::new("Open").on_click(move |_, window, cx| {
                         let path = open_path.clone();
                         open_view.update(cx, |this, cx| this.open_file(path, open_line, window, cx)).ok();
+                    }))
+                    .item(PopupMenuItem::new("Open in the system app").on_click(move |_, _, cx| cx.open_with_system(&system_path)))
+                    .separator()
+                    .item(PopupMenuItem::new("Reveal in file manager").on_click(move |_, _, cx| super::file_tree::reveal(reveal_path.clone(), false, cx)))
+                    .item(PopupMenuItem::new("Open terminal here").on_click(move |_, window, cx| {
+                        let here = here.clone();
+                        let _ = terminal_view.update(cx, |task, cx| task.new_terminal_in(here, window, cx));
+                    }))
+                    .item(PopupMenuItem::new("Compare with…").on_click(move |_, window, cx| {
+                        let path = compare_path.clone();
+                        let _ = compare_view.update(cx, |task, cx| task.compare_with_dialog(Some(path), window, cx));
                     }))
                 })
                 .separator()

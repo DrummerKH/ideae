@@ -891,6 +891,11 @@ impl Render for HistoryView {
                             "commit-file-list",
                             // Wrapped: unwrapped rows lose the vertical scrollbar here.
                             Diff::new(&self.diff)
+                                .binary_content({
+                                    // A commit's two sides are both in git.
+                                    let root = self.root.clone();
+                                    move |file, split, window, cx| crate::image_diff::render(file, split, &root, false, window, cx)
+                                })
                                 .line_number(true)
                                 .soft_wrap(true)
                                 // The size of the Changes tab's diff: Ctrl+wheel there and the presentation's size reach this one too.

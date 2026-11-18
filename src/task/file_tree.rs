@@ -434,7 +434,7 @@ type MadeIt = Rc<dyn Fn(&mut TaskView, PathBuf, &mut Window, &mut Context<TaskVi
 
 /// Shows `path` in the system's file manager: the folder, or the folder
 /// of the file (on Windows and macOS with the file picked).
-fn reveal(path: PathBuf, folder: bool, cx: &mut App) {
+pub(super) fn reveal(path: PathBuf, folder: bool, cx: &mut App) {
     cx.background_spawn(crate::procs::on_thread(move || {
         #[cfg(target_os = "macos")]
         let mut command = {

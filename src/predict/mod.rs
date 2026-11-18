@@ -167,6 +167,11 @@ impl CompletionProvider for Provider {
 
     fn edit_prediction(&self, text: &Rope, cursor: usize, _: InlineCompletionContext, window: &mut Window, cx: &mut App) -> Task<anyhow::Result<Option<EditPrediction>>> {
         let none = || Task::ready(Ok(None));
+        // Debug aid for screenshots: IDEAE_PREDICT_GHOST="text" is the suggestion, no model asked.
+        if let Some(ghost) = std::env::var("IDEAE_PREDICT_GHOST").ok().filter(|g| !g.is_empty()) {
+            let item = InlineCompletionItem { range: None, insert_text: ghost, filter_text: None, command: None, insert_text_format: None };
+            return Task::ready(Ok(Some(EditPrediction { ghost: Some(item), ..EditPrediction::default() })));
+        }
         match crate::state::with_settings(|s| s.edit_prediction) {
             None => {
                 offer(window, cx);

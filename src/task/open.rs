@@ -29,11 +29,18 @@ impl TaskView {
             return;
         }
 
+        if let Some((kind, _)) = crate::image_diff::kind(&path) {
+            let title = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let size = std::fs::metadata(&path).map(|m| super::helpers::human_size(m.len())).unwrap_or_default();
+            let view = cx.new(|_| BinaryView { path: path.clone(), reason: format!("{kind} image, {size}"), image: true });
+            self.place_tab(TabItem::new(title, TabKind::Binary(view)), how, window, cx);
+            return;
+        }
         let content = match read_text(&path) {
             Ok(content) => content,
             Err(reason) => {
                 let title = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let view = cx.new(|_| BinaryView { path: path.clone(), reason });
+                let view = cx.new(|_| BinaryView { path: path.clone(), reason, image: false });
                 self.place_tab(TabItem::new(title, TabKind::Binary(view)), how, window, cx);
                 return;
             }

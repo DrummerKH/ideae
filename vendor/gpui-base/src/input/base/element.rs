@@ -598,6 +598,8 @@ impl<M: InputModeKind> TextElement<M> {
         let mut scroll_offset = state.scroll_handle.offset();
         let mut current_row = None;
         let mut resize_reveal_owned = false;
+        // ideae patch: a jump placed its line; the cursor's own scroll to an edge does not undo it.
+        let mut revealed = false;
         let mut cursor_infos: Vec<CursorRenderInfo> = Vec::with_capacity(state.selections.len());
 
         // Padding kept between the cursor and the viewport's top/bottom
@@ -776,7 +778,10 @@ impl<M: InputModeKind> TextElement<M> {
                     let margin = if state.sticky_scopes.is_empty() { top_bottom_margin } else { top_bottom_margin.max(line_height * 3.) };
                     let comfortable = top >= margin && top + line_height <= height * 0.75;
                     if !comfortable {
-                        scroll_offset.y = -(cursor_pos.y - (height * fraction).round());
+                        revealed = true;
+                        // On a whole line: else the line under the sticky ones shows cut in half.
+                        let at = ((height * fraction) / line_height).floor() * line_height;
+                        scroll_offset.y = -(cursor_pos.y - at);
                     }
                 }
             }
@@ -797,7 +802,12 @@ impl<M: InputModeKind> TextElement<M> {
         }
 
         if let Some(deferred_scroll_offset) = state.deferred_scroll_offset {
-            scroll_offset = deferred_scroll_offset;
+            // A jump keeps the height it chose; across, the cursor is still followed.
+            if revealed {
+                scroll_offset.x = deferred_scroll_offset.x;
+            } else {
+                scroll_offset = deferred_scroll_offset;
+            }
         }
         scroll_offset.x = clamp_horizontal_scroll_offset(
             scroll_offset.x,
@@ -3957,8 +3967,6 @@ impl<M: InputModeKind> Element for TextElement<M> {
             let gutter = prepaint.last_layout.line_number_width;
             // The padding above too: text scrolls under it.
             window.paint_quad(fill(Bounds::new(input_bounds.origin, size(input_bounds.size.width, editor_paddings.top)), editor_background));
-            // The padding above too: text scrolls under it.
-            window.paint_quad(fill(Bounds::new(input_bounds.origin, size(input_bounds.size.width, editor_paddings.top)), editor_background));
             for (row, (line, shaped, number)) in prepaint.sticky.iter().enumerate() {
                 let y = top + line_height * row as f32;
                 let row_bounds = Bounds::new(point(input_bounds.origin.x, y), size(input_bounds.size.width, line_height));
@@ -3972,7 +3980,20 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 }
                 sticky_hits.push((row_bounds, *line));
             }
-            let bottom = top + line_height * prepaint.sticky.len() as f32;
+            let mut bottom = top + line_height * prepaint.sticky.len() as f32;
+            // Down to where a line of the text begins: the sticky lines start below the
+            // padding and the text's lines do not, and the line under them would show cut.
+            let first = origin.y + prepaint.last_layout.visible_top;
+            if line_height > px(0.) && bottom > first {
+                let past = (bottom - first) % line_height;
+                if past > px(0.5) {
+                    let cover = line_height - past;
+                    window.paint_quad(fill(Bounds::new(point(input_bounds.origin.x, bottom), size(input_bounds.size.width, cover)), editor_background));
+                    let gutter_bg = editor_style.editor_gutter_background.unwrap_or(editor_background);
+                    window.paint_quad(fill(Bounds::new(point(input_bounds.origin.x, bottom), size(gutter, cover)), gutter_bg));
+                    bottom += cover;
+                }
+            }
             window.paint_quad(fill(Bounds::new(point(input_bounds.origin.x, bottom - px(1.)), size(input_bounds.size.width, px(1.))), editor_style.border.opacity(0.85)));
             // The press is kept from the text below; the release jumps.
             let hits = sticky_hits.clone();

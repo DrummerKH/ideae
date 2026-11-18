@@ -116,11 +116,32 @@ pub(crate) enum FrontTab {
 pub struct BinaryView {
     path: PathBuf,
     reason: String,
+    /// Shown as a picture, fit in the tab, with what it is below.
+    image: bool,
 }
 
 impl Render for BinaryView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let path = self.path.clone();
+        if self.image {
+            return v_flex()
+                .size_full()
+                .p_4()
+                .gap_2()
+                .items_center()
+                .child(
+                    div().flex_1().min_h_0().w_full().flex().items_center().justify_center().child(
+                        img(self.path.clone()).size_full().object_fit(gpui::ObjectFit::ScaleDown),
+                    ),
+                )
+                .child(
+                    h_flex()
+                        .gap_3()
+                        .items_center()
+                        .child(div().text_sm().text_color(cx.theme().muted_foreground).child(self.reason.clone()))
+                        .child(Button::new("open-system").xsmall().ghost().label("Open in the system app").on_click(move |_, _, cx| cx.open_with_system(&path))),
+                );
+        }
         v_flex()
             .size_full()
             .items_center()

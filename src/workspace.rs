@@ -195,6 +195,8 @@ pub struct Workspace {
     pub(crate) peek_moved: std::time::Instant,
     /// Told that the battery runs low, this time it runs down.
     battery_told: bool,
+    /// When the window last lost the keyboard; None while it has it.
+    window_left: Option<std::time::Instant>,
     /// In the GNOME dash; asked once, not while the menu opens.
     /// How the app stands with the desktop, and whether it was told once that it is not listed there.
     pub desk: crate::desktop::Standing,
@@ -420,8 +422,15 @@ impl Workspace {
             cx.observe_window_activation(window, |this: &mut Self, window, cx| {
                 this.looked_at_in_view(window, cx);
                 if !window.is_window_active() {
+                    this.window_left.get_or_insert_with(std::time::Instant::now);
                     for view in this.views() {
                         view.update(cx, |t, cx| t.autosave_all(cx));
+                    }
+                } else {
+                    this.window_left = None;
+                    // Back at the window: the task in view has its servers again.
+                    if let Some(view) = this.active_view() {
+                        view.update(cx, |t, cx| t.wake_language_servers(cx));
                     }
                 }
             }),
@@ -589,6 +598,7 @@ impl Workspace {
             peek_hovered: false,
             peek_moved: std::time::Instant::now(),
             battery_told: false,
+            window_left: None,
             desk: Default::default(),
             told_unlisted: saved.told_unlisted,
             search: {
@@ -751,6 +761,8 @@ impl Workspace {
                         // A key alone is also the character it types.
                         if key.chars().count() == 1 {
                             stroke.key_char = Some(key.to_string());
+                        } else if key == "space" {
+                            stroke.key_char = Some(" ".to_string());
                         }
                         let handled = cx.update(|window, cx| window.dispatch_keystroke(stroke, cx));
                         if std::env::var_os("IDEAE_DEBUG").is_some() {
@@ -778,12 +790,20 @@ impl Workspace {
         }
         // Debug aid for runs nobody clicks in: IDEAE_NEW_TASK="title\nprompt"
         // starts a task in the first project, in IDEAE_VARIANTS variants.
-        if let (Ok(task), false) = (std::env::var("IDEAE_NEW_TASK"), this.projects.is_empty()) {
-            let (title, prompt) = task.split_once('\n').unwrap_or((task.as_str(), ""));
-            let variants = std::env::var("IDEAE_VARIANTS").ok().and_then(|n| n.parse::<usize>().ok()).unwrap_or(1).clamp(1, variants::MOST);
-            // IDEAE_AGENTS="claude,codex": the agent of each, by profile id.
-            let agents = std::env::var("IDEAE_AGENTS").map(|a| a.split(',').map(|id| id.trim().to_string()).collect()).unwrap_or_default();
-            this.create_task(0, title.trim().to_string(), prompt.trim().to_string(), vec![String::new(); variants], agents, window, cx);
+        // Several are parted by a line "---"; "project: title" puts one in
+        // the project of that name.
+        if let (Ok(tasks), false) = (std::env::var("IDEAE_NEW_TASK"), this.projects.is_empty()) {
+            for task in tasks.split("\n---\n") {
+                let (title, prompt) = task.split_once('\n').unwrap_or((task, ""));
+                let (project, title) = match title.split_once(": ") {
+                    Some((name, rest)) if let Some(pi) = this.projects.iter().position(|p| p.name == name.trim()) => (pi, rest),
+                    _ => (0, title),
+                };
+                let variants = std::env::var("IDEAE_VARIANTS").ok().and_then(|n| n.parse::<usize>().ok()).unwrap_or(1).clamp(1, variants::MOST);
+                // IDEAE_AGENTS="claude,codex": the agent of each, by profile id.
+                let agents = std::env::var("IDEAE_AGENTS").map(|a| a.split(',').map(|id| id.trim().to_string()).collect()).unwrap_or_default();
+                this.create_task(project, title.trim().to_string(), prompt.trim().to_string(), vec![String::new(); variants], agents, window, cx);
+            }
         }
         this
     }
@@ -1321,6 +1341,15 @@ impl Workspace {
         for view in self.views() {
             view.update(cx, |t, cx| t.drop_unused_language_servers(Self::lsp_idle(), cx));
         }
+        // The window left as long: the task in view sleeps too, a rust-analyzer
+        // holds gigabytes for nobody. Not while its agent works: it may ask them of problems.
+        if self.window_left.is_some_and(|left| left.elapsed() >= Self::lsp_idle())
+            && let Some(view) = self.active_view()
+            && !view.read(cx).agent_busy()
+            && view.read(cx).has_language_servers()
+        {
+            view.update(cx, |t, cx| t.put_language_servers_to_sleep(cx));
+        }
         for p in &self.projects {
             for t in &p.tasks {
                 let (Some(view), Some(left)) = (&t.view, t.left_view) else { continue };
@@ -1787,7 +1816,9 @@ impl Workspace {
                         // To its own agent: the task in view is another when the switch did not happen.
                         let view = this.entry_mut(&path).and_then(|entry| entry.view.clone());
                         if let (false, Some(view)) = (prompt.is_empty(), view) {
-                            view.update(cx, |t, cx| t.queue_prompt(prompt, false, window, cx));
+                            // A run of IDEAE_NEW_TASK has nobody to press Enter: its prompts are sent.
+                            let send = std::env::var_os("IDEAE_NEW_TASK").is_some();
+                            view.update(cx, |t, cx| t.queue_prompt(prompt, send, window, cx));
                         }
                     }
                     Err(e) => {

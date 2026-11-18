@@ -20,6 +20,7 @@ mod graph;
 mod indent;
 mod grammars;
 mod history;
+mod image_diff;
 mod ide;
 mod keymap;
 mod keys;

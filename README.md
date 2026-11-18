@@ -1,12 +1,36 @@
 # ideae
 
-An IDE in the agentic era: one window for running AI coding agents
-(Claude Code by default), one task per git worktree.
+**An IDE for running AI coding agents side by side.** Each task gets its own
+git worktree and its own agent, Claude Code by default. You see at a glance
+which agent is working, which one is waiting for you and which one is done.
+When you are ready, review its diff and commit, push or open a pull request
+without leaving the window.
 
-Every task gets the agent in a terminal, more terminals, an editor, the diff
-of its changes, git history and a browser tab, and keeps all of it while you
-switch between tasks. Linux, macOS (Apple Silicon) and Windows; early, and
-moving fast.
+![Five tasks in three projects: one agent done, one working, one asking](docs/images/tasks.png)
+
+Native (Rust and [GPUI](https://www.gpui.rs)), for Linux, macOS (Apple
+Silicon) and Windows. Early, and moving fast.
+
+## Why
+
+- **Agents don't trip over each other.** A task title becomes a branch and a
+  worktree. Five agents can work on one repository at once, each in its own
+  checkout, with its own terminals and services on its own ports.
+- **You know who needs you.** The sidebar puts the tasks that are waiting or
+  done at the top, with the agent's question or the start of its answer.
+  An agent that finishes while you look elsewhere sends a notification.
+- **Nothing is lost when you switch.** Each task keeps its agent, terminals,
+  open files, diffs and browser tabs. On Linux and macOS, terminals and
+  agents keep running when the window closes, and through an update of the
+  app.
+- **Review is part of the loop.** The task's changes sit beside the agent:
+  stage or revert single changes, comment, commit, push, open a PR. A pull
+  that would conflict can go to the agent to resolve.
+- **It stays light.** Language servers and browsers of tasks you are not
+  looking at go to sleep; a task you are done with is archived with its
+  conversation and comes back weeks later where it was.
+
+![The task's changes, side by side](docs/images/changes.png)
 
 ## Install
 
@@ -31,34 +55,38 @@ Claude Code and git should be installed.
 ## What it does
 
 - **Tasks.** A title becomes a branch and a worktree, with the agent started
-  in it. The sidebar shows which agents work, wait for you or are done, and
-  tells you when one out of view wants you.
-- **Archive.** A task that is done is archived with its agent's
-  conversation and any work on no remote; restored weeks later, the agent
-  goes on with the same conversation in a fresh worktree.
+  in it. Star the ones you care about; pause one to free what it holds.
 - **Variants.** One prompt to up to four agents at once, compared side by
   side, with a judge to say which to keep.
-- **[Agents](docs/agents.md)**: Claude Code by default; Codex, OpenCode or any
+- **[Agents](docs/agents.md).** Claude Code by default; Codex, OpenCode or any
   program as profiles (two accounts of one agent too), chosen per project,
-  task or variant, and a task carried on by another agent.
-- **[Chat agents](docs/agents.md#chat-agents-acp)**: any agent that speaks the
-  Agent Client Protocol (Gemini, Kimi, Qwen, OpenCode, Codex's and Claude
-  Code's adapters, the ACP registry's) as a chat instead of a terminal: tool
-  calls with their diffs, questions answered with a key or by the app's
-  rules, its model and effort, the files before each prompt to go back to,
-  ideae's own tools (open files, problems, the check) for its task, a daily
-  cost limit, keys kept sealed.
-- **Editor.** Tree-sitter highlighting, language servers (installed on
-  request), go to definition and usages, rename, fixes, sticky scroll,
-  replace in files, git blame in the gutter, bookmarks.
-- **Git.** Changes by file and by hunk, commit, push, pull requests, a pull
-  that warns before conflicting, branches, history, stashes.
-- **Terminals** that outlive the window, and **browser tabs** whose elements
-  can be picked for the agent.
-- **[Project settings](docs/services.md)**: a setup for each new worktree, a
-  check after each turn of its agent, a teardown, and services each task runs
+  task or variant. A task can be handed over to another agent.
+- **[Chat agents](docs/agents.md#chat-agents-acp).** Any agent that speaks the
+  Agent Client Protocol (Gemini, Kimi, Qwen, OpenCode, the adapters for Codex
+  and Claude Code, the agents of the ACP registry) runs as a chat: tool calls
+  with their diffs, questions answered with a key or by your rules, the
+  files before each prompt to go back to, a daily cost limit, keys kept
+  sealed. The agent can ask ideae for its task's open files, problems and
+  check results.
+- **Editor.** Tree-sitter highlighting, language servers installed on
+  request, go to definition and usages, rename, fixes, inline hints, sticky
+  scroll, replace in files, blame, bookmarks, and edit prediction from a local
+  model if you want it.
+- **Git.** Changes as a tree or a list, by file and by hunk, commit, amend,
+  undo the last commit, push, pull requests and their checks, branches,
+  history, stashes.
+- **Web tabs.** A Chrome per task shown in a tab, with DevTools; its own site
+  reloads after the agent's turn, and an element can be picked for the
+  agent.
+- **[Project settings](docs/services.md).** A setup for each new worktree, a
+  check after each turn of the agent, a teardown, and services each task runs
   on ports of its own.
-- Themes, spaces for sorting projects, a presentation mode.
+- Spaces to sort projects into (work, personal), a presentation mode, power
+  save mode, themes.
+
+![A file being edited: types from rust-analyzer in the code, a suggestion from the local model in gray, the Files panel](docs/images/editor.png)
+
+![An agent waits for permission; its question is in the sidebar too](docs/images/asking.png)
 
 More in [docs/features.md](docs/features.md); notes for each system in
 [docs/platforms.md](docs/platforms.md).
