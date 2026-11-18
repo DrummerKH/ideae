@@ -6,6 +6,17 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# The browser's two tests need a Chrome, and pass without running where
+# there is none: said here, where a passing test's own words are not shown.
+chrome="${IDEAE_CHROME:-}"
+for app in "Google Chrome" Chromium "Microsoft Edge"; do
+  [ -d "/Applications/$app.app" ] && chrome=$app
+done
+for program in google-chrome google-chrome-stable chromium chromium-browser; do
+  command -v "$program" >/dev/null 2>&1 && chrome=$program
+done
+[ -n "$chrome" ] || echo "no Chrome or Chromium here: the browser's tests are skipped (name one in IDEAE_CHROME)" >&2
+
 cargo build
 cargo test
 cargo test -- --ignored \

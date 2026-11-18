@@ -3710,10 +3710,23 @@ mod tests {
     /// What headless Chrome would show nowhere or keep to itself comes to
     /// the tab: a dialog, a select's list, the cursor, the page's errors, a
     /// page it opens, its title and the address of a page of an app.
+    /// A machine with no Chrome cannot run these, and says so: the check
+    /// before a push goes on with the rest instead of ending there.
+    fn no_chrome() -> bool {
+        let none = std::env::var_os("IDEAE_CHROME").is_none() && find_chrome().is_none();
+        if none {
+            eprintln!("SKIPPED: no Chrome or Chromium here (name one in IDEAE_CHROME)");
+        }
+        none
+    }
+
     /// Needs Chrome: `cargo test -- --ignored a_page_tells_the_tab`.
     #[core::prelude::v1::test]
     #[ignore]
     fn a_page_tells_the_tab() {
+        if no_chrome() {
+            return;
+        }
         let root = std::env::temp_dir().join(format!("ideae-web-test-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let owner = Owner::Task(root.clone());
@@ -3905,6 +3918,9 @@ mod tests {
     #[core::prelude::v1::test]
     #[ignore]
     fn a_task_s_browser_wakes_when_called() {
+        if no_chrome() {
+            return;
+        }
         let root = std::env::temp_dir().join(format!("ideae-wake-test-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let owner = Owner::Task(root.clone());

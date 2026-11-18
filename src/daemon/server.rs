@@ -868,8 +868,9 @@ mod tests {
         assert!(matches!(proto::read_frame(&mut flooded), Ok(Frame::Msg(Msg::Welcome { .. }))));
         let spec = Spec { cwd: dir.clone(), env: Vec::new(), input: None, program: vec!["yes".into(), "0123456789012345678901234567890123456789".into()] };
         proto::write_msg(&mut flooded, &Msg::Open { id: "pipe-flood".into(), spec, size }).unwrap();
-        std::thread::sleep(Duration::from_secs(1) + CLIENT_STALL + Duration::from_secs(2));
+        // Set while the daemon still holds the other end: macOS refuses it (EINVAL) on a socket that end has let go of, which is what is waited for here.
         flooded.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        std::thread::sleep(Duration::from_secs(1) + CLIENT_STALL + Duration::from_secs(2));
         let (mut waited, mut closed) = (0usize, false);
         loop {
             match flooded.read(&mut chunk) {

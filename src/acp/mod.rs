@@ -168,10 +168,10 @@ mod tests {
     /// The app itself, built next to the tests: `cargo build` first.
     #[cfg(unix)]
     fn app_binary() -> std::path::PathBuf {
+        // Above the tests' own folder, however deep cargo keeps that: `target/debug/deps` once, `target/debug/build/<crate>/<hash>/deps` since.
         let exe = std::env::current_exe().unwrap();
-        let bin = exe.parent().and_then(|deps| deps.parent()).unwrap().join("ideae");
-        assert!(bin.exists(), "{} is not built: cargo build first", bin.display());
-        bin
+        let bin = exe.ancestors().skip(1).map(|above| above.join("ideae")).find(|bin| bin.is_file());
+        bin.unwrap_or_else(|| panic!("no ideae above {}: cargo build first", exe.display()))
     }
 
     /// A chat's agent through an upgrade of the daemon: the real app's
