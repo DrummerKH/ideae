@@ -18,7 +18,7 @@ impl TaskView {
             .tabs
             .iter()
             .map(|tab| {
-                let mut s = TabSession { right: tab.right, preview: tab.preview, pinned: tab.pinned, ..Default::default() };
+                let mut s = TabSession { right: tab.pane.right, below: tab.pane.below, preview: tab.preview, pinned: tab.pinned, ..Default::default() };
                 match &tab.kind {
                     // The task's first terminal: the agent, or the shell without one.
                     TabKind::Terminal(_) if tab.title == "agent" || tab.title == "shell" => s.kind = "agent".into(),
@@ -55,9 +55,12 @@ impl TaskView {
         let index = |id: Option<usize>| id.and_then(|id| self.ix_of(id));
         TaskSession {
             tabs,
-            left_active: index(Some(self.left_active)),
-            right_active: index(self.right_active),
-            focus_right: self.focus_right,
+            left_active: index(self.active[0]),
+            left_below_active: index(self.active[1]),
+            right_active: index(self.active[2]),
+            right_below_active: index(self.active[3]),
+            focus_right: self.current.right,
+            focus_below: self.current.below,
             expanded: self.expanded.iter().map(|e| e.to_string()).collect(),
             review: self.changes.read(cx).review.clone(),
             viewed: self.viewed.clone(),
@@ -108,18 +111,20 @@ impl TaskView {
             }
             let new = self.tabs.iter_mut().find(|t| !before.contains(&t.id));
             ids.push(new.map(|tab| {
-                tab.right = saved.right;
+                tab.pane = Pane { right: saved.right, below: saved.below };
                 tab.preview = saved.preview;
                 tab.pinned = saved.pinned;
                 tab.id
             }));
         }
         let pick = |ix: Option<usize>| ix.and_then(|ix| ids.get(ix).copied().flatten());
-        if let Some(id) = pick(session.left_active) {
-            self.left_active = id;
+        let picked = [session.left_active, session.left_below_active, session.right_active, session.right_below_active].map(pick);
+        for (shown, id) in self.active.iter_mut().zip(picked) {
+            if id.is_some() {
+                *shown = id;
+            }
         }
-        self.right_active = pick(session.right_active);
-        self.focus_right = session.focus_right;
+        self.current = Pane { right: session.focus_right, below: session.focus_below };
         self.normalize();
         self.expanded = session.expanded.iter().map(|e| SharedString::from(e.clone())).collect();
         self.viewed = session.viewed.clone();

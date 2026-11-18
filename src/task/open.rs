@@ -222,11 +222,11 @@ impl TaskView {
     /// one too, and the file tabs over the limit that were left longest
     /// close.
     pub(super) fn place_tab(&mut self, mut tab: TabItem, how: OpenAs, window: &mut Window, cx: &mut Context<Self>) {
-        let right = self.focus_right && self.is_split();
-        tab.right = right;
+        let pane = self.current;
+        tab.pane = pane;
         tab.preview = how == OpenAs::Preview && crate::state::settings().preview_tabs;
         let id = tab.id;
-        let replaced = tab.preview.then(|| self.tabs.iter().position(|t| t.preview && !t.pinned && t.right == right)).flatten();
+        let replaced = tab.preview.then(|| self.tabs.iter().position(|t| t.preview && !t.pinned && t.pane == pane)).flatten();
         match replaced {
             Some(ix) => {
                 self.tabs.insert(ix + 1, tab);
@@ -253,7 +253,7 @@ impl TaskView {
             if files.clone().count() <= limit {
                 return;
             }
-            let shown = [Some(self.left_active), self.right_active, Some(opened)];
+            let shown = [self.active[0], self.active[1], self.active[2], self.active[3], Some(opened)];
             let busy = |t: &TabItem| match &t.kind {
                 TabKind::File(f) => f.read(cx).dirty || f.read(cx).saving.is_some(),
                 _ => false,

@@ -27,6 +27,7 @@ src/task/          one task, a module: what is private to it is seen by all of i
   branch_bar.rs    the branch line above the tabs
   branches.rs      the branches of the repository: open, compare, delete
   panels.rs        the tab bar and the side panels
+  panes.rs         where tabs are: two columns of an upper pane and, when a tab is put there, a lower one
   strip.rs         the side: the strip of the panels' marks, a panel in each half, one come over the task from its mark
   nav.rs           back and forward
   lookups.rs       outline, usages and places, installing a language server

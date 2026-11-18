@@ -77,8 +77,7 @@ impl TaskView {
     }
 
     pub fn cycle_tab(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let right = self.focus_right && self.is_split();
-        let in_pane: Vec<usize> = (0..self.tabs.len()).filter(|&ix| self.tabs[ix].right == right).collect();
+        let in_pane = self.in_pane(self.current);
         let Some(current) = self.focused_ix().and_then(|ix| in_pane.iter().position(|&i| i == ix)) else { return };
         let next = if forward { (current + 1) % in_pane.len() } else { (current + in_pane.len() - 1) % in_pane.len() };
         self.activate(in_pane[next], window, cx);

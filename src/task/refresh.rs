@@ -77,7 +77,7 @@ impl TaskView {
     /// task out of view would be done again on every change an agent makes.
     pub(super) fn show_diff_if_seen(&mut self, cx: &mut Context<Self>) {
         let seen = self.visible
-            && self.tabs.iter().any(|t| matches!(t.kind, TabKind::Changes) && (t.id == self.left_active || Some(t.id) == self.right_active));
+            && self.tabs.iter().any(|t| matches!(t.kind, TabKind::Changes) && self.is_shown(t.id));
         if self.diff_stale && seen {
             self.diff_stale = false;
             self.show_scope(cx);

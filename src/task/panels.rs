@@ -2,14 +2,18 @@ use super::*;
 use gpui_kit::component::menu::PopupMenuItem;
 
 impl TaskView {
-    pub(super) fn render_tabs(&self, right: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let shown = if right { self.right_active } else { Some(self.left_active) };
-        let in_pane: Vec<usize> = (0..self.tabs.len()).filter(|&ix| self.tabs[ix].right == right).collect();
+    pub(super) fn render_tabs(&self, pane: Pane, cx: &mut Context<Self>) -> impl IntoElement {
+        let shown = self.shown_in(pane);
+        let in_pane = self.in_pane(pane);
         let selected = in_pane.iter().position(|&ix| Some(self.tabs[ix].id) == shown).unwrap_or(0);
-        let can_split = !right && in_pane.len() > 1;
+        let right = pane.right;
+        // The tab in front to the right column, the one it opens when there is none.
+        let to_right = shown.and_then(|id| self.ix_of(id)).and_then(|ix| {
+            self.moves_of(ix).into_iter().find(|(_, to)| to.right && !to.below).map(|_| (ix, Pane { right: true, below: false }))
+        });
         let map = in_pane.clone();
         let menu_tab = self.menu_tab.clone();
-        let bar = TabBar::new(if right { "tabs-right" } else { "tabs-left" })
+        let bar = TabBar::new(["tabs-left", "tabs-left-below", "tabs-right", "tabs-right-below"][pane.ix()])
             .selected_index(selected)
             .on_click(cx.listener(move |this, pos: &usize, window, cx| {
                 let Some(&ix) = map.get(*pos) else { return };
@@ -26,7 +30,7 @@ impl TaskView {
                     if std::mem::take(&mut this.tabs[ix].preview) {
                         cx.notify();
                     } else {
-                        this.toggle_zoom(right, window, cx);
+                        this.toggle_zoom(pane, window, cx);
                     }
                 }
             }))
@@ -39,7 +43,7 @@ impl TaskView {
                             .label(if self.zoomed.is_some() { "⤡" } else { "⤢" })
                             .selected(self.zoomed.is_some())
                             .tooltip("Focus mode: this pane over everything (Shift+Esc, or double-click a tab)")
-                            .on_click(cx.listener(move |this, _, window, cx| this.toggle_zoom(right, window, cx))),
+                            .on_click(cx.listener(move |this, _, window, cx| this.toggle_zoom(pane, window, cx))),
                     )
                     .child(
                         Button::new("new-terminal")
@@ -48,7 +52,7 @@ impl TaskView {
                             .label("+")
                             .tooltip("New terminal here")
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.focus_right = right && this.is_split();
+                                this.current = pane;
                                 this.new_terminal(window, cx)
                             })),
                     )
@@ -59,33 +63,34 @@ impl TaskView {
                             .child(svg().path("side-icons/globe.svg").size(px(14.)).text_color(cx.theme().muted_foreground))
                             .tooltip("New browser tab here")
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.focus_right = right && this.is_split();
+                                this.current = pane;
                                 this.new_browser(window, cx)
                             })),
                     )
-                    .when(!right, |bar| {
+                    .when(!right && !pane.below, |bar| {
                         bar.child(
                             Button::new("split")
                                 .small()
                                 .ghost()
                                 .label("◫")
-                                .disabled(!can_split)
-                                .tooltip("Move this tab to the right pane (or from a tab's right-click menu)")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    if let Some(ix) = this.ix_of(this.left_active) {
-                                        this.move_to_other_pane(ix, window, cx)
+                                .disabled(to_right.is_none())
+                                .tooltip("Move this tab to the right (or down, by dragging it to a pane's lower edge or from its right-click menu)")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    if let Some((ix, to)) = to_right {
+                                        this.move_to(ix, to, window, cx)
                                     }
                                 })),
                         )
                     })
-                    .when(right, |bar| {
+                    .when(right || pane.below, |bar| {
+                        let tip = if pane.below { "Join: move these tabs to the pane above" } else { "Join: move these tabs back to the left" };
                         bar.child(
                             Button::new("join")
                                 .small()
                                 .ghost()
                                 .label("▣")
-                                .tooltip("Join: move these tabs back to the left pane")
-                                .on_click(cx.listener(|this, _, window, cx| this.join_panes(window, cx))),
+                                .tooltip(tip)
+                                .on_click(cx.listener(move |this, _, window, cx| this.join_pane(pane, window, cx))),
                         )
                     }),
             )
@@ -173,24 +178,24 @@ impl TaskView {
                 }
             }));
         let task = cx.weak_entity();
-        div().id(if right { "tab-bar-right" } else { "tab-bar-left" }).w_full().child(bar).context_menu(move |menu, _, cx| {
+        div().id(["tab-bar-left", "tab-bar-left-below", "tab-bar-right", "tab-bar-right-below"][pane.ix()]).w_full().child(bar).context_menu(move |menu, _, cx| {
             let Some(view) = task.upgrade() else { return menu };
             let clicked = menu_tab.take();
             let t = view.read(cx);
             let tab = clicked.and_then(|id| t.tabs.iter().find(|t| t.id == id));
             let reopen = !t.closed.is_empty();
-            let can_move = tab.is_some_and(|tab| tab.right || t.tabs.iter().filter(|t| !t.right).count() > 1);
+            let moves = tab.and_then(|tab| t.ix_of(tab.id)).map(|ix| t.moves_of(ix)).unwrap_or_default();
             let (pinned, id) = (tab.is_some_and(|t| t.pinned), tab.map(|t| t.id));
             // Each shown only when it would close something.
             let from = tab.and_then(|tab| t.ix_of(tab.id)).unwrap_or(usize::MAX);
-            let others = !t.closed_together(right, |_, other| Some(other.id) != id, cx).is_empty();
-            let to_right = !t.closed_together(right, |ix, _| ix > from, cx).is_empty();
-            let all = !t.closed_together(right, |_, _| true, cx).is_empty();
+            let others = !t.closed_together(pane, |_, other| Some(other.id) != id, cx).is_empty();
+            let to_right = !t.closed_together(pane, |ix, _| ix > from, cx).is_empty();
+            let all = !t.closed_together(pane, |_, _| true, cx).is_empty();
             let close = tab.is_some_and(closable);
-            let act = |label: &'static str, f: fn(&mut TaskView, Option<usize>, bool, &mut Window, &mut Context<TaskView>)| {
+            let act = |label: &'static str, f: fn(&mut TaskView, Option<usize>, Pane, &mut Window, &mut Context<TaskView>)| {
                 let view = view.downgrade();
                 PopupMenuItem::new(label).on_click(move |_, window, cx| {
-                    let _ = view.update(cx, |t, cx| f(t, id, right, window, cx));
+                    let _ = view.update(cx, |t, cx| f(t, id, pane, window, cx));
                 })
             };
             let menu = match id {
@@ -202,28 +207,34 @@ impl TaskView {
                             }
                         }))
                     })
-                    .when(others, |menu| menu.item(act("Close others", |t, id, right, window, cx| t.close_many(right, |_, tab| Some(tab.id) != id, window, cx))))
+                    .when(others, |menu| menu.item(act("Close others", |t, id, pane, window, cx| t.close_many(pane, |_, tab| Some(tab.id) != id, window, cx))))
                     .when(to_right, |menu| {
-                        menu.item(act("Close to the right", |t, id, right, window, cx| {
+                        menu.item(act("Close to the right", |t, id, pane, window, cx| {
                             let from = id.and_then(|id| t.ix_of(id)).unwrap_or(usize::MAX);
-                            t.close_many(right, |ix, _| ix > from, window, cx)
+                            t.close_many(pane, |ix, _| ix > from, window, cx)
                         }))
                     })
-                    .when(all, |menu| menu.item(act("Close all", |t, _, right, window, cx| t.close_many(right, |_, _| true, window, cx))))
+                    .when(all, |menu| menu.item(act("Close all", |t, _, pane, window, cx| t.close_many(pane, |_, _| true, window, cx))))
                     .when(close || others || to_right || all, |menu| menu.separator())
                     .item(act(if pinned { "Unpin" } else { "Pin" }, |t, id, _, _, cx| {
                         if let Some(id) = id {
                             t.toggle_pin(id, cx)
                         }
                     }))
-                    .when(can_move, |menu| {
-                        menu.item(act(if right { "Move to the left pane" } else { "Move to the right pane" }, |t, id, _, window, cx| {
-                            if let Some(ix) = id.and_then(|id| t.ix_of(id)) {
-                                t.move_to_other_pane(ix, window, cx)
-                            }
-                        }))
+                    .map(|mut menu| {
+                        for (label, to) in moves {
+                            let view = view.downgrade();
+                            menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                                let _ = view.update(cx, |t, cx| {
+                                    if let Some(ix) = id.and_then(|id| t.ix_of(id)) {
+                                        t.move_to(ix, to, window, cx)
+                                    }
+                                });
+                            }));
+                        }
+                        menu
                     }),
-                None => menu.when(all, |menu| menu.item(act("Close all", |t, _, right, window, cx| t.close_many(right, |_, _| true, window, cx)))),
+                None => menu.when(all, |menu| menu.item(act("Close all", |t, _, pane, window, cx| t.close_many(pane, |_, _| true, window, cx)))),
             };
             menu.when(reopen, |menu| menu.separator().item(act("Reopen closed tab", |t, _, _, window, cx| t.reopen_closed(window, cx))))
         })

@@ -446,6 +446,13 @@ pub struct TaskSession {
     pub left_active: Option<usize>,
     pub right_active: Option<usize>,
     pub focus_right: bool,
+    /// The same for the lower panes of the left and right columns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub left_below_active: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub right_below_active: Option<usize>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub focus_below: bool,
     /// Folders open in the file tree.
     pub expanded: Vec<String>,
     /// The panel in the side's upper half: 0 Changes, 1 Files, 2 Structure,
@@ -487,6 +494,9 @@ pub struct TabSession {
     pub line: u32,
     pub url: Option<String>,
     pub right: bool,
+    /// In its column's lower pane.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub below: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub preview: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

@@ -38,6 +38,8 @@ mod nav;
 mod branch_bar;
 mod open;
 mod panels;
+mod panes;
+use panes::Pane;
 mod git_ui;
 mod helpers;
 mod term;
@@ -263,8 +265,7 @@ struct TabItem {
     id: usize,
     title: SharedString,
     kind: TabKind,
-    /// In the right pane; every tab is in the left one when not split.
-    right: bool,
+    pane: Pane,
     /// What the tab's label needs of its view, kept here: the task is not
     /// to be drawn again whenever a terminal or a page draws a frame, as it
     /// would be if drawing it read them. The terminal's or the page's
@@ -296,7 +297,7 @@ impl TabItem {
             id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             title: title.into(),
             kind,
-            right: false,
+            pane: Pane::MAIN,
             shown: SharedString::default(),
             dirty: false,
             service: None,
@@ -311,7 +312,7 @@ struct ClosedTab {
     path: PathBuf,
     line: u32,
     col: u32,
-    right: bool,
+    pane: Pane,
 }
 
 /// A window narrower than this has the side panel over the task, on asking.
@@ -404,13 +405,12 @@ pub struct TaskView {
     /// Status changed to one that wants attention while the task was not in view.
     pub unseen: bool,
     tabs: Vec<TabItem>,
-    /// The tab shown in each pane, by id. `right_active` is None unless split.
-    left_active: usize,
-    right_active: Option<usize>,
+    /// The tab shown in each pane, by id, by [`Pane::ix`].
+    active: [Option<usize>; 4],
     /// The pane you work in: new tabs open there.
-    focus_right: bool,
-    /// Focus mode: this pane (right or not) fills the window alone.
-    zoomed: Option<bool>,
+    current: Pane,
+    /// Focus mode: this pane fills the window alone.
+    zoomed: Option<Pane>,
     last_tab_click: Option<(usize, std::time::Instant)>,
     /// The tab a right click opened the menu of; none for the bar around them.
     menu_tab: Rc<std::cell::Cell<Option<usize>>>,
@@ -758,9 +758,8 @@ impl TaskView {
             terminal_seq: 1,
             unseen: false,
             tabs,
-            left_active: 0,
-            right_active: None,
-            focus_right: false,
+            active: [None; 4],
+            current: Pane::MAIN,
             zoomed: None,
             last_tab_click: None,
             menu_tab: Rc::default(),
@@ -838,7 +837,7 @@ impl TaskView {
         };
         // Debug aid for headless screenshots: start on a given tab.
         let first = std::env::var("IDEAE_TAB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
-        this.left_active = this.tabs.get(first).or(this.tabs.first()).map_or(0, |t| t.id);
+        this.active[0] = this.tabs.get(first).or(this.tabs.first()).map(|t| t.id);
         this.sync_visibility(cx);
         this.watch_activity(cx);
         this
@@ -984,69 +983,6 @@ impl TaskView {
         self.tabs.iter().position(|t| t.id == id)
     }
 
-    fn is_split(&self) -> bool {
-        self.tabs.iter().any(|t| t.right)
-    }
-
-    /// Keeps the panes consistent after tabs move or close: an empty left pane
-    /// takes the right one's tabs (the split closes), and each pane shows one
-    /// of its own tabs.
-    fn normalize(&mut self) {
-        if self.tabs.iter().all(|t| t.right) {
-            for tab in &mut self.tabs {
-                tab.right = false;
-            }
-        }
-        let shows = |id: Option<usize>, right: bool, tabs: &[TabItem]| {
-            id.is_some_and(|id| tabs.iter().any(|t| t.id == id && t.right == right))
-        };
-        if !shows(Some(self.left_active), false, &self.tabs) {
-            self.left_active = self.tabs.iter().find(|t| !t.right).map_or(0, |t| t.id);
-        }
-        if !shows(self.right_active, true, &self.tabs) {
-            self.right_active = self.tabs.iter().find(|t| t.right).map(|t| t.id);
-        }
-        if self.right_active.is_none() {
-            self.focus_right = false;
-        }
-    }
-
-    /// Moves a tab to the other pane and shows it there, splitting if needed.
-    fn move_to_other_pane(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.get_mut(ix) else { return };
-        // The only tab on the left cannot leave it: there would be nothing to split from.
-        if !tab.right && self.tabs.iter().filter(|t| !t.right).count() < 2 {
-            return;
-        }
-        let tab = &mut self.tabs[ix];
-        tab.right = !tab.right;
-        tab.preview = false;
-        let (id, right) = (tab.id, tab.right);
-        if right {
-            self.right_active = Some(id);
-        } else {
-            self.left_active = id;
-        }
-        self.focus_right = right;
-        self.normalize();
-        self.sync_visibility(cx);
-        self.show_diff_if_seen(cx);
-        self.focus_active(window, cx);
-        cx.notify();
-    }
-
-    /// The right pane's tabs all go back to the left one.
-    fn join_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        for tab in &mut self.tabs {
-            tab.right = false;
-        }
-        self.normalize();
-        self.sync_visibility(cx);
-        self.show_diff_if_seen(cx);
-        self.focus_active(window, cx);
-        cx.notify();
-    }
-
     /// What Restart Agent asks: its program is not running in its tab.
     pub fn agent_restartable(&self, cx: &App) -> bool {
         self.has_agent()
@@ -1084,181 +1020,6 @@ impl TaskView {
     pub fn leave_focus_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.zoomed.is_some() {
             self.toggle_zoom_focused(window, cx);
-        }
-    }
-
-    /// The zoomed pane, for the window to float over everything. While it is
-    /// up, the task's own layout leaves that pane's slot empty: a view (a
-    /// terminal above all) is drawn in one place only.
-    pub fn render_zoomed(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let right = self.zoomed?;
-        Some(
-            div()
-                .size_full()
-                .track_focus(&self.focus)
-                .on_action(cx.listener(|this, _: &ToggleZoom, window, cx| this.toggle_zoom_focused(window, cx)))
-                .on_action(cx.listener(|this, _: &ShowOutline, window, cx| this.show_outline(window, cx)))
-                .on_action(cx.listener(|this, _: &ShowBookmarks, window, cx| this.show_bookmarks(window, cx)))
-                .on_action(cx.listener(|this, _: &ShowUsages, window, cx| this.show_usages_at_cursor(window, cx)))
-                .on_action(cx.listener(|this, _: &SendToAgent, window, cx| this.send_editor_selection(window, cx)))
-                .child(self.render_pane(right, cx))
-                .into_any_element(),
-        )
-    }
-
-    /// Focus mode for a pane, like Zed's: it takes the whole window, over the
-    /// sidebars and the other pane. The same gesture brings everything back.
-    /// Shift+Esc: focus mode for the pane you are in.
-    pub fn toggle_zoom_focused(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let right = self.focus_right;
-        self.toggle_zoom(right, window, cx)
-    }
-
-    fn toggle_zoom(&mut self, right: bool, window: &mut Window, cx: &mut Context<Self>) {
-        self.zoomed = if self.zoomed.is_some() { None } else { Some(right && self.is_split()) };
-        self.focus_right = right && self.is_split();
-        self.focus_active(window, cx);
-        cx.emit(TaskEvent::Changed);
-        cx.notify();
-    }
-
-    fn focus_pane(&mut self, right: bool, cx: &mut Context<Self>) {
-        if self.focus_right != right && (!right || self.is_split()) {
-            self.focus_right = right;
-            self.autosave_unfocused(cx);
-            cx.notify();
-        }
-    }
-
-    fn tab_content(&self, ix: Option<usize>) -> AnyElement {
-        match ix.and_then(|ix| self.tabs.get(ix)).map(|t| &t.kind) {
-            Some(TabKind::Terminal(view)) => view.clone().into_any_element(),
-            Some(TabKind::Changes) => self.changes.clone().into_any_element(),
-            Some(TabKind::History) => self.history.clone().into_any_element(),
-            Some(TabKind::File(file)) => file.clone().into_any_element(),
-            Some(TabKind::Browser(view)) => view.clone().into_any_element(),
-            Some(TabKind::Binary(view)) => view.clone().into_any_element(),
-            Some(TabKind::Diff(view)) => view.clone().into_any_element(),
-            None => div().into_any_element(),
-        }
-    }
-
-    /// A tab dropped on a pane moves there (or just shows, if already there).
-    fn drop_tab(&mut self, tab_id: usize, right: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ix) = self.ix_of(tab_id) else { return };
-        if self.tabs[ix].right == right {
-            self.activate(ix, window, cx);
-        } else {
-            self.move_to_other_pane(ix, window, cx);
-        }
-    }
-
-    /// One pane: its own tab bar over the tab it shows.
-    fn render_pane(&self, right: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let focused = self.is_split() && self.focus_right == right;
-        let shown = if right { self.right_active } else { Some(self.left_active) };
-        let highlight = cx.theme().primary.opacity(0.18);
-        // While a tab is dragged, a transparent layer over the pane takes the
-        // drop and shows the highlight: content such as a terminal paints an
-        // opaque background over anything set on the pane itself. Unsplit,
-        // the right edge is a separate zone that opens the right pane.
-        let drag = drag_active(cx);
-        // A terminal takes dropped files itself, as paths typed in: over it
-        // only the tab bar opens them.
-        let over_terminal = shown.and_then(|id| self.ix_of(id)).is_some_and(|ix| matches!(self.tabs[ix].kind, TabKind::Terminal(_)));
-        let split_zone = !self.is_split() && drag != Drag::None;
-        let layer = drag == Drag::Tab || drag == Drag::Files && !over_terminal;
-        v_flex()
-            .id(if right { "pane-right" } else { "pane-left" })
-            .relative()
-            .size_full()
-            .min_w_0()
-            .min_h_0()
-            .overflow_hidden()
-            .capture_any_mouse_down(cx.listener(move |this, _, _, cx| this.focus_pane(right, cx)))
-            .child(
-                div()
-                    .relative()
-                    .border_t_2()
-                    .border_color(if focused { cx.theme().primary } else { cx.theme().transparent })
-                    .child(self.render_tabs(right, cx))
-                    .when(drag == Drag::Files && over_terminal, |bar| {
-                        bar.child(
-                            div()
-                                .id("tab-bar-drop")
-                                .absolute()
-                                .top_0()
-                                .left_0()
-                                .size_full()
-                                .drag_over::<DraggedFiles>(move |style, _, _, _| style.bg(highlight))
-                                .on_drop(cx.listener(move |this, files: &DraggedFiles, window, cx| this.drop_files(files, right, window, cx))),
-                        )
-                    }),
-            )
-            .child(div().flex_1().min_h_0().child(self.tab_content(shown.and_then(|id| self.ix_of(id)))))
-            .when(layer, |pane| {
-                pane.child(
-                    div()
-                        .id("drop-layer")
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .h_full()
-                        .w(if split_zone { relative(0.7) } else { relative(1.) })
-                        .drag_over::<DraggedTab>(move |style, _, _, _| style.bg(highlight))
-                        .drag_over::<DraggedFiles>(move |style, _, _, _| style.bg(highlight))
-                        .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
-                            this.drop_tab(dragged.tab_id, right, window, cx)
-                        }))
-                        .on_drop(cx.listener(move |this, files: &DraggedFiles, window, cx| this.drop_files(files, right, window, cx))),
-                )
-            })
-            .when(split_zone, |pane| {
-                pane.child(
-                    div()
-                        .id("split-zone")
-                        .absolute()
-                        .top_0()
-                        .right_0()
-                        .h_full()
-                        .w(relative(0.3))
-                        .border_l_2()
-                        .border_color(cx.theme().primary)
-                        .drag_over::<DraggedTab>(move |style, _, _, _| style.bg(highlight))
-                        .drag_over::<DraggedFiles>(move |style, _, _, _| style.bg(highlight))
-                        .on_drop(cx.listener(|this, dragged: &DraggedTab, window, cx| {
-                            if let Some(ix) = this.ix_of(dragged.tab_id) {
-                                this.move_to_other_pane(ix, window, cx);
-                            }
-                        }))
-                        .on_drop(cx.listener(|this, files: &DraggedFiles, window, cx| this.drop_files(files, true, window, cx)))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(if drag == Drag::Files { "Drop to open beside" } else { "Drop to split" }),
-                )
-            })
-    }
-
-    /// Files dropped on a pane open there, kept; one open already moves over.
-    fn drop_files(&mut self, files: &DraggedFiles, right: bool, window: &mut Window, cx: &mut Context<Self>) {
-        cx.stop_propagation();
-        if !files.opens {
-            return;
-        }
-        for path in &files.paths {
-            self.focus_right = right && self.is_split();
-            self.open_file_as(path.clone(), 0, 0, OpenAs::Kept, window, cx);
-            let opened = self.tabs.iter().position(|t| match &t.kind {
-                TabKind::File(f) => f.read(cx).path == *path,
-                TabKind::Binary(b) => b.read(cx).path == *path,
-                _ => false,
-            });
-            if let Some(ix) = opened.filter(|&ix| self.tabs[ix].right != right) {
-                self.move_to_other_pane(ix, window, cx);
-            }
         }
     }
 
@@ -1304,7 +1065,7 @@ impl TaskView {
         .detach();
         let shown = view.read(cx).title();
         let mut tab = TabItem { shown, ..TabItem::new("web", TabKind::Browser(view)) };
-        tab.right = self.focus_right && self.is_split();
+        tab.pane = self.current;
         self.tabs.push(tab);
         self.activate(self.tabs.len() - 1, window, cx);
     }
@@ -1380,7 +1141,7 @@ impl TaskView {
 
     pub fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let at = self.new_terminal_tab(window, cx);
-        self.tabs[at].right = self.focus_right && self.is_split();
+        self.tabs[at].pane = self.current;
         self.activate(at, window, cx);
     }
 
@@ -1388,7 +1149,7 @@ impl TaskView {
     pub(super) fn new_terminal_in(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         self.terminal_seq += 1;
         let at = self.terminal_tab_in(self.terminal_seq, Some(dir), window, cx);
-        self.tabs[at].right = self.focus_right && self.is_split();
+        self.tabs[at].pane = self.current;
         self.activate(at, window, cx);
     }
 
@@ -1621,7 +1382,7 @@ impl TaskView {
     /// Hidden terminals keep parsing but stop producing frames.
     fn sync_visibility(&mut self, cx: &mut Context<Self>) {
         for tab in &self.tabs {
-            let shown = tab.id == self.left_active || Some(tab.id) == self.right_active;
+            let shown = self.is_shown(tab.id);
             let visible = self.visible && shown;
             match &tab.kind {
                 TabKind::Terminal(view) => view.read(cx).state.clone().update(cx, |s, cx| s.set_visible(visible, cx)),
@@ -1633,8 +1394,7 @@ impl TaskView {
 
     /// The tab in the pane that has focus.
     fn focused_ix(&self) -> Option<usize> {
-        let id = if self.focus_right { self.right_active } else { Some(self.left_active) };
-        id.and_then(|id| self.ix_of(id))
+        self.shown_in(self.current).and_then(|id| self.ix_of(id))
     }
 
     /// Whether the keyboard is with the tab in front, for tests.
@@ -1685,13 +1445,8 @@ impl TaskView {
         if matches!(tab.kind, TabKind::File(_)) {
             self.structure_file = Some(tab.id);
         }
-        if tab.right {
-            self.right_active = Some(tab.id);
-            self.focus_right = true;
-        } else {
-            self.left_active = tab.id;
-            self.focus_right = false;
-        }
+        self.active[tab.pane.ix()] = Some(tab.id);
+        self.current = tab.pane;
         self.autosave_unfocused(cx);
         self.sync_visibility(cx);
         self.show_diff_if_seen(cx);
@@ -1831,7 +1586,7 @@ impl TaskView {
             _ => return,
         };
         self.closed.retain(|c| c.path != path);
-        self.closed.push(ClosedTab { path, line, col, right: tab.right });
+        self.closed.push(ClosedTab { path, line, col, pane: tab.pane });
         if self.closed.len() > 30 {
             self.closed.remove(0);
         }
@@ -1840,7 +1595,7 @@ impl TaskView {
     pub fn reopen_closed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         while let Some(closed) = self.closed.pop() {
             if closed.path.is_file() {
-                self.focus_right = closed.right && self.is_split();
+                self.current = if self.has(closed.pane) { closed.pane } else { self.current };
                 self.open_file_as(closed.path, closed.line, closed.col, OpenAs::Kept, window, cx);
                 return;
             }
@@ -1854,8 +1609,8 @@ impl TaskView {
     }
 
     /// The tabs `which` picks in a pane that [`closed_in_bulk`] allows.
-    fn close_many(&mut self, right: bool, which: impl Fn(usize, &TabItem) -> bool, window: &mut Window, cx: &mut Context<Self>) {
-        let ids: Vec<usize> = self.closed_together(right, which, cx);
+    fn close_many(&mut self, pane: Pane, which: impl Fn(usize, &TabItem) -> bool, window: &mut Window, cx: &mut Context<Self>) {
+        let ids: Vec<usize> = self.closed_together(pane, which, cx);
         for id in ids {
             if let Some(ix) = self.ix_of(id) {
                 self.remember_closed(ix, cx);
@@ -1865,8 +1620,8 @@ impl TaskView {
     }
 
     /// The ids of the tabs [`Self::close_many`] would close.
-    fn closed_together(&self, right: bool, which: impl Fn(usize, &TabItem) -> bool, cx: &App) -> Vec<usize> {
-        self.tabs.iter().enumerate().filter(|(ix, t)| t.right == right && which(*ix, t) && closed_in_bulk(t, cx)).map(|(_, t)| t.id).collect()
+    fn closed_together(&self, pane: Pane, which: impl Fn(usize, &TabItem) -> bool, cx: &App) -> Vec<usize> {
+        self.tabs.iter().enumerate().filter(|(ix, t)| t.pane == pane && which(*ix, t) && closed_in_bulk(t, cx)).map(|(_, t)| t.id).collect()
     }
 
     fn toggle_pin(&mut self, id: usize, cx: &mut Context<Self>) {
@@ -1908,14 +1663,10 @@ impl TaskView {
             .iter()
             .rev()
             .chain(self.tabs[ix.min(self.tabs.len())..].iter())
-            .find(|t| t.right == removed.right)
+            .find(|t| t.pane == removed.pane)
             .map(|t| t.id);
-        if removed.right {
-            if self.right_active == Some(removed.id) {
-                self.right_active = neighbour;
-            }
-        } else if self.left_active == removed.id {
-            self.left_active = neighbour.unwrap_or(0);
+        if self.active[removed.pane.ix()] == Some(removed.id) {
+            self.active[removed.pane.ix()] = neighbour;
         }
         self.normalize();
         self.sync_visibility(cx);
@@ -2056,14 +1807,8 @@ impl TaskView {
     fn file_in_view(&self) -> Option<usize> {
         let file = |id: usize| self.tabs.iter().any(|t| t.id == id && matches!(t.kind, TabKind::File(_))).then_some(id);
         let focused = self.focused_ix().map(|ix| self.tabs[ix].id);
-        let beside = if !self.is_split() {
-            None
-        } else if self.focus_right {
-            Some(self.left_active)
-        } else {
-            self.right_active
-        };
-        focused.and_then(file).or(beside.and_then(file))
+        let beside = Pane::ALL.into_iter().filter(|&pane| pane != self.current).find_map(|pane| self.shown_in(pane).and_then(file));
+        focused.and_then(file).or(beside)
     }
 
     /// Whether the outline is that of the Structure file, if of an older text.
@@ -2117,7 +1862,7 @@ impl TaskView {
                     return;
                 };
                 let mut tab = TabItem::new(title, kind);
-                tab.right = self.focus_right && self.is_split();
+                tab.pane = self.current;
                 self.tabs.push(tab);
                 self.tabs.len() - 1
             }
@@ -2196,21 +1941,7 @@ impl Render for TaskView {
                 window.push_notification(note.title("Git"), cx);
             }
         }
-        let slot = |this: &Self, right: bool, cx: &mut Context<Self>| -> AnyElement {
-            if this.zoomed == Some(right) {
-                div().size_full().into_any_element()
-            } else {
-                this.render_pane(right, cx).into_any_element()
-            }
-        };
-        let content: AnyElement = if self.is_split() {
-            h_resizable("panes")
-                .child(resizable_panel().child(slot(self, false, cx)))
-                .child(resizable_panel().child(slot(self, true, cx)))
-                .into_any_element()
-        } else {
-            slot(self, false, cx)
-        };
+        let content = self.render_panes(cx);
         div()
             .size_full()
             .track_focus(&self.focus)
@@ -2359,6 +2090,7 @@ mod disk_tests {
 
 #[cfg(all(test, unix))]
 mod open_file_scenario {
+    use super::panes::Pane;
     use super::{FileView, TabKind, TaskView};
     use crate::state::{ProjectState, State};
     use crate::workspace::Workspace;
@@ -2627,7 +2359,7 @@ mod open_file_scenario {
                 let id = |t: &TaskView, cx: &App, name: &str| t.tabs.iter().find(|tab| matches!(&tab.kind, TabKind::File(f) if f.read(cx).path.ends_with(name))).unwrap().id;
                 let (a, b) = (id(t, cx, "a.txt"), id(t, cx, "b.txt"));
                 t.toggle_pin(a, cx);
-                t.close_many(false, |_, tab| tab.id != b, window, cx);
+                t.close_many(Pane::MAIN, |_, tab| tab.id != b, window, cx);
             })
         })
         .unwrap();
@@ -2652,6 +2384,39 @@ mod open_file_scenario {
             assert_eq!(chosen(cx).as_deref(), Some(name));
         }
         crate::state::set_settings(before);
+
+        // Panes: a tab split down opens the left column's lower pane, the
+        // right column comes beside, the session keeps them, and a pane's
+        // last tab gone, its tabs' column or floor closes up.
+        let pane_of = |cx: &mut TestAppContext, name: &str| {
+            task.update(cx, |t, cx| t.tabs.iter().find(|tab| matches!(&tab.kind, TabKind::File(f) if f.read(cx).path.ends_with(name))).map(|tab| tab.pane))
+        };
+        let move_file = |cx: &mut TestAppContext, name: &str, label: &str| {
+            cx.update_window(handle.into(), |_, window, cx| {
+                task.update(cx, |t, cx| {
+                    let ix = t.tabs.iter().position(|tab| matches!(&tab.kind, TabKind::File(f) if f.read(cx).path.ends_with(name))).unwrap();
+                    let moves = t.moves_of(ix);
+                    let (_, to) = moves.iter().find(|(l, _)| l == label).unwrap_or_else(|| panic!("{label} not in {moves:?}"));
+                    t.move_to(ix, *to, window, cx);
+                })
+            })
+            .unwrap();
+        };
+        let lower_left = Pane { right: false, below: true };
+        let upper_right = Pane { right: true, below: false };
+        move_file(cx, "a.txt", "Split down");
+        assert_eq!(pane_of(cx, "a.txt"), Some(lower_left));
+        task.update(cx, |t, _| assert_eq!(t.current, lower_left, "the pane it went to is worked in"));
+        move_file(cx, "c.txt", "Split right");
+        assert_eq!(pane_of(cx, "c.txt"), Some(upper_right));
+        let saved = task.update(cx, |t, cx| t.session(cx));
+        assert!(saved.tabs.iter().any(|tab| tab.below && !tab.right) && saved.left_below_active.is_some());
+        // a.txt back up: the lower pane closes.
+        move_file(cx, "a.txt", "Move to the upper left pane");
+        assert_eq!(pane_of(cx, "a.txt"), Some(Pane::MAIN));
+        task.update(cx, |t, _| assert!(!t.has(lower_left)));
+        // The left column emptied of all but the agent's tab, the right one stays.
+        assert_eq!(pane_of(cx, "c.txt"), Some(upper_right));
 
         task.update(cx, |t, cx| t.shut_down(cx));
         cx.update_window(handle.into(), |_, window, _| window.remove_window()).ok();
