@@ -586,6 +586,7 @@ fn main() {
             grammars::register();
             cx.bind_keys(gpui_cn::terminal::default_key_bindings());
             visible_scrollbars(cx);
+            theme::place_notices(cx);
             cx.observe_global::<gpui_kit::base::Theme>(visible_scrollbars).detach();
             menu::init(cx);
             keymap::bind_all(cx);

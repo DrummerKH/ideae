@@ -101,6 +101,22 @@ pub fn choose(name: &str, cx: &mut App) {
     }
 }
 
+/// The corner the window's notices show in, as Settings says.
+pub fn place_notices(cx: &mut App) {
+    use gpui_kit::Anchor;
+    let at = match crate::state::settings().notices_at.as_str() {
+        "top-left" => Anchor::TopLeft,
+        "top-right" => Anchor::TopRight,
+        "bottom-left" => Anchor::BottomLeft,
+        _ => Anchor::BottomRight,
+    };
+    let notices = &mut Theme::global_mut(cx).notification;
+    if notices.placement != at {
+        notices.placement = at;
+        cx.refresh_windows();
+    }
+}
+
 /// The same where there is no window at hand: the theme chosen in Settings.
 pub fn apply_everywhere(appearance: Appearance, cx: &mut App) {
     match appearance {

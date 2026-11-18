@@ -85,6 +85,9 @@ pub struct Settings {
     /// A notification has the agent's words (its answer, its question);
     /// off, only "Finished" or "Needs your answer".
     pub notify_said: bool,
+    /// The window's corner its notices show in: top-left, top-right,
+    /// bottom-left, bottom-right.
+    pub notices_at: String,
     /// Copy the main checkout's ignored `.env*` files into new worktrees.
     pub copy_env: bool,
     pub pr_status: bool,
@@ -226,6 +229,7 @@ impl Default for Settings {
             semantic_colors: true,
             inlay_hints: true,
             blame_at_line_end: true,
+            notices_at: "bottom-right".into(),
             format_on_save: false,
             diff_unified: false,
             diff_ignore_whitespace: false,

@@ -2299,6 +2299,9 @@ impl Workspace {
                 view.update(cx, |t, cx| t.code_settings_changed(cx));
             }
         }
+        if old.notices_at != new.notices_at {
+            theme::place_notices(cx);
+        }
         if old.gutter_since_base != new.gutter_since_base {
             for view in self.views() {
                 view.update(cx, |t, cx| t.reload_gutters(cx));

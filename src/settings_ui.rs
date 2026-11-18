@@ -87,6 +87,17 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
         })
         .default_value(SharedString::from("line"))
     };
+    let notices_at = {
+        let (read, write) = (draft.clone(), draft.clone());
+        let options = [("bottom-right", "Bottom right"), ("bottom-left", "Bottom left"), ("top-right", "Top right"), ("top-left", "Top left")]
+            .into_iter()
+            .map(|(at, label)| (SharedString::from(at), SharedString::from(label)))
+            .collect();
+        SettingField::dropdown(options, move |_| read.borrow().notices_at.clone().into(), move |value, _| {
+            write.borrow_mut().notices_at = value.to_string()
+        })
+        .default_value(SharedString::from(default.notices_at.clone()))
+    };
     let restore_with = {
         let (read, write) = (draft.clone(), draft.clone());
         let options = vec![(SharedString::from("full"), SharedString::from("The full conversation")), (SharedString::from("summary"), SharedString::from("A summary only"))];
@@ -164,6 +175,9 @@ fn pages(draft: &Draft, recording: &Rc<Cell<Option<&'static str>>>, catcher: &Rc
                     "Its last answer or its question. Off, a notification says only Finished or Needs your answer, with the task's name. Never while presenting.",
                     |s| s.notify_said,
                     |s, v| s.notify_said = v,
+                ))
+                .item(SettingItem::new("Where notices show", notices_at).description(
+                    "The window's corner for its own notices: a task finished, a check failed, an update.",
                 ))
                 .item(switch(
                     draft,
