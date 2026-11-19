@@ -458,6 +458,13 @@ pub struct TaskState {
     pub archive: String,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub archive_keep: bool,
+    /// Its latest session recorded and never run: a new one, not resumed.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub fresh: bool,
+    /// A deferred task come back on its own, not opened yet: what its agent
+    /// is told when it is (workspace.rs, `TaskEntry::woke`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub woke: Option<String>,
 }
 
 /// A session of an agent in a task.

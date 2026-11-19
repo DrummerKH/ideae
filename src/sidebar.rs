@@ -834,6 +834,7 @@ impl Workspace {
             let (pa, pb, pc, pd) = (menu_path.clone(), menu_path.clone(), menu_path.clone(), menu_path.clone());
             let (e, f, pe, pf) = (this.clone(), this.clone(), menu_path.clone(), menu_path.clone());
             let (g, pg) = (this.clone(), menu_path.clone());
+            let (h, ph) = (this.clone(), menu_path.clone());
             let branch = branch.clone();
             // What it is called and how it is found; its variants; its end.
             menu.when(can(T::Rename), |m| {
@@ -875,6 +876,12 @@ impl Workspace {
                 // In a row of its own the task needs no naming: "Pause", not "Pause task".
                 m.item(PopupMenuItem::new(if side { "Remove" } else { "Archive" }).on_click(move |_, window, cx| {
                     let _ = c.update(cx, |w, cx| if side { w.remove_side(&pc, window, cx) } else { w.archive_task(&pc, window, cx) });
+                }))
+            })
+            // Archived and kept, back on a day: a task to come back to.
+            .when(can(T::Defer), |m| {
+                m.item(PopupMenuItem::new("Defer…").on_click(move |_, window, cx| {
+                    let _ = h.update(cx, |w, cx| w.defer_task(&ph, window, cx));
                 }))
             })
         };
@@ -1114,8 +1121,11 @@ impl Workspace {
             let v = v.read(cx);
             (v.agent_status == AgentStatus::Working).then(|| v.agent_activity.clone()).flatten()
         });
+        // A deferred task come back on its own stays marked till it is opened.
+        let woke = t.woke.is_some();
         match activity {
             Some(activity) => details.push(activity),
+            None if woke => details.push("back from deferred".into()),
             None => details.extend(Some(ago(t.last_active)).filter(|when| !when.is_empty())),
         }
         // What stays whole at the end of the second line.
@@ -1194,6 +1204,7 @@ impl Workspace {
             .border_color(transparent_black())
             .when(is_active, |s| s.bg(cx.theme().accent).border_color(cx.theme().primary))
             .when(unseen && !is_active, |s| s.border_color(glyph.map(|g| g.1).unwrap_or(cx.theme().border)))
+            .when(woke && !is_active, |s| s.border_color(cx.theme().primary))
             .hover(|s| s.bg(cx.theme().accent.opacity(0.6)))
             .child(
                 h_flex()

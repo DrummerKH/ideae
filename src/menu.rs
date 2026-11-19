@@ -895,6 +895,7 @@ fn menus(shown: Shown) -> Vec<Menu> {
             sep(),
             task(TaskCommand::Pause),
             task(TaskCommand::Archive),
+            task(TaskCommand::Defer),
             task(TaskCommand::RemoveSide),
         ]),
         Menu::new("Git").items([

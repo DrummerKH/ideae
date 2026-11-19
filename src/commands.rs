@@ -22,6 +22,7 @@ pub enum TaskCommand {
     KeepVariant,
     Pause,
     Archive,
+    Defer,
     RemoveSide,
     CompareWithBranch,
     CompareThisFile,
@@ -44,6 +45,7 @@ impl TaskCommand {
             KeepVariant => "Keep Only This Variant…",
             Pause => "Pause Task",
             Archive => "Archive Task",
+            Defer => "Defer Task…",
             RemoveSide => "Remove Agent's Worktree",
             CompareWithBranch => "Compare with Branch, Tag, or Commit…",
             CompareThisFile => "Compare This File with…",
@@ -58,6 +60,7 @@ impl TaskCommand {
             StartServices => "task: all of .ideae.toml",
             Pause => "task: its agent and terminals end, the task stays",
             Archive => "task: it goes into the archive, to be restored",
+            Defer => "task: archived and kept, back on a day you choose",
             RemoveSide => "task: a worktree the agent made for itself",
             _ => "task",
         }
@@ -67,7 +70,7 @@ impl TaskCommand {
     /// or removing may ask first.
     pub fn opens(self) -> bool {
         use TaskCommand::*;
-        matches!(self, Rename | AnotherVariant | KeepVariant | Pause | Archive | RemoveSide | CompareWithBranch | CompareThisFile)
+        matches!(self, Rename | AnotherVariant | KeepVariant | Pause | Archive | Defer | RemoveSide | CompareWithBranch | CompareThisFile)
     }
 }
 
@@ -232,7 +235,7 @@ impl InHand {
         match what {
             Star | CopyBranchName => true,
             Rename => !self.main,
-            Archive | AnotherVariant => !self.main && !self.side && self.ready,
+            Archive | Defer | AnotherVariant => !self.main && !self.side && self.ready,
             RemoveSide => self.side && self.ready,
             KeepVariant => !self.main && !self.side && self.ready && self.grouped,
             RestartAgent => self.open && self.agent_ended,
@@ -315,6 +318,7 @@ impl Workspace {
             KeepVariant => self.keep_variant_dialog(&path, window, cx),
             Pause => self.close_task(&path, window, cx),
             Archive => self.archive_task(&path, window, cx),
+            Defer => self.defer_task(&path, window, cx),
             RemoveSide => self.remove_side(&path, window, cx),
         }
     }

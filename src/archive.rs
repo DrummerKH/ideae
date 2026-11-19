@@ -13,6 +13,10 @@
 //! - `work/uncommitted.patch`: changes not committed, new files too, binary-safe;
 //! - `chat.jsonl`: a chat agent's conversation as the app kept it (src/acp).
 //!
+//! A deferred task is an archive the clean-up leaves, with perhaps a day
+//! it comes back on: `deferred.json` in the archive folder says which, so
+//! deferring and changing one's day write no archive again.
+//!
 //! gzip and not zstd: `flate2` (pure Rust) is in the build already, through
 //! the image crates, where zstd would add a C library to every target; an
 //! archive is mostly text and written once.
@@ -33,6 +37,7 @@ const META: &str = "task.json";
 const BUNDLE: &str = "work/unpushed.bundle";
 const PATCH: &str = "work/uncommitted.patch";
 const CHAT: &str = "chat.jsonl";
+const DEFERRED: &str = "deferred.json";
 
 /// What an archive says of its task.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -401,6 +406,80 @@ pub struct Archived {
     pub file: PathBuf,
     pub size: u64,
     pub meta: std::sync::Arc<Meta>,
+    /// Deferred: kept until it comes back, not cleaned up.
+    pub deferred: Option<Deferred>,
+}
+
+/// A deferred task: when it was put off, and the day it comes back on,
+/// if one was said.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
+#[serde(default)]
+pub struct Deferred {
+    pub since: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub until: Option<u64>,
+}
+
+impl Deferred {
+    pub fn due(&self, now: u64) -> bool {
+        self.until.is_some_and(|until| until <= now)
+    }
+
+    /// "deferred till 2026-12-01", "deferred, no day set".
+    pub fn told(&self) -> String {
+        match self.until {
+            Some(until) => format!("deferred till {}", date(until)),
+            None => "deferred, no day set".into(),
+        }
+    }
+}
+
+/// One at a time: a read, a change and a write of `deferred.json`.
+static DEFERRING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The deferred archives, by file name under `root` (`<project>/<key>.tar.gz`).
+fn read_deferred(root: &Path) -> std::collections::BTreeMap<String, Deferred> {
+    std::fs::read_to_string(root.join(DEFERRED)).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
+}
+
+fn deferred_name(root: &Path, file: &Path) -> Option<String> {
+    Some(file.strip_prefix(root).ok()?.to_string_lossy().replace('\\', "/"))
+}
+
+/// Defers an archive, or with None makes it an archive like the others
+/// again, whose age counts from now: the clean-up does not take it at once.
+pub fn set_deferred(root: &Path, file: &Path, deferred: Option<Deferred>) -> Result<(), String> {
+    let _one = DEFERRING.lock().unwrap_or_else(|e| e.into_inner());
+    let name = deferred_name(root, file).ok_or("not an archive of this folder")?;
+    let mut all = read_deferred(root);
+    match deferred {
+        Some(deferred) => {
+            all.insert(name, deferred);
+        }
+        None => {
+            if all.remove(&name).is_none() {
+                return Ok(());
+            }
+            let _ = File::options().write(true).open(file).and_then(|f| f.set_modified(std::time::SystemTime::now()));
+        }
+    }
+    write_deferred(root, &all)
+}
+
+fn write_deferred(root: &Path, all: &std::collections::BTreeMap<String, Deferred>) -> Result<(), String> {
+    std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
+    let tmp = root.join(format!(".{DEFERRED}.tmp"));
+    std::fs::write(&tmp, serde_json::to_string_pretty(all).unwrap_or_default()).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, root.join(DEFERRED)).map_err(|e| e.to_string())
+}
+
+/// A project's deferred tasks become archives like the others: it is
+/// gone from the list, and they no longer come back.
+pub fn undefer_project(root: &Path, project: &Path) {
+    let dir = project_dir(root, project);
+    for item in list(root).into_iter().filter(|a| a.deferred.is_some() && a.file.starts_with(&dir)) {
+        let _ = set_deferred(root, &item.file, None);
+    }
 }
 
 impl Archived {
@@ -446,18 +525,36 @@ pub fn list(root: &Path) -> Vec<Archived> {
                 },
             };
             now.insert(file.clone(), (size, written, meta.clone()));
-            all.push(Archived { file, size, meta });
+            all.push(Archived { file, size, meta, deferred: None });
         }
     }
     *read = Some(now);
+    drop(read);
+    let deferred = {
+        let _one = DEFERRING.lock().unwrap_or_else(|e| e.into_inner());
+        let mut deferred = read_deferred(root);
+        // What is gone from disk leaves the list.
+        let before = deferred.len();
+        deferred.retain(|name, _| root.join(name).is_file());
+        if deferred.len() != before {
+            let _ = write_deferred(root, &deferred);
+        }
+        deferred
+    };
+    for item in &mut all {
+        item.deferred = deferred_name(root, &item.file).and_then(|name| deferred.get(&name).copied());
+    }
     all.sort_by(|a, b| b.meta.archived.cmp(&a.meta.archived));
     all
 }
 
 /// Deletes the archives older than `max_age` seconds (by when they were
-/// written), and what an archive left half-made a day ago. Returns how
-/// many archives went.
+/// written), deferred ones not, and what an archive left half-made a day
+/// ago. Returns how many archives went.
 pub fn clean_up(root: &Path, max_age: u64, now: u64) -> usize {
+    let _one = DEFERRING.lock().unwrap_or_else(|e| e.into_inner());
+    let deferred = read_deferred(root);
+    let kept = |file: &Path| deferred_name(root, file).is_some_and(|name| deferred.contains_key(&name));
     let mut removed = 0;
     let age = |entry: &std::fs::DirEntry| {
         let written = entry.metadata().and_then(|m| m.modified()).ok()?;
@@ -471,7 +568,7 @@ pub fn clean_up(root: &Path, max_age: u64, now: u64) -> usize {
             if name.starts_with('.') && age > 86_400 {
                 let path = entry.path();
                 let _ = if path.is_dir() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
-            } else if !name.starts_with('.') && name.ends_with(EXT) && max_age > 0 && age > max_age && std::fs::remove_file(entry.path()).is_ok() {
+            } else if !name.starts_with('.') && name.ends_with(EXT) && max_age > 0 && age > max_age && !kept(&entry.path()) && std::fs::remove_file(entry.path()).is_ok() {
                 removed += 1;
             }
         }
@@ -876,11 +973,18 @@ mod tests {
         };
         let old = made("old-1.tar.gz", 100);
         let new = made("new-1.tar.gz", 10);
+        let put_off = made("later-1.tar.gz", 300);
+        set_deferred(&dir, &put_off, Some(Deferred { since: now, until: None })).unwrap();
         let half = made(".old-1.tar.gz.tmp1", 2);
         assert_eq!(clean_up(&dir, 0, now), 0, "off");
         assert!(old.exists() && !half.exists(), "what was left half-made goes anyway");
         assert_eq!(clean_up(&dir, 90 * 86_400, now), 1);
         assert!(!old.exists() && new.exists());
+        assert!(put_off.exists(), "a deferred task stays, however old");
+        // Back to an archive like the others, its age from now.
+        set_deferred(&dir, &put_off, None).unwrap();
+        assert_eq!(clean_up(&dir, 90 * 86_400, now), 0);
+        assert!(put_off.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -71,6 +71,18 @@ its commits then, and what came back. With Settings → Tasks → "Restore
 with: A summary only", or when its agent can no longer resume it, a new
 session starts, told the task, what was said last and the same news.
 
+**Defer…** (a task's menu) is Archive for a task you will come back to,
+as the week of crash reports after a release: it goes as Archive does,
+and is kept, not cleaned up, until a day chosen then (a week to six
+months, or not sure yet). On that day it comes back by itself, as Restore
+does with what it offers first (from origin, or its PR's branch when that
+is still open; the work on no remote applied), paused and out of view, marked "back from deferred" in the sidebar: its
+project's setup runs and its agent is told what changed when you open it.
+Archived tasks lists the deferred ones first, with their day; Day… changes
+it, Archive makes one an archive like the others, Defer… defers an
+archived one. A project removed from the list takes its deferred tasks
+back to archives like the others.
+
 The archive stays after a restore: archived again, the task replaces it,
 unless it holds work the restored task did not get back. Delete one for
 good from the list. Settings → Tasks deletes archives after a while (3

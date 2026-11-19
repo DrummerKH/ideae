@@ -42,6 +42,41 @@ fn size(bytes: u64) -> String {
 /// they are read.
 type Listed = Rc<RefCell<Option<Vec<(Archived, String)>>>>;
 
+/// The deferred first, the soonest back first and those with no day after;
+/// then the archived, newest first.
+fn sort_listed(all: &mut [(Archived, String)]) {
+    all.sort_by_key(|(a, _)| (a.deferred.is_none(), a.deferred.map(|d| d.until.unwrap_or(u64::MAX)), std::cmp::Reverse(a.meta.archived)));
+}
+
+/// How long a task is put off: the days, or none for a day not set.
+const DEFER_FOR: [(&str, Option<u64>); 6] =
+    [("A week", Some(7)), ("Two weeks", Some(14)), ("A month", Some(30)), ("Three months", Some(91)), ("Six months", Some(182)), ("Not sure yet", None)];
+
+/// Asks how long a task is put off, and does `pick` with the answer.
+fn defer_dialog(title: String, told: String, window: &mut Window, cx: &mut App, pick: impl Fn(archive::Deferred, &mut Window, &mut App) + 'static) {
+    let pick = Rc::new(pick);
+    window.open_dialog(cx, move |dialog, _, _| {
+        let (told, pick) = (told.clone(), pick.clone());
+        dialog.title(title.clone()).w(px(560.)).content(move |content, _, cx| {
+            let mut choices = h_flex().gap_1().flex_wrap();
+            for (ix, (label, days)) in DEFER_FOR.into_iter().enumerate() {
+                let pick = pick.clone();
+                choices = choices.child(Button::new(("defer-for", ix)).small().outline().label(label).on_click(move |_, window, cx| {
+                    let since = state::now();
+                    window.close_dialog(cx);
+                    pick(archive::Deferred { since, until: days.map(|d| since + d * 86_400) }, window, cx);
+                }));
+            }
+            content.child(
+                v_flex()
+                    .gap_3()
+                    .child(div().text_sm().text_color(cx.theme().muted_foreground).child(told.clone()))
+                    .child(v_flex().gap_1().child(div().text_sm().child("Back in")).child(choices)),
+            )
+        })
+    });
+}
+
 /// What the restore dialog is set to.
 #[derive(Clone)]
 struct Choice {
@@ -76,18 +111,62 @@ impl Workspace {
                     .description("It is in the middle of a turn: it is stopped, and the conversation so far goes into the archive.")
                     .ok_text("Archive")
                     .on_ok(move |_, window, cx| {
-                        let _ = this.update(cx, |this, cx| this.archive_now(&path, window, cx));
+                        let _ = this.update(cx, |this, cx| this.archive_now(&path, None, window, cx));
                         true
                     })
             });
             return;
         }
-        self.archive_now(path, window, cx);
+        self.archive_now(path, None, window, cx);
     }
 
-    /// Stops the task as Pause does, writes its archive, and only once
-    /// that is read back whole removes its worktree and local branch.
-    pub(super) fn archive_now(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+    /// Defers a task: archived as Archive does, kept from the clean-up, and
+    /// back as a paused task on the day chosen here, if one is.
+    pub fn defer_task(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((pi, ti)) = self.find(path) else { return };
+        let t = &self.projects[pi].tasks[ti];
+        if t.main || t.side.is_some() || t.busy.is_some() {
+            return;
+        }
+        let busy = t.view.as_ref().is_some_and(|v| v.read(cx).agent_busy());
+        let mut told = "Its worktree goes, as with Archive; its goal and its agent's conversation are kept and not cleaned up. On the day, it comes back paused, from the current origin or its open PR's branch, its agent told what changed when you open it.".to_string();
+        if busy {
+            told.push_str(" Its agent is in the middle of a turn: it is stopped.");
+        }
+        let (this, path) = (cx.weak_entity(), path.to_path_buf());
+        let title = format!("Defer \"{}\"", t.label());
+        defer_dialog(title, told, window, cx, move |deferred, window, cx| {
+            let _ = this.update(cx, |w, cx| w.archive_now(&path, Some(deferred), window, cx));
+        });
+    }
+
+    /// Defers an archived task, changes the day of a deferred one, or with
+    /// None makes it an archive like the others; the list is told.
+    fn set_deferred(&mut self, file: PathBuf, deferred: Option<archive::Deferred>, listed: Listed, window: &mut Window, cx: &mut Context<Self>) {
+        let root = self.archive_dir.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            let job = file.clone();
+            let done = cx.background_spawn(async move { archive::set_deferred(&root, &job, deferred) }).await;
+            let _ = cx.update(|window, cx| match done {
+                Ok(()) => {
+                    if let Some(all) = listed.borrow_mut().as_mut() {
+                        for (item, _) in all.iter_mut().filter(|(item, _)| item.file == file) {
+                            item.deferred = deferred;
+                        }
+                        sort_listed(all);
+                    }
+                    window.refresh();
+                }
+                Err(e) => window.push_notification(Notification::error(e).title("Could not change the archive"), cx),
+            });
+        })
+        .detach();
+    }
+
+    /// Stops the task as Pause does, writes its archive (deferred, when it
+    /// is), and only once that is read back whole removes its worktree and
+    /// local branch.
+    pub(super) fn archive_now(&mut self, path: &Path, deferred: Option<archive::Deferred>, window: &mut Window, cx: &mut Context<Self>) {
         let Some((pi, ti)) = self.find(path) else { return };
         let t = &self.projects[pi].tasks[ti];
         if t.main || t.side.is_some() || t.busy.is_some() {
@@ -140,12 +219,15 @@ impl Workspace {
         let path = path.to_path_buf();
         cx.spawn_in(window, async move |this, cx| {
             torn_down.await;
+            let (root, file) = (archive_dir.clone(), dest.clone());
             let job = archive::Job { meta, profiles, dest };
             let task_path = path.clone();
             // Written: whether the archive is there, whatever came after.
             let result = cx
                 .background_spawn(async move {
                     archive::write(job).map_err(|e| (false, e))?;
+                    // Not deferred, an archive of the same key is not either.
+                    archive::set_deferred(&root, &file, deferred).map_err(|e| (false, e))?;
                     git::remove_task_worktree(&repo, &task_path, &branch, unlock).map_err(|e| (true, e))
                 })
                 .await;
@@ -158,7 +240,12 @@ impl Workspace {
                         if let Some(left) = this.dissolve_lonely_groups() {
                             this.switch(&left, window, cx);
                         }
-                        window.push_notification(Notification::info(format!("\"{title}\" is archived with its agent's conversation: the project's + brings it back.")).title("Archived"), cx);
+                        let told = match deferred {
+                            Some(d) if d.until.is_some() => format!("\"{title}\" comes back {} as a paused task; till then it is with the archived ones, kept.", d.told().trim_start_matches("deferred ")),
+                            Some(_) => format!("\"{title}\" is kept with the archived ones, not cleaned up, till you restore it or set a day."),
+                            None => format!("\"{title}\" is archived with its agent's conversation: the project's + brings it back."),
+                        };
+                        window.push_notification(Notification::info(told).title(if deferred.is_some() { "Deferred" } else { "Archived" }), cx);
                         this.save(cx);
                     }
                     Err((written, e)) => {
@@ -170,9 +257,9 @@ impl Workspace {
                             }
                         }
                         let (title, told) = if written {
-                            ("Archived, but the worktree stays", format!("The archive is written; removing the worktree failed: {e}"))
+                            (if deferred.is_some() { "Deferred, but the worktree stays" } else { "Archived, but the worktree stays" }, format!("The archive is written; removing the worktree failed: {e}"))
                         } else {
-                            ("Archive failed", format!("Nothing was removed. {e}"))
+                            (if deferred.is_some() { "Defer failed" } else { "Archive failed" }, format!("Nothing was removed. {e}"))
                         };
                         window.push_notification(Notification::error(told).title(title), cx);
                     }
@@ -210,7 +297,7 @@ impl Workspace {
                 .on_ok(move |_, window, cx| {
                     let _ = this.update(cx, |w, cx| {
                         for path in &paths {
-                            w.archive_now(path, window, cx);
+                            w.archive_now(path, None, window, cx);
                         }
                     });
                     true
@@ -260,6 +347,8 @@ impl Workspace {
                         }).collect::<Vec<_>>()
                     })
                     .await;
+                let mut found = found;
+                sort_listed(&mut found);
                 *listed.borrow_mut() = Some(found);
                 let _ = cx.update(|window, _| window.refresh());
             })
@@ -288,14 +377,23 @@ impl Workspace {
                 match shown.as_ref() {
                     _ if presenting => list = list.child(div().text_sm().text_color(muted).child("Not shown while presenting.")),
                     None => list = list.child(div().text_sm().text_color(muted).child("Reading…")),
-                    Some(all) if all.is_empty() => list = list.child(div().text_sm().text_color(muted).child("No task archived yet. A task's menu has Archive: its worktree goes, its goal and its agent's conversation stay here.")),
+                    Some(all) if all.is_empty() => list = list.child(div().text_sm().text_color(muted).child("No task archived yet. A task's menu has Archive: its worktree goes, its goal and its agent's conversation stay here. Defer… keeps it from the clean-up and brings it back on a day.")),
                     Some(all) => {
                         let mut any = false;
+                        // Deferred and archived apart, when there are both.
+                        let both = all.iter().any(|(a, _)| a.deferred.is_some()) && all.iter().any(|(a, _)| a.deferred.is_none());
+                        let mut heading: Option<bool> = None;
                         for (ix, (item, hay)) in all.iter().enumerate() {
-                            if !words.iter().all(|w| hay.contains(w)) {
+                            let deferred = item.deferred;
+                            if !words.iter().all(|w| hay.contains(w) || (deferred.is_some() && "deferred".contains(w.as_str()))) {
                                 continue;
                             }
                             any = true;
+                            if both && heading != Some(deferred.is_some()) {
+                                heading = Some(deferred.is_some());
+                                let label = if deferred.is_some() { "Deferred: kept, back on their day" } else { "Archived" };
+                                list = list.child(div().pt_1().px_2().text_xs().text_color(muted).child(label));
+                            }
                             let m = &item.meta;
                             let mut details = Vec::new();
                             if several {
@@ -305,7 +403,10 @@ impl Workspace {
                             if let Some(pr) = &m.pr {
                                 details.push(format!("PR #{} {}", pr.number, pr.state));
                             }
-                            details.push(format!("archived {}", archive::date(m.archived)));
+                            match deferred {
+                                Some(d) => details.push(d.told()),
+                                None => details.push(format!("archived {}", archive::date(m.archived))),
+                            }
                             if !m.unpushed.is_empty() || !m.uncommitted.is_empty() {
                                 details.push("with work on no remote".into());
                             }
@@ -313,6 +414,10 @@ impl Workspace {
                             let prompt = m.prompt.lines().find(|l| !l.trim().is_empty()).unwrap_or_default().to_string();
                             let (restore_item, delete_item, row_item) = (item.clone(), item.clone(), item.clone());
                             let (a, b, c, listed) = (this.clone(), this.clone(), this.clone(), listed.clone());
+                            // Deferred: another day, or an archive like the others; archived: deferred.
+                            let (day, undefer) = (this.clone(), this.clone());
+                            let (day_file, undefer_file, day_listed, undefer_listed) = (item.file.clone(), item.file.clone(), listed.clone(), listed.clone());
+                            let day_title = m.title.clone();
                             list = list.child(
                                 h_flex()
                                     .id(("archived", ix))
@@ -336,6 +441,20 @@ impl Workspace {
                                         let item = restore_item.clone();
                                         let _ = a.update(cx, |w, cx| w.restore_dialog(item, window, cx));
                                     }))
+                                    .child(Button::new(("archived-defer", ix)).small().ghost().label(if deferred.is_some() { "Day…" } else { "Defer…" }).on_click(move |_, window, cx| {
+                                        cx.stop_propagation();
+                                        let (this, file, listed) = (day.clone(), day_file.clone(), day_listed.clone());
+                                        let told = "It stays with the archived tasks, kept from the clean-up; on the day it comes back paused, from the current origin or its open PR's branch.".to_string();
+                                        defer_dialog(format!("Defer \"{day_title}\""), told, window, cx, move |d, window, cx| {
+                                            let _ = this.update(cx, |w, cx| w.set_deferred(file.clone(), Some(d), listed.clone(), window, cx));
+                                        });
+                                    }))
+                                    .when(deferred.is_some(), |row| {
+                                        row.child(Button::new(("archived-undefer", ix)).small().ghost().label("Archive").tooltip("An archive like the others: no day, cleaned up in time").on_click(move |_, window, cx| {
+                                            cx.stop_propagation();
+                                            let _ = undefer.update(cx, |w, cx| w.set_deferred(undefer_file.clone(), None, undefer_listed.clone(), window, cx));
+                                        }))
+                                    })
                                     .child(Button::new(("archived-delete", ix)).small().ghost().label("Delete…").on_click(move |_, window, cx| {
                                         cx.stop_propagation();
                                         let item = delete_item.clone();
@@ -480,7 +599,7 @@ impl Workspace {
                     let mut c = choice.borrow().clone();
                     c.branch = new_branch.clone();
                     window.close_dialog(cx);
-                    let _ = this.update(cx, |w, cx| w.restore_archived(item.clone(), c, window, cx));
+                    let _ = this.update(cx, |w, cx| w.restore_archived(item.clone(), c, false, window, cx));
                 }
             };
             dialog
@@ -568,11 +687,59 @@ impl Workspace {
         state::with_settings(|s| s.profile(&id).cloned())
     }
 
+    /// Deferred tasks whose day came are restored as Restore would, from
+    /// origin or their open PR's branch, and left paused: nothing starts
+    /// till they are opened. Not while presenting; a task restored from
+    /// the same archive already is not made twice.
+    pub(super) fn wake_deferred(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_presenting() {
+            return;
+        }
+        let projects: Vec<PathBuf> = self.projects.iter().map(|p| p.path.clone()).collect();
+        let root = self.archive_dir.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let now = state::now();
+            let due: Vec<(Archived, Option<PrNow>)> = cx
+                .background_spawn(async move {
+                    archive::list(&root)
+                        .into_iter()
+                        .filter(|a| a.deferred.is_some_and(|d| d.due(now)) && projects.contains(&a.meta.project))
+                        .map(|a| {
+                            let pr = a.meta.pr.as_ref().and_then(|pr| crate::pr::by_number(&a.meta.project, pr.number)).map(|(pr, head)| PrNow { state: pr.state, head });
+                            (a, pr)
+                        })
+                        .collect()
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                for (item, pr) in due {
+                    if this.waking.contains(&item.file) || this.wake_failed.contains(&item.file) {
+                        continue;
+                    }
+                    let key = item.key();
+                    if this.projects.iter().flat_map(|p| &p.tasks).any(|t| t.archive == key) {
+                        // Restored by hand already: only its day goes.
+                        let (root, file) = (this.archive_dir.clone(), item.file.clone());
+                        cx.background_spawn(async move { archive::set_deferred(&root, &file, None) }).detach();
+                        continue;
+                    }
+                    let on_branch = pr.as_ref().is_some_and(|p| matches!(p.state, crate::pr::PrState::Open | crate::pr::PrState::Draft) && !p.head.is_empty());
+                    let summary = state::with_settings(|s| s.restore_summary);
+                    let choice = Choice { pr: Some(pr), on_branch, commits: true, changes: true, summary, branch: String::new() };
+                    this.waking.insert(item.file.clone());
+                    this.restore_archived(item, choice, true, window, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
     /// Brings an archived task back as a new task: its worktree made and
     /// its work and sessions put back in the background, then its agent
     /// started on the same conversation (or a summary) and told what
-    /// changed since.
-    fn restore_archived(&mut self, item: Archived, choice: Choice, window: &mut Window, cx: &mut Context<Self>) {
+    /// changed since. A deferred one come back on its own (`woke`) is left
+    /// paused, out of view: that is done when it is opened.
+    fn restore_archived(&mut self, item: Archived, choice: Choice, woke: bool, window: &mut Window, cx: &mut Context<Self>) {
         let m = item.meta.clone();
         let Some(pi) = self.projects.iter().position(|p| p.path == m.project) else { return };
         let repo = self.projects[pi].path.clone();
@@ -594,18 +761,26 @@ impl Workspace {
         // Where it shows till its worktree is there: no task's path.
         let placeholder = git::task_worktree_dir(&repo, &format!("{wanted}.restoring-{}", state::now()));
         let p = &mut self.projects[pi];
-        p.collapsed = false;
+        if !woke {
+            p.collapsed = false;
+        }
         p.tasks.push(TaskEntry { path: placeholder.clone(), branch: wanted.clone(), title: m.title.clone(), last_active: state::now(), busy: Some("restoring…".into()), created: state::now(), ..Default::default() });
         cx.notify();
         let file = item.file.clone();
         let key = item.key();
+        let (root, was_deferred) = (self.archive_dir.clone(), item.deferred.is_some());
         let (copy_env, job_meta) = (settings.copy_env, m.clone());
         cx.spawn_in(window, async move |this, cx| {
-            let result = cx
+            let result: Result<archive::Restored, String> = cx
                 .background_spawn(async move {
                     let branch = if matches!(start, Start::Origin) { git::free_branch_name(&repo, &wanted) } else { wanted };
                     let plan = archive::Plan { start, branch, commits: choice.commits, changes: choice.changes, profiles, copy_env };
-                    archive::restore(&repo, &file, &job_meta, &plan)
+                    let restored = archive::restore(&repo, &file, &job_meta, &plan)?;
+                    // Back: it does not come back again; an archive like the others.
+                    if was_deferred {
+                        let _ = archive::set_deferred(&root, &file, None);
+                    }
+                    Ok(restored)
                 })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -615,10 +790,18 @@ impl Workspace {
                         if let Some((pi, ti)) = this.find(&placeholder) {
                             this.projects[pi].tasks.remove(ti);
                         }
-                        window.push_notification(Notification::error(e).title("Could not restore the task"), cx);
+                        if woke {
+                            this.waking.remove(&item.file);
+                            this.wake_failed.insert(item.file.clone());
+                            let told = format!("\"{}\" stays deferred: {e}\nRestore it from the archived tasks when that is mended.", m.title);
+                            window.push_notification(Notification::error(told).title("A deferred task could not come back"), cx);
+                        } else {
+                            window.push_notification(Notification::error(e).title("Could not restore the task"), cx);
+                        }
                         return cx.notify();
                     }
                 };
+                this.waking.remove(&item.file);
                 let Some(entry) = this.entry_mut(&placeholder) else { return };
                 let path = restored.path.clone();
                 entry.path = path.clone();
@@ -645,19 +828,29 @@ impl Workspace {
                     }
                     Conversation::Summary { profile: None, .. } => None,
                 };
-                this.switch(&path, window, cx);
-                this.task_made(&path, window, cx);
-                let view = this.entry_mut(&path).and_then(|entry| entry.view.clone());
-                if let (Some(text), Some(view)) = (text, view) {
-                    view.update(cx, |t, cx| t.queue_prompt(text, true, window, cx));
-                }
                 let mut problems = Vec::new();
+                if woke {
+                    entry.woke = Some(text.unwrap_or_default());
+                } else {
+                    this.switch(&path, window, cx);
+                    this.task_made(&path, window, cx);
+                    let view = this.entry_mut(&path).and_then(|entry| entry.view.clone());
+                    if let (Some(text), Some(view)) = (text, view) {
+                        view.update(cx, |t, cx| t.queue_prompt(text, true, window, cx));
+                    }
+                }
                 for (what, applied) in [("The commits on no remote", &restored.commits), ("The uncommitted changes", &restored.changes)] {
                     if let Applied::Failed { why, kept } = applied {
                         problems.push(format!("{what} did not apply ({why}); kept at {kept}."));
                     }
                 }
-                if problems.is_empty() {
+                if woke && problems.is_empty() {
+                    let told = format!("\"{}\" is back on {}, paused: its agent is told what changed when you open it.", m.title, restored.branch);
+                    window.push_notification(Notification::info(told).title("A deferred task is back"), cx);
+                } else if woke {
+                    problems.push("The archive keeps them too.".into());
+                    window.push_notification(Notification::warning(problems.join("\n")).title(format!("\"{}\" is back, not all of its work", m.title)), cx);
+                } else if problems.is_empty() {
                     window.push_notification(Notification::info(format!("\"{}\" is back on {}.", m.title, restored.branch)).title("Restored"), cx);
                 } else {
                     problems.push("The archive keeps them too.".into());
@@ -856,7 +1049,7 @@ exec cat > "$OUT/$name.told"
         assert_eq!((meta.unpushed.len(), meta.uncommitted.clone()), (1, vec!["new.txt".to_string()]));
 
         let item = listed[0].clone();
-        step(cx, &mut |w, window, cx| w.restore_archived(item.clone(), Choice { pr: Some(None), on_branch: false, commits: true, changes: true, summary: false, branch: String::new() }, window, cx));
+        step(cx, &mut |w, window, cx| w.restore_archived(item.clone(), Choice { pr: Some(None), on_branch: false, commits: true, changes: true, summary: false, branch: String::new() }, false, window, cx));
         let mut back = None;
         wait(cx, "the restored task", &mut |cx| {
             back = task(cx).filter(|t| !t.2 && t.3);
@@ -878,6 +1071,37 @@ exec cat > "$OUT/$name.told"
         wait(cx, "the note to reach the agent", &mut |_| out(&again, "told").contains("comes in my next message"));
         let told = out(&again, "told");
         assert!(told.contains("archived on") && told.contains("no pull request") && told.contains("not pushed") && told.contains("applied again"), "{told}");
+
+        // Deferred with its day come: it goes as Archive does and stays from the clean-up.
+        let since = crate::state::now();
+        step(cx, &mut |w, window, cx| w.archive_now(&again, Some(crate::archive::Deferred { since, until: Some(since) }), window, cx));
+        wait(cx, "the task to be deferred", &mut |cx| task(cx).is_none());
+        let listed = crate::archive::list(&archives);
+        assert_eq!(listed.len(), 1, "in the place of the archive it came from");
+        assert!(listed[0].deferred.is_some_and(|d| d.due(since)));
+        assert_eq!(crate::archive::clean_up(&archives, 1, since + 86_400), 0, "a deferred task is not cleaned up");
+        // Its day: back, paused, nothing started till it is opened.
+        step(cx, &mut |w, window, cx| w.wake_deferred(window, cx));
+        let mut woke = None;
+        wait(cx, "the deferred task to come back", &mut |cx| {
+            woke = task(cx).filter(|t| !t.2);
+            woke.is_some()
+        });
+        let (woke, ..) = woke.unwrap();
+        assert!(task(cx).is_some_and(|t| !t.3), "paused: no agent, no terminals");
+        assert!(workspace.update(cx, |w, _| w.projects[0].tasks.iter().any(|t| t.woke.is_some())));
+        assert!(crate::archive::list(&archives)[0].deferred.is_none(), "it does not come back twice");
+        step(cx, &mut |w, window, cx| w.wake_deferred(window, cx));
+        assert_eq!(workspace.update(cx, |w, _| w.projects[0].tasks.iter().filter(|t| !t.main).count()), 1);
+        assert_eq!(std::fs::read_to_string(woke.join("new.txt")).unwrap(), "kept\n");
+        // Opened: its agent resumes the conversation and is told what happened.
+        step(cx, &mut |w, window, cx| w.switch(&woke, window, cx));
+        wait(cx, "the agent to start", &mut |_| !out(&woke, "args").is_empty());
+        assert!(out(&woke, "args").contains(&format!("--resume {id}")), "{}", out(&woke, "args"));
+        let up = HookEvent { task: woke.clone(), ..up.clone() };
+        step(cx, &mut |w, window, cx| w.on_hook(up.clone(), window, cx));
+        wait(cx, "the note to reach the agent", &mut |_| out(&woke, "told").contains("comes in my next message"));
+        assert!(workspace.update(cx, |w, _| w.projects[0].tasks.iter().all(|t| t.woke.is_none())), "told once");
 
         step(cx, &mut |w, _, cx| {
             for view in w.views() {

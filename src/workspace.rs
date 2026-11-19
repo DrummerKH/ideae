@@ -83,6 +83,9 @@ pub struct TaskEntry {
     /// it did not get back (archive.rs).
     pub archive: String,
     pub archive_keep: bool,
+    /// A deferred task come back on its own: when it is first opened, its
+    /// project's setup runs and its agent is told this (empty: nothing).
+    pub woke: Option<String>,
 }
 
 pub mod agents_ui;
@@ -284,6 +287,9 @@ pub struct Workspace {
     auto: automation::AutoState,
     /// Where tasks are archived (archive.rs).
     pub archive_dir: PathBuf,
+    /// Deferred tasks coming back now, and those that could not: told once.
+    waking: std::collections::HashSet<PathBuf>,
+    wake_failed: std::collections::HashSet<PathBuf>,
 }
 
 impl Workspace {
@@ -571,6 +577,10 @@ impl Workspace {
                     if n % 28_800 == 5 {
                         this.clean_up_archives(cx);
                     }
+                    // Hourly, the first soon after start: deferred tasks whose day came.
+                    if n % 1_200 == 7 {
+                        this.wake_deferred(window, cx);
+                    }
                 });
                 if alive.is_err() {
                     break;
@@ -675,6 +685,8 @@ impl Workspace {
             build: crate::build_watch::BuildWatch::new(),
             auto: Default::default(),
             archive_dir: crate::archive::root(),
+            waking: Default::default(),
+            wake_failed: Default::default(),
         };
         this.restore(&saved, window, cx);
         this.tell_what_is_hidden();
@@ -860,9 +872,10 @@ impl Workspace {
                     agent: t.agent.clone(),
                     choices: t.choices.clone(),
                     sessions: t.sessions.clone(),
-                    fresh: false,
+                    fresh: t.fresh,
                     archive: t.archive.clone(),
                     archive_keep: t.archive_keep,
+                    woke: t.woke.clone(),
                 })
                 .collect();
             self.projects.push(project);
@@ -979,8 +992,10 @@ impl Workspace {
                             agent: t.agent.clone(),
                             choices: t.choices.clone(),
                             sessions: t.sessions.clone(),
+                            fresh: t.fresh,
                             archive: t.archive.clone(),
                             archive_keep: t.archive_keep,
+                            woke: t.woke.clone(),
                         })
                         .collect(),
                 })
@@ -1040,7 +1055,16 @@ impl Workspace {
             t
         });
         cx.subscribe_in(&view, window, |this, view, event: &TaskEvent, window, cx| this.on_task_event(view, event, window, cx)).detach();
-        self.entry_mut(path)?.view = Some(view.clone());
+        let entry = self.entry_mut(path)?;
+        entry.view = Some(view.clone());
+        // Come back while nobody looked: what a restore does on the spot.
+        if let Some(told) = entry.woke.take() {
+            if !told.is_empty() {
+                view.update(cx, |t, cx| t.queue_prompt(told, true, window, cx));
+            }
+            self.task_made(path, window, cx);
+            self.save_later(cx);
+        }
         Some(view)
     }
 
@@ -1971,6 +1995,9 @@ impl Workspace {
                             this.stop(task, window, cx);
                         }
                         this.projects.retain(|p| p.path != path);
+                        // Its deferred tasks no longer come back: archives like the others.
+                        let (root, project) = (this.archive_dir.clone(), path.clone());
+                        cx.background_spawn(async move { crate::archive::undefer_project(&root, &project) }).detach();
                         cx.notify();
                     });
                     true

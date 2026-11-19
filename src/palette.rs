@@ -304,7 +304,7 @@ impl Workspace {
                 .detail(crate::commands::git_hint(what))
             };
             use T::*;
-            of_task.extend([NewTerminal, NewBrowserTab, RestartAgent, CompareThisFile, Star, CopyBranchName, Rename, AnotherVariant, KeepVariant, StartServices, StopServices, Pause, Archive, RemoveSide].into_iter().filter(|what| hand.is_some_and(|t| t.allows(*what))).map(task));
+            of_task.extend([NewTerminal, NewBrowserTab, RestartAgent, CompareThisFile, Star, CopyBranchName, Rename, AnotherVariant, KeepVariant, StartServices, StopServices, Pause, Archive, Defer, RemoveSide].into_iter().filter(|what| hand.is_some_and(|t| t.allows(*what))).map(task));
             of_git = G::ALL.into_iter().filter(|what| hand.is_some_and(|t| t.git(*what))).map(git).collect();
         }
         let mut entries = vec![
@@ -469,13 +469,17 @@ impl Workspace {
                 .map(|(item, project)| {
                     let this = this.clone();
                     let title = item.meta.title.clone();
-                    let detail = format!("{project} · archived {}", crate::sidebar::ago(item.meta.archived));
+                    let detail = match item.deferred {
+                        Some(d) => format!("{project} · {}", d.told()),
+                        None => format!("{project} · archived {}", crate::sidebar::ago(item.meta.archived)),
+                    };
+                    let mark = if item.deferred.is_some() { "◷" } else { "↺" };
                     let mut entry = Entry::new(title, move |window, cx| {
                         let item = item.clone();
                         let _ = this.update(cx, |w, cx| w.restore_dialog(item, window, cx));
                     })
                     .detail(detail);
-                    entry.mark = Some(("↺", hsla(0., 0., 0.55, 1.)));
+                    entry.mark = Some((mark, hsla(0., 0., 0.55, 1.)));
                     entry.dim = true;
                     entry.archived = true;
                     entry.marked = true;
