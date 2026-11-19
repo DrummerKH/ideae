@@ -2682,8 +2682,9 @@ pub(crate) struct NodeContext {
 impl NodeContext {
     fn image_source(&self, image: &ImageNode) -> ImageSource {
         match &self.image_source {
-            Some(resolve) => resolve(&image.url),
-            None => image.source(),
+            // ideae patch: a `data:` URL carries its picture: decoded as without a resolver.
+            Some(resolve) if !image.url.starts_with("data:") => resolve(&image.url),
+            _ => image.source(),
         }
     }
 

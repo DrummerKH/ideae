@@ -79,6 +79,9 @@ pub struct Settings {
     pub quick_agent: String,
     /// Language servers (program names) never started.
     pub lsp_off: Vec<String>,
+    /// The hints said no more of, in every project ("check", "setup").
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hints_off: Vec<String>,
     /// Minutes a task out of view keeps its language servers.
     pub lsp_idle_minutes: u32,
     /// Minutes a chat agent with nothing to do keeps running in a task out
@@ -216,6 +219,7 @@ impl Default for Settings {
             default_agent: crate::agents::DEFAULT_ID.into(),
             quick_agent: String::new(),
             lsp_off: Vec::new(),
+            hints_off: Vec::new(),
             lsp_idle_minutes: 15,
             agent_idle_minutes: 30,
             agent_unanswered_minutes: 0,
@@ -237,7 +241,7 @@ impl Default for Settings {
             rail_open_ms: 750,
             theme: "Ayu".into(),
             dark_theme: String::new(),
-            show_load: true,
+            show_load: false,
             show_tokens: false,
             context_dial: true,
             context_on_tab: true,
@@ -407,6 +411,16 @@ pub struct ProjectState {
     /// Here and not in `.ideae.toml`: whose subscription runs is personal.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// Where its new tasks branch from (`develop`, `origin/release`); empty
+    /// for the remote's default branch.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub base: String,
+    /// No language servers in this project's tasks.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub lsp_off: bool,
+    /// Its tasks' pull requests are not asked of gh.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub pr_off: bool,
     /// Worktrees an agent made with `git worktree add` outside the places
     /// that tell (beside the repository), and the task whose agent did.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]

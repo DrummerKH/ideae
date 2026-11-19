@@ -14,7 +14,7 @@ use std::{
 };
 
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _,
+    ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     h_flex,
@@ -48,7 +48,7 @@ pub struct AutoState {
     /// Teardowns that run, by worktree: done when the sender is dropped.
     tearing: HashMap<PathBuf, async_channel::Receiver<()>>,
     /// Hints given this run, by project.
-    hinted: HashSet<(PathBuf, &'static str)>,
+    hinted: HashSet<&'static str>,
 }
 
 #[derive(Clone, Copy)]
@@ -64,6 +64,18 @@ impl Hint {
             Hint::Setup => "setup",
         }
     }
+}
+
+/// The pages of a project's settings.
+const SECTIONS: [&str; 7] = ["Tasks", "Services", "Agent", "Language servers", "Git", "Archive", "Look"];
+
+/// What a project keeps on this machine, as its settings dialog has it.
+#[derive(Clone)]
+pub(super) struct Local {
+    agent: Option<String>,
+    space: Option<String>,
+    lsp_off: bool,
+    pr_off: bool,
 }
 
 impl Workspace {
@@ -385,12 +397,13 @@ impl Workspace {
         }
     }
 
-    /// A word on what would have helped just now, once a run for each
-    /// project, with "Don't show again".
+    /// A word on what would have helped just now, once a run, with "Don't
+    /// show again" for every project.
     fn hint(&mut self, path: &Path, hint: Hint, window: &mut Window, cx: &mut Context<Self>) {
         let Some((pi, _)) = self.find(path) else { return };
         let project = self.projects[pi].path.clone();
-        if self.projects[pi].hints_off.contains(hint.key()) || !self.auto.hinted.insert((project.clone(), hint.key())) || self.presenting.is_some() {
+        let off = crate::state::with_settings(|s| s.hints_off.iter().any(|k| k == hint.key()));
+        if off || self.projects[pi].hints_off.contains(hint.key()) || !self.auto.hinted.insert(hint.key()) || self.presenting.is_some() {
             return;
         }
         let (title, text) = match hint {
@@ -406,7 +419,7 @@ impl Workspace {
         let this = cx.weak_entity();
         let note = Notification::new().title(title).autohide(false).content(move |_, _, cx| {
             let (set_up, off) = (this.clone(), this.clone());
-            let (project, project_off) = (project.clone(), project.clone());
+            let project = project.clone();
             v_flex()
                 .gap_2()
                 .child(div().text_sm().text_color(cx.theme().muted_foreground).child(text))
@@ -423,13 +436,12 @@ impl Workspace {
                             note.dismiss(window, cx);
                         })))
                         .child(Button::new("hint-off").small().ghost().label("Don't show again").on_click(cx.listener(move |note, _, window, cx| {
-                            let project = project_off.clone();
-                            let _ = off.update(cx, |w, cx| {
-                                if let Some(p) = w.projects.iter_mut().find(|p| p.path == project) {
-                                    p.hints_off.insert(hint.key().to_string());
-                                }
-                                w.save_later(cx);
-                            });
+                            let mut settings = crate::state::settings();
+                            if !settings.hints_off.iter().any(|k| k == hint.key()) {
+                                settings.hints_off.push(hint.key().to_string());
+                            }
+                            crate::state::set_settings(settings);
+                            let _ = off.update(cx, |w, cx| w.save_later(cx));
                             note.dismiss(window, cx);
                         }))),
                 )
@@ -462,18 +474,32 @@ impl Workspace {
         let Some(project) = self.projects.get(pi).map(|p| p.path.clone()) else { return };
         cx.spawn_in(window, async move |this, cx| {
             let job = project.clone();
-            let (file, suggested) = cx.background_spawn(async move { (project_config::read_file(&job), project_config::suggest(&job)) }).await;
+            let root = this.read_with(cx, |w, _| w.archive_dir.clone()).unwrap_or_default();
+            let (file, suggested, archived) = cx
+                .background_spawn(async move {
+                    let archived: Vec<(PathBuf, u64, bool)> =
+                        crate::archive::list(&root).into_iter().filter(|a| a.meta.project == job).map(|a| (a.file, a.size, a.deferred.is_some())).collect();
+                    (project_config::read_file(&job), project_config::suggest(&job), archived)
+                })
+                .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 if let Some(pi) = this.projects.iter().position(|p| p.path == project) {
-                    this.project_settings_dialog(pi, file, suggested, window, cx);
+                    this.project_settings_dialog(pi, file, suggested, archived, window, cx);
                 }
             });
         })
         .detach();
     }
 
-    fn project_settings_dialog(&mut self, pi: usize, file: Result<Option<Config>, String>, suggested: Suggested, window: &mut Window, cx: &mut Context<Self>) {
+    fn project_settings_dialog(&mut self, pi: usize, file: Result<Option<Config>, String>, suggested: Suggested, archived: Vec<(PathBuf, u64, bool)>, window: &mut Window, cx: &mut Context<Self>) {
+        let section = Rc::new(Cell::new(0usize));
         let p = &self.projects[pi];
+        // Kept on this machine, set here and applied on Save.
+        let local = Rc::new(RefCell::new(Local { agent: p.agent.clone(), space: p.space.clone(), lsp_off: p.lsp_off, pr_off: p.pr_off }));
+        let profiles: Vec<(String, String)> = crate::state::with_settings(|s| s.agents.iter().map(|a| (a.id.clone(), a.name.clone())).collect());
+        let spaces: Vec<(String, String)> = self.spaces.iter().map(|s| (s.name.clone(), s.mark())).collect();
+        let stale = p.merged_branches.len();
+        let archived = Rc::new(RefCell::new(archived));
         let (project, name) = (p.path.clone(), p.name.clone());
         let own = project_config::own(&project);
         let (file_error, file) = match file {
@@ -503,6 +529,7 @@ impl Workspace {
         let copy_default = if crate::state::settings().copy_env { "the ignored .env* files, as Settings say" } else { "none" };
         let copy_hint = if suggested.copy.is_empty() { copy_default.to_string() } else { format!("{}; empty: {copy_default}", suggested.copy.join(" ")) };
         let copy = line(start.task.copy.clone().unwrap_or_default().join(" "), copy_hint, window, cx);
+        let base = line(p.base.clone(), "the remote's default branch".to_string(), window, cx);
         let rows: Rc<RefCell<Vec<ServiceRow>>> = Rc::new(RefCell::new(Vec::new()));
         for service in &start.service {
             let row = ServiceRow::new_in(service.clone(), window, cx);
@@ -549,12 +576,17 @@ impl Workspace {
         };
         let this = cx.weak_entity();
         let save = {
-            let (this, project, only_me, collect) = (this.clone(), project.clone(), only_me.clone(), collect.clone());
+            let (this, project, only_me, collect, local, base) = (this.clone(), project.clone(), only_me.clone(), collect.clone(), local.clone(), base.clone());
             move |window: &mut Window, cx: &mut App| {
                 let config = collect(cx);
                 let only_me = only_me.get();
+                let local = local.borrow().clone();
+                let base = base.read(cx).value().trim().to_string();
                 window.close_dialog(cx);
-                let _ = this.update(cx, |w, cx| w.save_project_settings(&project, config, only_me, window, cx));
+                let _ = this.update(cx, |w, cx| {
+                    w.apply_local_project_settings(&project, local, base, window, cx);
+                    w.save_project_settings(&project, config, only_me, window, cx)
+                });
             }
         };
         let remove = {
@@ -594,9 +626,12 @@ impl Workspace {
             let (save, ask, fill, allow, file_trust, file_key, file_error) =
                 (save.clone(), ask.clone(), fill.clone(), allow.clone(), file_trust.clone(), file_key.clone(), file_error.clone());
             let remove = remove.clone();
+            let (section, local, profiles, spaces, archived, base, this, project) =
+                (section.clone(), local.clone(), profiles.clone(), spaces.clone(), archived.clone(), base.clone(), this.clone(), project.clone());
+            let (page_ask, page_fill) = (ask.clone(), fill.clone());
             dialog
                 .title(format!("Project settings · {name}"))
-                .w(px(760.))
+                .w(px(860.))
                 .content(move |content, window, cx| {
                     let muted = cx.theme().muted_foreground;
                     let height = (window.viewport_size().height - px(240.)).clamp(px(240.), px(640.));
@@ -650,14 +685,54 @@ impl Workspace {
                         }
                         _ => None,
                     };
-                    content.child(
-                        v_flex()
-                            .id("project-settings")
-                            .test_support()
-                            .max_h(height)
-                            .overflow_y_scroll()
+                    let now = section.get();
+                    let mut nav = v_flex().w(px(170.)).flex_none().gap_0p5().pr_2().border_r_1().border_color(cx.theme().border);
+                    for (ix, title) in SECTIONS.iter().enumerate() {
+                        let section = section.clone();
+                        nav = nav.child(
+                            Button::new(("project-section", ix)).small().ghost().w_full().justify_start().label(*title).selected(now == ix).on_click(move |_, window, _| {
+                                section.set(ix);
+                                window.refresh();
+                            }),
+                        );
+                    }
+                    let nav = nav.child(div().flex_1()).child({
+                        let remove = remove.clone();
+                        Button::new("project-remove").small().ghost().w_full().justify_start().label("Remove from the list…").on_click(move |_, window, cx| remove(window, cx))
+                    });
+                    // What fills in Tasks and Services: the project's files, or its agent.
+                    let helpers = |id: &'static str| {
+                        let (fill, ask) = (page_fill.clone(), page_ask.clone());
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new((id, 0usize))
+                                    .small()
+                                    .outline()
+                                    .label("Use suggestions")
+                                    .disabled(!has_suggestions)
+                                    .tooltip("Fill what is empty with what the project's files suggest (the grey text)")
+                                    .on_click(move |_, window, cx| fill(window, cx)),
+                            )
+                            .child(
+                                Button::new((id, 1usize))
+                                    .small()
+                                    .outline()
+                                    .label("Ask the agent to fill this in")
+                                    .tooltip("The agent of the main checkout writes .ideae.toml for this repository; you review it as any change")
+                                    .on_click(move |_, window, cx| ask(window, cx)),
+                            )
+                    };
+                    let toggle = |id: &'static str, label: &'static str, on: bool, set: Rc<dyn Fn(bool)>| {
+                        Checkbox::new(id).label(label).checked(on).on_click(move |checked, window, _| {
+                            set(*checked);
+                            window.refresh();
+                        })
+                    };
+                    let page: AnyElement = match now {
+                        // Tasks: what runs in them, kept in .ideae.toml or for you alone.
+                        0 => v_flex()
                             .gap_3()
-                            .pr_2()
                             .child(
                                 h_flex()
                                     .gap_2()
@@ -669,9 +744,9 @@ impl Workspace {
                                         }
                                     }))
                                     .child(div().flex_1().text_xs().text_color(muted).child(if mine {
-                                        "Kept in the app, nothing written to the repository; used in place of .ideae.toml.".to_string()
+                                        "Tasks and Services are kept in the app, nothing written to the repository; used in place of .ideae.toml.".to_string()
                                     } else {
-                                        format!("Written to {} at the repository root: commit it, and the team has the same.", crate::services::FILE)
+                                        format!("Tasks and Services are written to {} at the repository root: commit it, and the team has the same.", crate::services::FILE)
                                     })),
                             )
                             .when_some(file_error.clone(), |form, e| form.child(div().text_xs().text_color(gpui_kit::red()).child(e)))
@@ -680,43 +755,177 @@ impl Workspace {
                             .child(field("Teardown", "Runs when a task is paused or archived", Textarea::new(&teardown).into_any_element()))
                             .child(field("Check", "Runs when the agent finishes a turn; ✓ or ✗ on the task", Input::new(&check).into_any_element()))
                             .child(field("Files to copy", "Ignored files a new worktree gets from the main checkout", Input::new(&copy).into_any_element()))
-                            .child(field("Services", "Started from Run: name, command, port", services.into_any_element()))
-                            .child({
-                                let remove = remove.clone();
-                                h_flex()
-                                    .pt_3()
-                                    .mt_1()
-                                    .gap_2()
-                                    .border_t_1()
-                                    .border_color(cx.theme().border)
-                                    .child(div().flex_1().text_xs().text_color(cx.theme().muted_foreground).child("The project leaves the list; its folder, tasks' worktrees and branches stay on disk."))
-                                    .child(Button::new("project-remove").small().ghost().label("Remove from the list…").on_click(move |_, window, cx| remove(window, cx)))
-                            }),
+                            .child(field("New tasks from", "The branch new tasks start from; on this machine", Input::new(&base).into_any_element()))
+                            .child(helpers("tasks-fill"))
+                            .into_any_element(),
+                        1 => v_flex().gap_3().child(field("Services", "Started from Run: name, command, port", services.into_any_element())).child(helpers("services-fill")).into_any_element(),
+                        // The agent: whose subscription runs is personal, so on this machine.
+                        2 => {
+                            let chosen = local.borrow().agent.clone();
+                            let mut list = v_flex().gap_1().child(div().text_xs().text_color(muted).child("The agent this project's new tasks run; a task can still be given another when it is made."));
+                            let default = std::iter::once((None, "The default agent (Settings)".to_string()));
+                            for (ix, (id, label)) in default.chain(profiles.iter().map(|(id, name)| (Some(id.clone()), name.clone()))).enumerate() {
+                                let local = local.clone();
+                                let on = chosen == id;
+                                list = list.child(Checkbox::new(("project-agent", ix)).label(label).checked(on).on_click(move |_, window, _| {
+                                    local.borrow_mut().agent = id.clone();
+                                    window.refresh();
+                                }));
+                            }
+                            list.into_any_element()
+                        }
+                        3 => {
+                            let off = local.borrow().lsp_off;
+                            let set = { let local = local.clone(); Rc::new(move |on: bool| local.borrow_mut().lsp_off = !on) as Rc<dyn Fn(bool)> };
+                            v_flex()
+                                .gap_2()
+                                .child(toggle("project-lsp", "Language servers in this project's tasks", !off, set))
+                                .child(div().text_xs().text_color(muted).child("Off: no completion, types or go to definition from a server; a search finds definitions instead. Which servers run is in Settings → Language servers."))
+                                .into_any_element()
+                        }
+                        4 => {
+                            let off = local.borrow().pr_off;
+                            let set = { let local = local.clone(); Rc::new(move |on: bool| local.borrow_mut().pr_off = !on) as Rc<dyn Fn(bool)> };
+                            let (this, project) = (this.clone(), project.clone());
+                            v_flex()
+                                .gap_2()
+                                .child(toggle("project-pr", "Pull request status of its tasks (gh)", !off, set))
+                                .child(div().text_xs().text_color(muted).child("Off: gh is not asked about this project's branches."))
+                                .when(stale > 0, |page| {
+                                    page.child(h_flex().pt_2().child(Button::new("project-stale").small().outline().label(format!("Delete remote branches of merged PRs ({stale})…")).on_click(move |_, window, cx| {
+                                        window.close_dialog(cx);
+                                        let _ = this.update(cx, |w, cx| {
+                                            if let Some(pi) = w.projects.iter().position(|p| p.path == project) {
+                                                w.merged_branches_dialog(pi, window, cx);
+                                            }
+                                        });
+                                    })))
+                                })
+                                .into_any_element()
+                        }
+                        5 => {
+                            let all = archived.borrow();
+                            let size: u64 = all.iter().map(|(_, size, _)| size).sum();
+                            let deferred = all.iter().filter(|(_, _, d)| *d).count();
+                            let told = match all.len() {
+                                0 => "No archived tasks.".to_string(),
+                                n => format!("{n} archived task{}, {}{}.", if n == 1 { "" } else { "s" }, crate::task::human_size(size), if deferred > 0 { format!(", {deferred} of them deferred") } else { String::new() }),
+                            };
+                            let (archived, this, project) = (archived.clone(), this.clone(), project.clone());
+                            v_flex()
+                                .gap_2()
+                                .child(div().text_sm().child(told))
+                                .child(div().text_xs().text_color(muted).child("Each holds its agent's conversation and any work never pushed. Settings → Tasks deletes them after a while."))
+                                .when(!all.is_empty(), |page| {
+                                    page.child(h_flex().pt_2().child(Button::new("project-archives-delete").small().outline().label("Delete all archived tasks…").on_click(move |_, window, cx| {
+                                        let files: Vec<PathBuf> = archived.borrow().iter().map(|(file, _, _)| file.clone()).collect();
+                                        let _ = this.update(cx, |w, cx| w.delete_project_archives(&project, files, archived.clone(), window, cx));
+                                    })))
+                                })
+                                .into_any_element()
+                        }
+                        _ => {
+                            let chosen = local.borrow().space.clone();
+                            let mut list = v_flex().gap_1().child(div().text_xs().text_color(muted).child("The space the project is in; in none, it shows in every space."));
+                            let none = std::iter::once((None, "In no space".to_string()));
+                            for (ix, (space, label)) in none.chain(spaces.iter().map(|(name, mark)| (Some(name.clone()), format!("{mark}  {name}")))).enumerate() {
+                                let local = local.clone();
+                                let on = chosen == space;
+                                list = list.child(Checkbox::new(("project-space", ix)).label(label).checked(on).on_click(move |_, window, _| {
+                                    local.borrow_mut().space = space.clone();
+                                    window.refresh();
+                                }));
+                            }
+                            list.into_any_element()
+                        }
+                    };
+                    // Where it is on disk, to copy or to show.
+                    let place = {
+                        let (shown, copied, revealed) = (project.display().to_string(), project.display().to_string(), project.clone());
+                        h_flex()
+                            .gap_2()
+                            .pb_2()
+                            .child(div().flex_1().min_w_0().truncate().text_xs().font_family(cx.theme().mono_font_family.clone()).text_color(muted).child(shown))
+                            .child(Button::new("project-path-copy").xsmall().ghost().label("Copy").tooltip("Copy the path").on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()))))
+                            .child(Button::new("project-path-reveal").xsmall().ghost().label("Show in file manager").on_click(move |_, _, cx| cx.reveal_path(&revealed)))
+                    };
+                    content.child(place).child(
+                        h_flex()
+                            .items_start()
+                            .gap_4()
+                            .h(height)
+                            .child(nav.h_full())
+                            .child(v_flex().id("project-settings").test_support().flex_1().min_w_0().h_full().overflow_y_scroll().pr_2().child(page)),
                     )
                 })
                 .footer({
-                    let (save, ask, fill) = (save.clone(), ask.clone(), fill.clone());
+                    let save = save.clone();
                     h_flex()
                         .w_full()
                         .gap_2()
-                        .child(
-                            Button::new("settings-suggest")
-                                .ghost()
-                                .label("Use suggestions")
-                                .disabled(!has_suggestions)
-                                .tooltip("Fill what is empty with what the project's files suggest (the grey text)")
-                                .on_click(move |_, window, cx| fill(window, cx)),
-                        )
-                        .child(
-                            Button::new("settings-ask-agent")
-                                .ghost()
-                                .label("Ask the agent to fill this in")
-                                .tooltip("The agent of the main checkout writes .ideae.toml for this repository; you review it as any change")
-                                .on_click(move |_, window, cx| ask(window, cx)),
-                        )
                         .child(div().flex_1())
                         .child(Button::new("project-settings-cancel").ghost().label("Cancel").on_click(|_, window, cx| window.close_dialog(cx)))
                         .child(Button::new("project-settings-save").primary().label("Save").on_click(move |_, window, cx| save(window, cx)))
+                })
+        });
+    }
+
+    /// What the settings dialog changed of what the project keeps here.
+    fn apply_local_project_settings(&mut self, project: &Path, local: Local, base: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pi) = self.projects.iter().position(|p| p.path == project) else { return };
+        if self.projects[pi].agent != local.agent {
+            self.set_project_agent(pi, local.agent, cx);
+        }
+        if self.projects[pi].space != local.space {
+            self.set_project_space(pi, local.space, window, cx);
+        }
+        let p = &mut self.projects[pi];
+        p.base = base;
+        p.pr_off = local.pr_off;
+        if p.lsp_off != local.lsp_off {
+            p.lsp_off = local.lsp_off;
+            let on = !local.lsp_off;
+            for view in p.tasks.iter().filter_map(|t| t.view.clone()) {
+                view.update(cx, |t, cx| {
+                    t.lsp_off = !on;
+                    t.set_language_servers(false, cx);
+                    if on && !crate::lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed) {
+                        t.set_language_servers(true, cx);
+                    }
+                });
+            }
+        }
+        self.save_later(cx);
+        cx.notify();
+    }
+
+    /// Deletes every archive of a project, asked first.
+    fn delete_project_archives(&mut self, project: &Path, files: Vec<PathBuf>, listed: Rc<RefCell<Vec<(PathBuf, u64, bool)>>>, window: &mut Window, cx: &mut Context<Self>) {
+        let name = project.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let count = files.len();
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            let (files, listed) = (files.clone(), listed.clone());
+            dialog
+                .confirm()
+                .title(format!("Delete the {count} archived task{} of {name}?", if count == 1 { "" } else { "s" }))
+                .description("Their agents' conversations and any work in them that was never pushed go for good; deferred ones do not come back.")
+                .ok_text("Delete")
+                .on_ok(move |_, window, cx| {
+                    let (files, listed) = (files.clone(), listed.clone());
+                    window
+                        .spawn(cx, async move |cx| {
+                            let job = files.clone();
+                            let failed = cx.background_spawn(async move { job.iter().filter(|f| std::fs::remove_file(f).is_err()).count() }).await;
+                            let _ = cx.update(|window, cx| {
+                                listed.borrow_mut().retain(|(file, _, _)| file.exists());
+                                if failed > 0 {
+                                    window.push_notification(Notification::error(format!("{failed} could not be deleted.")).title("Archived tasks"), cx);
+                                }
+                                window.refresh();
+                            });
+                        })
+                        .detach();
+                    true
                 })
         });
     }
@@ -945,7 +1154,8 @@ mod tests {
 
         // A worktree its agent makes beside the repository, where nothing
         // else tells whose it is, folds under the task.
-        let beside = dir.join("repo-beside");
+        // As the hook says it: the folder's links followed, as git lists it.
+        let beside = dir.canonicalize().unwrap().join("repo-beside");
         let made = HookEvent { worktree: Some(beside.display().to_string()), ..hook("PreToolUse") };
         step(cx, &mut |w, window, cx| w.on_hook(made.clone(), window, cx));
         step(cx, &mut |w, window, cx| w.on_hook(hook("Stop"), window, cx));

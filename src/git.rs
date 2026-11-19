@@ -2356,6 +2356,26 @@ mod pull_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// A project's base: origin's branch of that name, fetched; else as said.
+    #[test]
+    fn a_task_starts_from_the_project_s_base() {
+        let base = std::env::temp_dir().join(format!("ideae-task-chosen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let script = "git init -q --bare -b main origin.git; git init -q -b main repo; cd repo; git config user.email t@t; git config user.name t; \
+            echo a > a; git add a; git commit -qm one; git remote add origin ../origin.git; git push -q origin main; \
+            git checkout -q -b develop; echo b > a; git commit -qam two; git push -q origin develop; git checkout -q main; git branch -q -D develop; \
+            git tag v1 main";
+        assert!(std::process::Command::new("sh").arg("-ec").arg(script).current_dir(&base).status().unwrap().success());
+        let repo = base.join("repo");
+        let head = |at: &std::path::Path, rev: &str| super::git(at, &["rev-parse", rev]).unwrap();
+        let task = super::create_task_worktree(&repo, "from-develop", "develop", false).unwrap();
+        assert_eq!(head(&task, "HEAD"), head(&repo, "origin/develop"), "origin's develop, fetched");
+        let tagged = super::create_task_worktree(&repo, "from-tag", "v1", false).unwrap();
+        assert_eq!(head(&tagged, "HEAD"), head(&repo, "v1"), "a name origin has no branch of, as it is");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn a_task_leaves_the_remote_branch_and_owns_only_its_commits() {
         let base = std::env::temp_dir().join(format!("ideae-task-base-{}", std::process::id()));
@@ -2367,7 +2387,7 @@ mod pull_tests {
             for n in 2 3 4; do echo $n > a; git commit -qam $n; done";
         assert!(std::process::Command::new("sh").arg("-ec").arg(script).current_dir(&base).status().unwrap().success());
         let repo = base.join("repo");
-        let task = super::create_task_worktree(&repo, "DEV-1_x", false).unwrap();
+        let task = super::create_task_worktree(&repo, "DEV-1_x", "", false).unwrap();
         let head = |at: &std::path::Path, rev: &str| super::git(at, &["rev-parse", rev]).unwrap();
         assert_eq!(head(&task, "HEAD"), head(&repo, "origin/main"), "from the remote's main, not the local one ahead of it");
         assert!(crate::archive::unpushed(&task).is_empty(), "nothing of its own to lose: main's commits not pushed are main's");
@@ -2661,6 +2681,15 @@ fn fetch_quietly(repo: &Path, args: &[&str]) -> Result<(), String> {
 
 /// Where a new task branches from: the remote's default branch, fetched
 /// first, else the main worktree's branch.
+/// A base the project names: origin's branch of that name, fetched, when
+/// there is one; else as it is said (a local branch, a tag, a commit).
+fn chosen_base(repo: &Path, base: &str) -> String {
+    let name = base.strip_prefix("origin/").unwrap_or(base);
+    let _ = git_status(repo, &["fetch", "--quiet", "origin", name]);
+    let remote = format!("origin/{name}");
+    if git(repo, &["rev-parse", "--verify", "-q", &format!("{remote}^{{commit}}")]).is_some_and(|s| !s.trim().is_empty()) { remote } else { base.to_string() }
+}
+
 fn new_task_base(repo: &Path) -> String {
     if let Some(branch) = remote_default(repo) {
         let _ = git_status(repo, &["fetch", "--quiet", "origin", &branch]);
@@ -2677,8 +2706,10 @@ pub fn task_worktree_dir(repo: &Path, branch: &str) -> PathBuf {
 /// Creates the worktree of a new task next to the repository, in
 /// `<repo>.worktrees/<branch>`, and copies the main worktree's untracked
 /// `.env*` files into it.
-pub fn create_task_worktree(repo: &Path, branch: &str, copy_env: bool) -> Result<PathBuf, String> {
-    worktree_at(repo, branch, &new_task_base(repo), copy_env)
+/// `base`: where the project's tasks branch from, empty for the remote's default.
+pub fn create_task_worktree(repo: &Path, branch: &str, base: &str, copy_env: bool) -> Result<PathBuf, String> {
+    let base = if base.trim().is_empty() { new_task_base(repo) } else { chosen_base(repo, base.trim()) };
+    worktree_at(repo, branch, &base, copy_env)
 }
 
 fn worktree_at(repo: &Path, branch: &str, base: &str, copy_env: bool) -> Result<PathBuf, String> {
@@ -2698,8 +2729,12 @@ fn worktree_at(repo: &Path, branch: &str, base: &str, copy_env: bool) -> Result<
 /// diffs compare: `from`, or where a new task would start, looked up once.
 ///
 /// With the commit they are from: what their diffs are counted against.
-pub fn create_variant_worktrees(repo: &Path, branches: &[String], from: Option<&str>, copy_env: bool) -> Result<(String, Vec<Result<PathBuf, String>>), String> {
-    let base = from.map_or_else(|| new_task_base(repo), str::to_string);
+pub fn create_variant_worktrees(repo: &Path, branches: &[String], from: Option<&str>, base: &str, copy_env: bool) -> Result<(String, Vec<Result<PathBuf, String>>), String> {
+    let base = match from {
+        Some(from) => from.to_string(),
+        None if !base.trim().is_empty() => chosen_base(repo, base.trim()),
+        None => new_task_base(repo),
+    };
     let commit = git(repo, &["rev-parse", "--verify", "-q", &format!("{base}^{{commit}}")])
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -2971,7 +3006,7 @@ mod variant_tests {
             printf 'one\\n' > f.txt; git add f.txt; git commit -qm base");
         let repo = base.join("repo");
         let branches = ["fix-a".to_string(), "fix-b".to_string()];
-        let (from, made) = create_variant_worktrees(&repo, &branches, None, false).unwrap();
+        let (from, made) = create_variant_worktrees(&repo, &branches, None, "", false).unwrap();
         let made: Vec<PathBuf> = made.into_iter().map(Result::unwrap).collect();
         let taken = TakenNames::read(&repo);
         assert!(taken.has("fix-a") && taken.has("main") && !taken.has("fix-c"));
@@ -2986,7 +3021,7 @@ mod variant_tests {
         assert_eq!(change_size(&made[0], Some(&from)), Some((1, 1, 0)));
         assert_eq!(change_size(&made[1], None), Some((2, 2, 1)), "the new file's line too");
         // A later try at the task starts where the first did.
-        let later = create_variant_worktrees(&repo, &["fix-c".to_string()], fork_point(&made[0]).as_deref(), false).unwrap().1.remove(0).unwrap();
+        let later = create_variant_worktrees(&repo, &["fix-c".to_string()], fork_point(&made[0]).as_deref(), "", false).unwrap().1.remove(0).unwrap();
         assert_eq!(head(&later), head(&repo));
 
         // What the gutter compares a file with: the last commit, or where the branch forked.

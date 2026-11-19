@@ -274,12 +274,24 @@ impl Workspace {
             .border_color(cx.theme().border)
             .child(
                 h_flex()
+                    .group("sidebar-top")
                     .gap_1()
                     .px_2()
                     .py_1p5()
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .child(div().flex_1().child(Input::new(&self.search).xsmall().appearance(false).cleanable(true)))
+                    // Under the pointer: the projects where nothing runs fold, those where something does open.
+                    .child(
+                        div().invisible().group_hover("sidebar-top", |s| s.visible()).child(
+                            Button::new("fold-idle")
+                                .xsmall()
+                                .ghost()
+                                .child(svg().path("side-icons/chevrons-down-up.svg").size(px(15.)).text_color(cx.theme().muted_foreground))
+                                .tooltip("Fold the projects where nothing runs; again, unfold all")
+                                .on_click(cx.listener(|this, _, _, cx| this.fold_idle_projects(cx))),
+                        ),
+                    )
                     // Not while presenting: the window shows what was chosen, and nothing is added to it by a stray click.
                     .when(!self.is_presenting(), |row| {
                         row.child(
@@ -294,6 +306,18 @@ impl Workspace {
                     }),
             )
             .child(list)
+    }
+
+    /// Folds the projects whose tasks are all paused and unfolds the others;
+    /// when that is how they are already, unfolds them all.
+    pub(crate) fn fold_idle_projects(&mut self, cx: &mut Context<Self>) {
+        let runs: Vec<bool> = self.projects.iter().map(|p| p.tasks.iter().any(|t| t.view.is_some())).collect();
+        let folded = self.projects.iter().zip(&runs).all(|(p, runs)| p.collapsed == !runs);
+        for (p, runs) in self.projects.iter_mut().zip(runs) {
+            p.collapsed = !folded && !runs;
+        }
+        self.save_later(cx);
+        cx.notify();
     }
 
     /// The sidebar as a rail when it was dragged that narrow, and while
@@ -772,6 +796,7 @@ impl Workspace {
                     let _ = stale_w.update(cx, |w, cx| w.merged_branches_dialog(pi, window, cx));
                 }))
             })
+            .separator()
             .item(PopupMenuItem::new("Project settings…").on_click(move |_, window, cx| {
                 let _ = settings.update(cx, |w, cx| w.project_settings(pi, window, cx));
             }))

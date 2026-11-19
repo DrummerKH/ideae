@@ -425,10 +425,10 @@ impl Deferred {
         self.until.is_some_and(|until| until <= now)
     }
 
-    /// "deferred till 2026-12-01", "deferred, no day set".
+    /// "deferred till Mon 1 Dec, 09:00", "deferred, no day set".
     pub fn told(&self) -> String {
         match self.until {
-            Some(until) => format!("deferred till {}", date(until)),
+            Some(until) => format!("deferred till {}", crate::local_time::day_and_hour(until, crate::state::now())),
             None => "deferred, no day set".into(),
         }
     }
@@ -691,7 +691,7 @@ impl Restored {
 /// archive itself is not changed. Not for the UI thread.
 pub fn restore(repo: &Path, archive: &Path, meta: &Meta, plan: &Plan) -> Result<Restored, String> {
     let path = match &plan.start {
-        Start::Origin => crate::git::create_task_worktree(repo, &plan.branch, plan.copy_env && crate::project_config::resolve(repo).config.task.copy.is_none())?,
+        Start::Origin => crate::git::create_task_worktree(repo, &plan.branch, "", plan.copy_env && crate::project_config::resolve(repo).config.task.copy.is_none())?,
         Start::PrBranch(branch) => crate::git::remote_branch_worktree(repo, branch, plan.copy_env && crate::project_config::resolve(repo).config.task.copy.is_none())?,
     };
     // Whatever goes wrong from here takes the worktree and its branch with it:

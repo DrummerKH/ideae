@@ -48,30 +48,78 @@ fn sort_listed(all: &mut [(Archived, String)]) {
     all.sort_by_key(|(a, _)| (a.deferred.is_none(), a.deferred.map(|d| d.until.unwrap_or(u64::MAX)), std::cmp::Reverse(a.meta.archived)));
 }
 
-/// How long a task is put off: the days, or none for a day not set.
-const DEFER_FOR: [(&str, Option<u64>); 6] =
-    [("A week", Some(7)), ("Two weeks", Some(14)), ("A month", Some(30)), ("Three months", Some(91)), ("Six months", Some(182)), ("Not sure yet", None)];
+/// When in the day a deferred task comes back: its name and the hour.
+const DEFER_AT: [(&str, i32); 3] = [("Morning", 9), ("Afternoon", 14), ("Evening", 19)];
 
-/// Asks how long a task is put off, and does `pick` with the answer.
+/// The days a task can be put off to, from `now`: a name and how many days
+/// ahead, or none for a day not set. The weekend is the coming Saturday,
+/// next week its Monday.
+fn defer_days(now: u64) -> Vec<(&'static str, Option<i32>)> {
+    let weekday = crate::local_time::weekday(now) as i32;
+    let saturday = match (6 - weekday).rem_euclid(7) {
+        0 => 7,
+        n => n,
+    };
+    let monday = match (1 - weekday).rem_euclid(7) {
+        0 => 7,
+        n => n,
+    };
+    // On the weekend itself, "this weekend" is the next one.
+    let weekend = if weekday == 6 || weekday == 0 { "Next weekend" } else { "This weekend" };
+    vec![
+        ("Tomorrow", Some(1)),
+        (weekend, Some(saturday)),
+        ("Next week", Some(monday)),
+        ("In 2 weeks", Some(14)),
+        ("In a month", Some(30)),
+        ("In 3 months", Some(91)),
+        ("In 6 months", Some(182)),
+        ("Not sure yet", None),
+    ]
+}
+
+/// Asks when a task comes back, a day and a time of it, and does `pick`
+/// with the answer.
 fn defer_dialog(title: String, told: String, window: &mut Window, cx: &mut App, pick: impl Fn(archive::Deferred, &mut Window, &mut App) + 'static) {
     let pick = Rc::new(pick);
+    let hour = Rc::new(std::cell::Cell::new(DEFER_AT[0].1));
     window.open_dialog(cx, move |dialog, _, _| {
-        let (told, pick) = (told.clone(), pick.clone());
+        let (told, pick, hour) = (told.clone(), pick.clone(), hour.clone());
         dialog.title(title.clone()).w(px(560.)).content(move |content, _, cx| {
-            let mut choices = h_flex().gap_1().flex_wrap();
-            for (ix, (label, days)) in DEFER_FOR.into_iter().enumerate() {
-                let pick = pick.clone();
-                choices = choices.child(Button::new(("defer-for", ix)).small().outline().label(label).on_click(move |_, window, cx| {
-                    let since = state::now();
-                    window.close_dialog(cx);
-                    pick(archive::Deferred { since, until: days.map(|d| since + d * 86_400) }, window, cx);
+            let now = state::now();
+            let muted = cx.theme().muted_foreground;
+            let at = hour.get();
+            let mut times = h_flex().gap_1();
+            for (ix, (label, h)) in DEFER_AT.into_iter().enumerate() {
+                let hour = hour.clone();
+                times = times.child(Button::new(("defer-at", ix)).small().ghost().label(label).selected(at == h).on_click(move |_, window, _| {
+                    hour.set(h);
+                    window.refresh();
                 }));
+            }
+            let mut choices = div().grid().grid_cols(2).gap_1();
+            for (ix, (label, days)) in defer_days(now).into_iter().enumerate() {
+                let pick = pick.clone();
+                let until = days.map(|d| crate::local_time::at(now, d, at));
+                let when = until.map(|u| crate::local_time::day(u, now)).unwrap_or_default();
+                choices = choices.child(
+                    Button::new(("defer-for", ix))
+                        .small()
+                        .outline()
+                        .w_full()
+                        .child(h_flex().w_full().justify_between().gap_2().child(label).child(div().text_color(muted).child(when)))
+                        .on_click(move |_, window, cx| {
+                            window.close_dialog(cx);
+                            pick(archive::Deferred { since: state::now(), until }, window, cx);
+                        }),
+                );
             }
             content.child(
                 v_flex()
                     .gap_3()
-                    .child(div().text_sm().text_color(cx.theme().muted_foreground).child(told.clone()))
-                    .child(v_flex().gap_1().child(div().text_sm().child("Back in")).child(choices)),
+                    .child(div().text_sm().text_color(muted).child(told.clone()))
+                    .child(h_flex().gap_2().items_center().child(div().text_sm().child("At")).child(times))
+                    .child(v_flex().gap_1().child(div().text_sm().child("Back")).child(choices)),
             )
         })
     });
@@ -925,6 +973,23 @@ impl Workspace {
 
 #[cfg(all(test, unix))]
 mod tests {
+    /// The weekend is the coming Saturday and next week its Monday, from any day.
+    #[test]
+    fn deferring_offers_the_coming_weekend_and_monday() {
+        let base = crate::local_time::at(1_795_000_000, 0, 12);
+        for ahead in 0..7 {
+            let now = base + ahead * 86_400;
+            let weekday = crate::local_time::weekday(now) as i32;
+            let days = super::defer_days(now);
+            let of = |name: &str| days.iter().find(|(n, _)| n.ends_with(name)).and_then(|(_, d)| *d).unwrap();
+            let saturday = of("weekend");
+            assert!((1..=7).contains(&saturday) && (weekday + saturday) % 7 == 6, "weekday {weekday}: {saturday}");
+            let monday = of("Next week");
+            assert!((1..=7).contains(&monday) && (weekday + monday) % 7 == 1, "weekday {weekday}: {monday}");
+            assert_eq!(days.iter().any(|(n, _)| *n == "Next weekend"), weekday == 6 || weekday == 0);
+        }
+    }
+
     use super::Choice;
     use crate::state::{ProjectState, State};
     use crate::workspace::Workspace;

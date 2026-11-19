@@ -9,7 +9,7 @@ use gpui_kit::component::{
     command::{Command, CommandGroup, CommandItem, CommandState},
     h_flex, v_flex,
 };
-use gpui_kit::*;
+use gpui_kit::{prelude::FluentBuilder as _, *};
 
 use crate::{search, task::TaskView};
 
@@ -83,7 +83,26 @@ pub struct Finder {
     /// under the list.
     searching: bool,
     told: SharedString,
+    /// The lines around the place the list has highlighted, read off the UI thread.
+    preview: Option<Rc<Preview>>,
+    _preview: Task<()>,
 }
+
+/// A piece of a file around a place: its lines from `first` (1-based), their
+/// colors, and which line the place is on with its matches.
+struct Preview {
+    first: u32,
+    lines: Vec<(String, Vec<(std::ops::Range<usize>, HighlightStyle)>)>,
+    line: u32,
+    /// The matches, moved left by the indent all the lines share.
+    ranges: Vec<std::ops::Range<usize>>,
+}
+
+/// Lines shown above and below the place.
+const PREVIEW_ABOVE: u32 = 5;
+const PREVIEW_BELOW: u32 = 7;
+/// A file larger is not read for a preview.
+const PREVIEW_MOST: u64 = 8 << 20;
 
 thread_local! {
     /// The title and the taker of the list being opened: on their way from
@@ -200,6 +219,8 @@ impl Finder {
             picked: None,
             searching: false,
             told: SharedString::default(),
+            preview: None,
+            _preview: Task::ready(()),
         });
         if kind == FinderKind::Pick {
             let picked = PICK.with(|pick| pick.borrow_mut().take());
@@ -258,7 +279,12 @@ impl Finder {
                         let (these, after) = rest.split_at(count.min(rest.len()));
                         rest = after;
                         let Some(first) = these.first() else { continue };
-                        palette = palette.group(CommandGroup::new().label(first.path.clone()).items(these.iter().map(|hit| item(hit, kind))));
+                        // The file's name first: a long folder gives way, not it.
+                        let label = match first.path.rsplit_once('/') {
+                            Some((dir, name)) => format!("{name}   {dir}"),
+                            None => first.path.clone(),
+                        };
+                        palette = palette.group(CommandGroup::new().label(label).items(these.iter().map(|hit| item(hit, kind))));
                     }
                 } else if kind == FinderKind::Places {
                     let sections = finder.read(cx).sections.clone();
@@ -324,15 +350,22 @@ impl Finder {
                             )
                     });
                 }
-                content.child(
-                    palette
-                        .on_query(move |query, _, cx| {
-                            let _ = query_owner.update(cx, |f, cx| f.query(query, cx));
-                        })
-                        .on_confirm(move |index, window, cx| {
-                            let _ = confirm_owner.update(cx, |f, cx| f.confirm(index, window, cx));
-                        }),
-                )
+                let select_owner = finder.clone();
+                let preview = finder.read(cx).preview.clone();
+                content
+                    .child(
+                        palette
+                            .on_query(move |query, _, cx| {
+                                let _ = query_owner.update(cx, |f, cx| f.query(query, cx));
+                            })
+                            .on_select(move |index, _, cx| {
+                                let _ = select_owner.update(cx, |f, cx| f.preview_row(index, cx));
+                            })
+                            .on_confirm(move |index, window, cx| {
+                                let _ = confirm_owner.update(cx, |f, cx| f.confirm(index, window, cx));
+                            }),
+                    )
+                    .when_some(preview.filter(|_| previewed(kind)), |content, preview| content.child(render_preview(&preview, cx)))
             })
         });
     }
@@ -431,17 +464,51 @@ impl Finder {
             self.told = told.into();
             self.shown = Rc::new(shown);
         }
+        // The list highlights its first row again: that one is shown.
+        match hits.first().cloned() {
+            Some(first) => self.preview_hit(first, cx),
+            None => self.preview = None,
+        }
         self.hits = Rc::new(hits);
         cx.notify();
         // The dialog content reads the hits when the window redraws.
         cx.refresh_windows();
     }
 
-    fn confirm(&mut self, index: IndexPath, window: &mut Window, cx: &mut Context<Self>) {
-        let row = match self.kind {
+    /// The hit an index of the list stands for.
+    fn row(&self, index: IndexPath) -> usize {
+        match self.kind {
             FinderKind::Places | FinderKind::Grep => self.shown.iter().take(index.section).sum::<usize>() + index.row,
             _ => index.row,
-        };
+        }
+    }
+
+    /// Reads the lines around the highlighted place, after a moment: going
+    /// down the list with the keys reads only where it stops.
+    fn preview_row(&mut self, index: IndexPath, cx: &mut Context<Self>) {
+        let Some(hit) = self.hits.get(self.row(index)).cloned() else { return };
+        self.preview_hit(hit, cx);
+    }
+
+    fn preview_hit(&mut self, hit: Hit, cx: &mut Context<Self>) {
+        if !previewed(self.kind) || hit.line == 0 {
+            return;
+        }
+        let path = self.root.join(&hit.path);
+        let theme = cx.theme().highlight_theme.clone();
+        self._preview = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(40)).await;
+            let read = cx.background_spawn(async move { read_preview(&path, &hit, &theme) }).await;
+            let _ = this.update(cx, |f, cx| {
+                f.preview = read.map(Rc::new);
+                cx.notify();
+                cx.refresh_windows();
+            });
+        });
+    }
+
+    fn confirm(&mut self, index: IndexPath, window: &mut Window, cx: &mut Context<Self>) {
+        let row = self.row(index);
         let Some(hit) = self.hits.get(row).cloned() else { return };
         window.close_dialog(cx);
         if let Some((_, picked)) = &self.picked {
@@ -453,6 +520,99 @@ impl Finder {
         let how = if self.kind == FinderKind::Files { crate::task::OpenAs::Kept } else { crate::task::OpenAs::Preview };
         let _ = self.task.update(cx, |t, cx| t.open_file_as(path, line, hit.col, how, window, cx));
     }
+}
+
+/// A place's second line: `Name.kt:99`, then its folder, cut first.
+fn where_it_is(name: &str, dir: &str, line: u32, muted: Hsla) -> impl IntoElement {
+    h_flex()
+        .gap_2()
+        .min_w_0()
+        .text_xs()
+        .text_color(muted)
+        .child(div().flex_none().child(format!("{name}:{line}")))
+        .child(div().min_w_0().truncate().opacity(0.75).child(dir.to_string()))
+}
+
+/// Lists of places in files show the lines around the one highlighted.
+fn previewed(kind: FinderKind) -> bool {
+    matches!(kind, FinderKind::Grep | FinderKind::Places | FinderKind::Outline | FinderKind::Symbols)
+}
+
+/// The lines around `hit` in `path`, colored as the editor colors them.
+/// Off the UI thread.
+fn read_preview(path: &std::path::Path, hit: &Hit, theme: &gpui_kit::component::highlighter::HighlightTheme) -> Option<Preview> {
+    if std::fs::metadata(path).ok()?.len() > PREVIEW_MOST {
+        return None;
+    }
+    let text = String::from_utf8(std::fs::read(path).ok()?).ok()?;
+    let first = hit.line.saturating_sub(PREVIEW_ABOVE).max(1);
+    let piece: Vec<&str> = text.lines().skip(first as usize - 1).take((hit.line + PREVIEW_BELOW + 1 - first) as usize).collect();
+    let joined = piece.join("\n");
+    let mut highlighter = gpui_kit::component::highlighter::SyntaxHighlighter::new(crate::lsp::language_for(path));
+    highlighter.update(None, &gpui_kit::component::Rope::from(joined.as_str()), None);
+    let styles = highlighter.styles(&(0..joined.len()), theme);
+    // The indent every line shares is room, not content: it goes.
+    let indent = |line: &str| line.len() - line.trim_start_matches([' ', '\t']).len();
+    let shared = piece.iter().filter(|l| !l.trim().is_empty()).map(|l| &l[..indent(l)]).reduce(|a, b| {
+        let same = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
+        &a[..same]
+    });
+    let cut = shared.map_or(0, str::len);
+    let mut start = 0;
+    let lines = piece
+        .iter()
+        .map(|line| {
+            let end = start + line.len();
+            let from = start + cut.min(indent(line));
+            let colored = styles
+                .iter()
+                .filter(|(r, _)| r.start < end && r.end > from)
+                .map(|(r, style)| (r.start.max(from) - from..r.end.min(end) - from, *style))
+                .filter(|(r, _)| !r.is_empty())
+                .collect();
+            start = end + 1;
+            (line[from - (end - line.len())..].to_string(), colored)
+        })
+        .collect();
+    let ranges = hit.ranges.iter().filter(|r| r.start >= cut).map(|r| r.start - cut..r.end - cut).collect();
+    Some(Preview { first, lines, line: hit.line, ranges })
+}
+
+/// The preview under the list: the place's line marked, its matches lit.
+fn render_preview(preview: &Preview, cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    let size = crate::zoom::size(crate::zoom::Kind::Editor, cx) * 0.93;
+    let numbers = (preview.first as usize + preview.lines.len()).to_string().len();
+    let lit = HighlightStyle { background_color: Some(theme.warning.opacity(0.35)), ..Default::default() };
+    v_flex()
+        .id("finder-preview")
+        .border_t_1()
+        .border_color(theme.border)
+        .py_1()
+        .font_family(theme.mono_font_family.clone())
+        .text_size(size)
+        .line_height(size * 1.5)
+        .overflow_hidden()
+        .children(preview.lines.iter().enumerate().map(|(ix, (text, colors))| {
+            let number = preview.first + ix as u32;
+            let here = number == preview.line;
+            let mut colors = colors.clone();
+            if here {
+                for range in preview.ranges.iter().filter(|r| r.end <= text.len()) {
+                    colors.push((range.clone(), lit));
+                }
+                colors.sort_by_key(|(r, _)| r.start);
+            }
+            let shown = SharedString::from(text.replace('\t', "    "));
+            // Tabs widen the line: the colors keep to lines without them.
+            let colors = if text.contains('\t') { Vec::new() } else { gpui_kit::combine_highlights(Vec::new(), colors).collect() };
+            h_flex()
+                .px_3()
+                .gap_3()
+                .when(here, |row| row.bg(theme.accent.opacity(0.5)))
+                .child(div().w(size * 0.65 * numbers as f32).flex_none().text_right().text_color(theme.muted_foreground).child(number.to_string()))
+                .child(div().min_w_0().overflow_hidden().whitespace_nowrap().child(StyledText::new(shown).with_highlights(colors)))
+        }))
 }
 
 fn item(hit: &Hit, kind: FinderKind) -> CommandItem {
@@ -492,28 +652,27 @@ fn item(hit: &Hit, kind: FinderKind) -> CommandItem {
                     .child(div().flex_none().text_xs().text_color(cx.theme().muted_foreground).child(format!(":{}", hit.line)))
                     .into_any_element()
             }
-            FinderKind::Outline => h_flex()
-                .gap_3()
+            // Places of a name in several files (Ctrl+B with more than one definition).
+            FinderKind::Outline => v_flex()
                 .min_w_0()
-                .child(
-                    div()
-                        .flex_1()
-                        .truncate()
-                        .font_family(cx.theme().mono_font_family.clone())
-                        .text_sm()
-                        .child(hit.text.clone()),
-                )
-                .child(div().text_xs().text_color(cx.theme().muted_foreground).child(format!(":{}", hit.line)))
+                .flex_1()
+                .child(div().min_w_0().truncate().font_family(cx.theme().mono_font_family.clone()).text_sm().child(hit.text.clone()))
+                .child(where_it_is(&name, &dir, hit.line, cx.theme().muted_foreground))
                 .into_any_element(),
             FinderKind::Symbols => {
                 let (symbol, detail) = hit.text.split_once(DETAIL).unwrap_or((&hit.text, ""));
-                h_flex()
-                    .gap_3()
+                let muted = cx.theme().muted_foreground;
+                v_flex()
                     .min_w_0()
-                    .child(div().flex_none().font_family(cx.theme().mono_font_family.clone()).text_sm().child(symbol.to_string()))
-                    .child(div().flex_none().text_xs().text_color(cx.theme().muted_foreground).child(detail.to_string()))
-                    .child(div().flex_1())
-                    .child(div().truncate().text_xs().text_color(cx.theme().muted_foreground).child(format!("{}:{}", hit.path, hit.line)))
+                    .flex_1()
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .min_w_0()
+                            .child(div().min_w_0().truncate().font_family(cx.theme().mono_font_family.clone()).text_sm().child(symbol.to_string()))
+                            .child(div().flex_none().text_xs().text_color(muted).child(detail.to_string())),
+                    )
+                    .child(where_it_is(&name, &dir, hit.line, muted))
                     .into_any_element()
             }
             FinderKind::Pick => {
@@ -540,8 +699,19 @@ fn item(hit: &Hit, kind: FinderKind) -> CommandItem {
                 .child(div().flex_none().child(name))
                 .child(div().truncate().text_xs().text_color(cx.theme().muted_foreground).child(dir))
                 .into_any_element(),
-            // A line each: the code, and where it is (its file heads the group in Find in files).
-            FinderKind::Grep | FinderKind::Places => h_flex()
+            // Two lines: the code the whole width, then where: the file's name, which
+            // stays, and its folder, which gives way.
+            FinderKind::Places => {
+                let muted = cx.theme().muted_foreground;
+                v_flex()
+                    .min_w_0()
+                    .flex_1()
+                    .child(div().min_w_0().truncate().font_family(cx.theme().mono_font_family.clone()).text_sm().child(highlighted(&hit, cx)))
+                    .child(where_it_is(&name, &dir, hit.line, muted))
+                    .into_any_element()
+            }
+            // The code, and its line: the file heads the group.
+            FinderKind::Grep => h_flex()
                 .gap_3()
                 .min_w_0()
                 .flex_1()
@@ -561,7 +731,7 @@ fn item(hit: &Hit, kind: FinderKind) -> CommandItem {
                         .truncate()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
-                        .child(if kind == FinderKind::Grep { format!(":{}", hit.line) } else { format!("{}:{}", hit.path, hit.line) }),
+                        .child(format!(":{}", hit.line)),
                 )
                 .into_any_element(),
         }
@@ -726,6 +896,29 @@ fn code_first(hits: Vec<Hit>) -> Vec<Hit> {
 
 #[cfg(test)]
 mod tests {
+    /// The lines around a place, colored, from the file as it is on disk.
+    #[test]
+    fn a_preview_holds_the_lines_around_the_place() {
+        crate::grammars::register();
+        let dir = std::env::temp_dir().join(format!("ideae-preview-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.rs");
+        let text: String = (1..=30).map(|n| format!("        fn f{n}() {{ let x = {n}; }}\n")).collect();
+        std::fs::write(&path, &text).unwrap();
+        let hit = super::Hit { path: "a.rs".into(), line: 20, col: 0, text: "        fn f20() { let x = 20; }".into(), ranges: vec![11..14] };
+        let theme = gpui_kit::component::highlighter::HighlightTheme::default_dark();
+        let preview = super::read_preview(&path, &hit, &theme).unwrap();
+        assert_eq!(preview.first, 20 - super::PREVIEW_ABOVE);
+        assert_eq!(preview.lines.len() as u32, super::PREVIEW_ABOVE + super::PREVIEW_BELOW + 1);
+        assert_eq!(preview.lines[super::PREVIEW_ABOVE as usize].0, "fn f20() { let x = 20; }", "the indent all lines share goes");
+        assert_eq!(preview.ranges, [3..6], "the match moves with the line");
+        assert!(preview.lines.iter().all(|(line, colors)| !colors.is_empty() && colors.iter().all(|(r, _)| r.end <= line.len())), "each line colored within itself");
+        // Near the top, it starts at the first line.
+        let top = super::read_preview(&path, &super::Hit { line: 2, ..hit }, &theme).unwrap();
+        assert_eq!(top.first, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::{Hit, code_first};
 
     fn hit(path: &str, line: u32, text: &str) -> Hit {

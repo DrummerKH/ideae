@@ -542,6 +542,8 @@ pub struct TaskView {
     /// Out of view long enough (or never shown): no language servers run;
     /// they start when the task comes into view.
     pub lsp_asleep: bool,
+    /// Its project said no language servers.
+    pub lsp_off: bool,
     file_states: HashMap<String, git::FileState>,
     commit_input: Entity<gpui_kit::component::input::TextareaState>,
     /// The next commit replaces the last one, which is not pushed; with the
@@ -857,6 +859,7 @@ impl TaskView {
             folded_viewed: HashMap::new(),
             folded_changes: HashSet::new(),
             lsp_asleep: false,
+            lsp_off: false,
             file_states: HashMap::new(),
             commit_input,
             amend: None,

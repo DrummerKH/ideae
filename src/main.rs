@@ -24,6 +24,7 @@ mod image_diff;
 mod ide;
 mod keymap;
 mod keys;
+mod local_time;
 mod lsp;
 #[cfg(target_os = "macos")]
 mod mac_notify;

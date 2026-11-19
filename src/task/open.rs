@@ -298,6 +298,9 @@ impl TaskView {
         if self.lsp_asleep && lsp::server_for(path).is_ok() {
             return set_status(file, Some(false), ASLEEP.to_string(), cx);
         }
+        if self.lsp_off && lsp::server_for(path).is_ok() {
+            return set_status(file, Some(false), "language servers off for this project (Project settings)".to_string(), cx);
+        }
         let lsp::Server { language_id, program, command, args } = match lsp::server_for(path) {
             Ok(server) => server,
             Err(reason) => return set_status(file, Some(false), reason, cx),

@@ -178,6 +178,12 @@ impl TaskView {
                     }
                     self.remove_tab(ix, window, cx);
                 }
+                // A server that could not import the build before the setup made it
+                // whole (a sibling checkout, generated files) is started again.
+                if !crate::lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed) && self.lsp.values().any(|client| client.problem().is_some()) {
+                    self.set_language_servers(false, cx);
+                    self.set_language_servers(true, cx);
+                }
             }
             RunState::Failed(code) => {
                 let code = code.map(|c| format!(" (exit {c})")).unwrap_or_default();

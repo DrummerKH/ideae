@@ -134,6 +134,11 @@ pub struct Project {
     pub hints_off: std::collections::BTreeSet<String>,
     /// The agent of its new tasks, by profile id; none for the default.
     pub agent: Option<String>,
+    /// Where its new tasks branch from; empty for the remote's default.
+    pub base: String,
+    /// No language servers in its tasks; its pull requests not asked of gh.
+    pub lsp_off: bool,
+    pub pr_off: bool,
     /// Branches of origin whose PR was merged, and when they were looked for.
     pub merged_branches: Vec<crate::merged_branches::MergedBranch>,
     pub merged_checked: Option<std::time::Instant>,
@@ -164,6 +169,9 @@ impl Project {
             trusted: Default::default(),
             hints_off: Default::default(),
             agent: None,
+            base: String::new(),
+            lsp_off: false,
+            pr_off: false,
             merged_branches: Vec::new(),
             merged_checked: None,
             made_by_agents: Default::default(),
@@ -832,6 +840,7 @@ impl Workspace {
             project.collapsed = p.collapsed;
             project.check = p.check.clone();
             project.check_auto = p.check_auto;
+            (project.base, project.lsp_off, project.pr_off) = (p.base.clone(), p.lsp_off, p.pr_off);
             project.trusted = p.trusted.clone();
             project.hints_off = p.hints_off.iter().cloned().collect();
             project.agent = p.agent.clone();
@@ -957,6 +966,9 @@ impl Workspace {
                     collapsed: p.collapsed,
                     check: p.check.clone(),
                     check_auto: p.check_auto,
+                    base: p.base.clone(),
+                    lsp_off: p.lsp_off,
+                    pr_off: p.pr_off,
                     own: crate::project_config::own(&p.path),
                     trusted: p.trusted.clone(),
                     hints_off: p.hints_off.iter().cloned().collect(),
@@ -1024,7 +1036,7 @@ impl Workspace {
 
     /// The now-and-then save: what it takes from the UI thread is the copy
     /// of the state; turning it into text and writing it happen off it.
-    fn save_later(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn save_later(&mut self, cx: &mut Context<Self>) {
         let snapshot = self.snapshot(cx);
         self.save_seq += 1;
         let (seq, last) = (self.save_seq, self.last_saved.clone());
@@ -1054,6 +1066,7 @@ impl Workspace {
         let fill = self.usage.get(path).map_or(0., |(_, usage)| usage.fill());
         let main = self.entry_mut(path).is_some_and(|entry| entry.main);
         let kept: Vec<String> = self.find(path).map(|(pi, _)| self.projects[pi].hints_off.iter().filter_map(|key| key.strip_prefix(automation::KEPT_BRANCH)).map(str::to_string).collect()).unwrap_or_default();
+        let lsp_off = self.find(path).is_some_and(|(pi, _)| self.projects[pi].lsp_off);
         let view = cx.new(|cx| {
             let mut t = TaskView::new(root, branch, launch, socket, slot, window, cx);
             t.context_fill = fill;
@@ -1063,6 +1076,7 @@ impl Workspace {
             t.pr = pr;
             t.main_thread = main;
             t.kept_branches = kept;
+            t.lsp_off = lsp_off;
             t
         });
         cx.subscribe_in(&view, window, |this, view, event: &TaskEvent, window, cx| this.on_task_event(view, event, window, cx)).detach();
@@ -1173,7 +1187,7 @@ impl Workspace {
         }
         use std::time::Duration;
         let mut due = Vec::new();
-        for p in &mut self.projects {
+        for p in self.projects.iter_mut().filter(|p| !p.pr_off) {
             for t in &mut p.tasks {
                 if t.main || t.busy.is_some() {
                     continue;
@@ -1811,7 +1825,7 @@ impl Workspace {
         }
         let Some(p) = self.projects.get_mut(project) else { return };
         let branch = naming::branch_name(&title);
-        let repo = p.path.clone();
+        let (repo, base) = (p.path.clone(), p.base.clone());
         let path = git::task_worktree_dir(&repo, &branch);
         p.collapsed = false;
         p.tasks.push(TaskEntry {
@@ -1833,7 +1847,7 @@ impl Workspace {
             let result = cx
                 .background_spawn(async move {
                     let copy = crate::project_config::resolve(&repo).config.task.copy;
-                    let made = git::create_task_worktree(&repo, &branch, copy_env && copy.is_none());
+                    let made = git::create_task_worktree(&repo, &branch, &base, copy_env && copy.is_none());
                     if let (Ok(dir), Some(copy)) = (&made, copy) {
                         crate::project_config::copy_ignored(&repo, dir, &copy);
                     }

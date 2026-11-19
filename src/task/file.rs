@@ -985,6 +985,17 @@ impl FileView {
     }
 }
 
+/// A picture of a Markdown preview: a path is a file beside the one shown
+/// (README's `docs/images/a.png`); one with a scheme is fetched.
+fn preview_image(dir: &std::path::Path, uri: &gpui_kit::SharedUri) -> gpui_kit::ImageSource {
+    let link: &str = uri.as_ref();
+    if link.contains("://") {
+        return gpui_kit::ImageSource::from(uri.clone());
+    }
+    let path = link.split(['#', '?']).next().unwrap_or_default();
+    gpui_kit::ImageSource::from(dir.join(path))
+}
+
 impl FileView {
     pub(super) fn is_busy(&self) -> bool {
         self.lsp_client.as_ref().is_some_and(|c| c.busy().is_some())
@@ -1007,8 +1018,10 @@ impl FileView {
             }
         };
         let (task, dir) = (self.task.clone(), self.path.parent().map(PathBuf::from).unwrap_or_default());
+        let images = dir.clone();
         div().id("markdown-preview").flex_1().min_h_0().bg(cx.theme().background).child(
             TextView::markdown("markdown", text)
+                .image_source(move |uri| preview_image(&images, uri))
                 .scrollable(true)
                 .selectable(true)
                 .on_link_click(move |link, _, window, cx| {
@@ -1543,6 +1556,19 @@ fn sticky_scopes(path: &std::path::Path, text: &str) -> Vec<std::ops::Range<usiz
     let mut scopes: Vec<_> = super::outline(path, text).into_iter().filter(|i| i.end > i.line).map(|i| i.line as usize..i.end as usize).collect();
     scopes.sort_by_key(|s| (s.start, std::cmp::Reverse(s.end)));
     scopes
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use gpui_kit::{ImageSource, Resource, SharedUri};
+
+    #[test]
+    fn a_preview_s_picture_is_beside_the_file_unless_it_has_a_scheme() {
+        let dir = std::path::Path::new("/repo");
+        let of = |link: &str| super::preview_image(dir, &SharedUri::from(link.to_string()));
+        assert!(matches!(of("docs/images/a.png?raw=1"), ImageSource::Resource(Resource::Path(p)) if p.as_ref() == std::path::Path::new("/repo/docs/images/a.png")));
+        assert!(matches!(of("https://example.com/a.png"), ImageSource::Resource(Resource::Uri(_))));
+    }
 }
 
 #[cfg(test)]

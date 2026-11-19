@@ -401,7 +401,7 @@ pub fn worktree_added(payload: &Value) -> Option<String> {
                         }
                         option if option.starts_with('-') => {}
                         path if path.contains('$') || path.contains('`') => return None,
-                        path => return Some(normal(&at.join(path)).display().to_string()),
+                        path => return Some(as_git_lists(&normal(&at.join(path))).display().to_string()),
                     }
                 }
             }
@@ -409,6 +409,15 @@ pub fn worktree_added(payload: &Value) -> Option<String> {
         }
     }
     None
+}
+
+/// A folder about to be made, as `git worktree list` will name it: its parent
+/// with links followed (`/var` is `/private/var` on macOS), else as it is.
+fn as_git_lists(path: &Path) -> PathBuf {
+    match (path.parent().and_then(|p| p.canonicalize().ok()), path.file_name()) {
+        (Some(parent), Some(name)) => parent.join(name),
+        _ => path.to_path_buf(),
+    }
 }
 
 /// Words as a shell splits them, quotes taken off; enough for a command line.
@@ -617,6 +626,9 @@ mod tests {
         assert_eq!(added("git -C .. worktree add --detach --reason why x"), at("/w/x"));
         assert_eq!(added("git worktree add \"$DIR\""), None, "a variable is not known");
         assert_eq!(added("git worktree list"), None);
+        // An existing folder's links are followed, as git lists the worktree.
+        let tmp = std::env::temp_dir();
+        assert_eq!(super::as_git_lists(&tmp.join("x")), tmp.canonicalize().unwrap().join("x"));
         assert_eq!(added("echo git worktree add x"), None);
         assert_eq!(worktree_added(&json!({ "tool_name": "Read", "cwd": "/w", "tool_input": { "command": "git worktree add x" } })), None);
     }

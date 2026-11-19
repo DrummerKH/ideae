@@ -543,6 +543,7 @@ impl Workspace {
     fn start_variants(&mut self, repo: PathBuf, branches: Vec<String>, like: Option<(PathBuf, String)>, window: &mut Window, cx: &mut Context<Self>) {
         cx.spawn_in(window, async move |this, cx| {
             let copy_env = state::settings().copy_env;
+            let base = this.read_with(cx, |w, _| w.projects.iter().find(|p| p.path == repo).map(|p| p.base.clone()).unwrap_or_default()).unwrap_or_default();
             let (job_repo, job_branches) = (repo.clone(), branches.clone());
             let like_path = like.as_ref().map(|(path, _)| path.clone());
             let made = cx
@@ -550,7 +551,7 @@ impl Workspace {
                     // The commit the first one was made from; where it forked, when that was not kept.
                     let from = like.and_then(|(path, base)| Some(base).filter(|b| !b.is_empty()).or_else(|| git::fork_point(&path)));
                     let copy = crate::project_config::resolve(&job_repo).config.task.copy;
-                    let made = git::create_variant_worktrees(&job_repo, &job_branches, from.as_deref(), copy_env && copy.is_none());
+                    let made = git::create_variant_worktrees(&job_repo, &job_branches, from.as_deref(), &base, copy_env && copy.is_none());
                     if let (Ok((_, made)), Some(copy)) = (&made, copy) {
                         for dir in made.iter().flatten() {
                             crate::project_config::copy_ignored(&job_repo, dir, &copy);
