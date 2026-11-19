@@ -2194,7 +2194,7 @@ pub(crate) mod tests {
             cx.update_window(handle.into(), |_, window, cx| workspace.update(cx, |w, cx| act(w, window, cx))).unwrap();
             cx.run_until_parked();
         };
-        let hook = |task: &std::path::Path, event: &str| HookEvent { task: task.to_path_buf(), event: event.into(), message: None, kind: None, file: None, said: None, replayed: None, session: None, guessed: false };
+        let hook = |task: &std::path::Path, event: &str| HookEvent { task: task.to_path_buf(), event: event.into(), message: None, kind: None, file: None, said: None, replayed: None, session: None, guessed: false, worktree: None };
 
         step(cx, &mut |w, window, cx| w.create_task(0, "Fix login".into(), "Make the file.".into(), vec![String::new(), "With the smallest patch.".into()], Vec::new(), window, cx));
         let (group, paths) = workspace.update(cx, |w, _| {
@@ -2583,7 +2583,7 @@ pub(crate) mod tests {
         .unwrap();
         // What the daemon heard before is told again on connect: new only
         // when it came after the task was last looked at.
-        let hook = |event: &str, replayed: Option<u64>| crate::agent::HookEvent { task: repo.clone(), event: event.into(), message: None, kind: None, file: None, said: None, replayed, session: None, guessed: false };
+        let hook = |event: &str, replayed: Option<u64>| crate::agent::HookEvent { task: repo.clone(), event: event.into(), message: None, kind: None, file: None, said: None, replayed, session: None, guessed: false, worktree: None };
         let unseen_after = |cx: &mut TestAppContext, event: crate::agent::HookEvent| {
             cx.update_window(handle.into(), |_, window, cx| workspace.update(cx, |w, cx| w.on_hook(event, window, cx))).unwrap();
             workspace.update(cx, |w, cx| w.projects[0].tasks[0].view.as_ref().unwrap().read(cx).unseen)

@@ -137,6 +137,9 @@ pub struct Project {
     /// Branches of origin whose PR was merged, and when they were looked for.
     pub merged_branches: Vec<crate::merged_branches::MergedBranch>,
     pub merged_checked: Option<std::time::Instant>,
+    /// Worktrees its tasks' agents made where nothing else tells it, and
+    /// the task of each ([`side`]).
+    pub made_by_agents: std::collections::BTreeMap<PathBuf, PathBuf>,
 }
 
 #[cfg(test)]
@@ -163,6 +166,7 @@ impl Project {
             agent: None,
             merged_branches: Vec::new(),
             merged_checked: None,
+            made_by_agents: Default::default(),
         }
     }
 }
@@ -374,6 +378,7 @@ impl Workspace {
                 said: h.said,
                 session: h.session,
                 guessed: false,
+                worktree: h.worktree,
             };
             match crate::daemon::client::connect(move |h| {
                 let _ = live.send_blocking(to_event(h, false));
@@ -830,6 +835,7 @@ impl Workspace {
             project.trusted = p.trusted.clone();
             project.hints_off = p.hints_off.iter().cloned().collect();
             project.agent = p.agent.clone();
+            project.made_by_agents = p.made_by_agents.clone();
             crate::project_config::set_own(&p.path, p.own.clone());
             // What the judge said and how the checks went: paid for, kept.
             for (group, verdict) in &p.verdicts {
@@ -955,6 +961,7 @@ impl Workspace {
                     trusted: p.trusted.clone(),
                     hints_off: p.hints_off.iter().cloned().collect(),
                     agent: p.agent.clone(),
+                    made_by_agents: p.made_by_agents.clone(),
                     verdicts: self
                         .judges
                         .iter()
@@ -2008,13 +2015,13 @@ impl Workspace {
     /// Brings the task list in line with `git worktree list`: worktrees made
     /// outside the app appear, removed ones go.
     pub fn sync_worktrees(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let repos: Vec<PathBuf> = self.projects.iter().map(|p| p.path.clone()).collect();
+        let repos: Vec<(PathBuf, std::collections::BTreeMap<PathBuf, PathBuf>)> = self.projects.iter().map(|p| (p.path.clone(), p.made_by_agents.clone())).collect();
         cx.spawn_in(window, async move |this, cx| {
             let lists = cx
                 .background_spawn(async move {
                     repos
                         .into_iter()
-                        .map(|r| {
+                        .map(|(r, made)| {
                             let worktrees = git::worktrees(&r);
                             let all: Vec<PathBuf> = worktrees.iter().map(|w| w.path.clone()).collect();
                             // An agent's worktrees, with what they hold beyond the branch they came from.
@@ -2023,7 +2030,11 @@ impl Workspace {
                                 .skip(1)
                                 .filter(|w| !w.in_use())
                                 .filter_map(|w| {
-                                    let parent = side::made_by_agent(&w.path, &all)?;
+                                    // Whose it is, as its agent's hook told, before what its place says.
+                                    let parent = made
+                                        .get(&w.path)
+                                        .map(|task| all.contains(task).then(|| task.clone()))
+                                        .or_else(|| side::made_by_agent(&w.path, &all))?;
                                     let from = parent.as_ref().unwrap_or(&all[0]);
                                     let base = worktrees.iter().find(|o| &o.path == from).map(|o| o.branch.clone()).unwrap_or_default();
                                     let (ahead, dirty) = git::work_beyond(&w.path, &base);
@@ -2031,15 +2042,21 @@ impl Workspace {
                                     Some((w.path.clone(), side::Side { parent, ahead, dirty, about }))
                                 })
                                 .collect();
-                            (worktrees, sides, r)
+                            // Removed since: forgotten. One not made yet (its hook comes
+                            // before the command runs) is not on disk either way.
+                            let gone: Vec<PathBuf> = made.keys().filter(|path| !all.contains(path) && !path.exists()).cloned().collect();
+                            (worktrees, sides, r, gone)
                         })
                         .collect::<Vec<_>>()
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 let restoring = this.restoring.clone();
-                for (worktrees, mut sides, repo) in lists {
+                for (worktrees, mut sides, repo, gone) in lists {
                     let Some(p) = this.projects.iter_mut().find(|p| p.path == repo) else { continue };
+                    for path in gone {
+                        p.made_by_agents.remove(&path);
+                    }
                     // Not readable now (unmounted, git missing): leave it be.
                     if worktrees.first().is_none_or(|w| w.path != repo) {
                         continue;
@@ -2127,6 +2144,13 @@ impl Workspace {
         // Which session the agent runs: what a restart, or the next run, resumes.
         if let Some(id) = event.session.as_deref().filter(|id| !id.is_empty()) {
             self.learn_session(&event.task, id, cx);
+        }
+        // A worktree its agent is about to make: folded under the task once it is there.
+        if let Some(made) = event.worktree.as_deref().map(PathBuf::from)
+            && let Some((pi, _)) = self.find(&event.task)
+            && made != event.task
+        {
+            self.projects[pi].made_by_agents.insert(made, event.task.clone());
         }
         let Some(status) = event.status() else { return };
         let Some((pi, ti)) = self.find(&event.task) else { return };

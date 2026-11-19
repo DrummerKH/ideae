@@ -12,7 +12,8 @@ when the task goes.
 
 Worktrees made outside the app show up as tasks too. Those an agent made for
 itself (Claude Code's subagents in `.claude/worktrees/`, a try in a temporary
-folder) are folded under the task they came from, with the commits and
+folder, or one its Claude Code made anywhere with `git worktree add`, which
+its hook tells) are folded under the task they came from, with the commits and
 changes they hold, and open with a shell, not an agent.
 
 Projects, tasks, open tabs, cursor lines and open folders survive a restart

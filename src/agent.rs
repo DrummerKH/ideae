@@ -81,6 +81,8 @@ pub struct HookEvent {
     pub session: Option<String>,
     /// Not reported but guessed from the agent's terminal.
     pub guessed: bool,
+    /// A worktree the agent is about to make with `git worktree add`.
+    pub worktree: Option<String>,
 }
 
 impl HookEvent {
@@ -331,6 +333,7 @@ fn parse_line(line: &str) -> Option<HookEvent> {
         replayed: None,
         session: v["session"].as_str().map(str::to_string),
         guessed: false,
+        worktree: v["worktree"].as_str().map(str::to_string),
     })
 }
 
@@ -365,6 +368,88 @@ pub fn activity(payload: &Value) -> Option<String> {
         other if other.starts_with("mcp__") => format!("Using {}", other.trim_start_matches("mcp__").replace("__", " ")),
         other => format!("Using {other}"),
     })
+}
+
+/// The folder a shell command makes a worktree in with `git worktree add`,
+/// made absolute from where it runs (`cd`, `git -C`, the agent's folder).
+/// Only Claude Code's Bash tool: a path in a variable or made by a script
+/// is not known, and nothing is said.
+pub fn worktree_added(payload: &Value) -> Option<String> {
+    if payload["tool_name"].as_str()? != "Bash" {
+        return None;
+    }
+    let command = payload["tool_input"]["command"].as_str()?;
+    let mut here = PathBuf::from(payload["cwd"].as_str()?);
+    for part in command.split(|c| matches!(c, '\n' | ';' | '|' | '&')) {
+        let words = shell_words(part);
+        let words: Vec<&str> = words.iter().map(String::as_str).collect();
+        match words.as_slice() {
+            ["cd", dir] => here = here.join(dir),
+            ["git", rest @ ..] => {
+                let mut at = here.clone();
+                let mut rest = rest;
+                while let ["-C", dir, more @ ..] = rest {
+                    at = at.join(dir);
+                    rest = more;
+                }
+                let ["worktree", "add", options @ ..] = rest else { continue };
+                let mut options = options.iter();
+                while let Some(word) = options.next() {
+                    match *word {
+                        "-b" | "-B" | "--reason" => {
+                            options.next();
+                        }
+                        option if option.starts_with('-') => {}
+                        path if path.contains('$') || path.contains('`') => return None,
+                        path => return Some(normal(&at.join(path)).display().to_string()),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Words as a shell splits them, quotes taken off; enough for a command line.
+fn shell_words(line: &str) -> Vec<String> {
+    let (mut words, mut word, mut quote, mut any) = (Vec::new(), String::new(), None, false);
+    for c in line.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => word.push(c),
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                any = true;
+            }
+            (None, c) if c.is_whitespace() => {
+                if any || !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+                any = false;
+            }
+            (None, c) => word.push(c),
+        }
+    }
+    if any || !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
+/// `a/./b/../c` as `a/c`, without asking the disk: the folder may not be there yet.
+fn normal(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Whether a tool call waits for the user to answer.
@@ -439,6 +524,7 @@ pub fn run_hook(args: &[String]) {
         "file": if event == "PreToolUse" { edited_file(&payload) } else { None },
         "said": said,
         "session": payload["session_id"].as_str(),
+        "worktree": if event == "PreToolUse" { worktree_added(&payload) } else { None },
     });
     #[cfg(unix)]
     if Path::new(&socket).file_name().is_some_and(|name| name.to_string_lossy().starts_with("daemon")) {
@@ -450,6 +536,7 @@ pub fn run_hook(args: &[String]) {
             file: line["file"].as_str().map(str::to_string),
             said,
             session: line["session"].as_str().map(str::to_string),
+            worktree: line["worktree"].as_str().map(str::to_string),
             at: 0,
         });
         return;
@@ -517,8 +604,23 @@ fn ancestors() -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// The worktree a command makes, wherever it is said to run.
+    #[test]
+    fn a_worktree_added_by_a_command() {
+        let added = |command: &str| worktree_added(&json!({ "tool_name": "Bash", "cwd": "/w/repo", "tool_input": { "command": command } }));
+        let made = "git -C /w/repo fetch -q origin && git -C /w/repo worktree add /w/repo-batch -b support_batch origin/main 2>&1 | tail -3";
+        assert_eq!(added(made).as_deref(), Some("/w/repo-batch"));
+        assert_eq!(added("git worktree add ../repo-x").as_deref(), Some("/w/repo-x"));
+        assert_eq!(added("cd sub && git worktree add -B 'my branch' \"../with space\" HEAD").as_deref(), Some("/w/repo/with space"));
+        assert_eq!(added("git -C .. worktree add --detach --reason why x").as_deref(), Some("/w/x"));
+        assert_eq!(added("git worktree add \"$DIR\""), None, "a variable is not known");
+        assert_eq!(added("git worktree list"), None);
+        assert_eq!(added("echo git worktree add x"), None);
+        assert_eq!(worktree_added(&json!({ "tool_name": "Read", "cwd": "/w", "tool_input": { "command": "git worktree add x" } })), None);
+    }
+
     fn note(message: &str, kind: Option<&str>) -> Option<AgentStatus> {
-        HookEvent { task: PathBuf::new(), event: "Notification".into(), message: Some(message.into()), kind: kind.map(Into::into), file: None, said: None, replayed: None, session: None, guessed: false }
+        HookEvent { task: PathBuf::new(), event: "Notification".into(), message: Some(message.into()), kind: kind.map(Into::into), file: None, said: None, replayed: None, session: None, guessed: false, worktree: None }
             .status()
     }
 
@@ -569,6 +671,7 @@ mod tests {
             replayed: None,
             session: None,
             guessed: false,
+            worktree: None,
         };
         let asked = event("PreToolUse", Some(ASKS_USER), Some("Which database?")).status().unwrap();
         assert_eq!(asked, AgentStatus::NeedsInput("Which database?".into()));

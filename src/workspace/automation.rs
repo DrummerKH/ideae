@@ -919,7 +919,7 @@ mod tests {
             pid.unwrap()
         });
 
-        let hook = |event: &str| HookEvent { task: path.clone(), event: event.into(), message: None, kind: None, file: None, said: None, replayed: None, session: None, guessed: false };
+        let hook = |event: &str| HookEvent { task: path.clone(), event: event.into(), message: None, kind: None, file: None, said: None, replayed: None, session: None, guessed: false, worktree: None };
         let turn = |cx: &mut TestAppContext| {
             step(cx, &mut |w, window, cx| w.on_hook(hook("UserPromptSubmit"), window, cx));
             step(cx, &mut |w, window, cx| w.on_hook(hook("Stop"), window, cx));
@@ -929,6 +929,23 @@ mod tests {
         std::fs::write(path.join("ok.txt"), "").unwrap();
         turn(cx);
         until(cx, "the check to pass", &mut |cx| mark(cx) == "✓ check");
+
+        // A worktree its agent makes beside the repository, where nothing
+        // else tells whose it is, folds under the task.
+        let beside = dir.join("repo-beside");
+        let made = HookEvent { worktree: Some(beside.display().to_string()), ..hook("PreToolUse") };
+        step(cx, &mut |w, window, cx| w.on_hook(made.clone(), window, cx));
+        step(cx, &mut |w, window, cx| w.on_hook(hook("Stop"), window, cx));
+        assert!(std::process::Command::new("git").args(["worktree", "add", "-q", "-b", "beside"]).arg(&beside).current_dir(&repo).status().unwrap().success());
+        step(cx, &mut |w, window, cx| w.sync_worktrees(window, cx));
+        until(cx, "the agent's worktree under its task", &mut |cx| {
+            workspace.update(cx, |w, _| w.projects[0].tasks.iter().any(|t| t.path == beside && t.side.as_ref().is_some_and(|s| s.parent.as_ref() == Some(&path))))
+        });
+        assert!(std::process::Command::new("git").args(["worktree", "remove", "--force"]).arg(&beside).current_dir(&repo).status().unwrap().success());
+        step(cx, &mut |w, window, cx| w.sync_worktrees(window, cx));
+        until(cx, "it to be forgotten once removed", &mut |cx| {
+            workspace.update(cx, |w, _| w.projects[0].made_by_agents.is_empty() && w.projects[0].tasks.iter().all(|t| t.path != beside))
+        });
 
         step(cx, &mut |w, window, cx| w.archive_task(&path, window, cx));
         until(cx, "the task to go", &mut |cx| workspace.update(cx, |w, _| w.projects[0].tasks.iter().all(|t| t.main)));

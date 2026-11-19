@@ -90,6 +90,7 @@ impl TaskView {
             replayed: None,
             session: None,
             guessed: true,
+            worktree: None,
         }));
     }
 }

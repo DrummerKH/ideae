@@ -1066,7 +1066,7 @@ exec cat > "$OUT/$name.told"
         assert!(out(&again, "args").contains(&format!("--resume {id}")), "{}", out(&again, "args"));
 
         // It is up: the note goes in first.
-        let up = HookEvent { task: again.clone(), event: "SessionStart".into(), message: None, kind: None, file: None, said: None, replayed: None, session: Some(id.clone()), guessed: false };
+        let up = HookEvent { task: again.clone(), event: "SessionStart".into(), message: None, kind: None, file: None, said: None, replayed: None, session: Some(id.clone()), guessed: false, worktree: None };
         step(cx, &mut |w, window, cx| w.on_hook(up.clone(), window, cx));
         wait(cx, "the note to reach the agent", &mut |_| out(&again, "told").contains("comes in my next message"));
         let told = out(&again, "told");

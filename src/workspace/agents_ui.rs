@@ -364,7 +364,7 @@ mod tests {
 
         // Claude Code says it runs another session (a /clear): a restart resumes that one.
         step(cx, &mut |w, window, cx| {
-            let event = HookEvent { task: a.clone(), event: "SessionStart".into(), message: None, kind: None, file: None, said: None, replayed: None, session: Some("after-clear".into()), guessed: false };
+            let event = HookEvent { task: a.clone(), event: "SessionStart".into(), message: None, kind: None, file: None, said: None, replayed: None, session: Some("after-clear".into()), guessed: false, worktree: None };
             w.on_hook(event, window, cx);
         });
         workspace.update(cx, |w, cx| {

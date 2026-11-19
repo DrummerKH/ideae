@@ -61,6 +61,9 @@ pub struct Hook {
     /// The agent's session id, when it says (newer `ideae --hook`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// A worktree the agent is about to make (`git worktree add`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
     /// When the daemon heard it, Unix seconds: a window that hears it again
     /// on connect tells whether it came after the task was last looked at.
     #[serde(default, skip_serializing_if = "is_zero")]

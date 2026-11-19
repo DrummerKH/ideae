@@ -410,6 +410,7 @@ impl TaskView {
             replayed: None,
             session,
             guessed: false,
+            worktree: None,
         }));
         cx.notify();
     }

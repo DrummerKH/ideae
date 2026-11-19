@@ -511,6 +511,7 @@ fn event_of(hook: &Hook) -> crate::agent::HookEvent {
         said: hook.said.clone(),
         session: hook.session.clone(),
         guessed: false,
+        worktree: hook.worktree.clone(),
         replayed: None,
     }
 }
@@ -784,6 +785,7 @@ mod tests {
             kind: kind.map(Into::into),
             file: None,
             session: None,
+            worktree: None,
             said: Some("x".into()),
             at: 0,
         };

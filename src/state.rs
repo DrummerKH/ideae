@@ -407,6 +407,10 @@ pub struct ProjectState {
     /// Here and not in `.ideae.toml`: whose subscription runs is personal.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// Worktrees an agent made with `git worktree add` outside the places
+    /// that tell (beside the repository), and the task whose agent did.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub made_by_agents: std::collections::BTreeMap<PathBuf, PathBuf>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq)]
