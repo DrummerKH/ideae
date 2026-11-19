@@ -16,6 +16,15 @@ folder, or one its Claude Code made anywhere with `git worktree add`, which
 its hook tells) are folded under the task they came from, with the commits and
 changes they hold, and open with a shell, not an agent.
 
+The main thread is the repository's own checkout, meant to be on its default
+branch. When it is on another one (left there weeks ago, or switched in a
+terminal), a line above its tabs says so and offers the fix: **Switch to
+main** when the remote's main already has all of the branch (merged,
+squashed or rebased; the branch is deleted, main brought up to date), or
+**Move … to a task** when it holds work of its own: a worktree for it, with
+what was not committed yet, and the main checkout back on main. **Keep … here**
+stops it for that branch.
+
 Projects, tasks, open tabs, cursor lines and open folders survive a restart
 (`~/.local/share/ideae/state.json`). A task that is done is archived, not
 deleted: see below.

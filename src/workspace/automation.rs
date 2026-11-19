@@ -33,6 +33,8 @@ use crate::{
 
 /// How long a teardown may run on Pause and Archive; at quit, all of them
 /// together, the window gone already.
+/// In a project's `hints_off`, before a branch its main thread stays on.
+pub const KEPT_BRANCH: &str = "main-on:";
 const TEARDOWN: Duration = Duration::from_secs(60);
 const TEARDOWN_AT_QUIT: Duration = Duration::from_secs(10);
 
@@ -263,6 +265,17 @@ impl Workspace {
     pub(super) fn on_task_event(&mut self, view: &Entity<TaskView>, event: &TaskEvent, window: &mut Window, cx: &mut Context<Self>) {
         if let TaskEvent::Heard(heard) = event {
             return self.on_hook(heard.clone(), window, cx);
+        }
+        if let TaskEvent::Worktrees = event {
+            return self.sync_worktrees(window, cx);
+        }
+        if let TaskEvent::KeepBranch(branch) = event {
+            let root = view.read(cx).root.clone();
+            if let Some((pi, _)) = self.find(&root) {
+                self.projects[pi].hints_off.insert(format!("{KEPT_BRANCH}{branch}"));
+                self.save_later(cx);
+            }
+            return;
         }
         let TaskEvent::Auto(ask) = event else {
             return cx.notify();

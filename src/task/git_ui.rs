@@ -1212,6 +1212,10 @@ impl TaskView {
                                 this.commit_input.update(cx, |input, cx| input.set_value(message, window, cx));
                             }
                         }
+                        // A worktree came, or the one here is on another branch: the list of tasks follows now.
+                        if matches!(label, "Open" | "Switch" | "Move") {
+                            cx.emit(TaskEvent::Worktrees);
+                        }
                         let summary = out.lines().next().unwrap_or_default().to_string();
                         this.action = Some((true, if summary.is_empty() { format!("{label}: done") } else { summary }));
                     }

@@ -1052,6 +1052,8 @@ impl Workspace {
         let entry = self.entry_mut(path)?;
         let (root, branch, session, pr) = (entry.path.clone(), entry.branch.clone(), entry.session.clone(), entry.pr.clone());
         let fill = self.usage.get(path).map_or(0., |(_, usage)| usage.fill());
+        let main = self.entry_mut(path).is_some_and(|entry| entry.main);
+        let kept: Vec<String> = self.find(path).map(|(pi, _)| self.projects[pi].hints_off.iter().filter_map(|key| key.strip_prefix(automation::KEPT_BRANCH)).map(str::to_string).collect()).unwrap_or_default();
         let view = cx.new(|cx| {
             let mut t = TaskView::new(root, branch, launch, socket, slot, window, cx);
             t.context_fill = fill;
@@ -1059,6 +1061,8 @@ impl Workspace {
             t.lsp_asleep = true;
             t.restore(&session, window, cx);
             t.pr = pr;
+            t.main_thread = main;
+            t.kept_branches = kept;
             t
         });
         cx.subscribe_in(&view, window, |this, view, event: &TaskEvent, window, cx| this.on_task_event(view, event, window, cx)).detach();

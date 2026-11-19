@@ -81,7 +81,7 @@ impl TaskView {
             .when(b.upstream.is_none() && !b.head.is_empty(), |this| {
                 this.child(div().text_color(cx.theme().muted_foreground).child("no upstream"))
             })
-            .when_some(b.base.clone().filter(|_| b.behind_base > 0), |this, base| {
+            .when_some(b.base.clone().filter(|_| b.behind_base > 0 && self.off_default().is_none()), |this, base| {
                 let busy = self.busy.is_some();
                 this.child(
                     Button::new("rebase")
@@ -173,5 +173,86 @@ impl TaskView {
                 let hash = this.branch_info.last_hash.clone();
                 this.show_commit(&hash, window, cx)
             }))
+    }
+
+    /// The main thread on another branch than the default one, unless it was
+    /// asked to stay there.
+    fn off_default(&self) -> Option<&git::OffDefault> {
+        let b = &self.branch_info;
+        b.off_default.as_ref().filter(|_| self.main_thread && !self.kept_branches.contains(&b.head))
+    }
+
+    /// Says the main thread is not on the default branch, and what fixes it:
+    /// a switch when nothing of the branch would be lost, else the branch
+    /// moved to a task of its own.
+    pub(super) fn render_off_default(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let off = self.off_default()?.clone();
+        let head = self.branch_info.head.clone();
+        let theme = cx.theme();
+        let busy = self.busy.is_some();
+        let dirty = !self.changed_paths.is_empty();
+        let said = if off.contained {
+            format!("The main thread is on {head}, not {}: {} has all of {head}.", off.default, off.base)
+        } else {
+            format!("The main thread is on {head}, not {}: {head} has work {} lacks.", off.default, off.base)
+        };
+        let switch = {
+            let (off, head) = (off.clone(), head.clone());
+            Button::new("off-default-switch")
+                .xsmall()
+                .when(off.contained, |b| b.primary())
+                .when(!off.contained, |b| b.outline())
+                .disabled(busy)
+                .label(format!("Switch to {}", off.default))
+                .tooltip(if off.contained {
+                    format!("git switch {}, brought up to {}; {head} is deleted, nothing of it is lost", off.default, off.base)
+                } else {
+                    format!("git switch {}, brought up to {}; {head} stays, in the list of branches", off.default, off.base)
+                })
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    let (off, head) = (off.clone(), head.clone());
+                    this.run_action("Switch", move |root| git::switch_to_default(&root, &off, &head), false, window, cx)
+                }))
+        };
+        let to_task = (!off.contained || dirty).then(|| {
+            let (off, head) = (off.clone(), head.clone());
+            Button::new("off-default-move")
+                .xsmall()
+                .when(!off.contained, |b| b.primary())
+                .when(off.contained, |b| b.outline())
+                .disabled(busy)
+                .label(format!("Move {head} to a task"))
+                .tooltip(format!("{head} gets a worktree of its own, with what is not committed here, and shows up as a task; the main thread goes to {}", off.default))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    let (off, head) = (off.clone(), head.clone());
+                    let copy_env = crate::state::settings().copy_env;
+                    this.run_action("Move", move |root| git::move_to_task(&root, &off, &head, copy_env).map(|dir| format!("{head} is a task in {}", dir.display())), false, window, cx)
+                }))
+        });
+        let keep = Button::new("off-default-keep").xsmall().ghost().label(format!("Keep {head} here")).tooltip("Not told again while the main thread is on this branch").on_click(cx.listener(move |this, _, _, cx| {
+            cx.stop_propagation();
+            this.kept_branches.push(head.clone());
+            cx.emit(TaskEvent::KeepBranch(head.clone()));
+            cx.notify();
+        }));
+        Some(
+            h_flex()
+                .id("off-default")
+                .flex_none()
+                .gap_2()
+                .px_3()
+                .py_1()
+                .text_xs()
+                .bg(theme.muted)
+                .border_b_1()
+                .border_color(theme.border)
+                .child(div().flex_1().min_w_0().truncate().child(said))
+                .children(to_task)
+                .child(switch)
+                .child(keep)
+                .into_any_element(),
+        )
     }
 }

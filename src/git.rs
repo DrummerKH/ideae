@@ -516,6 +516,83 @@ pub struct BranchInfo {
     /// The files a pull would leave in conflict, with what is committed
     /// here or only written; empty when none, or when it cannot be told.
     pub pull_conflicts: Vec<String>,
+    /// The repository's own checkout is on another branch than the default.
+    pub off_default: Option<OffDefault>,
+}
+
+/// The repository's own checkout on a branch other than the default one.
+#[derive(Clone, Default, PartialEq, Debug)]
+pub struct OffDefault {
+    /// The default branch as checked out (main), and the ref it is
+    /// compared with (origin/main, or main itself without a remote).
+    pub default: String,
+    pub base: String,
+    /// All the branch changed is in the base already (merged, squashed or
+    /// rebased): nothing of it is lost when it goes.
+    pub contained: bool,
+}
+
+/// Whether `base` holds all that HEAD changed: merged into it, it would
+/// stay as it is.
+fn holds_all(root: &Path, base: &str) -> bool {
+    let merged = git(root, &["merge-tree", "--write-tree", base, "HEAD"]).and_then(|out| out.lines().next().map(str::to_string));
+    let tree = git(root, &["rev-parse", &format!("{base}^{{tree}}")]).map(|t| t.trim().to_string());
+    merged.is_some() && merged == tree
+}
+
+/// The main checkout goes to its default branch, brought up to the base
+/// when it only lags behind; the branch it was on is deleted when the base
+/// holds all of it.
+pub fn switch_to_default(root: &Path, off: &OffDefault, from: &str) -> Result<String, String> {
+    let contained = holds_all(root, off.base.as_str());
+    let mut said = switch_default(root, off)?;
+    if contained {
+        git_status(root, &["branch", "-D", from])?;
+        said.push_str(&format!("; {from} deleted, {} has all of it", off.base));
+    }
+    Ok(said)
+}
+
+fn switch_default(root: &Path, off: &OffDefault) -> Result<String, String> {
+    let local = git(root, &["rev-parse", "--verify", "-q", &format!("refs/heads/{}", off.default)]).is_some_and(|hash| !hash.trim().is_empty());
+    if local || off.base == off.default {
+        git_status(root, &["switch", &off.default])?;
+    } else {
+        git_status(root, &["switch", "--track", "-c", &off.default, &off.base])?;
+    }
+    let mut said = format!("On {}", off.default);
+    if off.base != off.default && git_status(root, &["merge", "--ff-only", "-q", &off.base]).is_err() {
+        said.push_str(&format!(", which has commits {} lacks: not brought up to it", off.base));
+    }
+    Ok(said)
+}
+
+/// The branch the main checkout is on goes to a worktree of its own, with
+/// what is not committed yet, and the checkout to its default branch.
+pub fn move_to_task(root: &Path, off: &OffDefault, branch: &str, copy_env: bool) -> Result<PathBuf, String> {
+    let dir = task_worktree_dir(root, branch);
+    if dir.exists() {
+        return Err(format!("{} already exists", dir.display()));
+    }
+    let dirty = git(root, &["status", "--porcelain"]).is_some_and(|out| !out.trim().is_empty());
+    if dirty {
+        git_status(root, &["stash", "push", "-u", "-m", &format!("ideae: {branch} to a task of its own")])?;
+    }
+    if let Err(e) = switch_default(root, off) {
+        if dirty {
+            let _ = git_status(root, &["stash", "pop", "--index"]);
+        }
+        return Err(e);
+    }
+    let dir_s = dir.to_string_lossy().into_owned();
+    git_status(root, &["worktree", "add", &dir_s, branch])?;
+    if dirty {
+        git_status(&dir, &["stash", "pop", "--index"]).map_err(|e| format!("{e}; the changes are in the stash"))?;
+    }
+    if copy_env {
+        copy_env_files(root, &dir);
+    }
+    Ok(dir)
 }
 
 /// `git status` read once for all it tells: the branch, how far it is from
@@ -631,6 +708,8 @@ pub struct Known {
     /// files and the new ones last: made again only when one of the two is
     /// another, and one list for all who read it.
     listed: Option<Listed>,
+    /// The repository's own checkout, not a worktree added to it.
+    main_worktree: bool,
     /// What only a new commit or a moved base changes.
     history: Option<(HistoryKey, History)>,
     /// What the patches last given were made of.
@@ -663,15 +742,16 @@ struct History {
     last_subject: String,
     /// Where the branch left the one it is compared with.
     fork: Option<String>,
+    off_default: Option<OffDefault>,
 }
 
 impl Known {
     fn fresh(&mut self, root: &Path) {
         if self.age % 30 == 0 {
             self.git_dir = git(root, &["rev-parse", "--absolute-git-dir"]).map(|dir| PathBuf::from(dir.trim()));
-            self.refs = git(root, &["rev-parse", "--path-format=absolute", "--git-common-dir"])
-                .map(|common| PathBuf::from(common.trim()).join("refs"))
-                .filter(|refs| refs.is_dir());
+            let common = git(root, &["rev-parse", "--path-format=absolute", "--git-common-dir"]).map(|common| PathBuf::from(common.trim()));
+            self.main_worktree = self.git_dir.is_some() && self.git_dir == common;
+            self.refs = common.map(|common| common.join("refs")).filter(|refs| refs.is_dir());
             self.has_origin = git(root, &["remote", "get-url", "origin"]).is_some();
             self.base = base_ref(root);
         }
@@ -863,6 +943,12 @@ pub fn refresh(root: &Path, picked: Option<String>, light: bool, known: &mut Kno
                     (history.last_hash, history.last_subject) = (hash.to_string(), subject.to_string());
                 }
             }
+            // The main checkout on another branch than the one work starts from.
+            if let Some(base) = base.as_ref().filter(|_| known.main_worktree && info.head != "(detached)" && !info.head.is_empty()) {
+                let default = base.split_once('/').filter(|_| base.starts_with("origin/")).map_or(base.as_str(), |(_, name)| name).to_string();
+                let contained = history.ahead_of_base == 0 || holds_all(root, base);
+                history.off_default = Some(OffDefault { default, base: base.clone(), contained });
+            }
             history.fork = compared.as_ref().and_then(|base| git(root, &["merge-base", "HEAD", base])).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
             known.history = key.map(|key| (key, history.clone()));
             history
@@ -876,6 +962,7 @@ pub fn refresh(root: &Path, picked: Option<String>, light: bool, known: &mut Kno
         }
         info.base = base;
     }
+    info.off_default = history.off_default.clone();
     (info.last_hash, info.last_subject) = (history.last_hash, history.last_subject);
     info.head_pushed = head_pushed(info.upstream.is_some(), info.ahead, info.base.is_some(), history.ahead_of_base);
 
@@ -3010,6 +3097,44 @@ mod refresh_tests {
             [Change::Modified, Change::Added, Change::Modified, Change::Conflict, Change::Untracked, Change::Deleted].map(Some)
         );
         assert_eq!(status.ignored, ["target/", ".env"]);
+    }
+
+    /// The repository's own checkout on a branch the remote took in by a
+    /// squash: told, and switched with the branch gone; on one with work of
+    /// its own, moved to a worktree with what was not committed yet.
+    #[test]
+    fn the_main_checkout_off_its_default_branch() {
+        let base = std::env::temp_dir().join(format!("ideae-off-default-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        sh(&base, "git init -q --bare -b main remote.git; git clone -q remote.git a 2>/dev/null; cd a
+            git config user.email t@t; git config user.name t
+            echo one > f.txt; git add .; git commit -qm base; git push -q origin main
+            git checkout -qb old; echo two >> f.txt; git commit -qam two; echo three >> f.txt; git commit -qam three
+            git checkout -q main; git merge -q --squash old; git commit -qm squashed; git push -q origin main
+            git reset -q --hard HEAD~1; git checkout -q old");
+        let root = base.join("a").canonicalize().unwrap();
+        let read = refresh(&root, None, false, &mut Known::default());
+        let off = read.info.off_default.clone().expect("off the default branch");
+        assert_eq!(off, OffDefault { default: "main".into(), base: "origin/main".into(), contained: true });
+        switch_to_default(&root, &off, "old").unwrap();
+        let read = refresh(&root, None, false, &mut Known::default());
+        assert_eq!((read.info.head.as_str(), read.info.off_default.is_none(), read.info.last_subject.as_str()), ("main", true, "squashed"));
+        assert!(git(&root, &["rev-parse", "--verify", "-q", "refs/heads/old"]).is_none_or(|out| out.trim().is_empty()), "old is deleted");
+
+        sh(&root, "git checkout -qb work; echo four >> f.txt; git commit -qam four; echo five >> f.txt; echo new > new.txt");
+        let off = refresh(&root, None, false, &mut Known::default()).info.off_default.unwrap();
+        assert!(!off.contained);
+        let dir = move_to_task(&root, &off, "work", false).unwrap();
+        assert_eq!(dir, task_worktree_dir(&root, "work"));
+        let read = refresh(&root, None, false, &mut Known::default());
+        assert!(read.info.head == "main" && read.states.is_empty(), "the checkout is on main and clean");
+        let moved = refresh(&dir, None, false, &mut Known::default());
+        assert_eq!((moved.info.head.as_str(), moved.info.off_default.is_none()), ("work", true), "a worktree of a task is not told");
+        let f = std::fs::read_to_string(dir.join("f.txt")).unwrap();
+        assert!(f.lines().map(str::trim).eq(["one", "two", "three", "four", "five"]) && dir.join("new.txt").exists(), "{f}");
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 
     /// A refresh of a real worktree: what it reads, and its patch of new

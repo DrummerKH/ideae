@@ -371,11 +371,19 @@ pub enum TaskEvent {
     Auto(AutoAsk),
     /// What the agent does, as guessed from its terminal (activity.rs).
     Heard(crate::agent::HookEvent),
+    /// The main thread stays on this branch: not to be told again.
+    KeepBranch(String),
+    /// A worktree was added, or this one put on another branch.
+    Worktrees,
 }
 
 impl EventEmitter<TaskEvent> for TaskView {}
 
 pub struct TaskView {
+    /// The project's own checkout, not a worktree of a task.
+    pub main_thread: bool,
+    /// The branches the main thread was asked to stay on, not the default.
+    pub kept_branches: Vec<String>,
     /// What the chat's agent was last reported doing, not to report it twice.
     chat_told: Option<(String, Option<String>)>,
     pub root: PathBuf,
@@ -761,6 +769,8 @@ impl TaskView {
 
         let mut this = Self {
             chat_told: None,
+            main_thread: false,
+            kept_branches: Vec::new(),
             root,
             branch: branch.into(),
             agent_status: crate::agent::AgentStatus::Unknown,
@@ -2097,7 +2107,7 @@ impl Render for TaskView {
             .on_action(cx.listener(|this, _: &ShowBranches, window, cx| this.branches_dialog(window, cx)))
             .on_action(cx.listener(|this, _: &CompareFileWith, window, cx| this.compare_open_file(window, cx)))
             .map(|view| {
-                let main = v_flex().size_full().min_w_0().child(self.render_branch(cx)).child(div().flex_1().min_h_0().child(content));
+                let main = v_flex().size_full().min_w_0().child(self.render_branch(cx)).children(self.render_off_default(cx)).child(div().flex_1().min_h_0().child(content));
                 let held = self.side != [None, None];
                 // Narrow, the side would leave the task too little: it is over it, on asking.
                 let body: AnyElement = if narrow || !held {
