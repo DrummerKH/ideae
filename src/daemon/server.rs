@@ -22,6 +22,9 @@ const REPLAY_BYTES: usize = 2 << 20;
 /// How long a daemon with no sessions and no window stays. With sessions it
 /// stays: a closed window leaves the agents working.
 const EMPTY: Duration = Duration::from_secs(60);
+/// How long a terminal's size holds before it counts as the window's, and
+/// how long the change that makes an attached program draw again is held.
+const SIZE_HELD: Duration = Duration::from_millis(500);
 
 struct Session {
     handle: Arc<Mutex<Box<dyn ByteHandle>>>,
@@ -31,8 +34,9 @@ struct Session {
     /// Input the pty could not take yet.
     pending: Vec<u8>,
     fg: Option<Fg>,
-    /// The grid the windows last asked for.
+    /// The grid the windows last asked for, and when.
     size: Size,
+    sized: Instant,
     /// A program on pipes (an agent's host), not a shell on a pty.
     pipe: Option<Arc<super::pipe::Pipe>>,
 }
@@ -251,6 +255,7 @@ fn serve(shared: Shared, stream: UnixStream) {
                 let mut s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(session) = s.sessions.get_mut(&id) {
                     session.size = size;
+                    session.sized = Instant::now();
                     let _ = session.handle.lock().unwrap_or_else(std::sync::PoisonError::into_inner).resize(viewport(size));
                 }
             }
@@ -325,6 +330,7 @@ fn open(shared: &Shared, client: u64, id: String, spec: Spec, size: Size) {
         }
         // Attach: what it printed so far, then live output.
         session.size = size;
+        session.sized = Instant::now();
         let replay: Vec<u8> = session.replay.iter().copied().collect();
         let fg = session.fg.clone();
         let handle = session.handle.clone();
@@ -332,20 +338,32 @@ fn open(shared: &Shared, client: u64, id: String, spec: Spec, size: Size) {
         s.send(client, proto::encode_msg(&Msg::Foreground { id: id.clone(), fg }));
         drop(s);
         // A size change makes full-screen programs (the agent) draw again,
-        // over whatever the replay could not restore. It ends on the size
-        // the window has by then: a window that maximizes right after it
-        // opens sends a new one meanwhile. The width changes too, and for a
-        // while: Claude Code draws all of itself again only for a new width,
-        // and one that shows a session run elsewhere (in the background)
-        // passes the size on to it, where two changes close together are one.
+        // over whatever the replay could not restore. Not before the window
+        // has its size: one that maximizes right after it opens sends
+        // another meanwhile, and Claude Code showing a session moved to the
+        // background takes changes close together as one, back to where it
+        // was, and does not draw. Then narrower by a few columns, held: one
+        // column less it takes as no change of width, and only a new width
+        // makes it draw all of itself.
         let shared = shared.clone();
         std::thread::spawn(move || {
-            let shrunk = Size { rows: size.rows.saturating_sub(1).max(2), cols: size.cols.saturating_sub(1).max(2), ..size };
-            let _ = handle.lock().unwrap_or_else(std::sync::PoisonError::into_inner).resize(viewport(shrunk));
-            std::thread::sleep(Duration::from_millis(300));
-            let s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(session) = s.sessions.get(&id).filter(|x| Arc::ptr_eq(&x.handle, &handle)) {
-                let _ = handle.lock().unwrap_or_else(std::sync::PoisonError::into_inner).resize(viewport(session.size));
+            let since = Instant::now();
+            let current = || {
+                let s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                s.sessions.get(&id).filter(|x| Arc::ptr_eq(&x.handle, &handle)).map(|x| (x.size, x.sized))
+            };
+            let size = loop {
+                std::thread::sleep(Duration::from_millis(100));
+                let Some((size, sized)) = current() else { return };
+                if sized.elapsed() >= SIZE_HELD || since.elapsed() >= SIZE_HELD * 10 {
+                    break size;
+                }
+            };
+            let narrower = Size { rows: size.rows.saturating_sub(1).max(2), cols: size.cols.saturating_sub(8).max(2), ..size };
+            let _ = handle.lock().unwrap_or_else(std::sync::PoisonError::into_inner).resize(viewport(narrower));
+            std::thread::sleep(SIZE_HELD);
+            if let Some((size, _)) = current() {
+                let _ = handle.lock().unwrap_or_else(std::sync::PoisonError::into_inner).resize(viewport(size));
             }
         });
         return;
@@ -395,6 +413,7 @@ fn open(shared: &Shared, client: u64, id: String, spec: Spec, size: Size) {
             pending: Vec::new(),
             fg: None,
             size,
+            sized: Instant::now(),
             pipe,
         },
     );
@@ -763,6 +782,7 @@ mod handover {
                     pending: Vec::new(),
                     fg: session.fg,
                     size: session.size,
+                    sized: std::time::Instant::now(),
                     pipe,
                 },
             );
@@ -896,6 +916,29 @@ mod tests {
         let Ok(Frame::Msg(Msg::Welcome { sessions, .. })) = proto::read_frame(&mut stream) else { panic!("no welcome") };
         assert!(sessions.contains(&"pipe-flood".to_string()), "the program on pipes ran on: {sessions:?}");
         proto::write_msg(&mut stream, &Msg::Kill { id: "pipe-flood".into() }).unwrap();
+
+        // Attached again, a program is made to draw anew once the window's
+        // size holds: narrower for a while, then that size.
+        let sizes = dir.join("sizes");
+        // Not the interactive shell: with job control the signal goes to the foreground job alone.
+        let input = format!("exec bash --norc -c \"trap 'stty size >> {}' WINCH; while :; do sleep 0.05; done\"\n", sizes.display());
+        let spec = Spec { cwd: dir.clone(), env: Vec::new(), input: Some(input), program: Vec::new() };
+        proto::write_msg(&mut stream, &Msg::Open { id: "sizes".into(), spec: spec.clone(), size }).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        let mut again = UnixStream::connect(&path).unwrap();
+        proto::write_msg(&mut again, &Msg::Hello { protocol: proto::PROTOCOL, version: crate::build_watch::build_id() }).unwrap();
+        let small = Size { cols: 60, rows: 20, ..size };
+        proto::write_msg(&mut again, &Msg::Open { id: "sizes".into(), spec, size: small }).unwrap();
+        // The window maximizes right after it opens.
+        std::thread::sleep(Duration::from_millis(150));
+        let big = Size { cols: 120, rows: 40, ..size };
+        proto::write_msg(&mut again, &Msg::Resize { id: "sizes".into(), size: big }).unwrap();
+        std::thread::sleep(SIZE_HELD * 3);
+        let told = std::fs::read_to_string(&sizes).unwrap_or_default();
+        let told: Vec<&str> = told.lines().collect();
+        assert_eq!(told.last().copied(), Some("40 120"), "{told:?}");
+        assert!(told.contains(&"39 112") && !told.contains(&"19 52"), "narrower once the size held, not before: {told:?}");
+        proto::write_msg(&mut again, &Msg::Kill { id: "sizes".into() }).unwrap();
         std::thread::sleep(Duration::from_millis(200));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(&dir);
