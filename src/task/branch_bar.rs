@@ -255,4 +255,55 @@ impl TaskView {
                 .into_any_element(),
         )
     }
+
+    pub fn set_own_branch(&mut self, own: String, off: Option<String>, cx: &mut Context<Self>) {
+        if self.own_branch != own || self.off_own != off {
+            self.own_branch = own;
+            self.off_own = off;
+            cx.notify();
+        }
+    }
+
+    /// Says the task's worktree is not on the task's branch, and puts it
+    /// back: an agent detached it, or went to another branch.
+    pub(super) fn render_off_own(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let off = self.off_own.clone().filter(|_| !self.main_thread)?;
+        let own = self.own_branch.clone();
+        let theme = cx.theme();
+        let doing = ["rebasing", "merging", "cherry-picking", "reverting", "bisecting"].iter().any(|d| off.starts_with(d));
+        let said = if doing {
+            format!("The worktree is {off}: finish or abort it, and the task is on {own} again.")
+        } else {
+            format!("The worktree is {off}, not on the task's branch {own}.")
+        };
+        let back = (!doing).then(|| {
+            let own = own.clone();
+            Button::new("off-own-back")
+                .xsmall()
+                .primary()
+                .disabled(self.busy.is_some())
+                .label(format!("Back on {own}"))
+                .tooltip(format!("With all of {own} here, {own} is moved here; else the worktree goes to {own}, and commits here on no branch get one"))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    let own = own.clone();
+                    this.run_action("Switch", move |root| git::back_on_branch(&root, &own), false, window, cx)
+                }))
+        });
+        Some(
+            h_flex()
+                .id("off-own")
+                .flex_none()
+                .gap_2()
+                .px_3()
+                .py_1()
+                .text_xs()
+                .bg(theme.muted)
+                .border_b_1()
+                .border_color(theme.border)
+                .child(div().flex_1().min_w_0().truncate().child(said))
+                .children(back)
+                .into_any_element(),
+        )
+    }
 }

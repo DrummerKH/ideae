@@ -177,14 +177,30 @@ fn commit_lines(root: &Path, args: &[&str]) -> Vec<CommitLine> {
 
 /// The commits of `root`'s HEAD that are on no remote and no other local
 /// branch: what deleting its branch would lose. Merges are left out.
+#[cfg(test)]
 pub fn unpushed(root: &Path) -> Vec<CommitLine> {
+    unpushed_of(root, "")
+}
+
+/// The same, `own` (the task's branch, which goes with it) not counted as
+/// another branch either, though the worktree be on none or another.
+fn unpushed_of(root: &Path, own: &str) -> Vec<CommitLine> {
     let mut args = vec!["--no-merges".to_string(), "HEAD".into(), "--not".into(), "--remotes".into()];
-    if let Ok(own) = git(root, &["symbolic-ref", "--short", "-q", "HEAD"]) {
-        args.push(format!("--exclude={}", own.trim()));
-    }
+    args.extend(going_with(root, own));
     args.push("--branches".into());
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     commit_lines(root, &args)
+}
+
+/// `--exclude`s for the branches that go with the task: the one checked
+/// out and its own.
+fn going_with(root: &Path, own: &str) -> Vec<String> {
+    let here = git(root, &["symbolic-ref", "--short", "-q", "HEAD"]).map(|b| b.trim().to_string()).unwrap_or_default();
+    let mut names = vec![here];
+    if !own.is_empty() && !own.starts_with('(') && !names.iter().any(|n| n == own) {
+        names.push(own.to_string());
+    }
+    names.into_iter().filter(|n| !n.is_empty()).map(|n| format!("--exclude={n}")).collect()
 }
 
 /// Everything not committed in `root`, new files not ignored too, as one
@@ -264,7 +280,7 @@ pub fn write(job: Job) -> Result<Meta, String> {
     if !meta.base.is_empty() && meta.base != meta.head {
         meta.commits = commit_lines(&root, &["-n", "50", &format!("{}..HEAD", meta.base)]);
     }
-    meta.unpushed = unpushed(&root);
+    meta.unpushed = unpushed_of(&root, &meta.branch);
 
     // What exists nowhere else: in files of the scratch folder first.
     let mut work: Vec<(PathBuf, &str)> = Vec::new();
@@ -272,10 +288,8 @@ pub fn write(job: Job) -> Result<Meta, String> {
         let bundle = scratch.0.join("unpushed.bundle");
         let bundle_s = bundle.to_string_lossy().into_owned();
         let mut args = vec!["bundle", "create", "-q", &bundle_s, "HEAD", "--not", "--remotes"];
-        let own = git(&root, &["symbolic-ref", "--short", "-q", "HEAD"]).map(|b| format!("--exclude={}", b.trim()));
-        if let Ok(own) = own.as_deref() {
-            args.push(own);
-        }
+        let going = going_with(&root, &meta.branch);
+        args.extend(going.iter().map(String::as_str));
         args.push("--branches");
         git(&root, &args).map_err(|e| format!("the bundle of unpushed commits: {e}"))?;
         work.push((bundle, BUNDLE));
@@ -1091,4 +1105,22 @@ mod tests {
         assert!(again.left_something());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// A task's worktree an agent left on no branch: its commits on its own
+    /// branch alone are its to keep, not another branch's.
+    #[cfg(unix)]
+    #[test]
+    fn a_detached_task_s_own_branch_is_not_another_branch() {
+        let dir = std::env::temp_dir().join(format!("ideae-archive-detached-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        sh(&dir, "git init -q -b main repo; cd repo; git config user.email t@t; git config user.name t
+            echo one > f; git add f; git commit -qm base
+            git worktree add -q -b task ../wt; cd ../wt; echo two >> f; git commit -qam mine; git checkout -q --detach");
+        let wt = dir.join("wt");
+        assert!(unpushed(&wt).is_empty(), "as before: the branch task has it");
+        assert_eq!(unpushed_of(&wt, "task").len(), 1, "the task's branch goes with it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
+

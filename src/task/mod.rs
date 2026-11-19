@@ -388,6 +388,9 @@ pub struct TaskView {
     chat_told: Option<(String, Option<String>)>,
     pub root: PathBuf,
     pub branch: SharedString,
+    /// The branch the task owns, and where its worktree is when not on it, in words.
+    own_branch: String,
+    off_own: Option<String>,
     pub agent_status: crate::agent::AgentStatus,
     /// What the working agent does now: its latest tool call, in words.
     pub agent_activity: Option<String>,
@@ -778,6 +781,8 @@ impl TaskView {
             main_thread: false,
             kept_branches: Vec::new(),
             root,
+            own_branch: branch.clone(),
+            off_own: None,
             branch: branch.into(),
             agent_status: crate::agent::AgentStatus::Unknown,
             agent_activity: None,
@@ -2115,7 +2120,7 @@ impl Render for TaskView {
             .on_action(cx.listener(|this, _: &ShowBranches, window, cx| this.branches_dialog(window, cx)))
             .on_action(cx.listener(|this, _: &CompareFileWith, window, cx| this.compare_open_file(window, cx)))
             .map(|view| {
-                let main = v_flex().size_full().min_w_0().child(self.render_branch(cx)).children(self.render_off_default(cx)).child(div().flex_1().min_h_0().child(content));
+                let main = v_flex().size_full().min_w_0().child(self.render_branch(cx)).children(self.render_off_default(cx)).children(self.render_off_own(cx)).child(div().flex_1().min_h_0().child(content));
                 let held = self.side != [None, None];
                 // Narrow, the side would leave the task too little: it is over it, on asking.
                 let body: AnyElement = if narrow || !held {

@@ -1163,6 +1163,10 @@ impl Workspace {
             // A branch named after the task says nothing its title does not.
             fixed.push(t.branch.clone());
         }
+        // Its worktree not on its branch: detached, on another, mid-rebase.
+        if let Some(off) = t.head.as_ref().and_then(|h| h.off(&t.branch)) {
+            fixed.push(off);
+        }
         if let Some(info) = self.variant_info.get(&path).filter(|i| listed && i.files > 0) {
             details.push(format!("+{} −{}", info.additions, info.deletions));
         }

@@ -104,6 +104,128 @@ pub fn worktrees(path: &Path) -> Vec<Worktree> {
     result
 }
 
+/// Where a task's worktree is when that is not on the branch the task owns:
+/// another branch, no branch, or a git operation under way.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Head {
+    /// The branch checked out, or being rebased; empty on none.
+    pub branch: String,
+    /// On no branch: the ref it is at (origin/main), else its short hash.
+    pub at: String,
+    /// "rebasing", "merging", "cherry-picking", "reverting", "bisecting".
+    pub doing: Option<&'static str>,
+}
+
+impl Head {
+    /// In words, against the task's own branch; None when it is on it.
+    pub fn off(&self, own: &str) -> Option<String> {
+        match (self.doing, self.branch.as_str()) {
+            (Some(doing), b) if b.is_empty() || b == own => Some(doing.to_string()),
+            (Some(doing), b) => Some(format!("{doing} {b}")),
+            (None, "") => Some(format!("detached at {}", self.at)),
+            (None, b) if b != own => Some(format!("on {b}")),
+            _ => None,
+        }
+    }
+}
+
+/// The git folder of a worktree: its `.git`, or where its `.git` file points.
+fn git_dir_of(worktree: &Path) -> Option<PathBuf> {
+    let dot = worktree.join(".git");
+    if dot.is_dir() {
+        return Some(dot);
+    }
+    let text = std::fs::read_to_string(&dot).ok()?;
+    let dir = PathBuf::from(text.trim().strip_prefix("gitdir:")?.trim());
+    Some(if dir.is_absolute() { dir } else { worktree.join(dir) })
+}
+
+/// What a worktree's HEAD is on, `listed` being its branch as `git worktree
+/// list` gave it ("(detached)" for none).
+pub fn head_of(worktree: &Path, listed: &str) -> Head {
+    let dir = git_dir_of(worktree);
+    let has = |name: &str| dir.as_ref().is_some_and(|d| d.join(name).exists());
+    let rebasing = ["rebase-merge", "rebase-apply"].into_iter().find(|d| has(d));
+    let doing = if rebasing.is_some() {
+        Some("rebasing")
+    } else if has("MERGE_HEAD") {
+        Some("merging")
+    } else if has("CHERRY_PICK_HEAD") {
+        Some("cherry-picking")
+    } else if has("REVERT_HEAD") {
+        Some("reverting")
+    } else if has("BISECT_LOG") {
+        Some("bisecting")
+    } else {
+        None
+    };
+    let mut branch = if listed.starts_with('(') { String::new() } else { listed.to_string() };
+    if let (Some(rebase), Some(dir)) = (rebasing, dir.as_ref()) {
+        if let Ok(name) = std::fs::read_to_string(dir.join(rebase).join("head-name")) {
+            branch = name.trim().trim_start_matches("refs/heads/").to_string();
+        }
+    }
+    let at = if branch.is_empty() && doing.is_none() { described_head(worktree) } else { String::new() };
+    Head { branch, at, doing }
+}
+
+/// A ref HEAD is at, a remote's first (origin/main), else its short hash.
+fn described_head(worktree: &Path) -> String {
+    let names = git(worktree, &["for-each-ref", "--points-at", "HEAD", "--format=%(refname)", "refs/remotes", "refs/heads", "refs/tags"]).unwrap_or_default();
+    ["refs/remotes/", "refs/heads/", "refs/tags/"]
+        .iter()
+        .find_map(|kind| names.lines().filter(|name| !name.ends_with("/HEAD")).find_map(|name| name.strip_prefix(kind)))
+        .map(str::to_string)
+        .or_else(|| git(worktree, &["rev-parse", "--short", "HEAD"]).map(|h| h.trim().to_string()))
+        .unwrap_or_default()
+}
+
+fn is_ancestor(root: &Path, older: &str, newer: &str) -> bool {
+    git_status(root, &["merge-base", "--is-ancestor", older, newer]).is_ok()
+}
+
+/// The branch `other`, checked out in a task's worktree, is that task's work
+/// under another name: made since the task was (`since`, Unix seconds), from
+/// its branch `own`, which it has all of unless it is gone (renamed).
+pub fn grew_from(worktree: &Path, own: &str, other: &str, since: u64) -> bool {
+    if since == 0 || own.is_empty() || other == own {
+        return false;
+    }
+    if branch_exists(worktree, own) && !is_ancestor(worktree, own, other) {
+        return false;
+    }
+    // The first line of its reflog is when it was made.
+    let made = git(worktree, &["log", "-g", "--format=%ct", &format!("refs/heads/{other}")])
+        .and_then(|out| out.lines().last().and_then(|l| l.trim().parse::<u64>().ok()));
+    made.is_some_and(|made| made >= since)
+}
+
+/// Puts a task's worktree back on its branch `own`. With all of it here,
+/// the branch is moved to where the worktree is; else the worktree goes to
+/// it, and commits here on no other branch get a branch first.
+pub fn back_on_branch(worktree: &Path, own: &str) -> Result<String, String> {
+    if !branch_exists(worktree, own) {
+        git_status(worktree, &["switch", "-c", own])?;
+        return Ok(format!("On {own} again, made here"));
+    }
+    if is_ancestor(worktree, own, "HEAD") {
+        git_status(worktree, &["switch", "-C", own])?;
+        return Ok(format!("On {own} again, moved here"));
+    }
+    let loose: u32 = git(worktree, &["rev-list", "--count", "HEAD", "--not", "--branches", "--remotes"]).and_then(|n| n.trim().parse().ok()).unwrap_or(0);
+    let mut kept = String::new();
+    if loose > 0 {
+        let name = std::iter::once(format!("{own}-here"))
+            .chain((2..).map(|n| format!("{own}-here-{n}")))
+            .find(|name| !branch_exists(worktree, name))
+            .unwrap_or_else(|| format!("{own}-here"));
+        git_status(worktree, &["branch", &name])?;
+        kept = format!("; the {loose} commit{} on no branch {} on {name}", if loose == 1 { "" } else { "s" }, if loose == 1 { "is" } else { "are" });
+    }
+    git_status(worktree, &["switch", own])?;
+    Ok(format!("On {own} again{kept}"))
+}
+
 const DIFF_ARGS: &[&str] = &[
     "--no-color",
     "--no-ext-diff",
@@ -2995,7 +3117,7 @@ pub fn park_and_remove(repo: &Path, path: &Path, branch: &str, keep_ref: &str) -
             .unwrap_or_else(|| keep_ref.to_string());
         git_status(path, &["update-ref", &free, "HEAD"])?;
     }
-    remove_task_worktree(repo, path, branch, false)
+    remove_task_worktree(repo, path, branch, false).map(|_| ())
 }
 
 /// Drops the parked tries whose ref, `…/<unix seconds>-<group>/<letter>`,
@@ -3104,9 +3226,21 @@ pub fn remove_side_worktree(repo: &Path, path: &Path, branch: &str) -> Result<Op
     git_status(repo, &["branch", "-D", branch]).map(|_| None)
 }
 
-/// Removes a task's worktree and its branch; a lock is overridden only
-/// when `unlock`.
-pub fn remove_task_worktree(repo: &Path, path: &Path, branch: &str, unlock: bool) -> Result<(), String> {
+/// Removes a task's worktree and its branch `branch`, the one the task
+/// owns, not whatever the worktree is on; a lock is overridden only when
+/// `unlock`. The branch stays when it has commits that neither the
+/// worktree's HEAD nor a remote or another branch has, and the reason is
+/// returned.
+pub fn remove_task_worktree(repo: &Path, path: &Path, branch: &str, unlock: bool) -> Result<Option<String>, String> {
+    let named = !branch.is_empty() && !branch.starts_with('(');
+    let only_there: u32 = if named && path.exists() && branch_exists(repo, branch) {
+        let exclude = format!("--exclude={branch}");
+        git(path, &["rev-list", "--count", &format!("refs/heads/{branch}"), "--not", "HEAD", "--remotes", &exclude, "--branches"])
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or(0)
+    } else {
+        0
+    };
     // A chat agent's conversation goes with its task (an archive keeps its copy).
     let journal = crate::acp::journal_path(path);
     let _ = std::fs::remove_file(&journal);
@@ -3126,10 +3260,18 @@ pub fn remove_task_worktree(repo: &Path, path: &Path, branch: &str, unlock: bool
     } else {
         let _ = git_status(repo, &["worktree", "prune"]);
     }
-    if !branch.is_empty() && !branch.starts_with('(') {
-        let _ = git_status(repo, &["branch", "-D", branch]);
+    if !named {
+        return Ok(None);
     }
-    Ok(())
+    if only_there > 0 {
+        return Ok(Some(format!(
+            "The branch {branch} stays: {only_there} commit{} on it {} on no remote, no other branch and not where the worktree was.",
+            if only_there == 1 { "" } else { "s" },
+            if only_there == 1 { "is" } else { "are" }
+        )));
+    }
+    let _ = git_status(repo, &["branch", "-D", branch]);
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -3762,5 +3904,69 @@ mod push_tests {
         let Err(Ok(told)) = push_or_tell(&here, true) else { panic!("not told as diverged") };
         assert!(told.keep.as_deref().is_some_and(|why| why.contains("main branch")));
         std::fs::remove_dir_all(&top).unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod own_branch_tests {
+    use super::*;
+
+    fn sh(dir: &Path, script: &str) {
+        let ok = std::process::Command::new("bash").arg("-ec").arg(script).current_dir(dir).status().unwrap().success();
+        assert!(ok, "{script}");
+    }
+
+    #[test]
+    fn a_task_keeps_its_branch_wherever_an_agent_puts_its_worktree() {
+        let base = std::env::temp_dir().join(format!("ideae-own-branch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        sh(&base, "git init -q --bare -b main origin.git; git init -q -b main repo; cd repo; git config user.email t@t; git config user.name t
+            git remote add origin ../origin.git; echo one > f; git add f; git commit -qm base; git push -q origin main
+            GIT_COMMITTER_DATE='2001-01-01T00:00:00' git branch develop
+            git worktree add -q -b task ../wt; cd ../wt; echo two >> f; git commit -qam mine");
+        let (repo, wt) = (base.join("repo"), base.join("wt"));
+        let since = crate::state::now() - 60;
+
+        // Its work merged into main, the agent leaves its worktree on main, detached.
+        sh(&wt, "git push -q origin task:main; git fetch -q origin; git checkout -q --detach origin/main");
+        let head = head_of(&wt, "(detached)");
+        assert_eq!(head.off("task").as_deref(), Some("detached at origin/main"));
+        // The branch is not deleted with the worktree, since it holds nothing that is not elsewhere.
+        assert_eq!(remove_task_worktree(&repo, &wt, "task", false), Ok(None));
+        assert!(!branch_exists(&repo, "task"));
+
+        // On another branch: that one is not the task's, and stays.
+        sh(&repo, "git worktree add -q -b task ../wt origin/main; cd ../wt; echo three >> f; git commit -qam unpushed; git switch -q develop");
+        assert_eq!(head_of(&wt, "develop").off("task").as_deref(), Some("on develop"));
+        assert!(!grew_from(&wt, "task", "develop", since), "made before the task, and not from its branch");
+        let stays = remove_task_worktree(&repo, &wt, "task", false).unwrap();
+        assert!(stays.is_some_and(|s| s.contains("1 commit")), "its commit is nowhere else");
+        assert!(branch_exists(&repo, "task") && branch_exists(&repo, "develop"));
+
+        // A branch the agent made from the task's: the same work under another name.
+        sh(&repo, "git worktree add -q ../wt task; cd ../wt; git switch -q -c task-2; echo four >> f; git commit -qam more");
+        assert!(grew_from(&wt, "task", "task-2", since));
+        assert!(!grew_from(&wt, "task", "task-2", 0), "a worktree made elsewhere owns nothing");
+
+        // Back on its branch: moved to where the worktree is when it has all of it.
+        sh(&wt, "git checkout -q --detach HEAD");
+        assert_eq!(head_of(&wt, "(detached)").off("task").as_deref(), Some("detached at task-2"));
+        assert!(back_on_branch(&wt, "task").unwrap().contains("moved here"));
+        assert_eq!(git(&wt, &["rev-parse", "task"]), git(&wt, &["rev-parse", "task-2"]));
+        // Else the worktree goes to it, and what is on no branch gets one.
+        sh(&wt, "git checkout -q --detach origin/main; echo five > g; git add g; git commit -qm loose");
+        let back = back_on_branch(&wt, "task").unwrap();
+        assert!(back.contains("task-here"), "{back}");
+        assert_eq!(git(&wt, &["symbolic-ref", "--short", "HEAD"]).unwrap().trim(), "task");
+
+        // Mid-rebase: told as such, the branch being rebased read from git.
+        let dir = git_dir_of(&wt).unwrap();
+        std::fs::create_dir_all(dir.join("rebase-merge")).unwrap();
+        std::fs::write(dir.join("rebase-merge/head-name"), "refs/heads/task\n").unwrap();
+        let head = head_of(&wt, "(detached)");
+        assert_eq!((head.branch.as_str(), head.off("task").as_deref()), ("task", Some("rebasing")));
+        assert_eq!(head.off("other").as_deref(), Some("rebasing task"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

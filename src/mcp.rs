@@ -298,7 +298,7 @@ pub fn run_server() {
                 "protocolVersion": msg.pointer("/params/protocolVersion").cloned().unwrap_or(json!("2025-06-18")),
                 "capabilities": { "tools": {} },
                 "serverInfo": { "name": "ideae", "version": env!("CARGO_PKG_VERSION") },
-                "instructions": "ideae is the IDE this task runs in. Its tools tell what the user sees of this task (open files and selection, the language servers' problems, the project's check) and ask its language servers: where a name is declared, where it is used, what it is, which names the project declares.",
+                "instructions": "ideae is the IDE this task runs in. Its tools tell what the user sees of this task (open files and selection, the language servers' problems, the project's check) and ask its language servers: where a name is declared, where it is used, what it is, which names the project declares. The task is this git worktree and its branch: work and commit here, not in the repository's main checkout; once its work is merged, keep the worktree on the task's branch (reset or rebase it onto the base) rather than detaching it or putting it on another branch.",
             })),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({ "tools": tools() })),

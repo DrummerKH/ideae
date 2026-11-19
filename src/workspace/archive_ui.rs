@@ -281,9 +281,12 @@ impl Workspace {
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 match result {
-                    Ok(()) => {
+                    Ok(stays) => {
                         if let Some((pi, ti)) = this.find(&path) {
                             this.projects[pi].tasks.remove(ti);
+                        }
+                        if let Some(stays) = stays {
+                            window.push_notification(Notification::warning(stays), cx);
                         }
                         if let Some(left) = this.dissolve_lonely_groups() {
                             this.switch(&left, window, cx);
@@ -429,6 +432,12 @@ impl Workspace {
                     Some(all) if all.is_empty() => list = list.child(div().text_sm().text_color(muted).child("No task archived yet. A task's menu has Archive: its worktree goes, its goal and its agent's conversation stay here. Defer… keeps it from the clean-up and brings it back on a day.")),
                     Some(all) => {
                         let mut any = false;
+                        // Archives whose task is restored and here: its path, and whether the
+                        // archive keeps work that did not come back.
+                        let live: std::collections::HashMap<String, (PathBuf, bool)> = this
+                            .upgrade()
+                            .map(|w| w.read(cx).projects.iter().flat_map(|p| &p.tasks).filter(|t| !t.archive.is_empty()).map(|t| (t.archive.clone(), (t.path.clone(), t.archive_keep))).collect())
+                            .unwrap_or_default();
                         // Deferred and archived apart, when there are both.
                         let both = all.iter().any(|(a, _)| a.deferred.is_some()) && all.iter().any(|(a, _)| a.deferred.is_none());
                         let mut heading: Option<bool> = None;
@@ -460,6 +469,10 @@ impl Workspace {
                                 details.push("with work on no remote".into());
                             }
                             details.push(size(item.size));
+                            let live = live.get(&item.key()).cloned();
+                            if let Some((_, keep)) = &live {
+                                details.insert(0, if *keep { "restored, in the list; this keeps what did not come back".into() } else { "restored, in the list".into() });
+                            }
                             let prompt = m.prompt.lines().find(|l| !l.trim().is_empty()).unwrap_or_default().to_string();
                             let (restore_item, delete_item, row_item) = (item.clone(), item.clone(), item.clone());
                             let (a, b, c, listed) = (this.clone(), this.clone(), this.clone(), listed.clone());
@@ -484,20 +497,28 @@ impl Workspace {
                                             .child(div().text_xs().text_color(muted).truncate().child(details.join(" · ")))
                                             .when(!prompt.is_empty() && prompt.trim() != m.title.trim(), |col| col.child(div().text_xs().text_color(muted).truncate().child(prompt))),
                                     )
-                                    .child(Button::new(("archived-restore", ix)).small().primary().label("Restore…").on_click(move |_, window, cx| {
-                                        cx.stop_propagation();
-                                        window.close_dialog(cx);
-                                        let item = restore_item.clone();
-                                        let _ = a.update(cx, |w, cx| w.restore_dialog(item, window, cx));
-                                    }))
-                                    .child(Button::new(("archived-defer", ix)).small().ghost().label(if deferred.is_some() { "Day…" } else { "Defer…" }).on_click(move |_, window, cx| {
+                                    .map(|row| match live.clone() {
+                                        // Restored twice, two tasks would write one archive.
+                                        Some((path, _)) => row.child(Button::new(("archived-open", ix)).small().primary().label("Open").tooltip("Restored already: go to the task").on_click(move |_, window, cx| {
+                                            cx.stop_propagation();
+                                            window.close_dialog(cx);
+                                            let _ = a.update(cx, |w, cx| w.switch(&path, window, cx));
+                                        })),
+                                        None => row.child(Button::new(("archived-restore", ix)).small().primary().label("Restore…").on_click(move |_, window, cx| {
+                                            cx.stop_propagation();
+                                            window.close_dialog(cx);
+                                            let item = restore_item.clone();
+                                            let _ = a.update(cx, |w, cx| w.restore_dialog(item, window, cx));
+                                        })),
+                                    })
+                                    .when(live.is_none(), |row| row.child(Button::new(("archived-defer", ix)).small().ghost().label(if deferred.is_some() { "Day…" } else { "Defer…" }).on_click(move |_, window, cx| {
                                         cx.stop_propagation();
                                         let (this, file, listed) = (day.clone(), day_file.clone(), day_listed.clone());
                                         let told = "It stays with the archived tasks, kept from the clean-up; on the day it comes back paused, from the current origin or its open PR's branch.".to_string();
                                         defer_dialog(format!("Defer \"{day_title}\""), told, window, cx, move |d, window, cx| {
                                             let _ = this.update(cx, |w, cx| w.set_deferred(file.clone(), Some(d), listed.clone(), window, cx));
                                         });
-                                    }))
+                                    })))
                                     .when(deferred.is_some(), |row| {
                                         row.child(Button::new(("archived-undefer", ix)).small().ghost().label("Archive").tooltip("An archive like the others: no day, cleaned up in time").on_click(move |_, window, cx| {
                                             cx.stop_propagation();
@@ -512,7 +533,10 @@ impl Workspace {
                                     .on_click(move |_, window, cx| {
                                         window.close_dialog(cx);
                                         let item = row_item.clone();
-                                        let _ = c.update(cx, |w, cx| w.restore_dialog(item, window, cx));
+                                        let _ = c.update(cx, |w, cx| match &live {
+                                            Some((path, _)) => w.switch(path, window, cx),
+                                            None => w.restore_dialog(item, window, cx),
+                                        });
                                     }),
                             );
                         }
@@ -571,6 +595,11 @@ impl Workspace {
     /// How to bring an archived task back: where from, its work, its
     /// conversation. Its PR is asked about meanwhile.
     pub fn restore_dialog(&mut self, item: Archived, window: &mut Window, cx: &mut Context<Self>) {
+        // Restored already: a second task of it would write the same archive.
+        let key = item.key();
+        if let Some(path) = self.projects.iter().flat_map(|p| &p.tasks).find(|t| t.archive == key).map(|t| t.path.clone()) {
+            return self.switch(&path, window, cx);
+        }
         let Some(pi) = self.projects.iter().position(|p| p.path == item.meta.project) else {
             let told = format!("Its project, {}, is not in the list: add it first.", item.meta.project.display());
             window.push_notification(Notification::error(told).title("Restore"), cx);
@@ -1131,6 +1160,13 @@ exec cat > "$OUT/$name.told"
         });
         let (again, ..) = back.unwrap();
         assert_ne!(again, path, "a new worktree");
+        // Asked again: the task that is here, not a second one writing the same archive.
+        let mut asked = true;
+        step(cx, &mut |w, window, cx| {
+            w.restore_dialog(item.clone(), window, cx);
+            asked = gpui_kit::component::WindowExt::has_active_dialog(window, cx);
+        });
+        assert!(!asked, "no Restore dialog for an archive whose task is here");
         let subject = std::process::Command::new("git").args(["log", "-1", "--format=%s"]).current_dir(&again).output().unwrap();
         assert_eq!(String::from_utf8_lossy(&subject.stdout).trim(), "not pushed");
         assert_eq!(std::fs::read_to_string(again.join("new.txt")).unwrap(), "kept\n");

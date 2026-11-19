@@ -216,6 +216,10 @@ impl TaskView {
         if !info.head.is_empty() {
             self.branch = info.head.clone().into();
         }
+        // Put on another branch or none, by an agent or in a terminal: the task says so now, not at the next look.
+        if !self.branch_info.head.is_empty() && info.head != self.branch_info.head {
+            cx.emit(TaskEvent::Worktrees);
+        }
         self.history.update(cx, |h, cx| h.sync_head(&info.last_hash, cx));
         // A new commit changes who last touched the lines.
         if info.last_hash != self.branch_info.last_hash {

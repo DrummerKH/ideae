@@ -66,6 +66,9 @@ pub struct TaskEntry {
     pub seen_at: u64,
     /// The commit a variant was made from: what its diff is counted against.
     pub base: String,
+    /// Where its worktree is when not on its branch, which stays the task's
+    /// (`branch`): read from git, not saved.
+    pub head: Option<git::Head>,
     /// A worktree an agent made for itself (side.rs), not a task of the user's.
     pub side: Option<side::Side>,
     /// The agent chosen when it was made, by profile id; empty for its
@@ -99,6 +102,12 @@ pub mod variants;
 pub mod welcome;
 
 impl TaskEntry {
+    /// Made by the app (or restored) on a branch of its own, which stays its
+    /// whatever its worktree is put on; one made elsewhere follows its worktree.
+    pub fn owns_branch(&self) -> bool {
+        !self.main && self.created > 0 && !self.branch.is_empty() && !self.branch.starts_with('(')
+    }
+
     /// The agent's latest session, to find its file by.
     pub fn session_ref(&self) -> Option<crate::agents::SessionRef> {
         let session = self.sessions.last()?;
@@ -891,6 +900,7 @@ impl Workspace {
                     done_at: t.done_at,
                     seen_at: t.seen_at,
                     base: t.base.clone(),
+                    head: None,
                     side: None,
                     agent: t.agent.clone(),
                     choices: t.choices.clone(),
@@ -2057,6 +2067,9 @@ impl Workspace {
     /// outside the app appear, removed ones go.
     pub fn sync_worktrees(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let repos: Vec<(PathBuf, std::collections::BTreeMap<PathBuf, PathBuf>)> = self.projects.iter().map(|p| (p.path.clone(), p.made_by_agents.clone())).collect();
+        // The branch each task owns, and since when.
+        let owned: std::collections::HashMap<PathBuf, (String, u64)> =
+            self.projects.iter().flat_map(|p| &p.tasks).filter(|t| t.owns_branch()).map(|t| (t.path.clone(), (t.branch.clone(), t.created))).collect();
         cx.spawn_in(window, async move |this, cx| {
             let lists = cx
                 .background_spawn(async move {
@@ -2064,6 +2077,17 @@ impl Workspace {
                         .into_iter()
                         .map(|(r, made)| {
                             let worktrees = git::worktrees(&r);
+                            // Where each task's worktree is, and whether a branch it is on is its own work renamed.
+                            let heads: std::collections::HashMap<PathBuf, (git::Head, bool)> = worktrees
+                                .iter()
+                                .skip(1)
+                                .filter_map(|w| {
+                                    let (own, since) = owned.get(&w.path)?;
+                                    let head = git::head_of(&w.path, &w.branch);
+                                    let grew = head.doing.is_none() && !head.branch.is_empty() && git::grew_from(&w.path, own, &head.branch, *since);
+                                    Some((w.path.clone(), (head, grew)))
+                                })
+                                .collect();
                             let all: Vec<PathBuf> = worktrees.iter().map(|w| w.path.clone()).collect();
                             // An agent's worktrees, with what they hold beyond the branch they came from.
                             let sides: std::collections::HashMap<PathBuf, side::Side> = worktrees
@@ -2086,14 +2110,14 @@ impl Workspace {
                             // Removed since: forgotten. One not made yet (its hook comes
                             // before the command runs) is not on disk either way.
                             let gone: Vec<PathBuf> = made.keys().filter(|path| !all.contains(path) && !path.exists()).cloned().collect();
-                            (worktrees, sides, r, gone)
+                            (worktrees, sides, r, gone, heads)
                         })
                         .collect::<Vec<_>>()
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 let restoring = this.restoring.clone();
-                for (worktrees, mut sides, repo, gone) in lists {
+                for (worktrees, mut sides, repo, gone, mut heads) in lists {
                     let Some(p) = this.projects.iter_mut().find(|p| p.path == repo) else { continue };
                     for path in gone {
                         p.made_by_agents.remove(&path);
@@ -2110,7 +2134,22 @@ impl Workspace {
                         let side = sides.remove(&wt.path);
                         match p.tasks.iter_mut().find(|t| t.path == wt.path) {
                             Some(t) => {
-                                t.branch = wt.branch.clone();
+                                match heads.remove(&wt.path).filter(|_| t.owns_branch()) {
+                                    Some((head, grew)) => {
+                                        if grew {
+                                            t.branch = head.branch.clone();
+                                        }
+                                        t.head = head.off(&t.branch).is_some().then_some(head);
+                                    }
+                                    None => {
+                                        t.branch = wt.branch.clone();
+                                        t.head = None;
+                                    }
+                                }
+                                if let Some(view) = t.view.clone() {
+                                    let (own, off) = (t.branch.clone(), t.head.as_ref().and_then(|h| h.off(&t.branch)));
+                                    view.update(cx, |v, cx| v.set_own_branch(own, off, cx));
+                                }
                                 t.locked = wt.locked.clone();
                                 t.side = side.filter(|_| t.title.is_empty() && t.group.is_empty() && t.prompt.is_empty());
                             }
