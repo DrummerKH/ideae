@@ -607,12 +607,14 @@ mod tests {
     /// The worktree a command makes, wherever it is said to run.
     #[test]
     fn a_worktree_added_by_a_command() {
-        let added = |command: &str| worktree_added(&json!({ "tool_name": "Bash", "cwd": "/w/repo", "tool_input": { "command": command } }));
+        // As paths, not text: Windows parts them with backslashes.
+        let added = |command: &str| worktree_added(&json!({ "tool_name": "Bash", "cwd": "/w/repo", "tool_input": { "command": command } })).map(PathBuf::from);
+        let at = |path: &str| Some(PathBuf::from(path));
         let made = "git -C /w/repo fetch -q origin && git -C /w/repo worktree add /w/repo-batch -b support_batch origin/main 2>&1 | tail -3";
-        assert_eq!(added(made).as_deref(), Some("/w/repo-batch"));
-        assert_eq!(added("git worktree add ../repo-x").as_deref(), Some("/w/repo-x"));
-        assert_eq!(added("cd sub && git worktree add -B 'my branch' \"../with space\" HEAD").as_deref(), Some("/w/repo/with space"));
-        assert_eq!(added("git -C .. worktree add --detach --reason why x").as_deref(), Some("/w/x"));
+        assert_eq!(added(made), at("/w/repo-batch"));
+        assert_eq!(added("git worktree add ../repo-x"), at("/w/repo-x"));
+        assert_eq!(added("cd sub && git worktree add -B 'my branch' \"../with space\" HEAD"), at("/w/repo/with space"));
+        assert_eq!(added("git -C .. worktree add --detach --reason why x"), at("/w/x"));
         assert_eq!(added("git worktree add \"$DIR\""), None, "a variable is not known");
         assert_eq!(added("git worktree list"), None);
         assert_eq!(added("echo git worktree add x"), None);
