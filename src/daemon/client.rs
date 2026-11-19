@@ -39,7 +39,15 @@ struct Peer {
     /// the grid it last had.
     spec: Spec,
     size: Option<Size>,
+    /// The daemon was asked for the session, and when the size last changed.
+    opened: bool,
+    sized: Instant,
 }
+
+/// How long a terminal's size holds before it attaches to a session that
+/// runs: a window that maximizes right after it opens would show the
+/// program a size for a moment, and its output replayed into that one.
+const SIZE_SETTLES: Duration = Duration::from_millis(300);
 
 pub struct Daemon {
     /// The daemon process, as the socket's peer: changes with a handover.
@@ -50,6 +58,9 @@ pub struct Daemon {
     quitting: std::sync::atomic::AtomicBool,
     /// It went away and did not come back: terminals run in the window.
     lost: std::sync::atomic::AtomicBool,
+    /// The sessions it had when this window came: attached once their
+    /// terminal's size holds.
+    running: Mutex<std::collections::HashSet<String>>,
 }
 
 static DAEMON: OnceLock<Option<Arc<Daemon>>> = OnceLock::new();
@@ -63,8 +74,15 @@ pub fn get() -> Option<Arc<Daemon>> {
 /// to a daemon of this build when it runs another. Hook reports and the
 /// latest ones the daemon kept go to `on_hook`.
 pub fn connect(on_hook: impl Fn(Hook) + Send + Sync + 'static) -> Option<(Arc<Daemon>, Vec<Hook>)> {
-    let (writer, reader, hooks) = dial(true)?;
-    let daemon = Arc::new(Daemon { pid: peer_pid(&writer).into(), writer: Mutex::new(writer), peers: Mutex::default(), quitting: Default::default(), lost: Default::default() });
+    let (writer, reader, hooks, sessions) = dial(true)?;
+    let daemon = Arc::new(Daemon {
+        pid: peer_pid(&writer).into(),
+        writer: Mutex::new(writer),
+        peers: Mutex::default(),
+        quitting: Default::default(),
+        lost: Default::default(),
+        running: Mutex::new(sessions.into_iter().collect()),
+    });
     let reading = daemon.clone();
     std::thread::Builder::new()
         .name("daemon-reader".into())
@@ -82,7 +100,7 @@ pub fn connect(on_hook: impl Fn(Hook) + Send + Sync + 'static) -> Option<(Arc<Da
                 // The daemon went away: handed over to a newer one, or died.
                 // Attach again where it serves now.
                 match dial(false) {
-                    Some((writer, next, kept)) => {
+                    Some((writer, next, kept, _)) => {
                         reading.pid.store(peer_pid(&writer), std::sync::atomic::Ordering::Relaxed);
                         *reading.writer.lock().unwrap() = writer;
                         reader = next;
@@ -114,8 +132,9 @@ pub fn connect(on_hook: impl Fn(Hook) + Send + Sync + 'static) -> Option<(Arc<Da
     Some((daemon, hooks))
 }
 
-/// A connection that said hello: the writer, the reader, the kept hooks.
-fn dial(upgrade: bool) -> Option<(UnixStream, UnixStream, Vec<Hook>)> {
+/// A connection that said hello: the writer, the reader, the kept hooks,
+/// the sessions that run.
+fn dial(upgrade: bool) -> Option<(UnixStream, UnixStream, Vec<Hook>, Vec<String>)> {
     let path = proto::socket_path();
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut started = false;
@@ -146,9 +165,9 @@ fn dial(upgrade: bool) -> Option<(UnixStream, UnixStream, Vec<Hook>)> {
         let welcome = proto::read_frame(&mut reader);
         let _ = reader.set_read_timeout(None);
         match welcome {
-            Ok(Frame::Msg(Msg::Welcome { protocol, version, hooks, .. })) => {
+            Ok(Frame::Msg(Msg::Welcome { protocol, version, hooks, sessions })) => {
                 if protocol == proto::PROTOCOL && (version == crate::build_watch::build_id() || upgraded) {
-                    return Some((writer, reader, hooks));
+                    return Some((writer, reader, hooks, sessions));
                 }
                 upgraded = true;
                 // A window that only attaches again ends nobody's daemon.
@@ -241,7 +260,7 @@ impl Daemon {
     fn reopen(&self) {
         let peers = self.peers.lock().unwrap();
         for (id, p) in peers.iter() {
-            let Some(size) = p.size else { continue };
+            let Some(size) = p.size.filter(|_| p.opened) else { continue };
             if let Link::Term { peer, .. } = &p.link {
                 peer.output(b"\x1b[H\x1b[2J\x1b[3J\x1bc");
             }
@@ -321,10 +340,11 @@ impl Daemon {
     ) -> TerminalState {
         let (source, peer) = StreamSource::new();
         let events = peer.clone();
-        self.peers.lock().unwrap().insert(id.clone(), Peer { link: Link::Term { peer, mute_until: None }, spec: spec.clone(), size: None });
+        self.peers.lock().unwrap().insert(id.clone(), Peer { link: Link::Term { peer, mute_until: None }, spec: spec.clone(), size: None, opened: false, sized: Instant::now() });
+        let attach = self.running.lock().unwrap().remove(&id);
         let daemon = self.clone();
         cx.background_spawn(async move {
-            let mut opened = false;
+            let mut waiting = false;
             while let Ok(event) = events.events().recv().await {
                 match event {
                     StreamEvent::Input(bytes) => {
@@ -344,16 +364,20 @@ impl Daemon {
                     }
                     StreamEvent::Resize(viewport) => {
                         let size = size_of(viewport);
-                        if let Some(p) = daemon.peers.lock().unwrap().get_mut(&id) {
-                            p.size = Some(size);
+                        let mut peers = daemon.peers.lock().unwrap();
+                        let Some(p) = peers.get_mut(&id) else { continue };
+                        p.size = Some(size);
+                        p.sized = Instant::now();
+                        if p.opened {
+                            daemon.send(proto::encode_msg(&Msg::Resize { id: id.clone(), size }));
+                        } else if !attach {
+                            p.opened = true;
+                            daemon.send(proto::encode_msg(&Msg::Open { id: id.clone(), spec: spec.clone(), size }));
+                        } else if !waiting {
+                            waiting = true;
+                            let (daemon, id, spec) = (daemon.clone(), id.clone(), spec.clone());
+                            std::thread::spawn(move || daemon.attach_when_sized(&id, &spec));
                         }
-                        let msg = if opened {
-                            Msg::Resize { id: id.clone(), size }
-                        } else {
-                            opened = true;
-                            Msg::Open { id: id.clone(), spec: spec.clone(), size }
-                        };
-                        daemon.send(proto::encode_msg(&msg));
                     }
                     // The window let go of the terminal; whether the program
                     // ends is the task's call (`kill`).
@@ -367,6 +391,24 @@ impl Daemon {
         TerminalState::new(Engine::new(source, EngineOptions::default()), config, window, cx)
     }
 
+    /// Asks for a session that runs once its terminal's size has held, or
+    /// after a few seconds of changes. Under the lock a resize also takes:
+    /// the size sent is the last one.
+    fn attach_when_sized(&self, id: &str, spec: &Spec) {
+        let since = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_millis(50));
+            let mut peers = self.peers.lock().unwrap();
+            let Some(p) = peers.get_mut(id) else { return };
+            let Some(size) = p.size else { return };
+            if p.sized.elapsed() >= SIZE_SETTLES || since.elapsed() >= SIZE_SETTLES * 10 {
+                p.opened = true;
+                self.send(proto::encode_msg(&Msg::Open { id: id.to_string(), spec: spec.clone(), size }));
+                return;
+            }
+        }
+    }
+
     /// A pipe session `id` (an agent's host): attached when it runs, else
     /// started from `spec`. What it prints comes as events; [`Self::write`]
     /// gives it input.
@@ -374,7 +416,7 @@ impl Daemon {
         let (tx, rx) = async_channel::unbounded();
         // Pipes have no grid; the size only marks the session as opened.
         let size = Size { cols: 80, rows: 24, cell_w: 8, cell_h: 16 };
-        self.peers.lock().unwrap().insert(id.clone(), Peer { link: Link::Pipe(tx), spec: spec.clone(), size: Some(size) });
+        self.peers.lock().unwrap().insert(id.clone(), Peer { link: Link::Pipe(tx), spec: spec.clone(), size: Some(size), opened: true, sized: Instant::now() });
         self.send(proto::encode_msg(&Msg::Open { id, spec, size }));
         rx
     }
