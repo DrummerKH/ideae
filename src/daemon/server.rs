@@ -334,12 +334,15 @@ fn open(shared: &Shared, client: u64, id: String, spec: Spec, size: Size) {
         // A size change makes full-screen programs (the agent) draw again,
         // over whatever the replay could not restore. It ends on the size
         // the window has by then: a window that maximizes right after it
-        // opens sends a new one meanwhile.
+        // opens sends a new one meanwhile. The width changes too, and for a
+        // while: Claude Code draws all of itself again only for a new width,
+        // and one that shows a session run elsewhere (in the background)
+        // passes the size on to it, where two changes close together are one.
         let shared = shared.clone();
         std::thread::spawn(move || {
-            let shrunk = Size { rows: size.rows.saturating_sub(1).max(2), ..size };
+            let shrunk = Size { rows: size.rows.saturating_sub(1).max(2), cols: size.cols.saturating_sub(1).max(2), ..size };
             let _ = handle.lock().unwrap_or_else(std::sync::PoisonError::into_inner).resize(viewport(shrunk));
-            std::thread::sleep(Duration::from_millis(60));
+            std::thread::sleep(Duration::from_millis(300));
             let s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(session) = s.sessions.get(&id).filter(|x| Arc::ptr_eq(&x.handle, &handle)) {
                 let _ = handle.lock().unwrap_or_else(std::sync::PoisonError::into_inner).resize(viewport(session.size));
