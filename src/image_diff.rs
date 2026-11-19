@@ -1,5 +1,6 @@
 //! Images in diffs: a changed picture shows what it was and what it is,
-//! side by side or one above the other, in place of "binary file".
+//! side by side or one above the other, in place of "binary file". Any
+//! other binary file has its size before and after.
 //!
 //! The two versions are git's blobs named on the patch's `index` line, read
 //! off the UI thread and kept a while; a side git has no blob of (a file not
@@ -68,6 +69,17 @@ struct Source {
 }
 
 impl Source {
+    /// Off the UI thread: its size, by git or the disk, without reading it.
+    fn size(&self) -> Option<u64> {
+        if let Some(blob) = &self.blob {
+            let out = crate::procs::command("git").arg("-C").arg(&self.root).args(["cat-file", "-s", blob]).output().ok();
+            if let Some(size) = out.filter(|out| out.status.success()).and_then(|out| String::from_utf8_lossy(&out.stdout).trim().parse().ok()) {
+                return Some(size);
+            }
+        }
+        Some(std::fs::metadata(self.file.as_ref()?).ok()?.len())
+    }
+
     fn key(&self) -> String {
         format!("{}\0{}\0{}", self.root.display(), self.blob.as_deref().unwrap_or_default(), self.file.as_ref().map(|f| f.display().to_string()).unwrap_or_default())
     }
@@ -121,14 +133,88 @@ fn side(source: Source, format: ImageFormat, cx: &mut App) -> Slot {
     Slot::Loading
 }
 
-/// What a binary file of a diff shows when it is an image: the version
-/// before and after, each with its size. `root` is the repository the
-/// diff is of; `worktree` is where the after side may be read from when
-/// git has no blob of it (a change not staged). None for other files.
+/// Sizes read, as pictures are: None while read, Some(None) when there is
+/// no telling.
+static SIZES: Mutex<Option<HashMap<String, Option<Option<u64>>>>> = Mutex::new(None);
+
+/// The size of a side if it is known; else starts asking and has the
+/// windows drawn again when it is told.
+fn size_of(source: Source, cx: &mut App) -> Option<Option<u64>> {
+    let key = source.key();
+    {
+        let mut kept = SIZES.lock().unwrap();
+        let kept = kept.get_or_insert_with(HashMap::new);
+        if let Some(size) = kept.get(&key) {
+            return *size;
+        }
+        if kept.len() >= MOST_KEPT * 4 {
+            kept.retain(|_, size| size.is_none());
+        }
+        kept.insert(key.clone(), None);
+    }
+    let read = cx.background_spawn(async move { source.size() });
+    cx.spawn(async move |cx| {
+        let size = read.await;
+        if let Some(kept) = SIZES.lock().unwrap().as_mut() {
+            kept.insert(key, Some(size));
+        }
+        cx.update(|cx| cx.refresh_windows());
+    })
+    .detach();
+    None
+}
+
+/// A side's size, as a binary file's diff tells it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Size {
+    /// The file is not on this side: added or deleted.
+    Absent,
+    Reading,
+    Unknown,
+    Bytes(u64),
+}
+
+impl Size {
+    fn of(asked: Option<Option<u64>>) -> Self {
+        match asked {
+            None => Size::Reading,
+            Some(None) => Size::Unknown,
+            Some(Some(bytes)) => Size::Bytes(bytes),
+        }
+    }
+
+    fn told(self) -> String {
+        match self {
+            Size::Absent => "none".into(),
+            Size::Reading => "…".into(),
+            Size::Unknown => "?".into(),
+            Size::Bytes(bytes) => crate::task::human_size(bytes),
+        }
+    }
+}
+
+/// "Binary file changed: 1.2 KB → 1.3 KB (+100 B)", "Binary file added, 4 KB".
+fn sizes_told(before: Size, after: Size) -> String {
+    match (before, after) {
+        (Size::Absent, a) => format!("Binary file added, {}", a.told()),
+        (b, Size::Absent) => format!("Binary file deleted, was {}", b.told()),
+        (Size::Bytes(b), Size::Bytes(a)) if a == b => format!("Binary file changed, {} as before", after.told()),
+        (Size::Bytes(b), Size::Bytes(a)) => {
+            let change = if a > b { format!("+{}", crate::task::human_size(a - b)) } else { format!("−{}", crate::task::human_size(b - a)) };
+            format!("Binary file changed: {} → {} ({change})", before.told(), after.told())
+        }
+        (b, a) => format!("Binary file changed: {} → {}", b.told(), a.told()),
+    }
+}
+
+/// What a binary file of a diff shows: an image's two versions, each with
+/// its size; any other file its sizes. `root` is the repository the diff
+/// is of; `worktree` is where the after side may be read from when git
+/// has no blob of it (a change not staged, a file not tracked).
 pub fn render(file: &DiffFile, split: bool, root: &Path, worktree: bool, window: &mut Window, cx: &mut App) -> Option<AnyElement> {
     let _ = window;
     let path = file.path().to_string();
-    let (name, format) = kind(Path::new(&path))?;
+    let Some((name, format)) = kind(Path::new(&path)) else { return Some(sizes(file, root, worktree, cx)) };
     let (old_blob, new_blob) = blobs(file.extended_headers());
     let status = file.status();
     use gpui_kit::component::diff::DiffFileStatus as S;
@@ -169,6 +255,36 @@ pub fn render(file: &DiffFile, split: bool, root: &Path, worktree: bool, window:
     let (old, new) = (pane("Before", before), pane("After", after));
     let row = if split { h_flex().gap_3().child(old).child(new).into_any_element() } else { v_flex().gap_2().child(old).child(new).into_any_element() };
     Some(div().w_full().px_3().py_2().child(row).into_any_element())
+}
+
+/// A binary file that is not a picture: its headers, as the diff has
+/// them, and how large it was and is.
+fn sizes(file: &DiffFile, root: &Path, worktree: bool, cx: &mut App) -> AnyElement {
+    use gpui_kit::component::diff::DiffFileStatus as S;
+    let (old_blob, new_blob) = blobs(file.extended_headers());
+    let status = file.status();
+    let before = if status == S::Added || old_blob.is_none() {
+        Size::Absent
+    } else {
+        Size::of(size_of(Source { root: root.to_path_buf(), blob: old_blob, file: None }, cx))
+    };
+    let after = if status == S::Deleted {
+        Size::Absent
+    } else {
+        let modified = file.modified_path().map(|p| root.join(p.as_ref()));
+        Size::of(size_of(Source { root: root.to_path_buf(), blob: new_blob, file: modified.filter(|_| worktree) }, cx))
+    };
+    let told = sizes_told(before, after);
+    v_flex()
+        .w_full()
+        .px_3()
+        .py_2()
+        .gap_1()
+        .text_xs()
+        .text_color(cx.theme().muted_foreground)
+        .children(file.extended_headers().iter().filter(|line| !line.starts_with("Binary files ")).cloned().map(|line| div().child(line)))
+        .child(div().id("binary-sizes").test_support().text_sm().child(told))
+        .into_any_element()
 }
 
 #[cfg(test)]
@@ -260,6 +376,15 @@ mod tests {
     }
 
     #[test]
+    fn a_binary_file_tells_its_sizes() {
+        assert_eq!(sizes_told(Size::Absent, Size::Bytes(4096)), "Binary file added, 4 KB");
+        assert_eq!(sizes_told(Size::Bytes(2048), Size::Absent), "Binary file deleted, was 2 KB");
+        assert_eq!(sizes_told(Size::Bytes(1024), Size::Bytes(3072)), "Binary file changed: 1 KB → 3 KB (+2 KB)");
+        assert_eq!(sizes_told(Size::Bytes(300), Size::Bytes(100)), "Binary file changed: 300 B → 100 B (−200 B)");
+        assert_eq!(sizes_told(Size::Reading, Size::Bytes(5)), "Binary file changed: … → 5 B");
+    }
+
+    #[test]
     fn a_side_is_read_from_its_blob_or_else_the_worktree() {
         let dir = std::env::temp_dir().join(format!("ideae-image-diff-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -276,6 +401,7 @@ mod tests {
         // Not staged: git has no blob of what is in the worktree.
         let new = Source { root: root.into(), blob: Some("abcdef1".into()), file: Some(root.join("a.png")) };
         assert_eq!(new.read().as_deref(), Some(&b"second"[..]));
+        assert_eq!((old.size(), new.size()), (Some(5), Some(6)), "sizes too, from git and from the disk");
         let gone = Source { root: root.into(), blob: Some("abcdef1".into()), file: None };
         assert_eq!(gone.read(), None);
         let _ = std::fs::remove_dir_all(&dir);

@@ -679,12 +679,76 @@ pub(crate) fn score(path: &str, query: &[char]) -> Option<i64> {
 fn grep(root: &PathBuf, query: &str, regex: bool, mask: &str, stop: &std::sync::atomic::AtomicBool) -> Vec<Hit> {
     let matcher = if regex { search::regex(query) } else { search::literal(query) };
     let Some(matcher) = matcher else { return Vec::new() };
-    search::search_in(root, &matcher, search::mask(root, mask), 20, 300, GREP_LIMIT, stop)
+    let hits = search::search_in(root, &matcher, search::mask(root, mask), 20, 300, GREP_LIMIT, stop)
         .into_iter()
         .map(|m| {
             // The cursor goes to the first match.
             let col = m.matches.first().map_or(0, |r| m.text[..r.start].chars().count() as u32);
             Hit { path: m.path.to_string_lossy().into_owned(), line: m.line as u32, col, text: m.text, ranges: m.matches }
         })
-        .collect()
+        .collect();
+    code_first(hits)
+}
+
+/// A match in a comment or in prose (Markdown, text), as far as the line
+/// tells without parsing: after `//` or `#`, on a line of `*` or `--`.
+fn in_comment(hit: &Hit) -> bool {
+    let lower = hit.path.to_ascii_lowercase();
+    if [".md", ".markdown", ".txt", ".rst", ".adoc"].iter().any(|ext| lower.ends_with(ext)) {
+        return true;
+    }
+    let line = hit.text.trim_start();
+    let starts = ["//", "/*", "*", "<!--", "-- ", "# ", "#\t"].iter().any(|mark| line.starts_with(mark)) || line == "#";
+    let before = &hit.text[..hit.ranges.first().map_or(0, |r| r.start).min(hit.text.len())];
+    // `//` that is not a URL's.
+    let after_slashes = before.match_indices("//").any(|(at, _)| !before[..at].ends_with(':'));
+    starts || after_slashes
+}
+
+/// Lines of code before comments: within a file, then files with a match
+/// in code before those with matches in comments only; otherwise in order.
+fn code_first(hits: Vec<Hit>) -> Vec<Hit> {
+    let mut files: Vec<(bool, Vec<(bool, Hit)>)> = Vec::new();
+    for hit in hits {
+        let comment = in_comment(&hit);
+        match files.last_mut() {
+            Some((_, lines)) if lines[0].1.path == hit.path => lines.push((comment, hit)),
+            _ => files.push((true, vec![(comment, hit)])),
+        }
+    }
+    for (all_comments, lines) in &mut files {
+        lines.sort_by_key(|(comment, _)| *comment);
+        *all_comments = lines[0].0;
+    }
+    files.sort_by_key(|(all_comments, _)| *all_comments);
+    files.into_iter().flat_map(|(_, lines)| lines.into_iter().map(|(_, hit)| hit)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Hit, code_first};
+
+    fn hit(path: &str, line: u32, text: &str) -> Hit {
+        let start = text.find("cert").unwrap();
+        Hit { path: path.into(), line, col: 0, text: text.into(), ranges: vec![start..start + 4] }
+    }
+
+    /// A match in code comes before one in a comment, in its file and
+    /// among files; a URL's `//` is not a comment's.
+    #[test]
+    fn code_comes_before_comments() {
+        let hits = vec![
+            hit("a.kt", 3, "// the cert of Play"),
+            hit("a.kt", 9, "    * cert, baked in"),
+            hit("b.kt", 1, "# cert"),
+            hit("b.md", 2, "the cert is here"),
+            hit("c.kt", 5, "val cert = load()"),
+            hit("c.kt", 7, "load() // the cert"),
+            hit("d.kt", 2, "    * the cert"),
+            hit("d.kt", 4, "url = \"https://x/cert\""),
+        ];
+        let order: Vec<(String, u32)> = code_first(hits).into_iter().map(|h| (h.path, h.line)).collect();
+        let want = [("c.kt", 5), ("c.kt", 7), ("d.kt", 4), ("d.kt", 2), ("a.kt", 3), ("a.kt", 9), ("b.kt", 1), ("b.md", 2)];
+        assert_eq!(order, want.map(|(p, l)| (p.to_string(), l)));
+    }
 }

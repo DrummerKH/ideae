@@ -46,15 +46,16 @@ impl InputBaseState<EditorMode> {
         let text = self.text.clone();
         let mut symbol_range = self.text.word_range(offset).unwrap_or(offset..offset);
         let editor = cx.entity();
-        let should_delay = self.extras.hover_popover.is_none();
+        // ideae patch: the pointer rests a while before a hover shows, and
+        // again before one shown gives way to another (JetBrains waits half a
+        // second): passed over on the way somewhere, words show nothing.
+        let delay = if self.extras.hover_popover.is_none() { 500 } else { 300 };
         // Ask the provider only after the delay: every mouse move replaces this
         // task, so positions the pointer merely passes over never reach it.
         self.extras.lsp._hover_task = cx.spawn_in(window, async move |this, cx| {
-            if should_delay {
-                cx.background_executor()
-                    .timer(Duration::from_millis(150))
-                    .await;
-            }
+            cx.background_executor()
+                .timer(Duration::from_millis(delay))
+                .await;
 
             let task = this.update_in(cx, |_, window, cx| {
                 provider.hover(&text, offset, window, cx)

@@ -170,6 +170,8 @@ all: what is removed stays under `refs/ideae/variants` for two weeks.
 - The gutter marks what differs from the last commit. A right click on the
   line numbers annotates the file with git blame. Bookmarks (F11) follow
   their text and are listed for the whole task (Shift+F11).
+- Find in files lists matches in code before those in comments and prose
+  (Markdown, text), within a file and among files.
 - Replace in files (Ctrl+Shift+R) shows every match with what it becomes.
 - Autosave when you leave a file; Markdown has a Preview.
 
@@ -203,7 +205,8 @@ task until it leaves.
   with no commits of their own (only merges into them) left out; both are
   kept in the repository's git config.
 - Stash, and the stashes listed to look into, bring back or drop.
-- A changed image shows in diffs as it was and as it is.
+- A changed image shows in diffs as it was and as it is; any other binary
+  file with its size before and after.
 
 ## Terminals and browser tabs
 

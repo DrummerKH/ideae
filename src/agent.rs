@@ -428,6 +428,9 @@ pub fn run_hook(args: &[String]) {
         "PreToolUse" => crate::said::asks(&payload),
         _ => None,
     };
+    if cfg!(debug_assertions) {
+        log_hook(&task, event, &payload);
+    }
     let line = json!({
         "task": task,
         "event": event,
@@ -452,6 +455,62 @@ pub fn run_hook(args: &[String]) {
         return;
     }
     send(&socket, &line.to_string());
+}
+
+/// Debug builds: every hook as it came, to hooks.log next to the state, so
+/// which process of an agent told which session can be seen afterwards
+/// (Claude Code may move a session to a process of its own, under another
+/// id). Kept to a few megabytes: the log before is hooks.log.old.
+fn log_hook(task: &str, event: &str, payload: &Value) {
+    let path = crate::state::state_dir().join("hooks.log");
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 4 << 20) {
+        let _ = std::fs::rename(&path, path.with_extension("log.old"));
+    }
+    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0., |d| d.as_secs_f64());
+    let line = json!({
+        "at": at,
+        "task": task,
+        "event": event,
+        "session": payload["session_id"],
+        "source": payload["source"],
+        "reason": payload["reason"],
+        "transcript": payload["transcript_path"],
+        "cwd": payload["cwd"],
+        "by": ancestors(),
+    });
+    if let Ok(mut log) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(log, "{line}");
+    }
+}
+
+/// The processes this hook was run by, nearest first: pid and command line.
+#[cfg(target_os = "linux")]
+fn ancestors() -> Vec<String> {
+    let mut chain = Vec::new();
+    let mut pid = std::os::unix::process::parent_id();
+    for _ in 0..4 {
+        if pid <= 1 {
+            break;
+        }
+        let args = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        let args: String = String::from_utf8_lossy(&args).replace('\0', " ").trim().chars().take(160).collect();
+        chain.push(format!("{pid} {args}"));
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        // After the command's name in parentheses: state, then the parent.
+        pid = stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().nth(1)?.parse().ok()).unwrap_or(0);
+    }
+    chain
+}
+
+#[cfg(unix)]
+#[cfg(not(target_os = "linux"))]
+fn ancestors() -> Vec<String> {
+    vec![std::os::unix::process::parent_id().to_string()]
+}
+
+#[cfg(windows)]
+fn ancestors() -> Vec<String> {
+    Vec::new()
 }
 
 #[cfg(test)]
