@@ -396,7 +396,8 @@ fn show(view: Entity<ReplaceView>, window: &mut Window, cx: &mut App) {
     let focused = Rc::new(std::cell::Cell::new(false));
     window.open_dialog(cx, move |dialog, _, _| {
         let (view, focused) = (view.clone(), focused.clone());
-        dialog.title("Replace in files").w(px(900.)).content(move |content, window, cx| {
+        // Enter in a field reaches the dialog: it stays.
+        dialog.title("Replace in files").w(px(900.)).on_ok(|_, _, _| false).content(move |content, window, cx| {
             if !focused.replace(true) {
                 let query = view.read(cx).query.clone();
                 window.defer(cx, move |window, cx| query.read(cx).focus_handle(cx).focus(window, cx));

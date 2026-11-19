@@ -79,6 +79,10 @@ pub struct Settings {
     pub quick_agent: String,
     /// Language servers (program names) never started.
     pub lsp_off: Vec<String>,
+    /// Where tasks' worktrees go, a folder of each project's name in it;
+    /// empty: beside each repository.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub worktrees_dir: String,
     /// The hints said no more of, in every project ("check", "setup").
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub hints_off: Vec<String>,
@@ -219,6 +223,7 @@ impl Default for Settings {
             default_agent: crate::agents::DEFAULT_ID.into(),
             quick_agent: String::new(),
             lsp_off: Vec::new(),
+            worktrees_dir: String::new(),
             hints_off: Vec::new(),
             lsp_idle_minutes: 15,
             agent_idle_minutes: 30,
@@ -415,6 +420,9 @@ pub struct ProjectState {
     /// for the remote's default branch.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub base: String,
+    /// The folder its tasks' worktrees go in; empty for what Settings say.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub worktrees: String,
     /// No language servers in this project's tasks.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub lsp_off: bool,

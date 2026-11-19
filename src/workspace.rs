@@ -136,6 +136,8 @@ pub struct Project {
     pub agent: Option<String>,
     /// Where its new tasks branch from; empty for the remote's default.
     pub base: String,
+    /// The folder its tasks' worktrees go in; empty for what Settings say.
+    pub worktrees: String,
     /// No language servers in its tasks; its pull requests not asked of gh.
     pub lsp_off: bool,
     pub pr_off: bool,
@@ -170,6 +172,7 @@ impl Project {
             hints_off: Default::default(),
             agent: None,
             base: String::new(),
+            worktrees: String::new(),
             lsp_off: false,
             pr_off: false,
             merged_branches: Vec::new(),
@@ -841,6 +844,8 @@ impl Workspace {
             project.check = p.check.clone();
             project.check_auto = p.check_auto;
             (project.base, project.lsp_off, project.pr_off) = (p.base.clone(), p.lsp_off, p.pr_off);
+            project.worktrees = p.worktrees.clone();
+            git::set_project_worktrees(&project.path, &project.worktrees);
             project.trusted = p.trusted.clone();
             project.hints_off = p.hints_off.iter().cloned().collect();
             project.agent = p.agent.clone();
@@ -967,6 +972,7 @@ impl Workspace {
                     check: p.check.clone(),
                     check_auto: p.check_auto,
                     base: p.base.clone(),
+                    worktrees: p.worktrees.clone(),
                     lsp_off: p.lsp_off,
                     pr_off: p.pr_off,
                     own: crate::project_config::own(&p.path),
@@ -1508,21 +1514,21 @@ impl Workspace {
                 cx.notify();
             }
         };
-        let on_enter = apply.clone();
-        // Kept by the dialog and gone with it: detached, it would hold the input it listens to for good.
-        let listening = Rc::new(cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, window, cx| {
-            if matches!(event, InputEvent::PressEnter { .. }) {
-                on_enter(this, window, cx);
-            }
-        }));
         let this = cx.weak_entity();
         let focused = std::rc::Rc::new(std::cell::Cell::new(false));
         window.open_dialog(cx, move |dialog, _, _| {
             let (input, focused, this, apply) = (input.clone(), focused.clone(), this.clone(), apply.clone());
-            let _ = &listening;
             dialog
                 .title("Rename task")
                 .w(px(480.))
+                // Enter in the input reaches the dialog.
+                .on_ok({
+                    let (this, apply) = (this.clone(), apply.clone());
+                    move |_, window, cx| {
+                        let _ = this.update(cx, |this, cx| apply(this, window, cx));
+                        false
+                    }
+                })
                 .content(move |content, window, cx| {
                     if !focused.replace(true) {
                         let input = input.clone();
@@ -1639,21 +1645,17 @@ impl Workspace {
         // Runs inside this entity's update, so it cannot go through `submit`.
         let on_enter = {
             let filled_in = filled_in.clone();
-            move |this: &mut Self, event: &InputEvent, in_prompt: bool, window: &mut Window, cx: &mut Context<Self>| {
-                // Enter in the title, Ctrl+Enter anywhere.
-                let InputEvent::PressEnter { secondary, .. } = event else { return };
-                if in_prompt && !*secondary {
-                    return;
-                }
+            move |this: &mut Self, event: &InputEvent, window: &mut Window, cx: &mut Context<Self>| {
+                // Ctrl+Enter in the prompt; Enter in the title is the dialog's.
+                let InputEvent::PressEnter { secondary: true, .. } = event else { return };
                 if let Some((title, text, notes, agents)) = filled_in(cx) {
                     window.close_dialog(cx);
                     this.create_task(project, title, text, notes, agents, window, cx);
                 }
             }
         };
-        let on_title = on_enter.clone();
         // Kept by the dialog and gone with it: detached, they would hold the inputs they listen to for good.
-        let mut listening = vec![cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, window, cx| on_title(this, event, false, window, cx))];
+        let mut listening = Vec::new();
         // A ticket in the title fills the prompt, unless you wrote one yourself.
         let filled: Rc<RefCell<String>> = Rc::default();
         let fetch: Rc<RefCell<Option<Task<()>>>> = Rc::default();
@@ -1703,7 +1705,7 @@ impl Workspace {
                 }
             }));
         }
-        listening.push(cx.subscribe_in(&prompt, window, move |this, _, event: &InputEvent, window, cx| on_enter(this, event, true, window, cx)));
+        listening.push(cx.subscribe_in(&prompt, window, move |this, _, event: &InputEvent, window, cx| on_enter(this, event, window, cx)));
         let listening = Rc::new(listening);
         let focused = std::rc::Rc::new(std::cell::Cell::new(false));
         window.open_dialog(cx, move |dialog, _, cx| {
@@ -1716,6 +1718,14 @@ impl Workspace {
             dialog
                 .title(format!("New task in {name}"))
                 .w(px(640.))
+                // Enter in the title reaches the dialog, which closes on it, its listeners with it.
+                .on_ok({
+                    let submit = submit.clone();
+                    move |_, window, cx| {
+                        submit(window, cx);
+                        false
+                    }
+                })
                 .content(move |content, window, cx| {
                     if !focused.replace(true) {
                         let input = input.clone();
@@ -2245,7 +2255,8 @@ impl Workspace {
         if hidden && status.is_attention() && status != was && event.replayed.is_none() {
             self.hold_notice(&event.task);
         }
-        if status.is_attention() && !seen && !hidden && status != was && event.replayed.is_none() && state::settings().notifications {
+        // Not while the window is in front: the sidebar says it there, in Needs you.
+        if status.is_attention() && !seen && !hidden && !window.is_window_active() && status != was && event.replayed.is_none() && state::settings().notifications {
             let said = self.said_shown(&view, cx);
             let words = state::with_settings(|s| s.notify_said && s.show_said) && !self.is_presenting();
             let body = match (&status, &group) {

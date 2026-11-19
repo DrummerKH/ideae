@@ -1,3 +1,4 @@
 target/
 /.cargo/config.toml
 /a.o
+.DS_Store

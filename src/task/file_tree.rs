@@ -485,6 +485,17 @@ impl TaskView {
             .separator()
             .item(PopupMenuItem::new("Copy path").on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()))))
             .item(PopupMenuItem::new("Copy relative path").on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copied_relative.clone()))))
+            // The tree's menu takes no submenu: the ways into .gitignore are listed here.
+            .separator()
+            .map(|menu| {
+                git::ignore_patterns(&relative, folder).into_iter().fold(menu, |menu, (label, pattern, _)| {
+                    let view = view.clone();
+                    menu.item(PopupMenuItem::new(format!("Add to .gitignore: {label}")).on_click(move |_, window, cx| {
+                        let pattern = pattern.clone();
+                        let _ = view.update(cx, |t, cx| t.run_action("Ignore", move |root| git::ignore(&root, &pattern, git::IgnoreIn::Shared), false, window, cx));
+                    }))
+                })
+            })
             .separator()
             .item(PopupMenuItem::new("Reveal in file manager").on_click(move |_, _, cx| reveal(shown.clone(), folder, cx)))
             .item(PopupMenuItem::new("Open terminal here").on_click(move |_, window, cx| {
@@ -541,21 +552,21 @@ impl TaskView {
                 .detach();
             })
         };
-        let on_enter = apply.clone();
-        // Kept by the dialog and gone with it.
-        let listening = Rc::new(cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, window, cx| {
-            if matches!(event, InputEvent::PressEnter { .. }) {
-                on_enter(this, window, cx);
-            }
-        }));
         let this = cx.weak_entity();
         let focused = Rc::new(std::cell::Cell::new(false));
         window.open_dialog(cx, move |dialog, _, _| {
             let (input, focused, this, apply, said, hint) = (input.clone(), focused.clone(), this.clone(), apply.clone(), said.clone(), hint.clone());
-            let _ = &listening;
             dialog
                 .title(title.clone())
                 .w(px(460.))
+                // Enter in the input reaches the dialog.
+                .on_ok({
+                    let (this, apply) = (this.clone(), apply.clone());
+                    move |_, window, cx| {
+                        let _ = this.update(cx, |task, cx| apply(task, window, cx));
+                        false
+                    }
+                })
                 .content(move |content, window, cx| {
                     if !focused.replace(true) {
                         let input = input.clone();

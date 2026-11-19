@@ -626,6 +626,16 @@ impl Workspace {
             let chosen = agent.clone();
             let muted = cx.theme().muted_foreground;
             let (create_prompt, create_note) = (prompt.clone(), note.clone());
+            let start = std::rc::Rc::new(move |window: &mut Window, cx: &mut App| {
+                let text = create_prompt.read(cx).value().trim().to_string();
+                if text.is_empty() {
+                    return;
+                }
+                let note = create_note.read(cx).value().trim().to_string();
+                let agent = chosen.borrow().clone();
+                window.close_dialog(cx);
+                let _ = this.update(cx, |this, cx| this.add_variant(&path, text, note, agent, window, cx));
+            });
             dialog
                 .title(format!("Another variant of \"{title}\""))
                 .w(px(640.))
@@ -645,16 +655,15 @@ impl Workspace {
                         ),
                     )
                 })
-                .footer(h_flex().justify_end().child(Button::new("another-variant").primary().label("Start").on_click(move |_, window, cx| {
-                    let text = create_prompt.read(cx).value().trim().to_string();
-                    if text.is_empty() {
-                        return;
+                // Enter in the note reaches the dialog: it starts, as the button does.
+                .on_ok({
+                    let start = start.clone();
+                    move |_, window, cx| {
+                        start(window, cx);
+                        false
                     }
-                    let note = create_note.read(cx).value().trim().to_string();
-                    let agent = chosen.borrow().clone();
-                    window.close_dialog(cx);
-                    let _ = this.update(cx, |this, cx| this.add_variant(&path, text, note, agent, window, cx));
-                })))
+                })
+                .footer(h_flex().justify_end().child(Button::new("another-variant").primary().label("Start").on_click(move |_, window, cx| start(window, cx))))
         });
     }
 
@@ -1009,7 +1018,8 @@ impl Workspace {
     fn notify_ready(&self, group: &str, window: &Window) {
         let members = self.members(group);
         let Some(&(pi, first)) = members.first() else { return };
-        if !state::settings().notifications || (self.active_group.as_deref() == Some(group) && window.is_window_active()) {
+        // Not while the window is in front: the group's row says it there.
+        if !state::settings().notifications || window.is_window_active() {
             return;
         }
         // Nothing is told of what is out of the window: another space's, or left out of a presentation.

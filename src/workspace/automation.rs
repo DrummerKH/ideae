@@ -530,6 +530,8 @@ impl Workspace {
         let copy_hint = if suggested.copy.is_empty() { copy_default.to_string() } else { format!("{}; empty: {copy_default}", suggested.copy.join(" ")) };
         let copy = line(start.task.copy.clone().unwrap_or_default().join(" "), copy_hint, window, cx);
         let base = line(p.base.clone(), "the remote's default branch".to_string(), window, cx);
+        let worktrees_now = crate::git::task_worktrees(&p.path).display().to_string();
+        let worktrees = line(p.worktrees.clone(), format!("as Settings say: {worktrees_now}"), window, cx);
         let rows: Rc<RefCell<Vec<ServiceRow>>> = Rc::new(RefCell::new(Vec::new()));
         for service in &start.service {
             let row = ServiceRow::new_in(service.clone(), window, cx);
@@ -576,15 +578,16 @@ impl Workspace {
         };
         let this = cx.weak_entity();
         let save = {
-            let (this, project, only_me, collect, local, base) = (this.clone(), project.clone(), only_me.clone(), collect.clone(), local.clone(), base.clone());
+            let (this, project, only_me, collect, local, base, worktrees) = (this.clone(), project.clone(), only_me.clone(), collect.clone(), local.clone(), base.clone(), worktrees.clone());
             move |window: &mut Window, cx: &mut App| {
                 let config = collect(cx);
                 let only_me = only_me.get();
                 let local = local.borrow().clone();
                 let base = base.read(cx).value().trim().to_string();
+                let worktrees = worktrees.read(cx).value().trim().to_string();
                 window.close_dialog(cx);
                 let _ = this.update(cx, |w, cx| {
-                    w.apply_local_project_settings(&project, local, base, window, cx);
+                    w.apply_local_project_settings(&project, local, base, worktrees, window, cx);
                     w.save_project_settings(&project, config, only_me, window, cx)
                 });
             }
@@ -626,12 +629,20 @@ impl Workspace {
             let (save, ask, fill, allow, file_trust, file_key, file_error) =
                 (save.clone(), ask.clone(), fill.clone(), allow.clone(), file_trust.clone(), file_key.clone(), file_error.clone());
             let remove = remove.clone();
-            let (section, local, profiles, spaces, archived, base, this, project) =
-                (section.clone(), local.clone(), profiles.clone(), spaces.clone(), archived.clone(), base.clone(), this.clone(), project.clone());
+            let (section, local, profiles, spaces, archived, base, this, project, worktrees) =
+                (section.clone(), local.clone(), profiles.clone(), spaces.clone(), archived.clone(), base.clone(), this.clone(), project.clone(), worktrees.clone());
             let (page_ask, page_fill) = (ask.clone(), fill.clone());
             dialog
                 .title(format!("Project settings · {name}"))
                 .w(px(860.))
+                // Enter in a field reaches the dialog: it saves, as the button does.
+                .on_ok({
+                    let save = save.clone();
+                    move |_, window, cx| {
+                        save(window, cx);
+                        false
+                    }
+                })
                 .content(move |content, window, cx| {
                     let muted = cx.theme().muted_foreground;
                     let height = (window.viewport_size().height - px(240.)).clamp(px(240.), px(640.));
@@ -756,6 +767,7 @@ impl Workspace {
                             .child(field("Check", "Runs when the agent finishes a turn; ✓ or ✗ on the task", Input::new(&check).into_any_element()))
                             .child(field("Files to copy", "Ignored files a new worktree gets from the main checkout", Input::new(&copy).into_any_element()))
                             .child(field("New tasks from", "The branch new tasks start from; on this machine", Input::new(&base).into_any_element()))
+                            .child(field("Worktrees in", "The folder new tasks' worktrees go in; on this machine", Input::new(&worktrees).into_any_element()))
                             .child(helpers("tasks-fill"))
                             .into_any_element(),
                         1 => v_flex().gap_3().child(field("Services", "Started from Run: name, command, port", services.into_any_element())).child(helpers("services-fill")).into_any_element(),
@@ -871,7 +883,7 @@ impl Workspace {
     }
 
     /// What the settings dialog changed of what the project keeps here.
-    fn apply_local_project_settings(&mut self, project: &Path, local: Local, base: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn apply_local_project_settings(&mut self, project: &Path, local: Local, base: String, worktrees: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(pi) = self.projects.iter().position(|p| p.path == project) else { return };
         if self.projects[pi].agent != local.agent {
             self.set_project_agent(pi, local.agent, cx);
@@ -881,6 +893,8 @@ impl Workspace {
         }
         let p = &mut self.projects[pi];
         p.base = base;
+        crate::git::set_project_worktrees(&p.path, &worktrees);
+        p.worktrees = worktrees;
         p.pr_off = local.pr_off;
         if p.lsp_off != local.lsp_off {
             p.lsp_off = local.lsp_off;

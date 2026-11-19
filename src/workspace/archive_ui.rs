@@ -413,7 +413,8 @@ impl Workspace {
         let several = project.is_none();
         window.open_dialog(cx, move |dialog, _, _| {
             let (listed, query, this, focused, names, _keep) = (listed.clone(), query.clone(), this.clone(), focused.clone(), names.clone(), listening.clone());
-            dialog.title(title.clone()).w(px(720.)).content(move |content, window, cx| {
+            // Enter in the search reaches the dialog: the list stays.
+            dialog.title(title.clone()).w(px(720.)).on_ok(|_, _, _| false).content(move |content, window, cx| {
                 if !focused.replace(true) {
                     let query = query.clone();
                     window.defer(cx, move |window, cx| query.read(cx).focus_handle(cx).focus(window, cx));
@@ -653,6 +654,14 @@ impl Workspace {
             dialog
                 .title(format!("Restore \"{}\"", m.title))
                 .w(px(620.))
+                // Enter in the branch name reaches the dialog: it restores, as the button does.
+                .on_ok({
+                    let restore = restore.clone();
+                    move |_, window, cx| {
+                        restore(window, cx);
+                        false
+                    }
+                })
                 .content(move |content, _, cx| {
                     let mut form = v_flex()
                         .gap_3()

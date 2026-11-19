@@ -25,8 +25,9 @@ pub struct Side {
 pub fn made_by_agent(path: &Path, all: &[PathBuf]) -> Option<Option<PathBuf>> {
     // Where the app makes tasks, wherever the repository is.
     if let Some(main) = all.first() {
-        let tasks = main.with_file_name(format!("{}.worktrees", main.file_name()?.to_string_lossy()));
-        if path.starts_with(&tasks) && !path.components().any(|c| c.as_os_str() == ".claude") {
+        // Beside it, and where Settings or the project put them now.
+        let places = [crate::git::worktrees_beside(main), crate::git::task_worktrees(main)];
+        if places.iter().any(|tasks| path.starts_with(tasks)) && !path.components().any(|c| c.as_os_str() == ".claude") {
             return None;
         }
     }

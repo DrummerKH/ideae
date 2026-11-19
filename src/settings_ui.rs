@@ -197,7 +197,7 @@ fn pages(
                 .item(switch(
                     draft,
                     "Notifications",
-                    "A desktop notification when an agent in a task you are not looking at finishes or needs your answer.",
+                    "A desktop notification when an agent finishes or needs your answer while ideae is not the window in front; in front, the sidebar's Needs you has it.",
                     |s| s.notifications,
                     |s, v| s.notifications = v,
                 ))
@@ -376,7 +376,18 @@ fn pages(
                     "New worktrees get copies of the main checkout's ignored .env* files, unless the project's settings list other files to copy.",
                     |s| s.copy_env,
                     |s, v| s.copy_env = v,
-                )),
+                ))
+                .item({
+                    let (read, write) = (draft.clone(), draft.clone());
+                    SettingItem::new(
+                        "Worktrees in",
+                        SettingField::input(
+                            move |_| read.borrow().worktrees_dir.clone().into(),
+                            move |value: SharedString, _| write.borrow_mut().worktrees_dir = value.trim().to_string(),
+                        ),
+                    )
+                    .description("Empty: beside each repository, in <repository>.worktrees, where the tools of the folders above it still apply. A folder (~/worktrees): one of each project's name in it, as for a repository in a synced folder. New tasks only; a project's settings can name its own.")
+                }),
         ).group(
             SettingGroup::new().title("Archived tasks")
                 .item(SettingItem::new("Restore with", restore_with).description(
@@ -863,9 +874,54 @@ fn profile_dialog(draft: Draft, at: Option<usize>, template: Option<crate::agent
         let (save_name, save_command, save_env, save_kind, save_chat, save_forget, save_key, save_limit) = (name.clone(), command.clone(), env.clone(), kind.clone(), chat.clone(), forget.clone(), key.clone(), limit.clone());
         let (remembered, forget) = (remembered.clone(), forget.clone());
         let label = |text: &'static str| div().text_sm().w(px(110.)).flex_none().child(text);
+        let save = Rc::new(move |window: &mut Window, cx: &mut App| {
+            let k = save_kind.get();
+            let command = save_command.read(cx).value().trim().to_string();
+            let acp = save_chat.get();
+            let command = if command.is_empty() { if acp { k.acp_command() } else { k.program() }.to_string() } else { command };
+            if command.is_empty() {
+                return;
+            }
+            let mut name = save_name.read(cx).value().trim().to_string();
+            if name.is_empty() {
+                name = command.split_whitespace().next().unwrap_or("Agent").to_string();
+            }
+            let mut env_text = save_env.read(cx).value().to_string();
+            let typed = save_key.read(cx).value().trim().to_string();
+            if let (true, Some((var, _))) = (acp && !typed.is_empty(), api_key_var(k, &command)) {
+                env_text = with_env_line(&env_text, var, &typed);
+            }
+            {
+                let mut d = draft.borrow_mut();
+                let id = match at {
+                    Some(_) if !editing.id.is_empty() => editing.id.clone(),
+                    _ => crate::agents::new_profile_id(&name, &d.agents),
+                };
+                let choices = if save_forget.get() { Default::default() } else { editing.choices.clone() };
+                let daily_limit = save_limit.read(cx).value().trim().trim_start_matches('$').parse::<f64>().ok().filter(|l| *l > 0.0 && acp);
+                let mark: String = save_mark.read(cx).value().trim().chars().take(3).collect();
+                let mut profile = crate::agents::Profile { id, name, kind: k, command, acp, secrets: editing.secrets.clone(), choices, offered: editing.offered.clone(), daily_limit, mark, color: save_color.get(), ..Default::default() };
+                profile.set_env_text(&env_text);
+                match at.filter(|ix| *ix < d.agents.len()) {
+                    Some(ix) => d.agents[ix] = profile,
+                    None => d.agents.push(profile),
+                }
+                d.normalize();
+            }
+            window.close_dialog(cx);
+            window.refresh();
+        });
         dialog
             .title(if at.is_some() { "Edit agent" } else { "Add agent" })
             .w(px(620.))
+            // Enter in a field reaches the dialog: it saves, as the button does.
+            .on_ok({
+                let save = save.clone();
+                move |_, window, cx| {
+                    save(window, cx);
+                    false
+                }
+            })
             .content(move |content, _, cx| {
                 let current = kind.get();
                 let as_chat = chat.get();
@@ -971,42 +1027,9 @@ fn profile_dialog(draft: Draft, at: Option<usize>, template: Option<crate::agent
                 )
             })
             .footer(h_flex().justify_end().gap_2().child(Button::new("agent-cancel").ghost().label("Cancel").on_click(|_, window, cx| window.close_dialog(cx))).child(
-                Button::new("agent-save").primary().label("Save").on_click(move |_, window, cx| {
-                    let k = save_kind.get();
-                    let command = save_command.read(cx).value().trim().to_string();
-                    let acp = save_chat.get();
-                    let command = if command.is_empty() { if acp { k.acp_command() } else { k.program() }.to_string() } else { command };
-                    if command.is_empty() {
-                        return;
-                    }
-                    let mut name = save_name.read(cx).value().trim().to_string();
-                    if name.is_empty() {
-                        name = command.split_whitespace().next().unwrap_or("Agent").to_string();
-                    }
-                    let mut env_text = save_env.read(cx).value().to_string();
-                    let typed = save_key.read(cx).value().trim().to_string();
-                    if let (true, Some((var, _))) = (acp && !typed.is_empty(), api_key_var(k, &command)) {
-                        env_text = with_env_line(&env_text, var, &typed);
-                    }
-                    {
-                        let mut d = draft.borrow_mut();
-                        let id = match at {
-                            Some(_) if !editing.id.is_empty() => editing.id.clone(),
-                            _ => crate::agents::new_profile_id(&name, &d.agents),
-                        };
-                        let choices = if save_forget.get() { Default::default() } else { editing.choices.clone() };
-                        let daily_limit = save_limit.read(cx).value().trim().trim_start_matches('$').parse::<f64>().ok().filter(|l| *l > 0.0 && acp);
-                        let mark: String = save_mark.read(cx).value().trim().chars().take(3).collect();
-                        let mut profile = crate::agents::Profile { id, name, kind: k, command, acp, secrets: editing.secrets.clone(), choices, offered: editing.offered.clone(), daily_limit, mark, color: save_color.get(), ..Default::default() };
-                        profile.set_env_text(&env_text);
-                        match at.filter(|ix| *ix < d.agents.len()) {
-                            Some(ix) => d.agents[ix] = profile,
-                            None => d.agents.push(profile),
-                        }
-                        d.normalize();
-                    }
-                    window.close_dialog(cx);
-                    window.refresh();
+                Button::new("agent-save").primary().label("Save").on_click({
+                    let save = save.clone();
+                    move |_, window, cx| save(window, cx)
                 }),
             ))
     });
@@ -1096,6 +1119,8 @@ fn open(
                         ),
                 )
             })
+            // Enter in a field or the search reaches the dialog: it stays, the edits with it.
+            .on_ok(|_, _, _| false)
             .footer(
                 h_flex()
                     .justify_end()

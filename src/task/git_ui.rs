@@ -32,6 +32,35 @@ pub(super) enum ChangeRow {
 /// A file's row with its buttons is 26.5 high.
 pub(super) const CHANGE_ROW: f32 = 27.;
 
+/// The ways to ignore `path`: in `.gitignore`, which the team shares, or
+/// only in this clone (`info/exclude`).
+pub(super) fn ignore_submenu(view: WeakEntity<TaskView>, path: String, folder: bool) -> impl Fn(gpui_kit::component::menu::PopupMenu, &mut Window, &mut Context<gpui_kit::component::menu::PopupMenu>) -> gpui_kit::component::menu::PopupMenu + 'static {
+    use gpui_kit::component::menu::PopupMenuItem;
+    move |mut menu, _, _| {
+        let patterns = git::ignore_patterns(&path, folder);
+        let places = [
+            (git::IgnoreIn::Shared, "In .gitignore, for everyone"),
+            (git::IgnoreIn::Local, "Just for me, in this repository"),
+            (git::IgnoreIn::Everywhere, "In all my repositories"),
+        ];
+        for (ix, (place, heading)) in places.into_iter().enumerate() {
+            if ix > 0 {
+                menu = menu.separator();
+            }
+            menu = menu.label(heading);
+            // A path of one repository means nothing in the others.
+            for (label, pattern, _) in patterns.iter().filter(|(_, _, this_only)| !(*this_only && place == git::IgnoreIn::Everywhere)) {
+                let (view, pattern) = (view.clone(), pattern.clone());
+                menu = menu.item(PopupMenuItem::new(label.clone()).on_click(move |_, window, cx| {
+                    let pattern = pattern.clone();
+                    let _ = view.update(cx, |t, cx| t.run_action("Ignore", move |root| git::ignore(&root, &pattern, place), false, window, cx));
+                }));
+            }
+        }
+        menu
+    }
+}
+
 impl TaskView {
     pub(super) fn staged_paths(&self) -> Vec<String> {
         self.files.iter().filter(|f| self.state_of(&f.path).staged).map(|f| f.path.to_string()).collect()
@@ -614,8 +643,9 @@ impl TaskView {
                 this.side_selected = ix;
                 this.show_changed_file(path.clone(), window, cx)
             }))
-            .context_menu(move |menu, _, _| {
+            .context_menu(move |menu, window, cx| {
                 use gpui_kit::component::menu::PopupMenuItem;
+                let menu = if untracked { menu.submenu("Add to .gitignore", window, cx, ignore_submenu(view.clone(), menu_path.clone(), false)).separator() } else { menu };
                 let (open_view, open_path) = (view.clone(), open_path.clone());
                 let (stage_view, stage_path) = (view.clone(), menu_path.clone());
                 let (viewed_view, viewed_path) = (view.clone(), menu_path.clone());

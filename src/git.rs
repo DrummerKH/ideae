@@ -2356,6 +2356,42 @@ mod pull_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// A file ignored by its path, its name or its extension, in .gitignore
+    /// or in info/exclude; once.
+    #[test]
+    fn a_file_is_ignored_where_it_is_said() {
+        let pats = |path: &str, folder| super::ignore_patterns(path, folder).into_iter().map(|(_, p, _)| p).collect::<Vec<_>>();
+        assert_eq!(pats(".DS_Store", false), [".DS_Store", "/.DS_Store"], "at the root too: every one first");
+        assert_eq!(pats("src/.DS_Store", false), [".DS_Store", "/src/.DS_Store"]);
+        assert_eq!(pats("logs/app.log", false), ["app.log", "/logs/app.log", "*.log"]);
+        assert_eq!(pats("build", true), ["build/", "/build/"]);
+        let root = std::env::temp_dir().join(format!("ideae-ignore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(std::process::Command::new("git").args(["init", "-q"]).current_dir(&root).status().unwrap().success());
+        std::fs::write(root.join(".gitignore"), "target").unwrap();
+        super::ignore(&root, ".DS_Store", super::IgnoreIn::Shared).unwrap();
+        super::ignore(&root, ".DS_Store", super::IgnoreIn::Shared).unwrap();
+        assert_eq!(std::fs::read_to_string(root.join(".gitignore")).unwrap(), "target\n.DS_Store\n", "once, on a line of its own");
+        super::ignore(&root, "*.log", super::IgnoreIn::Local).unwrap();
+        assert!(std::fs::read_to_string(root.join(".git/info/exclude")).unwrap().lines().any(|l| l == "*.log"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A project's tasks go beside it, or in the folder its settings name.
+    #[test]
+    fn a_project_s_worktrees_go_where_it_says() {
+        let repo = std::path::Path::new("/nowhere/ideae-worktrees-test/app");
+        assert_eq!(super::task_worktree_dir(repo, "fix/a"), std::path::Path::new("/nowhere/ideae-worktrees-test/app.worktrees/fix-a"));
+        super::set_project_worktrees(repo, "/elsewhere/app-tasks");
+        assert_eq!(super::task_worktree_dir(repo, "fix"), std::path::Path::new("/elsewhere/app-tasks/fix"));
+        super::set_project_worktrees(repo, "");
+        assert_eq!(super::task_worktrees(repo), super::worktrees_beside(repo));
+        if let Some(home) = std::env::var_os("HOME") {
+            assert_eq!(super::home_expanded("~/wt"), std::path::PathBuf::from(home).join("wt"));
+        }
+    }
+
     /// A project's base: origin's branch of that name, fetched; else as said.
     #[test]
     fn a_task_starts_from_the_project_s_base() {
@@ -2699,8 +2735,119 @@ fn new_task_base(repo: &Path) -> String {
 }
 
 pub fn task_worktree_dir(repo: &Path, branch: &str) -> PathBuf {
+    task_worktrees(repo).join(branch.replace('/', "-"))
+}
+
+/// The folders projects keep their tasks' worktrees in, where their own
+/// settings name one.
+static WORKTREES_IN: std::sync::RwLock<Option<std::collections::HashMap<PathBuf, PathBuf>>> = std::sync::RwLock::new(None);
+
+/// Where a project's new tasks go: its own folder, set here; else the one
+/// Settings names, a folder of the project's name in it; else beside the
+/// repository, `<repo>.worktrees`.
+pub fn task_worktrees(repo: &Path) -> PathBuf {
     let name = repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "repo".into());
-    repo.with_file_name(format!("{name}.worktrees")).join(branch.replace('/', "-"))
+    if let Some(own) = WORKTREES_IN.read().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|all| all.get(repo).cloned()) {
+        return own;
+    }
+    match crate::state::with_settings(|s| s.worktrees_dir.trim().to_string()) {
+        dir if !dir.is_empty() => home_expanded(&dir).join(name),
+        _ => worktrees_beside(repo),
+    }
+}
+
+/// `<repo>.worktrees`: where tasks went before a folder was chosen, and go by default.
+pub fn worktrees_beside(repo: &Path) -> PathBuf {
+    let name = repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "repo".into());
+    repo.with_file_name(format!("{name}.worktrees"))
+}
+
+/// What a path can be ignored by, for a menu: the path itself (anchored
+/// at the root), every file or folder of its name, every file of its
+/// extension; each with what it is called there.
+/// The first: every file (or folder) of its name, in any folder: a
+/// pattern without a slash is matched at every depth. Then this one alone,
+/// anchored at the root, and every file of its extension. Each with
+/// whether it names this path only.
+pub fn ignore_patterns(path: &str, folder: bool) -> Vec<(String, String, bool)> {
+    let path = path.trim_end_matches('/');
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let (slash, what) = if folder { ("/", "folder") } else { ("", "file") };
+    let mut all = vec![
+        (format!("Every {name}{slash}, in any folder"), format!("{name}{slash}"), false),
+        (format!("Only this {what}: /{path}{slash}"), format!("/{path}{slash}"), true),
+    ];
+    if !folder && let Some((_, ext)) = name.rsplit_once('.').filter(|(stem, ext)| !stem.is_empty() && !ext.is_empty()) {
+        all.push((format!("Every *.{ext} file"), format!("*.{ext}"), false));
+    }
+    all
+}
+
+/// Where `ignore` writes: the worktree's .gitignore, shared with the team;
+/// the repository's info/exclude, for you alone; git's own file for every
+/// repository of this user (`core.excludesFile`, else ~/.config/git/ignore).
+#[derive(Clone, Copy, PartialEq)]
+pub enum IgnoreIn {
+    Shared,
+    Local,
+    Everywhere,
+}
+
+/// Adds `pattern` to the worktree's `.gitignore`, or with `local` to the
+/// repository's `info/exclude`, which is not committed; once.
+pub fn ignore(root: &Path, pattern: &str, place: IgnoreIn) -> Result<String, String> {
+    let file = match place {
+        IgnoreIn::Shared => root.join(".gitignore"),
+        IgnoreIn::Local => {
+            let at = git(root, &["rev-parse", "--git-path", "info/exclude"]).ok_or("not a git repository")?;
+            let at = PathBuf::from(at.trim());
+            if at.is_absolute() { at } else { root.join(at) }
+        }
+        IgnoreIn::Everywhere => match git(root, &["config", "--global", "--get", "core.excludesFile"]).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+            Some(file) => home_expanded(&file),
+            None => match std::env::var_os("XDG_CONFIG_HOME").filter(|d| !d.is_empty()) {
+                Some(config) => PathBuf::from(config).join("git/ignore"),
+                None => home_expanded("~/.config/git/ignore"),
+            },
+        },
+    };
+    let mut text = std::fs::read_to_string(&file).unwrap_or_default();
+    let named = match place {
+        IgnoreIn::Shared => ".gitignore".to_string(),
+        IgnoreIn::Local => "info/exclude".to_string(),
+        IgnoreIn::Everywhere => file.display().to_string(),
+    };
+    if text.lines().any(|line| line.trim() == pattern) {
+        return Ok(format!("{pattern} is in {named} already"));
+    }
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(pattern);
+    text.push('\n');
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(&file, text).map_err(|e| format!("{}: {e}", file.display()))?;
+    Ok(format!("{pattern} added to {named}"))
+}
+
+/// A project's own folder for its tasks, or none for what Settings say.
+pub fn set_project_worktrees(repo: &Path, dir: &str) {
+    let mut all = WORKTREES_IN.write().unwrap_or_else(|e| e.into_inner());
+    let all = all.get_or_insert_with(Default::default);
+    match dir.trim() {
+        "" => all.remove(repo),
+        dir => all.insert(repo.to_path_buf(), home_expanded(dir)),
+    };
+}
+
+/// `~/x` as the home folder's `x`.
+pub fn home_expanded(dir: &str) -> PathBuf {
+    match (dir.strip_prefix("~/").or((dir == "~").then_some("")), std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))) {
+        (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
+        _ => PathBuf::from(dir),
+    }
 }
 
 /// Creates the worktree of a new task next to the repository, in
