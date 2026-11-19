@@ -67,6 +67,11 @@ pub struct FileView {
     pub(super) lsp_program: String,
     /// The server this file would have if it were installed.
     pub(super) lsp_missing: Option<&'static str>,
+    /// Counts the times it asked for its server: an answer to an older one
+    /// is not applied.
+    pub(super) lsp_attach: u64,
+    /// Its server runs without the licence that would give it more.
+    pub(super) lsp_unlicensed: bool,
     /// Markdown shown as it reads instead of its source.
     pub(super) preview: bool,
     /// The text the preview was drawn from, by edit version: the same
@@ -998,7 +1003,7 @@ fn preview_image(dir: &std::path::Path, uri: &gpui_kit::SharedUri) -> gpui_kit::
 
 impl FileView {
     pub(super) fn is_busy(&self) -> bool {
-        self.lsp_client.as_ref().is_some_and(|c| c.busy().is_some())
+        self.lsp_client.as_ref().is_some_and(|c| c.busy_for(&self.path).is_some())
     }
 
     pub(super) fn is_markdown(&self) -> bool {
@@ -1045,7 +1050,7 @@ impl FileView {
     }
 
     pub(super) fn status_text(&self) -> String {
-        let busy = self.lsp_client.as_ref().and_then(|c| c.busy());
+        let busy = self.lsp_client.as_ref().and_then(|c| c.busy_for(&self.path));
         match (self.lsp_program.is_empty(), self.lsp_ok, busy) {
             (true, _, _) => self.lsp_status.to_string(),
             (false, Some(true), Some(work)) => format!("{}: {work}…", self.lsp_program),
@@ -1181,6 +1186,20 @@ impl Render for FileView {
                                 self.status_text()
                             }),
                     )
+                    .when(self.lsp_unlicensed && self.lsp_ok == Some(true), |header| {
+                        header.child(
+                            Button::new("lsp-licence")
+                                .xsmall()
+                                .ghost()
+                                .label("no licence")
+                                .text_color(hsla(0.12, 0.9, 0.5, 1.))
+                                .tooltip(
+                                    "intelephense runs without a licence: no rename, go to implementation, inlay hints or code actions. \
+                                     Enter a licence key in Settings, or choose phpactor for PHP there.",
+                                )
+                                .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::LanguageServerSettings), cx)),
+                        )
+                    })
                     .when_some(self.lsp_missing.filter(|p| !crate::lsp_install::is_installing(p)), |header, program| {
                         let task = self.task.clone();
                         header.when(crate::lsp_install::recipe(program).is_some(), |header| {

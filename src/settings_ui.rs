@@ -35,6 +35,67 @@ fn switch(
     SettingItem::new(title, field).description(hint)
 }
 
+/// A language with more than one server: which one runs, or none; and
+/// for PHP, intelephense's licence key.
+fn language_choice(
+    draft: &Draft,
+    key: &'static str,
+    language: &'static str,
+    programs: &'static [&'static str],
+    def: &lsp::ServerDef,
+    there: &dyn Fn(&'static str) -> bool,
+) -> Vec<SettingItem> {
+    const OFF: &str = "off";
+    let (read, write) = (draft.clone(), draft.clone());
+    let options = programs
+        .iter()
+        .map(|p| (SharedString::from(*p), SharedString::from(if there(p) { p.to_string() } else { format!("{p} (not installed)") })))
+        .chain([(SharedString::from(OFF), SharedString::from("Off"))])
+        .collect();
+    let field = SettingField::dropdown(
+        options,
+        move |_| {
+            let d = read.borrow();
+            let off = programs.iter().all(|p| d.lsp_off.iter().any(|o| o == p));
+            SharedString::from(if off { OFF } else { lsp::chosen(key, &d) })
+        },
+        move |value, cx| {
+            let mut d = write.borrow_mut();
+            d.lsp_off.retain(|o| !programs.contains(&o.as_str()));
+            if value.as_ref() == OFF {
+                d.lsp_off.extend(programs.iter().map(|p| p.to_string()));
+            } else {
+                d.lsp_choice.insert(key.to_string(), value.to_string());
+            }
+            cx.refresh_windows();
+        },
+    )
+    .default_value(SharedString::from(programs[0]));
+    let mut items = vec![SettingItem::new(language, field).description(match key {
+        "php" => format!(
+            "{}. intelephense is quick, also on large projects; rename, go to implementation, inlay hints and code actions need its licence. \
+             phpactor has them all for free, but indexes a large project slowly and needs PHP 8.1 or newer.",
+            def.extensions()
+        ),
+        _ => def.extensions(),
+    })];
+    if key == "php" {
+        let (read, write) = (draft.clone(), draft.clone());
+        let field = SettingField::input(
+            move |_| {
+                let typed = read.borrow().lsp_licence.clone();
+                let kept = || if crate::secrets::get(lsp::INTELEPHENSE_LICENCE).is_some() { crate::agents::MASK } else { "" };
+                SharedString::from(typed.unwrap_or_else(|| kept().to_string()))
+            },
+            move |value, _| write.borrow_mut().lsp_licence = Some(value.to_string()),
+        );
+        items.push(SettingItem::new("intelephense licence key", field).description(
+            "Kept sealed on this machine, not in the settings file. Without one, intelephense also reads licence.txt from its own folder.",
+        ));
+    }
+    items
+}
+
 fn pages(
     draft: &Draft,
     look: &Rc<Cell<Appearance>>,
@@ -174,8 +235,17 @@ fn pages(
         .default_value(SharedString::from(Appearance::Auto.label()))
     };
     let now = if dark_now { "dark" } else { "light" };
-    let servers = lsp::SERVERS.iter().map(|def| {
+    // Looked for on disk once while the dialog is open: this runs with every frame of it.
+    let there = |program: &'static str| {
+        INSTALLED.with(|known| {
+            *known.borrow_mut().entry(program).or_insert_with(|| lsp::SERVERS.iter().any(|d| d.program == program && d.available()))
+        })
+    };
+    let servers = lsp::SERVERS.iter().flat_map(|def| {
         let program = def.program;
+        if let Some(&(key, language, programs)) = lsp::ALTERNATIVES.iter().find(|(_, _, programs)| programs.contains(&program)) {
+            return if programs[0] == program { language_choice(draft, key, language, programs, def, &there) } else { vec![] };
+        }
         let (read, write) = (draft.clone(), draft.clone());
         let field = SettingField::checkbox(move |_| !read.borrow().lsp_off.iter().any(|p| p == program), move |on, cx| {
             let mut d = write.borrow_mut();
@@ -186,10 +256,8 @@ fn pages(
             cx.refresh_windows();
         })
         .default_value(true);
-        // Looked for on disk once while the dialog is open: this runs with every frame of it.
-        let there = INSTALLED.with(|known| *known.borrow_mut().entry(program).or_insert_with(|| def.available()));
-        let missing = if there { "" } else { ", not installed" };
-        SettingItem::new(program, field).description(format!("{}{missing}", def.extensions()))
+        let missing = if there(program) { "" } else { ", not installed" };
+        vec![SettingItem::new(program, field).description(format!("{}{missing}", def.extensions()))]
     });
     vec![
         SettingPage::new("General").default_open(true).group(
@@ -441,6 +509,13 @@ fn pages(
         ),
         SettingPage::new("Language servers").default_open(true).groups([
             SettingGroup::new().title("Servers").items(servers),
+            SettingGroup::new().title("Sharing").item(switch(
+                draft,
+                "A language server for each task",
+                "Off, the tasks of a project share one server per language: a task's worktree is one more folder of it, and what they have alike (the standard library, the dependencies) is read once, a third of the memory for three tasks. rust-analyzer, clangd, gopls, basedpyright and the TypeScript server; the others run one per task anyway. Turn it on if a shared server gets something wrong.",
+                |s| s.lsp_separate,
+                |s, v| s.lsp_separate = v,
+            )),
             SettingGroup::new().title("Sleep").item(
                 SettingItem::new("Sleep after (minutes)", idle)
                     .description("A task you have not opened for this long stops its language servers. The task on screen stops them too when the app has been in the background this long and its agent is not working. They start again when you come back."),
@@ -508,6 +583,7 @@ fn pages(
 /// Where the shortcuts are among the pages.
 pub const KEYS_PAGE: usize = 5;
 pub const AGENTS_PAGE: usize = 1;
+pub const LSP_PAGE: usize = 4;
 
 /// The Agents page: the profiles, the default, the one for quick questions.
 fn agents_page(draft: &Draft, lsp_switch: SettingItem, token_warn: SettingField<SharedString>) -> SettingPage {

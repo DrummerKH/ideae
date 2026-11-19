@@ -180,7 +180,7 @@ impl TaskView {
                 }
                 // A server that could not import the build before the setup made it
                 // whole (a sibling checkout, generated files) is started again.
-                if !crate::lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed) && self.lsp.values().any(|client| client.problem().is_some()) {
+                if !crate::lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed) && self.lsp.clients().iter().any(|client| client.problem().is_some()) {
                     self.set_language_servers(false, cx);
                     self.set_language_servers(true, cx);
                 }

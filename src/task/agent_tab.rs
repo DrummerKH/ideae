@@ -32,7 +32,7 @@ impl TaskView {
         if TermView::gone(state.read(cx)) {
             TermView::end(&view, cx);
             let mut env = self.terminal_env();
-            env.extend(launch.env());
+            env.extend(launch.env(&self.root));
             let tab = Self::make_terminal(&self.root, self.hook_socket.as_ref(), "agent", 0, Some(command), env, None, None, window, cx);
             (self.tabs[ix].kind, self.tabs[ix].shown) = (tab.kind, tab.shown);
         } else {
@@ -71,7 +71,7 @@ impl TaskView {
             Self::make_chat(&self.root, &launch, task_env, window, cx)
         } else {
             let mut env = task_env;
-            env.extend(launch.env());
+            env.extend(launch.env(&self.root));
             Self::make_terminal(&self.root, self.hook_socket.as_ref(), "agent", 0, Some(launch.command()), env, None, None, window, cx)
         };
         self.chat_told = None;

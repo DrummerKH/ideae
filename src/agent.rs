@@ -129,6 +129,8 @@ pub struct Bridge {
     pub settings: PathBuf,
     /// OpenCode's plugin, next to the settings.
     plugin: PathBuf,
+    /// Claude Code's `--mcp-config`, next to them too.
+    mcp: PathBuf,
 }
 
 #[cfg(unix)]
@@ -204,6 +206,7 @@ impl Bridge {
             dir.join(format!("hooks-{pid}.json"))
         };
         let plugin = settings.with_extension("opencode.js");
+        let mcp = settings.with_extension("mcp.json");
         let (socket, socket_file, incoming) = listen(&dir, pid)?;
 
         std::thread::Builder::new().name("hook-listener".into()).spawn(move || {
@@ -217,13 +220,24 @@ impl Bridge {
             }
         })?;
 
-        let bridge = Self { socket, socket_file, settings, plugin };
+        let bridge = Self { socket, socket_file, settings, plugin, mcp };
         bridge.write_settings()?;
         let exe = std::env::current_exe().ok();
+        let mut claude_mcp = None;
         if let Some(exe) = &exe {
             let _ = std::fs::write(&bridge.plugin, crate::agents::opencode::plugin_source(exe));
+            // No token here: `ideae --mcp` reads the agent's terminal's variables.
+            let config = json!({ "mcpServers": { "ideae": { "command": exe, "args": ["--mcp"] } } });
+            if std::fs::write(&bridge.mcp, serde_json::to_vec_pretty(&config).unwrap_or_default()).is_ok() {
+                claude_mcp = Some(bridge.mcp.clone());
+            }
         }
-        crate::agents::set_hooks(crate::agents::Hooks { claude_settings: Some(bridge.settings.clone()), exe, opencode_plugin: Some(bridge.plugin.clone()) });
+        crate::agents::set_hooks(crate::agents::Hooks {
+            claude_settings: Some(bridge.settings.clone()),
+            exe,
+            opencode_plugin: Some(bridge.plugin.clone()),
+            claude_mcp,
+        });
         Ok(bridge)
     }
 
@@ -248,6 +262,7 @@ impl Drop for Bridge {
         if cfg!(windows) {
             let _ = std::fs::remove_file(&self.settings);
             let _ = std::fs::remove_file(&self.plugin);
+            let _ = std::fs::remove_file(&self.mcp);
         }
     }
 }

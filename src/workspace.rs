@@ -575,6 +575,9 @@ impl Workspace {
                     if n % 40 == 5 {
                         this.look_at_battery(window, cx);
                     }
+                    if n % 2 == 0 {
+                        this.restart_lost_language_servers(cx);
+                    }
                     if n % 10 == 0 {
                         this.sleep_idle_language_servers(cx);
                         this.refresh_prs(false, window, cx);
@@ -1392,6 +1395,15 @@ impl Workspace {
         std::time::Duration::from_secs(secs)
     }
 
+    /// A server that ended by itself starts again, as the files that had it ask.
+    fn restart_lost_language_servers(&mut self, cx: &mut Context<Self>) {
+        for view in self.views() {
+            if view.read(cx).lost_a_language_server() {
+                view.update(cx, |t, cx| t.restart_lost_language_servers(cx));
+            }
+        }
+    }
+
     fn sleep_idle_language_servers(&mut self, cx: &mut Context<Self>) {
         for view in self.views() {
             view.update(cx, |t, cx| t.drop_unused_language_servers(Self::lsp_idle(), cx));
@@ -1401,6 +1413,7 @@ impl Workspace {
         if self.window_left.is_some_and(|left| left.elapsed() >= Self::lsp_idle())
             && let Some(view) = self.active_view()
             && !view.read(cx).agent_busy()
+            && !view.read(cx).asked_of_lately(Self::lsp_idle())
             && view.read(cx).has_language_servers()
         {
             view.update(cx, |t, cx| t.put_language_servers_to_sleep(cx));
@@ -1409,7 +1422,7 @@ impl Workspace {
             for t in &p.tasks {
                 let (Some(view), Some(left)) = (&t.view, t.left_view) else { continue };
                 if self.active.as_deref() != Some(t.path.as_path()) && left.elapsed() >= Self::lsp_idle() {
-                    if view.read(cx).has_language_servers() {
+                    if view.read(cx).has_language_servers() && !view.read(cx).asked_of_lately(Self::lsp_idle()) {
                         view.update(cx, |t, cx| t.put_language_servers_to_sleep(cx));
                     }
                     // Its browser too, unless its agent may be driving a page right now.
@@ -2505,11 +2518,21 @@ impl Workspace {
 
     /// New settings: they go to the state, and what they change now
     /// changes (new tasks' agent, language servers of open files).
-    pub fn apply_settings(&mut self, new: state::Settings, cx: &mut Context<Self>) {
+    pub fn apply_settings(&mut self, mut new: state::Settings, cx: &mut Context<Self>) {
         let old = state::settings();
+        let licence = new.lsp_licence.take().map(|key| key.trim().to_string()).filter(|key| key != crate::agents::MASK);
+        let licence_changed = licence.as_ref().is_some_and(|key| crate::secrets::get(crate::lsp::INTELEPHENSE_LICENCE).as_ref() != Some(key));
+        match licence.as_deref() {
+            Some("") => crate::secrets::remove(crate::lsp::INTELEPHENSE_LICENCE),
+            Some(key) => crate::secrets::set(crate::lsp::INTELEPHENSE_LICENCE, key),
+            None => {}
+        }
         state::set_settings(new.clone());
         // The keys of profiles that are gone.
         for scope in crate::secrets::scopes() {
+            if scope.starts_with("lsp:") {
+                continue;
+            }
             let (profile, name) = scope.split_once('/').unwrap_or_default();
             if !new.agents.iter().any(|p| p.id == profile && p.secrets.contains(name)) {
                 crate::secrets::remove(&scope);
@@ -2548,7 +2571,7 @@ impl Workspace {
                 let _ = bridge.write_settings();
             }
         }
-        if old.lsp_off != new.lsp_off {
+        if old.lsp_off != new.lsp_off || old.lsp_choice != new.lsp_choice || old.lsp_separate != new.lsp_separate || licence_changed {
             for view in self.views() {
                 view.update(cx, |t, cx| {
                     t.set_language_servers(false, cx);

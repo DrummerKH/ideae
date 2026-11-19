@@ -264,9 +264,7 @@ impl TaskView {
             })
             .collect();
         if !on {
-            for client in self.lsp.values() {
-                client.shut_down();
-            }
+            // Each lets go of its folder: its own server ends, a shared one goes on for the others.
             self.lsp.clear();
         }
         for file in files {
@@ -279,6 +277,7 @@ impl TaskView {
                 self.attach_lsp(&path, content, &editor, &file, cx);
             } else {
                 file.update(cx, |f, cx| {
+                    f.lsp_attach += 1;
                     f.lsp_client = None;
                     f.lsp_program.clear();
                     f.lsp_ok = Some(false);
@@ -331,22 +330,56 @@ impl TaskView {
             .collect();
         let now = std::time::Instant::now();
         let mut over = Vec::new();
-        for (key, client) in &self.lsp {
-            if used.iter().any(|u| Arc::ptr_eq(u, client)) {
-                self.lsp_unused.remove(key);
+        for (key, client) in self.lsp.entries() {
+            if used.iter().any(|u| Arc::ptr_eq(u, &client)) {
+                self.lsp_unused.remove(&key);
             } else if now.duration_since(*self.lsp_unused.entry(key.clone()).or_insert(now)) >= idle {
-                over.push(key.clone());
+                over.push(key);
             }
+        }
+        // What its agent asks of them through MCP is use too.
+        if self.asked_of_lately(idle) {
+            return;
         }
         for key in over {
             self.lsp_unused.remove(&key);
-            if let Some(client) = self.lsp.remove(&key) {
-                client.shut_down();
-            }
+            self.lsp.remove(&key);
         }
     }
 
     pub fn has_language_servers(&self) -> bool {
         !self.lsp.is_empty()
+    }
+
+    /// A server of this task ended by itself (crashed, killed).
+    pub fn lost_a_language_server(&self) -> bool {
+        self.lsp.clients().iter().any(|client| client.is_gone())
+    }
+
+    /// Starts again the servers that ended by themselves, for the files
+    /// that had them: a shared one for every task it served, each joining
+    /// the new one.
+    pub fn restart_lost_language_servers(&mut self, cx: &mut Context<Self>) {
+        let lost: Vec<_> = self.lsp.entries().into_iter().filter(|(key, client)| client.is_gone() && crate::lsp_share::may_restart(key.0, client)).collect();
+        for (key, client) in lost {
+            self.lsp.remove(&key);
+            self.lsp_unused.remove(&key);
+            let files: Vec<Entity<FileView>> = self
+                .tabs
+                .iter()
+                .filter_map(|t| match &t.kind {
+                    TabKind::File(f) if f.read(cx).lsp_client.as_ref().is_some_and(|c| Arc::ptr_eq(c, &client)) => Some(f.clone()),
+                    _ => None,
+                })
+                .collect();
+            for file in files {
+                let (path, editor) = {
+                    let f = file.read(cx);
+                    (f.path.clone(), f.editor.clone())
+                };
+                let content = editor.read(cx).value().to_string();
+                self.attach_lsp(&path, content, &editor, &file, cx);
+            }
+        }
     }
 }

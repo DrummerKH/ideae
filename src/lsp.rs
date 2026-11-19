@@ -8,7 +8,7 @@ use std::{
     process::{Child, ChildStdin, Stdio},
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicI64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -136,7 +136,24 @@ pub struct LspClient {
     commanded: Commanded,
     /// One command at a time: what the server asks while it runs is its.
     command: Mutex<()>,
+    /// How it serves several tasks' worktrees, when it does (`lsp_share`).
+    sharing: Option<crate::lsp_share::Share>,
+    /// The folders it serves, one per task that holds it.
+    folders: Mutex<Vec<PathBuf>>,
+    /// Folders added whose indexing has not ended: the work the server
+    /// does now is theirs, not the others'.
+    warming: Warming,
+    /// Folders let go of: rust-analyzer keeps what it read of each.
+    removed: AtomicUsize,
+    /// Files opened for an agent's question alone (uri): closed after it,
+    /// unless the editor opened them meanwhile.
+    borrowed: Mutex<HashSet<String>>,
+    /// Its output closed: the server has ended.
+    gone: Arc<AtomicBool>,
 }
+
+/// Folders whose reading has not ended, and since when.
+type Warming = Arc<Mutex<HashMap<PathBuf, std::time::Instant>>>;
 
 /// Power saving: no language servers run, none start.
 pub static POWER_SAVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -200,6 +217,7 @@ pub const SERVERS: &[ServerDef] = &[
         &["tsconfig.json", "jsconfig.json", "package.json"],
     ),
     server("intelephense", &["--stdio"], &[("php", "php")], &["composer.json"]),
+    server("phpactor", &["language-server"], &[("php", "php")], &["composer.json"]),
     server("kotlin-lsp", &["--stdio"], &[("kt", "kotlin"), ("kts", "kotlin")], &["settings.gradle.kts", "settings.gradle"]),
     server(
         "basedpyright-langserver",
@@ -292,6 +310,34 @@ pub const SERVERS: &[ServerDef] = &[
     server("terraform-ls", &["serve"], &[("tf", "terraform"), ("tfvars", "terraform-vars")], &[]),
 ];
 
+/// Languages with more than one server, one of which runs: the key the
+/// choice is kept by, the language's name, and the servers, the default
+/// first.
+pub const ALTERNATIVES: &[(&str, &str, &[&str])] = &[("php", "PHP", &["intelephense", "phpactor"])];
+
+/// The sealed store's name for intelephense's licence key.
+pub const INTELEPHENSE_LICENCE: &str = "lsp:intelephense/licence";
+
+/// The server chosen for a language of [`ALTERNATIVES`].
+pub fn chosen(key: &str, settings: &crate::state::Settings) -> &'static str {
+    let Some((_, _, programs)) = ALTERNATIVES.iter().find(|(k, _, _)| *k == key) else { return "" };
+    let choice = settings.lsp_choice.get(key);
+    programs.iter().copied().find(|p| choice.is_some_and(|c| c == p)).unwrap_or(programs[0])
+}
+
+/// intelephense without a licence, which leaves out rename, go to
+/// implementation, inlay hints and code actions. Waits for initialization.
+pub fn without_licence(program: &str, client: &LspClient) -> bool {
+    program == "intelephense" && !client.supports("renameProvider")
+}
+
+/// Another server than the one chosen for its language.
+fn passed_over(program: &str) -> bool {
+    ALTERNATIVES.iter().find(|(_, _, programs)| programs.contains(&program)).is_some_and(|(key, _, _)| {
+        crate::state::with_settings(|s| chosen(key, s)) != program
+    })
+}
+
 impl ServerDef {
     /// ".go", ".ts .tsx .js .jsx", ".sh .bash .bashrc": what it is for, in
     /// Settings; names that have an extension of its own go without saying.
@@ -324,14 +370,15 @@ fn known(path: &Path) -> Option<(&'static str, &'static str, &'static [&'static 
         Some((start, end)) => name.len() >= start.len() + end.len() && name.starts_with(start) && name.ends_with(end),
         None => name == pattern,
     };
-    let by_name = SERVERS.iter().find_map(|def| {
+    let servers = || SERVERS.iter().filter(|def| !passed_over(def.program));
+    let by_name = servers().find_map(|def| {
         def.names.iter().find(|(pattern, _)| named(pattern)).map(|(_, language)| (*language, def.program, def.args))
     });
     if by_name.is_some() {
         return by_name;
     }
     let ext = extension_of(path);
-    SERVERS.iter().find_map(|def| {
+    servers().find_map(|def| {
         def.languages.iter().find(|(e, _)| *e == ext).map(|(_, language)| (*language, def.program, def.args))
     })
 }
@@ -586,8 +633,22 @@ impl LspClient {
     /// Starts the server; initialization runs on its own thread, and every
     /// call waits for it.
     pub fn spawn(program: &str, executable: &Path, args: &[&str], root: &Path, init_options: Value) -> Result<Arc<Self>> {
+        Self::spawn_in(program, executable, args, root, root, None, init_options)
+    }
+
+    /// The same, run in `cwd`: for a server several worktrees share, the
+    /// main checkout, which outlives each of them.
+    pub fn spawn_in(
+        program: &str,
+        executable: &Path,
+        args: &[&str],
+        root: &Path,
+        cwd: &Path,
+        sharing: Option<crate::lsp_share::Share>,
+        init_options: Value,
+    ) -> Result<Arc<Self>> {
         let mut command = crate::procs::command(executable);
-        command.args(args).args(project_args(program, root)).envs(server_env(program)).current_dir(root).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+        command.args(args).args(project_args(program, root)).envs(server_env(program)).current_dir(cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
         // A group of its own: what it starts (cargo check, a proc-macro
         // server, tsserver) is ended with it, not left to notice.
         #[cfg(unix)]
@@ -614,10 +675,15 @@ impl LspClient {
         let reader_settings = settings(program);
         let commanded: Commanded = Arc::default();
         let reader_commanded = commanded.clone();
+        let warming: Warming = Arc::new(Mutex::new(HashMap::from([(root.to_path_buf(), std::time::Instant::now())])));
+        let reader_warming = warming.clone();
+        let gone = Arc::new(AtomicBool::new(false));
+        let reader_gone = gone.clone();
         thread::Builder::new()
             .name(format!("lsp-read-{program}"))
             .spawn(move || {
-                read_loop(stdout, reader_out, reader_pending, reader_progress, reader_import, reader_problems, reader_opened, reader_commanded, reader_settings)
+                read_loop(stdout, reader_out, reader_pending, reader_progress, reader_import, reader_problems, reader_opened, reader_commanded, reader_settings, reader_warming);
+                reader_gone.store(true, Ordering::Relaxed);
             })?;
 
         let client = Arc::new(Self {
@@ -633,6 +699,12 @@ impl LspClient {
             child: Mutex::new(Some(child)),
             commanded,
             command: Mutex::new(()),
+            sharing,
+            folders: Mutex::new(vec![root.to_path_buf()]),
+            warming,
+            removed: AtomicUsize::new(0),
+            borrowed: Mutex::new(HashSet::new()),
+            gone,
         });
 
         let init = client.clone();
@@ -742,6 +814,121 @@ impl LspClient {
         self.progress.lock().unwrap().values().next().cloned()
     }
 
+    /// The same, as a file of one of its folders sees it: while a folder
+    /// just added is read, that is the work, and the others' files are not
+    /// told of it.
+    pub fn busy_for(&self, path: &Path) -> Option<String> {
+        let work = self.busy()?;
+        let warming = self.warming.lock().unwrap();
+        let mine = self.folder_of(path).is_some_and(|folder| warming.contains_key(&folder));
+        (warming.is_empty() || mine).then_some(work)
+    }
+
+    /// Whether what it says of `path` may be short of the truth: it is still
+    /// reading the folder (indexing), or was given it a moment ago and has
+    /// not said it began.
+    pub fn reading(&self, path: &Path) -> bool {
+        if self.busy_for(path).is_some() {
+            return true;
+        }
+        let since = self.folder_of(path).and_then(|folder| self.warming.lock().unwrap().get(&folder).copied());
+        since.is_some_and(|at| at.elapsed() < Duration::from_secs(15))
+    }
+
+    /// The server has ended, crashed or killed.
+    pub fn is_gone(&self) -> bool {
+        self.gone.load(Ordering::Relaxed)
+    }
+
+    pub fn sharing(&self) -> Option<crate::lsp_share::Share> {
+        self.sharing
+    }
+
+    /// The folders it serves now.
+    #[cfg(test)]
+    pub fn folders(&self) -> Vec<PathBuf> {
+        self.folders.lock().unwrap().clone()
+    }
+
+    /// How many folders it has let go of since it started.
+    pub fn removed(&self) -> usize {
+        self.removed.load(Ordering::Relaxed)
+    }
+
+    /// The folder of `path` among those it serves, the deepest.
+    pub fn folder_of(&self, path: &Path) -> Option<PathBuf> {
+        self.folders.lock().unwrap().iter().filter(|f| path.starts_with(f)).max_by_key(|f| f.as_os_str().len()).cloned()
+    }
+
+    /// A place found for a file of `asking` that is in another task's
+    /// worktree: a server several share knows them all.
+    pub fn foreign(&self, asking: &Path, found: &Path) -> bool {
+        match (self.folder_of(asking), self.folder_of(found)) {
+            (Some(mine), Some(theirs)) => mine != theirs,
+            _ => false,
+        }
+    }
+
+    /// The same for a task by its worktree: found in a folder outside it.
+    pub fn foreign_to_root(&self, root: &Path, found: &Path) -> bool {
+        self.folder_of(found).is_some_and(|folder| !folder.starts_with(root))
+    }
+
+    fn foreign_uri(&self, asking: &str, found: &str) -> bool {
+        self.sharing.is_some()
+            && match (uri_to_path(asking), uri_to_path(found)) {
+                (Some(asking), Some(found)) => self.foreign(&asking, &found),
+                _ => false,
+            }
+    }
+
+    /// Serves one more folder; servers that read their folders are told of it.
+    pub fn add_folder(&self, folder: &Path) {
+        let mut folders = self.folders.lock().unwrap();
+        if folders.iter().any(|f| f == folder) {
+            return;
+        }
+        folders.push(folder.to_path_buf());
+        drop(folders);
+        self.warming.lock().unwrap().insert(folder.to_path_buf(), std::time::Instant::now());
+        self.tell_folders(folder, true);
+    }
+
+    /// Lets go of a folder; whether none is left.
+    pub fn remove_folder(&self, folder: &Path) -> bool {
+        let mut folders = self.folders.lock().unwrap();
+        let before = folders.len();
+        folders.retain(|f| f != folder);
+        let (went, left) = (folders.len() < before, folders.len());
+        drop(folders);
+        self.warming.lock().unwrap().remove(folder);
+        if went && left > 0 {
+            self.removed.fetch_add(1, Ordering::Relaxed);
+            // Its files close with it: when the task comes back the editor
+            // opens them again with their text then, not the one they had.
+            let prefix = path_to_uri(folder) + "/";
+            let theirs: Vec<String> = self.opened.lock().unwrap().iter().filter(|uri| uri.starts_with(&prefix)).cloned().collect();
+            for uri in theirs {
+                self.opened.lock().unwrap().remove(&uri);
+                self.borrowed.lock().unwrap().remove(&uri);
+                self.problems.lock().unwrap().1.remove(&uri);
+                let _ = self.notify("textDocument/didClose", json!({ "textDocument": { "uri": uri } }));
+            }
+            self.tell_folders(folder, false);
+        }
+        left == 0
+    }
+
+    fn tell_folders(&self, folder: &Path, added: bool) {
+        if self.sharing != Some(crate::lsp_share::Share::Folders) {
+            return;
+        }
+        let name = folder.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let one = json!([{ "uri": path_to_uri(folder), "name": name }]);
+        let event = if added { json!({ "added": one, "removed": [] }) } else { json!({ "added": [], "removed": one }) };
+        let _ = self.notify("workspace/didChangeWorkspaceFolders", json!({ "event": event }));
+    }
+
     /// Why the server knows less of the project than it should: its import
     /// of the build failed, so what other modules and libraries declare is
     /// not found.
@@ -753,12 +940,38 @@ impl LspClient {
         self.wait_ready()?;
         let uri = path_to_uri(path);
         if !self.opened.lock().unwrap().insert(uri.clone()) {
+            // Opened for a question: the editor's now, with the editor's text.
+            if self.borrowed.lock().unwrap().remove(&uri) {
+                return self.did_change(path, 0, text);
+            }
             return Ok(());
         }
         self.notify(
             "textDocument/didOpen",
             json!({ "textDocument": { "uri": uri, "languageId": language_id, "version": 1, "text": text } }),
         )
+    }
+
+    /// Whether the file is open in the server, its text the editor's.
+    pub fn has_open(&self, path: &Path) -> bool {
+        self.opened.lock().unwrap().contains(&path_to_uri(path))
+    }
+
+    /// Opens a file the editor has not, for a question; whether it did.
+    pub fn borrow_file(&self, path: &Path, language_id: &str, text: &str) -> Result<bool> {
+        if self.has_open(path) {
+            return Ok(false);
+        }
+        self.did_open(path, language_id, text)?;
+        self.borrowed.lock().unwrap().insert(path_to_uri(path));
+        Ok(true)
+    }
+
+    /// Closes a file opened for a question, unless the editor took it.
+    pub fn return_file(&self, path: &Path) {
+        if self.borrowed.lock().unwrap().remove(&path_to_uri(path)) {
+            let _ = self.did_close(path);
+        }
     }
 
     /// The file's tab closed: the server lets go of the text, and opening
@@ -812,11 +1025,12 @@ impl LspClient {
             target_range: l.range,
             target_selection_range: l.range,
         };
-        Ok(match response {
+        let links = match response {
             lsp_types::GotoDefinitionResponse::Scalar(l) => vec![to_link(l)],
             lsp_types::GotoDefinitionResponse::Array(ls) => ls.into_iter().map(to_link).collect(),
             lsp_types::GotoDefinitionResponse::Link(links) => links,
-        })
+        };
+        Ok(links.into_iter().filter(|l| !self.foreign_uri(uri, l.target_uri.as_str())).collect())
     }
 
     /// Whether the server offers `provider` (such as `referencesProvider`):
@@ -839,14 +1053,15 @@ impl LspClient {
             return Ok(vec![]);
         }
         let response: lsp_types::GotoDefinitionResponse = serde_json::from_value(value)?;
-        Ok(match response {
+        let found = match response {
             lsp_types::GotoDefinitionResponse::Scalar(l) => vec![l],
             lsp_types::GotoDefinitionResponse::Array(ls) => ls,
             lsp_types::GotoDefinitionResponse::Link(links) => links
                 .into_iter()
                 .map(|l| lsp_types::Location { uri: l.target_uri, range: l.target_selection_range })
                 .collect(),
-        })
+        };
+        Ok(found.into_iter().filter(|l| !self.foreign_uri(uri, l.uri.as_str())).collect())
     }
 
     /// textDocument/references, without the declaration itself.
@@ -855,7 +1070,8 @@ impl LspClient {
         let mut params = position_params(uri, pos);
         params["context"] = json!({ "includeDeclaration": false });
         let value = self.raw_request("textDocument/references", params)?;
-        Ok(serde_json::from_value::<Option<Vec<lsp_types::Location>>>(value)?.unwrap_or_default())
+        let found = serde_json::from_value::<Option<Vec<lsp_types::Location>>>(value)?.unwrap_or_default();
+        Ok(found.into_iter().filter(|l| !self.foreign_uri(uri, l.uri.as_str())).collect())
     }
 
     /// textDocument/completion at a position; `trigger` is the character
@@ -1030,7 +1246,20 @@ impl LspClient {
         self.wait_ready()?;
         let mut params = position_params(uri, pos);
         params["newName"] = json!(name);
-        Ok(serde_json::from_value(self.raw_request("textDocument/rename", params)?)?)
+        let mut edit = self.raw_request("textDocument/rename", params)?;
+        // Another task's files are its own: a shared server would rename there too.
+        if self.sharing.is_some() {
+            if let Some(changes) = edit["changes"].as_object_mut() {
+                changes.retain(|file, _| !self.foreign_uri(uri, file));
+            }
+            if let Some(changes) = edit["documentChanges"].as_array_mut() {
+                changes.retain(|change| {
+                    let file = change["textDocument"]["uri"].as_str().or(change["uri"].as_str()).or(change["oldUri"].as_str());
+                    !file.is_some_and(|file| self.foreign_uri(uri, file))
+                });
+            }
+        }
+        Ok(serde_json::from_value(edit)?)
     }
 
     /// textDocument/formatting: the edits that format the file.
@@ -1343,8 +1572,9 @@ fn read_loop(
     opened: Opened,
     commanded: Commanded,
     settings: Value,
+    warming: Warming,
 ) {
-    read_messages(stdout, out, &pending, progress, import, problems, opened, &commanded, &settings);
+    read_messages(stdout, out, &pending, progress, import, problems, opened, &commanded, &settings, &warming);
     // The server is gone: what waits for its answer need not wait out its time.
     pending.lock().unwrap().clear();
 }
@@ -1360,6 +1590,7 @@ fn read_messages(
     opened: Opened,
     commanded: &Commanded,
     settings: &Value,
+    warming: &Warming,
 ) {
     let mut reader = BufReader::new(stdout);
     loop {
@@ -1448,7 +1679,12 @@ fn read_messages(
                         progress.lock().unwrap().insert(token, title);
                     }
                     Some("end") => {
-                        progress.lock().unwrap().remove(&token);
+                        let mut progress = progress.lock().unwrap();
+                        progress.remove(&token);
+                        // All it had to do is done: the folders added are read.
+                        if progress.is_empty() {
+                            warming.lock().unwrap().clear();
+                        }
                     }
                     _ => {}
                 }
@@ -1564,6 +1800,16 @@ pub fn init_options(program: &str) -> Value {
                 "includeInlayEnumMemberValueHints": true,
             },
         }),
+        // Its own copy of the key, or none: it looks for licence.txt itself.
+        "intelephense" => match crate::secrets::get(INTELEPHENSE_LICENCE) {
+            Some(key) => json!({ "licenceKey": key }),
+            None => Value::Null,
+        },
+        "phpactor" => json!({
+            "language_server_worse_reflection.inlay_hints.enable": true,
+            "language_server_worse_reflection.inlay_hints.types": true,
+            "language_server_worse_reflection.inlay_hints.params": true,
+        }),
         "jdtls" => json!({ "settings": { "java": { "inlayHints": { "parameterNames": { "enabled": "all" } } } } }),
         "ruby-lsp" => json!({ "featuresConfiguration": { "inlayHint": { "enableAll": true } } }),
         "vscode-json-language-server" | "vscode-css-language-server" | "vscode-html-language-server" => {
@@ -1668,9 +1914,13 @@ fn prune_jdtls_in(home: &Path) {
 /// Android's Gradle plugin fails to configure a project without the SDK,
 /// which Android Studio names in an untracked local.properties: a new
 /// worktree has none.
-fn server_env(program: &str) -> Vec<(&'static str, PathBuf)> {
+fn server_env(program: &str) -> Vec<(&'static str, std::ffi::OsString)> {
+    let mut env = Vec::new();
+    if let Some(options) = java_options(program, std::env::var_os("JAVA_TOOL_OPTIONS")) {
+        env.push(("JAVA_TOOL_OPTIONS", options));
+    }
     if program != "kotlin-lsp" || ["ANDROID_HOME", "ANDROID_SDK_ROOT"].iter().any(|v| std::env::var_os(v).is_some()) {
-        return vec![];
+        return env;
     }
     let sdk = if cfg!(target_os = "macos") {
         std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Android/sdk"))
@@ -1679,7 +1929,28 @@ fn server_env(program: &str) -> Vec<(&'static str, PathBuf)> {
     } else {
         std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Android/Sdk"))
     };
-    sdk.filter(|dir| dir.is_dir()).map(|dir| ("ANDROID_HOME", dir)).into_iter().collect()
+    env.extend(sdk.filter(|dir| dir.is_dir()).map(|dir| ("ANDROID_HOME", dir.into_os_string())));
+    env
+}
+
+/// The JVM servers keep the heap they once grew to, gigabytes, for as long
+/// as they run; G1 gives back what is free when it collects every 30 s of
+/// quiet (about a fifth of kotlin-lsp and its Gradle daemon). Every JVM
+/// they start reads it too, of any Java: one that does not know a flag
+/// (before 12) or another collector leaves it, rather than not start. The
+/// user's own options go after, and win.
+fn java_options(program: &str, user: Option<std::ffi::OsString>) -> Option<std::ffi::OsString> {
+    if !matches!(program, "kotlin-lsp" | "jdtls") {
+        return None;
+    }
+    let mut options = std::ffi::OsString::from(
+        "-XX:+IgnoreUnrecognizedVMOptions -XX:G1PeriodicGCInterval=30000 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=30",
+    );
+    if let Some(user) = user.filter(|u| !u.is_empty()) {
+        options.push(" ");
+        options.push(user);
+    }
+    Some(options)
 }
 
 #[cfg(test)]
@@ -2168,8 +2439,36 @@ mod configuration_tests {
         let mut seen = HashSet::new();
         for def in SERVERS {
             assert!(!def.languages.is_empty(), "{}", def.program);
+            // A language's other servers serve what its first does.
+            if ALTERNATIVES.iter().any(|(_, _, programs)| programs[1..].contains(&def.program)) {
+                continue;
+            }
             for (ext, _) in def.languages {
                 assert!(seen.insert(*ext), ".{ext} twice");
+            }
+        }
+    }
+
+    #[test]
+    fn jvm_servers_give_memory_back() {
+        assert_eq!(java_options("rust-analyzer", None), None);
+        let ours = java_options("kotlin-lsp", None).unwrap();
+        assert!(ours.to_string_lossy().starts_with("-XX:+IgnoreUnrecognizedVMOptions "));
+        let with_user = java_options("jdtls", Some("-Xmx4g".into())).unwrap();
+        assert!(with_user.to_string_lossy().ends_with(" -Xmx4g"));
+    }
+
+    #[test]
+    fn a_language_runs_the_server_chosen_for_it() {
+        let mut settings = crate::state::Settings::default();
+        assert_eq!(chosen("php", &settings), "intelephense");
+        settings.lsp_choice.insert("php".into(), "phpactor".into());
+        assert_eq!(chosen("php", &settings), "phpactor");
+        settings.lsp_choice.insert("php".into(), "gone".into());
+        assert_eq!(chosen("php", &settings), "intelephense");
+        for (_, _, programs) in ALTERNATIVES {
+            for program in *programs {
+                assert!(SERVERS.iter().any(|d| d.program == *program), "{program}");
             }
         }
     }

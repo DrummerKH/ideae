@@ -142,12 +142,19 @@ worktree or when another agent takes the task.
 Changes tab beside the chat, where it is staged or reverted whole or in
 parts.
 
-**ideae's tools.** A chat agent is given ideae as an MCP server
-(`ideae --mcp`), for its own task alone: `open_files` (the files open in
+**ideae's tools.** A chat agent, and Claude Code in a task's terminal
+(`--mcp-config`, its token in the terminal's variables, not on the
+command line), is given ideae as an MCP server (`ideae --mcp`), for its
+own task alone: `open_files` (the files open in
 the editor, the one in front with its cursor and selection, those not
 saved), `diagnostics` (what the language servers report for a file of
-the worktree or for the open ones) and `run_check` (the project's check,
-run as after a turn, the user's trust of a `.ideae.toml` asked first). It
+the worktree or for the open ones), `run_check` (the project's check,
+run as after a turn, the user's trust of a `.ideae.toml` asked first), and
+questions for the task's language servers: `definition`, `references`,
+`hover` (a file, a line and the name on it) and `symbols` (names the
+project declares). Those start the task's server when it sleeps, keep it
+from sleeping while the agent asks, and wait out its indexing rather
+than answer nothing: the agent needs no language server of its own. It
 asks the window over a socket of the app, with a token made for its
 worktree: another task's agent cannot ask about this one. With no window
 open it says so.

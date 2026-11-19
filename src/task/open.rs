@@ -130,6 +130,8 @@ impl TaskView {
             lsp_client: None,
             lsp_program: String::new(),
             lsp_missing: None,
+            lsp_attach: 0,
+            lsp_unlicensed: false,
             preview: false,
             preview_text: None,
             veiled,
@@ -157,7 +159,7 @@ impl TaskView {
                             return None;
                         }
                         f.show_problems(cx);
-                        Some(f.lsp_client.as_ref().map(|c| (c.busy(), c.problem())))
+                        Some(f.lsp_client.as_ref().map(|c| (c.busy_for(&f.path), c.problem())))
                     }) else {
                         break;
                     };
@@ -278,6 +280,10 @@ impl TaskView {
         }
     }
 
+    /// Gives an open file its language server: found and started off the
+    /// UI thread (the project's directory looked for, a process started),
+    /// put to use here once there. `content` is the file's text to open it
+    /// with.
     pub(super) fn attach_lsp(
         &mut self,
         path: &PathBuf,
@@ -286,60 +292,58 @@ impl TaskView {
         file: &Entity<FileView>,
         cx: &mut Context<Self>,
     ) {
-        let set_status = |file: &Entity<FileView>, ok: Option<bool>, status: String, cx: &mut App| {
-            file.update(cx, |f, cx| {
-                f.lsp_ok = ok;
-                f.lsp_status = status.into();
-                cx.notify();
+        // The newest asking wins: an answer to one before it is not applied.
+        let asked = file.update(cx, |f, _| {
+            f.lsp_unlicensed = false;
+            f.lsp_attach += 1;
+            f.lsp_attach
+        });
+        let (servers, root, at) = (self.lsp.clone(), self.root.clone(), path.clone());
+        let (asleep, off) = (self.lsp_asleep, self.lsp_off);
+        let found = cx.background_spawn(crate::procs::on_thread(move || {
+            let missing = lsp::missing_server(&at);
+            let found = match lsp::server_for(&at) {
+                Err(reason) => Err(reason),
+                Ok(_) if asleep => Err(ASLEEP.to_string()),
+                Ok(_) if off => Err(LSP_OFF.to_string()),
+                Ok(_) => servers.server_for(&root, &at),
+            };
+            (missing, found)
+        }));
+        let (path, editor, file) = (path.clone(), editor.clone(), file.clone());
+        cx.spawn(async move |this, cx| {
+            let (missing, found) = found.await;
+            let _ = this.update(cx, |t, cx| {
+                if file.read(cx).lsp_attach != asked {
+                    return;
+                }
+                file.update(cx, |f, _| f.lsp_missing = missing);
+                match found {
+                    Err(reason) if reason == crate::lsp_share::STOPPED => {}
+                    Err(reason) => file.update(cx, |f, cx| {
+                        f.lsp_ok = Some(false);
+                        f.lsp_status = reason.into();
+                        cx.notify();
+                    }),
+                    // Let go of while it started (asleep, stopped): not this file's.
+                    Ok(found) if !t.lsp.holds(&found.client) => {}
+                    Ok(found) => t.use_lsp(&path, content, &editor, &file, found, cx),
+                }
             });
-        };
-        let missing = lsp::missing_server(path);
-        file.update(cx, |f, _| f.lsp_missing = missing);
-        if self.lsp_asleep && lsp::server_for(path).is_ok() {
-            return set_status(file, Some(false), ASLEEP.to_string(), cx);
-        }
-        if self.lsp_off && lsp::server_for(path).is_ok() {
-            return set_status(file, Some(false), "language servers off for this project (Project settings)".to_string(), cx);
-        }
-        let lsp::Server { language_id, program, command, args } = match lsp::server_for(path) {
-            Ok(server) => server,
-            Err(reason) => return set_status(file, Some(false), reason, cx),
-        };
-        let project = if path.starts_with(&self.root) {
-            lsp::project_root(program, path, &self.root)
-        } else {
-            // A library file (std, the registry, a jump target): the task's own
-            // server for the language reads it; one more would index it all again.
-            self.lsp
-                .keys()
-                .find(|(p, _)| *p == program)
-                .map(|(_, root)| root.clone())
-                .unwrap_or_else(|| lsp::project_root(program, &self.root.join("_"), &self.root))
-        };
-        let key = (program, project.clone());
-        let client = match self.lsp.get(&key) {
-            Some(client) => client.clone(),
-            None => match lsp::LspClient::spawn(program, &command, args, &project, crate::lsp_install::init_options(program, &command)) {
-                Ok(client) => {
-                    self.lsp.insert(key, client.clone());
-                    client
-                }
-                Err(error) => {
-                    // Not installed is the normal case for many languages, not an error.
-                    let missing = error
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound);
-                    let status = if missing { format!("{program} not installed") } else { format!("{program} failed: {error:#}") };
-                    return set_status(file, Some(false), status, cx);
-                }
-            },
-        };
-        set_status(file, None, "starting…".to_string(), cx);
+        })
+        .detach();
+    }
+
+    fn use_lsp(&mut self, path: &PathBuf, content: String, editor: &Entity<EditorState>, file: &Entity<FileView>, found: crate::lsp_share::Found, cx: &mut Context<Self>) {
+        let crate::lsp_share::Found { client, language_id, program, project } = found;
         let shown_root = project.strip_prefix(&self.root).unwrap_or(&project).display().to_string();
         let shown_root = if shown_root.is_empty() { ".".to_string() } else { shown_root };
-        file.update(cx, |f, _| {
+        file.update(cx, |f, cx| {
+            f.lsp_ok = None;
+            f.lsp_status = "starting…".into();
             f.lsp_client = Some(client.clone());
             f.lsp_program = if shown_root == "." { program.to_string() } else { format!("{program} @ {shown_root}") };
+            cx.notify();
         });
 
         let open_client = client.clone();
@@ -347,14 +351,17 @@ impl TaskView {
         let weak_file = file.downgrade();
         cx.spawn(async move |_, cx| {
             let result = cx
-                .background_spawn(crate::procs::on_thread(move || { open_client.did_open(&open_path, language_id, &content) }))
+                .background_spawn(crate::procs::on_thread(move || {
+                    open_client.did_open(&open_path, language_id, &content).map(|()| lsp::without_licence(program, &open_client))
+                }))
                 .await;
-            let (ok, status) = match result {
-                Ok(()) => (true, "ready".to_string()),
-                Err(error) => (false, format!("failed: {error:#}")),
+            let (ok, unlicensed, status) = match result {
+                Ok(unlicensed) => (true, unlicensed, "ready".to_string()),
+                Err(error) => (false, false, format!("failed: {error:#}")),
             };
             let _ = weak_file.update(cx, |f, cx| {
                 f.lsp_ok = Some(ok);
+                f.lsp_unlicensed = unlicensed;
                 f.lsp_status = status.into();
                 cx.notify();
             });
@@ -378,6 +385,8 @@ impl TaskView {
         });
     }
 }
+
+pub(super) const LSP_OFF: &str = "language servers off for this project (Project settings)";
 
 impl TaskView {
     /// Whether git ignores a file of this task: it is in the worktree and

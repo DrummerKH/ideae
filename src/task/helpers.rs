@@ -596,7 +596,7 @@ pub(super) fn symbol_source(root: PathBuf, clients: Vec<Arc<lsp::LspClient>>, fi
     Arc::new(move |query: &str| {
         let mut hits = Vec::new();
         for client in &clients {
-            for symbol in client.workspace_symbols(query).unwrap_or_default() {
+            for symbol in client.workspace_symbols(query).unwrap_or_default().into_iter().filter(|s| !client.foreign_to_root(&root, &s.path)) {
                 let kind = lsp::symbol_kind(symbol.kind);
                 let detail = if symbol.container.is_empty() { kind.to_string() } else { format!("{kind} in {}", symbol.container) };
                 hits.push(Hit {

@@ -29,6 +29,7 @@ mod lsp;
 #[cfg(target_os = "macos")]
 mod mac_notify;
 mod lsp_install;
+mod lsp_share;
 mod merged_branches;
 mod commands;
 mod menu;
@@ -350,6 +351,9 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &ReplaceInFiles, window, cx| this.replace_in_files(window, cx)))
             .on_action(cx.listener(|this, _: &Quit, window, cx| this.request_quit(window, cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)))
+            .on_action(cx.listener(|this, _: &LanguageServerSettings, window, cx| {
+                this.open_settings_at(settings_ui::LSP_PAGE, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &palette::CommandPalette, window, cx| this.command_palette(window, cx)))
             .on_action(cx.listener(|this, _: &palette::RecentPlaces, window, cx| this.recent_tasks(window, cx)))
             .on_action(cx.listener(|this, _: &palette::NextWaiting, window, cx| this.next_waiting(window, cx)))
@@ -357,7 +361,7 @@ impl Render for Workspace {
     }
 }
 
-actions!(ideae, [GoToFile, GoToSymbol, FindInFiles, ReplaceInFiles, NewTask, Quit, OpenSettings, SwitchTheme]);
+actions!(ideae, [GoToFile, GoToSymbol, FindInFiles, ReplaceInFiles, NewTask, Quit, OpenSettings, LanguageServerSettings, SwitchTheme]);
 
 impl Workspace {
     pub fn new_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {

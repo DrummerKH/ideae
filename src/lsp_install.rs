@@ -32,6 +32,10 @@ pub fn recipe(program: &str) -> Option<Recipe> {
             ("Installs typescript-language-server and typescript with npm, about 30 MB.", &["npm"])
         }
         "intelephense" => ("Installs intelephense with npm, about 20 MB.", &["npm"]),
+        "phpactor" => (
+            "Downloads the latest phpactor release from GitHub, about 5 MB. It runs on the PHP on PATH, 8.1 or newer. The download is checked against its published SHA-256.",
+            &["curl", "php"],
+        ),
         "kotlin-lsp" => (
             "Downloads the latest JetBrains Kotlin LSP release: about 370 MB, 1.2 GB unpacked, Java included. The download is checked against its published SHA-256.",
             &["curl", "tar"],
@@ -115,6 +119,7 @@ fn executable(program: &str) -> Option<String> {
     Some(match program {
         _ if npm_packages(program).is_some() => format!("node_modules/.bin/{program}{}", if cfg!(windows) { ".cmd" } else { "" }),
         "kotlin-lsp" => format!("bin/intellij-server{EXE}"),
+        "phpactor" => format!("bin/phpactor{}", if cfg!(windows) { ".cmd" } else { "" }),
         "jdtls" => format!("bin/ideae-jdtls{}", if cfg!(windows) { ".cmd" } else { "" }),
         "gopls" | "rust-analyzer" | "clangd" | "csharp-ls" | "lua-language-server" | "zls" | "taplo" | "marksman" | "terraform-ls" => {
             format!("bin/{program}{EXE}")
@@ -254,6 +259,29 @@ fn build(program: &str, staging: &Path) -> Result<PathBuf> {
             std::fs::remove_file(&archive)?;
             // In a folder of its own (Linux, macOS) or right at the top (Windows).
             return holding(&into, &executable(program).unwrap_or_default());
+        }
+        "phpactor" => {
+            let release = fetch("https://api.github.com/repos/phpactor/phpactor/releases/latest")?;
+            let release: serde_json::Value = serde_json::from_slice(&release).context("reading the latest release")?;
+            let asset = release["assets"]
+                .as_array()
+                .and_then(|assets| assets.iter().find(|a| a["name"] == "phpactor.phar"))
+                .ok_or_else(|| anyhow!("no phpactor.phar in the latest release"))?;
+            let url = asset["browser_download_url"].as_str().unwrap_or_default();
+            if !url.starts_with("https://github.com/phpactor/phpactor/releases/download/") {
+                bail!("unexpected phpactor download {url}");
+            }
+            let digest = asset["digest"].as_str().and_then(|d| d.strip_prefix("sha256:")).unwrap_or_default();
+            let phar = bin.join("phpactor.phar");
+            download(url, &phar)?;
+            check_sha256(&phar, digest.as_bytes())?;
+            let launcher = bin.join(executable(program).unwrap_or_default().trim_start_matches("bin/"));
+            if cfg!(windows) {
+                std::fs::write(&launcher, "@echo off\r\nphp \"%~dp0phpactor.phar\" %*\r\n")?;
+            } else {
+                std::fs::write(&launcher, "#!/bin/sh\nexec php \"$(dirname \"$0\")/phpactor.phar\" \"$@\"\n")?;
+                make_executable(&launcher)?;
+            }
         }
         "clangd" => {
             let tag = latest_tag("clangd/clangd")?;
@@ -596,6 +624,13 @@ mod tests {
     #[ignore]
     fn installs_kotlin_lsp_from_jetbrains() {
         installs("kotlin-lsp");
+    }
+
+    /// Needs PHP on PATH.
+    #[test]
+    #[ignore]
+    fn installs_phpactor_from_github() {
+        installs("phpactor");
     }
 
     #[test]

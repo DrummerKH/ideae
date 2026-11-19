@@ -50,6 +50,9 @@ impl Adapter for Claude {
         if let Some(settings) = hooks.and_then(|h| h.claude_settings.as_ref()) {
             cmd = format!("{cmd} --settings {}", quote(&settings.display().to_string()));
         }
+        if let Some(mcp) = hooks.and_then(|h| h.claude_mcp.as_ref()) {
+            cmd = format!("{cmd} --mcp-config {}", quote(&mcp.display().to_string()));
+        }
         if picks_conversation(&cmd) {
             return cmd;
         }
@@ -60,6 +63,10 @@ impl Adapter for Claude {
             Start::Resume(id) => or_else(&format!("{cmd} --resume {id}"), &format!("{cmd} --session-id {id}")),
             Start::Last => or_else(&format!("{cmd} --continue"), &cmd),
         }
+    }
+
+    fn takes_mcp(&self, hooks: Option<&Hooks>) -> bool {
+        hooks.is_some_and(|h| h.claude_mcp.is_some())
     }
 
     fn events(&self) -> Events {
@@ -172,6 +179,17 @@ mod tests {
         assert_eq!(last.matches("claude --model opus --settings '/run/h.json'").count(), 2, "{last}");
         // The user's own choice stands.
         assert_eq!(command("claude --resume abc", Start::New(Some("u".into())), false), "claude --resume abc --settings '/run/h.json'");
+    }
+
+    #[test]
+    fn it_is_given_ideae_s_mcp_server_by_its_terminal() {
+        let given = Hooks { claude_mcp: Some(PathBuf::from("/run/h.mcp.json")), ..hooks() };
+        let profile = Profile { command: "claude".into(), ..Default::default() };
+        assert_eq!(
+            Claude.command(&profile, &Start::New(Some("u".into())), false, Some(&given)),
+            "claude --settings '/run/h.json' --mcp-config '/run/h.mcp.json' --session-id u"
+        );
+        assert!(Claude.takes_mcp(Some(&given)) && !Claude.takes_mcp(Some(&hooks())));
     }
 
     #[test]

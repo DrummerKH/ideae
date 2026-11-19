@@ -324,6 +324,9 @@ pub struct Hooks {
     pub exe: Option<PathBuf>,
     /// The plugin file written for OpenCode.
     pub opencode_plugin: Option<PathBuf>,
+    /// The `--mcp-config` file that gives Claude Code ideae's MCP server
+    /// (`ideae --mcp`), which finds its task by the terminal's variables.
+    pub claude_mcp: Option<PathBuf>,
 }
 
 static HOOKS: std::sync::RwLock<Option<Hooks>> = std::sync::RwLock::new(None);
@@ -404,6 +407,12 @@ pub trait Adapter: Sync {
     /// Variables for the agent's terminal besides the profile's own.
     fn env(&self, _profile: &Profile, _hooks: Option<&Hooks>) -> Vec<(String, String)> {
         Vec::new()
+    }
+
+    /// It is given ideae's MCP server (its tools, the task's language
+    /// servers): its terminal then has the worktree's token.
+    fn takes_mcp(&self, _hooks: Option<&Hooks>) -> bool {
+        false
     }
 
     fn events(&self) -> Events {
@@ -593,8 +602,16 @@ impl Launch {
         format!("{} {command}", made.join(" "))
     }
 
-    pub fn env(&self) -> Vec<(String, String)> {
-        let mut env = self.profile.adapter().env(&self.profile, hooks().as_ref());
+    /// Its terminal's variables, for the task at `root`. The MCP server's
+    /// token is in them, not on the command line, which other users of the
+    /// machine see.
+    pub fn env(&self, root: &Path) -> Vec<(String, String)> {
+        let hooks = hooks();
+        let adapter = self.profile.adapter();
+        let mut env = adapter.env(&self.profile, hooks.as_ref());
+        if adapter.takes_mcp(hooks.as_ref()) {
+            env.extend(crate::mcp::server_for(root).map(|(_, _, env)| env).unwrap_or_default());
+        }
         env.extend(self.profile.env_vars().into_iter().filter(|(_, v)| crate::secrets::command_value(v).is_none()));
         env
     }

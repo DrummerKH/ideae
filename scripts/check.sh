@@ -32,7 +32,9 @@ cargo test -- --ignored \
   a_task_s_browser_wakes_when_called \
   a_stream_has_the_screen_s_pixels \
   a_local_model_predicts_at_the_cursor \
-  a_local_model_predicts_the_next_edits
+  a_local_model_predicts_the_next_edits \
+  two_tasks_share_one_rust_analyzer \
+  an_agent_asks_the_language_server
 
 if rustup target list --installed 2>/dev/null | grep -q x86_64-pc-windows-gnu; then
   # With the tests: CI builds them there too, and code only they have was once left for Unix alone.

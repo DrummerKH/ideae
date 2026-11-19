@@ -152,7 +152,7 @@ all: what is removed stays under `refs/ideae/variants` for two weeks.
   (with a language server, else a search-based fallback). A missing server
   can be installed from the editor header.
 - Language servers: gopls (Go), rust-analyzer, typescript-language-server
-  (TypeScript, JavaScript), intelephense (PHP), kotlin-lsp, basedpyright
+  (TypeScript, JavaScript), intelephense or phpactor (PHP), kotlin-lsp, basedpyright
   (Python), clangd (C, C++), jdtls (Java), csharp-ls (C#), LuaLS, zls (Zig),
   bash-language-server, the JSON, CSS and HTML servers of VS Code,
   yaml-language-server, Taplo (TOML), Marksman (Markdown),
@@ -160,6 +160,17 @@ all: what is removed stays under `refs/ideae/variants` for two weeks.
   Dart's, elixir-ls and Metals (Scala) are used when on PATH: they come with
   their language, or need it to install. A server on PATH wins over one ideae
   installed; Settings → Language servers turns each off.
+- PHP has intelephense or phpactor, chosen in Settings → Language servers,
+  with intelephense's licence key kept sealed there. intelephense without one
+  is marked "no licence" in the editor header: a click opens that page.
+- The tasks of a project share one language server per language: a task's
+  worktree is one more folder of it, and what they have alike (the standard
+  library, the dependencies, the system's headers) is read once, about a
+  third of the memory for three tasks. rust-analyzer, clangd, gopls,
+  basedpyright and the TypeScript server; a branch on another toolchain or
+  TypeScript gets its own. Jumps, usages, rename and Go to symbol stay in
+  the task's own worktree. A server that ends by itself starts again.
+  Settings → Language servers → A language server for each task turns it off.
 - A task you have not opened for a while (Settings → Language servers) stops
   its language servers. The task on screen stops them too when the app has
   been in the background as long and its agent is not working. They start

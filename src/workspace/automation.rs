@@ -99,6 +99,21 @@ impl Workspace {
                     Err(e) => Answer::error(e),
                 })
             }
+            "definition" | "references" | "hover" | "symbols" => {
+                match view.update(cx, |t, _| t.mcp_code(&request.tool, &request.args)) {
+                    Err(e) => reply(Answer::error(e)),
+                    Ok(question) => {
+                        let asked = cx.background_spawn(crate::procs::on_thread(move || question.answer()));
+                        cx.spawn(async move |_, _| {
+                            let _ = answer.try_send(match asked.await {
+                                Ok(text) => Answer::ok(text),
+                                Err(e) => Answer::error(e),
+                            });
+                        })
+                        .detach();
+                    }
+                }
+            }
             "run_check" => {
                 let root = request.root.clone();
                 self.resolved(&root.clone(), window, cx, move |this, resolved, window, cx| {

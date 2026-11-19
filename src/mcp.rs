@@ -5,8 +5,10 @@
 //! is given. With no window open it says so.
 //!
 //! Tools: the files open in the task's editor (the one in front, its
-//! cursor and selection), the language servers' problems in its files, and
-//! the project's check run in the task, as the window runs it.
+//! cursor and selection), the language servers' problems in its files, the
+//! project's check run in the task, as the window runs it, and questions
+//! for the task's language servers (definition, references, hover,
+//! symbols), which start them when asleep: the agent need run none of its own.
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -216,7 +218,7 @@ fn ask(address: &str, request: &Request) -> Answer {
         .and_then(|a| std::net::TcpStream::connect_timeout(&a, Duration::from_secs(2)))
         .map(|s| Box::new(s) as Box<dyn Stream>);
     let Ok(mut stream) = stream else {
-        return Answer::error("ideae's window is not open: what it shows (open files, problems, the check) is not known now");
+        return Answer::error("ideae's window is not open: what it shows (open files, problems, the check) and its language servers are not at hand now");
     };
     let _ = stream.write_all(&serde_json::to_vec(request).unwrap_or_default());
     let _ = stream.write_all(b"\n");
@@ -238,6 +240,38 @@ fn tools() -> Value {
             "name": "diagnostics",
             "description": "Errors and warnings the language servers report for this task's files, as ideae's editor shows them: for one file (a path in the worktree), or for all files open in the editor. Faster and fresher than running a build for a quick look; only files the editor has open are analysed.",
             "inputSchema": { "type": "object", "properties": { "path": { "type": "string", "description": "A file of the worktree, relative to it or absolute; all open files when left out." } } }
+        },
+        {
+            "name": "definition",
+            "description": "Where a name used in this task's code is declared, from the language server ideae runs for the task (rust-analyzer, gopls, clangd, the TypeScript server…): file, line and the line's text. Exact where a text search guesses; it knows imports, methods, overloads and the libraries. Give the file, the line and the name as written on it.",
+            "inputSchema": { "type": "object", "properties": {
+                "path": { "type": "string", "description": "A file of the worktree, relative to it or absolute." },
+                "line": { "type": "integer", "description": "The line the name is on, counted from 1." },
+                "symbol": { "type": "string", "description": "The name as written on that line; its first occurrence there is asked about." },
+                "column": { "type": "integer", "description": "Instead of symbol: the column, counted from 1." }
+            }, "required": ["path", "line"] }
+        },
+        {
+            "name": "references",
+            "description": "Every place in this task's code that uses a name, from the language server: what a change of it would touch. Its own declaration is left out. Same arguments as definition.",
+            "inputSchema": { "type": "object", "properties": {
+                "path": { "type": "string" }, "line": { "type": "integer" }, "symbol": { "type": "string" }, "column": { "type": "integer" }
+            }, "required": ["path", "line"] }
+        },
+        {
+            "name": "hover",
+            "description": "What a name is, from the language server: its type or signature and its documentation. Same arguments as definition.",
+            "inputSchema": { "type": "object", "properties": {
+                "path": { "type": "string" }, "line": { "type": "integer" }, "symbol": { "type": "string" }, "column": { "type": "integer" }
+            }, "required": ["path", "line"] }
+        },
+        {
+            "name": "symbols",
+            "description": "Types, functions and other names this task's project and its libraries declare that match a query, with where each is: to find a declaration by name without knowing its file.",
+            "inputSchema": { "type": "object", "properties": {
+                "query": { "type": "string", "description": "A name or the start of one." },
+                "path": { "type": "string", "description": "A file of the language to search, when no language server runs for the task yet." }
+            }, "required": ["query"] }
         },
         {
             "name": "run_check",
@@ -264,7 +298,7 @@ pub fn run_server() {
                 "protocolVersion": msg.pointer("/params/protocolVersion").cloned().unwrap_or(json!("2025-06-18")),
                 "capabilities": { "tools": {} },
                 "serverInfo": { "name": "ideae", "version": env!("CARGO_PKG_VERSION") },
-                "instructions": "ideae is the IDE this task runs in. Its tools tell what the user sees of this task: open files and selection, the language servers' problems, and the project's check.",
+                "instructions": "ideae is the IDE this task runs in. Its tools tell what the user sees of this task (open files and selection, the language servers' problems, the project's check) and ask its language servers: where a name is declared, where it is used, what it is, which names the project declares.",
             })),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({ "tools": tools() })),

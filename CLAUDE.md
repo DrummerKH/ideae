@@ -36,7 +36,7 @@ src/task/          one task, a module: what is private to it is seen by all of i
   change_popup.rs  a change of an open file, from its mark in the gutter: what was there, Revert, Stage
   term.rs          a terminal tab
   chat.rs          an ACP agent's tab: the conversation, permission answers, the agent's choices, the prompt
-  tell.rs          what a task tells its agent through ideae's MCP server
+  tell.rs          what a task tells its agent through ideae's MCP server, and its language servers' answers to it
   session.rs       session save/restore, language servers asleep
   services.rs      the Run panel
   auto.rs          the project's setup (a terminal) and check (background) in this task, CI failure to the agent
@@ -75,6 +75,7 @@ src/stalls.rs      debug aid: tells when the UI thread was held (debug builds, `
 src/git.rs         git CLI wrappers, worktrees
 src/lsp.rs         language server client
 src/lsp_install.rs language servers installed on request, ~/.local/share/ideae/lsp
+src/lsp_share.rs   one server for the tasks of a project: a worktree is a folder of it, held by a Lease; a task's servers (TaskServers), found and started off the UI thread
 src/trash.rs       files to the system's trash and back (Undo of Delete in the Files panel)
 src/browser.rs     Web tabs: a headless Chrome per task (its profile kept, IDEAE_BROWSER_CDP), CDP screencast, pages it opens as tabs
 src/procs.rs       starting helper programs (no console on Windows), ending child sessions on quit
@@ -105,6 +106,7 @@ scripts/           Xvfb driver for UI checks, wayland.sh (the same in a headless
 - And the daemon's terminals: `cargo test -- --ignored a_window_that_does_not_read` after changing how output goes from a session to a window (it floods one that reads nothing).
 - And a project's setup, check and teardown: `cargo test -- --ignored a_task_is_set_up_checked_and_torn_down` after changing them.
 - And Web tabs (needs Chrome): `cargo test -- --ignored a_page_tells_the_tab a_task_s_browser_wakes_when_called` after changing browser.rs: a page's dialog, select, pickers, cursor, errors, title, user agent, DevTools and the pages it opens; a task's Chrome started again by a call at its port.
+- And tasks sharing a language server: `cargo test -- --ignored two_tasks_share_one_rust_analyzer` after changing lsp_share.rs or how a task holds its servers; `an_agent_asks_the_language_server` after changing the MCP server's code questions (tell.rs). Both need rust-analyzer.
 - `scripts/check.sh` runs all of these and the Windows check: before every push, and again after merging main. A new end-to-end test goes into it; none of them waits on real time except for a timeout it is about, and together they stay under a minute.
 - UI can be tested without a display: `#[gpui_kit::test]` with `gpui_kit::test` (find, click, scroll by element id; mark elements with `.test_support()`), as `settings_ui.rs` does.
 - A debug build is the separate app `ideae-dev`: own state, sockets, window class, launcher. Keep that split for anything new that has an identity on the system.

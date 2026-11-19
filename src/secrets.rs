@@ -313,7 +313,7 @@ mod tests {
         if cfg!(unix) {
             assert!(launch.command().starts_with("GH_TOKEN=\"$(echo t)\" "), "{}", launch.command());
         }
-        assert!(!launch.env().iter().any(|(k, _)| k == "GH_TOKEN"));
+        assert!(!launch.env(std::path::Path::new("/w")).iter().any(|(k, _)| k == "GH_TOKEN"));
         assert_eq!(crate::agents::run_made(vec![("GH_TOKEN".into(), "$(echo t)".into())]), vec![("GH_TOKEN".to_string(), "t".to_string())]);
         super::flush();
         let _ = std::fs::remove_dir_all(&dir);

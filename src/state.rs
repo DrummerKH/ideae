@@ -86,6 +86,17 @@ pub struct Settings {
     /// The hints said no more of, in every project ("check", "setup").
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub hints_off: Vec<String>,
+    /// For a language with more than one server (`lsp::ALTERNATIVES`), the
+    /// one it runs, by the language's key; none, the first.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub lsp_choice: std::collections::BTreeMap<String, String>,
+    /// A licence key typed in Settings, on its way to the sealed store
+    /// (`secrets`), never written here: empty to remove the one kept.
+    #[serde(skip)]
+    pub lsp_licence: Option<String>,
+    /// Every task has its own language servers, not one for the project's
+    /// tasks (`lsp_share`).
+    pub lsp_separate: bool,
     /// Minutes a task out of view keeps its language servers.
     pub lsp_idle_minutes: u32,
     /// Minutes a chat agent with nothing to do keeps running in a task out
@@ -225,6 +236,9 @@ impl Default for Settings {
             lsp_off: Vec::new(),
             worktrees_dir: String::new(),
             hints_off: Vec::new(),
+            lsp_choice: Default::default(),
+            lsp_licence: None,
+            lsp_separate: false,
             lsp_idle_minutes: 15,
             agent_idle_minutes: 30,
             agent_unanswered_minutes: 0,

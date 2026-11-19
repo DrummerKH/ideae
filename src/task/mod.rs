@@ -544,6 +544,9 @@ pub struct TaskView {
     pub lsp_asleep: bool,
     /// Its project said no language servers.
     pub lsp_off: bool,
+    /// When its agent last asked a language server through ideae's MCP
+    /// server: that is use, as a file open is.
+    lsp_asked: Option<std::time::Instant>,
     file_states: HashMap<String, git::FileState>,
     commit_input: Entity<gpui_kit::component::input::TextareaState>,
     /// The next commit replaces the last one, which is not pushed; with the
@@ -572,8 +575,9 @@ pub struct TaskView {
     /// Kept for as long as the task: the refresh, off the UI thread, tells
     /// it what to watch.
     _watching: Arc<std::sync::Mutex<Watching>>,
-    /// One server per (program, project root).
-    lsp: HashMap<(&'static str, PathBuf), Arc<lsp::LspClient>>,
+    /// One server per (program, project root): its own, or its folder in
+    /// the one the project's tasks share.
+    lsp: Arc<crate::lsp_share::TaskServers>,
     /// Since when no open file uses a server.
     lsp_unused: HashMap<(&'static str, PathBuf), std::time::Instant>,
     /// Where you were before each jump, for Back and Forward.
@@ -616,7 +620,7 @@ impl TaskView {
             Some(launch) if launch.profile.acp => tabs.push(Self::make_chat(&root, launch, task_env.clone(), window, cx)),
             Some(launch) => {
                 let mut env = task_env.clone();
-                env.extend(launch.env());
+                env.extend(launch.env(&root));
                 tabs.push(Self::make_terminal(&root, hook_socket.as_ref(), "agent", 0, Some(launch.command()), env, None, None, window, cx))
             }
             None => tabs.push(Self::make_terminal(&root, hook_socket.as_ref(), "shell", 1, None, task_env.clone(), None, None, window, cx)),
@@ -873,8 +877,9 @@ impl TaskView {
             refresh_tx,
             base_override,
             _watching: watching,
-            lsp: HashMap::new(),
+            lsp: Arc::default(),
             lsp_unused: HashMap::new(),
+            lsp_asked: None,
             nav_back: Vec::new(),
             nav_forward: Vec::new(),
             navigating: false,
@@ -1096,7 +1101,7 @@ impl TaskView {
     pub fn open_finder(&mut self, kind: crate::finder::FinderKind, window: &mut Window, cx: &mut Context<Self>) {
         let files = self.tree_files.clone();
         if kind == crate::finder::FinderKind::Symbols {
-            let symbols = symbol_source(self.root.clone(), self.lsp.values().cloned().collect(), files);
+            let symbols = symbol_source(self.root.clone(), self.lsp.clients(), files);
             return crate::finder::Finder::open_symbols(self.root.clone(), symbols, cx.weak_entity(), window, cx);
         }
         crate::finder::Finder::open(kind, self.root.clone(), files, cx.weak_entity(), window, cx);
