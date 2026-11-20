@@ -125,11 +125,9 @@ impl TaskView {
                 let tab = Self::make_terminal(
                     &t.root,
                     t.hook_socket.as_ref(),
-                    "⚙ setup",
-                    t.terminal_seq,
+                    Term::Service { title: "⚙ setup".into(), seq: t.terminal_seq, name: SETUP_TAB.to_string(), cwd: t.root.clone() },
                     Some(line),
                     t.service_env(),
-                    Some((SETUP_TAB.to_string(), t.root.clone())),
                     None,
                     window,
                     cx,
@@ -372,7 +370,7 @@ impl TaskView {
     }
 
     pub fn has_agent(&self) -> bool {
-        self.launch.is_some()
+        self.agent.launch.is_some()
     }
 
     pub(super) fn show_run_panel(&mut self, cx: &mut Context<Self>) {

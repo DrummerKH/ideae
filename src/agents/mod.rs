@@ -467,7 +467,22 @@ pub trait Adapter: Sync {
     fn one_shot(&self, _profile: &Profile, _ask: &Ask) -> Option<OneShot> {
         None
     }
+
+    /// Its command for a question asked aside: one that does not change the
+    /// task's files by default, though it may when allowed. The user's own
+    /// choice of how it asks stands.
+    fn aside(&self, command: &str) -> String {
+        command.to_string()
+    }
+
+    /// Its variables for a question asked aside.
+    fn aside_env(&self, profile: &Profile, hooks: Option<&Hooks>) -> Vec<(String, String)> {
+        self.env(profile, hooks)
+    }
 }
+
+/// What an agent asked a question aside is told on top of its own prompt.
+pub const ASIDE: &str = "You are asked questions beside another agent that works in this same folder. Answer them; do not change files unless you are asked to.";
 
 /// The files a session is kept in, relative to `base`.
 #[derive(Clone, Debug, PartialEq)]
@@ -580,6 +595,8 @@ pub struct Launch {
     pub profile: Profile,
     pub start: Start,
     pub unasked: bool,
+    /// Asked a question aside: it changes nothing unless allowed.
+    pub aside: bool,
     /// A chat agent's choices for this task alone (a variant's model), over
     /// those the profile remembers.
     pub options: Vec<(String, String)>,
@@ -589,7 +606,11 @@ impl Launch {
     /// What its terminal's shell is given. Variables made by a command
     /// are set before it, so that shell runs the command.
     pub fn command(&self) -> String {
-        let command = self.profile.adapter().command(&self.profile, &self.start, self.unasked, hooks().as_ref());
+        let adapter = self.profile.adapter();
+        let command = match self.aside {
+            true => adapter.command(&Profile { command: adapter.aside(&self.profile.command), ..self.profile.clone() }, &self.start, false, hooks().as_ref()),
+            false => adapter.command(&self.profile, &self.start, self.unasked, hooks().as_ref()),
+        };
         let made: Vec<String> = self
             .profile
             .env_vars()
@@ -608,7 +629,10 @@ impl Launch {
     pub fn env(&self, root: &Path) -> Vec<(String, String)> {
         let hooks = hooks();
         let adapter = self.profile.adapter();
-        let mut env = adapter.env(&self.profile, hooks.as_ref());
+        let mut env = match self.aside {
+            true => adapter.aside_env(&self.profile, hooks.as_ref()),
+            false => adapter.env(&self.profile, hooks.as_ref()),
+        };
         if adapter.takes_mcp(hooks.as_ref()) {
             env.extend(crate::mcp::server_for(root).map(|(_, _, env)| env).unwrap_or_default());
         }
@@ -760,7 +784,7 @@ mod tests {
 
     #[test]
     fn restart_resumes() {
-        let launch = Launch { profile: Profile::claude_code(), start: Start::New(Some("abc".into())), unasked: false, options: Vec::new() };
+        let launch = Launch { profile: Profile::claude_code(), start: Start::New(Some("abc".into())), unasked: false, aside: false, options: Vec::new() };
         assert_eq!(launch.again().start, Start::Resume("abc".into()));
         let legacy = Launch { start: Start::Last, ..launch.clone() };
         assert_eq!(legacy.again().start, Start::Last);

@@ -1,7 +1,7 @@
 //! What an agent that reports little does, guessed from its terminal: it
 //! works while it writes (and nobody types), it is done once quiet for a
 //! while; a bell or a desktop notification it asks for says it is done or
-//! asks something. Guesses are marked as such (`status_guessed`).
+//! asks something. Guesses are marked as such (`AgentState::guessed`).
 
 use super::*;
 use crate::agent::{AgentStatus, HookEvent};
@@ -27,61 +27,72 @@ pub(super) fn asks(body: &str) -> bool {
 
 impl TaskView {
     /// For an agent whose adapter does not report when it starts work.
-    pub(super) fn watch_activity(&mut self, cx: &mut Context<Self>) {
-        let watched = self.launch.as_ref().is_some_and(|l| l.profile.adapter().events() != crate::agents::Events::All);
-        if !watched {
-            self.activity = Watch::default();
-            return;
+    pub(super) fn watch_activity(&mut self, who: Who, cx: &mut Context<Self>) {
+        let Some(agent) = self.agent_of(who) else { return };
+        let watched = agent.launch.as_ref().is_some_and(|l| l.profile.adapter().events() != crate::agents::Events::All);
+        let watch = if watched {
+            let task = cx.spawn(async move |this, cx| loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                match this.update(cx, |t, cx| t.activity_tick(who, cx)) {
+                    Ok(true) => {}
+                    _ => break,
+                }
+            });
+            Watch { _task: Some(task), ..Watch::default() }
+        } else {
+            Watch::default()
+        };
+        if let Some(agent) = self.agent_of_mut(who) {
+            agent.watch = watch;
         }
-        let task = cx.spawn(async move |this, cx| loop {
-            cx.background_executor().timer(Duration::from_secs(1)).await;
-            if this.update(cx, |t, cx| t.activity_tick(cx)).is_err() {
-                break;
-            }
-        });
-        self.activity = Watch { _task: Some(task), ..Watch::default() };
     }
 
-    fn activity_tick(&mut self, cx: &mut Context<Self>) {
-        let Some(state) = self.agent_terminal(cx) else { return };
+    /// False once the agent is gone from the task.
+    fn activity_tick(&mut self, who: Who, cx: &mut Context<Self>) -> bool {
+        let Some(state) = self.agent_terminal(who, cx) else { return self.agent_of(who).is_some() };
         let state = state.read(cx);
         let output = state.output_seen();
         let running = state.foreground().is_some_and(|p| !p.is_shell());
         let typed = state.typed_at().is_some_and(|at| at.elapsed() < Duration::from_millis(1500));
-        let grew = output != self.activity.output;
-        self.activity.output = output;
+        let Some(agent) = self.agent_of_mut(who) else { return false };
+        let watch = &mut agent.watch;
+        let grew = output != watch.output;
+        watch.output = output;
         if !running {
-            (self.activity.active, self.activity.quiet) = (0, 0);
-            return;
+            (watch.active, watch.quiet) = (0, 0);
+            return true;
         }
         match (grew, typed) {
-            (true, false) => (self.activity.active, self.activity.quiet) = (self.activity.active + 1, 0),
-            (true, true) => (self.activity.active, self.activity.quiet) = (0, 0),
-            (false, _) => (self.activity.active, self.activity.quiet) = (0, self.activity.quiet + 1),
+            (true, false) => (watch.active, watch.quiet) = (watch.active + 1, 0),
+            (true, true) => (watch.active, watch.quiet) = (0, 0),
+            (false, _) => (watch.active, watch.quiet) = (0, watch.quiet + 1),
         }
-        let working = self.agent_status == AgentStatus::Working;
-        if !working && self.activity.active >= WORKING_AFTER {
-            self.guess("UserPromptSubmit", None, cx);
-        } else if working && self.status_guessed && self.activity.quiet >= DONE_AFTER {
-            self.guess("Stop", None, cx);
+        let working = agent.status == AgentStatus::Working;
+        if !working && watch.active >= WORKING_AFTER {
+            self.guess(who, "UserPromptSubmit", None, cx);
+        } else if working && agent.guessed && watch.quiet >= DONE_AFTER {
+            self.guess(who, "Stop", None, cx);
         }
+        true
     }
 
     /// A bell or a notification from the agent's terminal.
-    pub(super) fn agent_signal(&mut self, notification: Option<&str>, cx: &mut Context<Self>) {
-        if self.launch.as_ref().is_none_or(|l| l.profile.adapter().events() == crate::agents::Events::All) {
+    pub(super) fn agent_signal(&mut self, who: Who, notification: Option<&str>, cx: &mut Context<Self>) {
+        let Some(agent) = self.agent_of(who) else { return };
+        if agent.launch.as_ref().is_none_or(|l| l.profile.adapter().events() == crate::agents::Events::All) {
             return;
         }
         match notification {
-            Some(body) if asks(body) => self.guess("Notification", Some(body.to_string()), cx),
-            _ if self.agent_status == AgentStatus::Working || notification.is_some() => self.guess("Stop", None, cx),
+            Some(body) if asks(body) => self.guess(who, "Notification", Some(body.to_string()), cx),
+            _ if agent.status == AgentStatus::Working || notification.is_some() => self.guess(who, "Stop", None, cx),
             _ => {}
         }
     }
 
-    fn guess(&mut self, event: &str, message: Option<String>, cx: &mut Context<Self>) {
+    fn guess(&mut self, who: Who, event: &str, message: Option<String>, cx: &mut Context<Self>) {
         cx.emit(TaskEvent::Heard(HookEvent {
             task: self.root.clone(),
+            agent: who.tag(),
             event: event.into(),
             kind: (event == "Notification").then(|| "guessed".to_string()),
             message,

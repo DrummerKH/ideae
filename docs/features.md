@@ -123,6 +123,40 @@ pointer rests on the task). The title bar can show what all the agents took
 in the last 24 hours (Settings → Title bar). A session that has used more than a limit you set is told
 of once (Settings → Agents).
 
+## Questions aside
+
+**Ask a question…** (a project's +, the File menu and the command palette,
+for the project in hand; a key of your own in Settings → Keys) is for something to find out, not to
+change: it goes to an agent of its own in the main thread, beside the main
+thread's agent, which goes on with what it was doing. No branch, no worktree,
+no title to think of: its first line names it, and the agent for quick
+questions gives it a shorter name when there is more. It runs where the main
+thread is, told to change nothing unless asked (Claude Code asks before each
+change, Codex has a read-only sandbox, OpenCode asks), which it may still do
+with your leave: notes for thinking it over, say.
+
+Each open question is a row under the main thread, with what its agent does
+(a double click renames it), and a tab with `?`. One that asks you something
+is in Needs you under its task, Alt+Down goes to it, and its notification
+opens it. The tab's × only hides it, the agent going on; its row
+brings it back. **Close question** above the tab (or the row's ×) ends its
+agent; **Closed questions…** in the project's + lists them, and one picked
+goes on with its conversation. Recent tasks (Ctrl+E) lists the open ones
+with the tasks, marked `?`, and the closed ones once something is typed, as
+archived tasks. **Make a task** (above its tab) carries a question on in a
+task of its own: a worktree and a branch named after it, its conversation
+resumed there, and its agent told the files it wrote in the main thread, to
+move them over. Asked while the main thread is not running,
+only the question's agent starts; the main thread's starts when you open its
+tab (Ctrl+1). Questions come back after a restart, their agents running on
+in the background. A question's agent with nothing to do for a while, its
+tab not in front, stops (Settings → Tasks, 15 minutes): the row says asleep,
+and the agent resumes the conversation when the question is opened. An open
+one with no message for days (3), yours or its agent's, goes to the closed
+ones. Once a question was asked, every agent there is resumed by its own
+session: the main thread's session, if its id was never told, is found when
+the first question is asked.
+
 ## Variants
 
 A hard task can be started as up to four variants: the same prompt to as

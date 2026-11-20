@@ -296,6 +296,9 @@ impl Workspace {
         if let TaskEvent::Worktrees = event {
             return self.sync_worktrees(window, cx);
         }
+        if let TaskEvent::Asked(asked) = event {
+            return self.on_asked(view, asked, window, cx);
+        }
         if let TaskEvent::KeepBranch(branch) = event {
             let root = view.read(cx).root.clone();
             if let Some((pi, _)) = self.find(&root) {
@@ -475,7 +478,7 @@ impl Workspace {
         view.update(cx, |t, cx| {
             if !t.has_agent() {
                 window.push_notification(Notification::warning("This task has no agent to ask.").title("Project settings"), cx);
-            } else if t.agent_status == crate::agent::AgentStatus::Unknown {
+            } else if t.agent.status == crate::agent::AgentStatus::Unknown {
                 t.queue_prompt(text, true, window, cx);
             } else {
                 t.message_agent(text, window, cx);
@@ -1170,7 +1173,7 @@ mod tests {
             pid.unwrap()
         });
 
-        let hook = |event: &str| HookEvent { task: path.clone(), event: event.into(), message: None, kind: None, file: None, said: None, replayed: None, session: None, guessed: false, worktree: None };
+        let hook = |event: &str| HookEvent { task: path.clone(), agent: None, event: event.into(), message: None, kind: None, file: None, said: None, replayed: None, session: None, guessed: false, worktree: None };
         let turn = |cx: &mut TestAppContext| {
             step(cx, &mut |w, window, cx| w.on_hook(hook("UserPromptSubmit"), window, cx));
             step(cx, &mut |w, window, cx| w.on_hook(hook("Stop"), window, cx));

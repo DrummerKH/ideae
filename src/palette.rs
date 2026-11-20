@@ -309,6 +309,7 @@ impl Workspace {
         }
         let mut entries = vec![
             keyed("New task…", "new_task", "task"),
+            keyed("Ask a question…", "ask_question", "task: beside the main thread's agent, which goes on"),
             keyed("Next waiting task", "next_waiting", "task: an agent that asks or is done"),
             key(own("Recent tasks", "task", |w, window, cx| w.recent_tasks(window, cx)), "recent"),
             own("Recent files", "go to", |w, window, cx| w.recent_files(window, cx)).keys({
@@ -394,6 +395,8 @@ impl Workspace {
             detail: String,
             mark: Option<(&'static str, Hsla)>,
             paused: bool,
+            /// A question asked aside in the task, and whether it was closed.
+            question: Option<(u32, bool)>,
         }
         let mut tasks: Vec<Row> = Vec::new();
         for (pi, p) in self.projects.iter().enumerate() {
@@ -410,14 +413,34 @@ impl Workspace {
                         if changes > 0 {
                             detail.push(if changes == 1 { "1 file changed".into() } else { format!("{changes} files changed") });
                         }
-                        (task::status_glyph(&v.agent_status), false)
+                        (task::status_glyph(&v.agent.status), false)
                     }
                     None => {
                         detail.push("paused".into());
                         (None, true)
                     }
                 };
-                tasks.push(Row { when: t.last_active, path: t.path.clone(), title: self.task_title(pi, ti, cx), detail: detail.join(" · "), mark, paused });
+                tasks.push(Row { when: t.last_active, path: t.path.clone(), title: self.task_title(pi, ti, cx), detail: detail.join(" · "), mark, paused, question: None });
+            }
+            // Its questions, open ones with the tasks, closed ones found as archived tasks are.
+            for (ti, t) in p.tasks.iter().enumerate() {
+                // A main thread paused is not listed, its questions are.
+                if t.busy.is_some() || !self.in_space(pi) || (!t.main && !self.shows(pi, ti)) {
+                    continue;
+                }
+                let view = t.view.as_ref().map(|v| v.read(cx));
+                for q in &t.questions {
+                    let closed = q.closed > 0;
+                    let status = view.filter(|_| !closed).and_then(|v| v.agent_of(task::Who::Question(q.id))).and_then(|a| task::status_glyph(&a.status));
+                    let when = if closed { q.closed } else { q.created };
+                    let mut detail = format!("question · {}", p.name);
+                    if !t.main {
+                        detail.push_str(&format!(" · {}", self.task_title(pi, ti, cx)));
+                    }
+                    detail.push_str(&if closed { format!(" · closed {}", crate::sidebar::ago(q.closed)) } else { format!(" · {}", crate::sidebar::ago(q.created)) });
+                    let mark = status.or(Some(("?", hsla(0., 0., 0.55, 1.))));
+                    tasks.push(Row { when, path: t.path.clone(), title: format!("? {}", q.title), detail, mark, paused: closed, question: Some((q.id, closed)) });
+                }
             }
         }
         tasks.sort_by(|a, b| b.when.cmp(&a.when));
@@ -427,17 +450,24 @@ impl Workspace {
             .map(|row| {
                 let this = this.clone();
                 let path = row.path;
+                let question = row.question;
                 let mut entry = Entry::new(row.title, move |window, cx| {
-                    let _ = this.update(cx, |w, cx| {
-                        w.switch(&path, window, cx);
-                        if let Some(view) = w.active_view() {
-                            view.update(cx, |t, cx| t.show_view(0, window, cx));
+                    let _ = this.update(cx, |w, cx| match question {
+                        Some((n, false)) => w.show_question(&path, n, window, cx),
+                        Some((n, true)) => w.reopen_question(&path, n, window, cx),
+                        None => {
+                            w.switch(&path, window, cx);
+                            if let Some(view) = w.active_view() {
+                                view.update(cx, |t, cx| t.show_view(0, window, cx));
+                            }
                         }
                     });
                 })
                 .detail(row.detail);
                 entry.mark = row.mark;
                 entry.dim = row.paused;
+                // Closed, it comes when looked for, after the rest.
+                entry.archived = matches!(question, Some((_, true)));
                 entry.marked = true;
                 entry
             })

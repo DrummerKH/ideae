@@ -176,7 +176,7 @@ impl TermView {
     }
 
     pub(super) fn render_agent_ended(&self, cx: &mut Context<Self>) -> AnyElement {
-        let task = self.task.clone();
+        let (task, state) = (self.task.clone(), self.state.clone());
         h_flex()
             .flex_none()
             .gap_2()
@@ -195,7 +195,7 @@ impl TermView {
                     .tooltip("Start the agent again, continuing its last conversation")
                     .on_click(move |_, window, cx| {
                         if let Some(task) = task.as_ref().and_then(|t| t.upgrade()) {
-                            task.update(cx, |t, cx| t.restart_agent(window, cx));
+                            task.update(cx, |t, cx| t.restart_in(&state, window, cx));
                         }
                     }),
             )            .into_any_element()

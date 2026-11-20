@@ -457,6 +457,26 @@ fn pages(
                     .description("Empty: beside each repository, in <repository>.worktrees, where the tools of the folders above it still apply. A folder (~/worktrees): one of each project's name in it, as for a repository in a synced folder. New tasks only; a project's settings can name its own.")
                 }),
         ).group(
+            SettingGroup::new().title("Questions asked aside")
+                .item(SettingItem::new("Stop an idle one's agent after", {
+                    let (read, write) = (draft.clone(), draft.clone());
+                    SettingField::number_input(NumberFieldOptions { min: 0., max: 24. * 60., step: 5. }, move |_| f64::from(read.borrow().question_sleep_minutes), move |value, _| {
+                        write.borrow_mut().question_sleep_minutes = value as u32
+                    })
+                    .default_value(f64::from(state::Settings::default().question_sleep_minutes))
+                }).description(
+                    "Minutes; 0 means never. A question whose agent is neither working nor waiting for an answer, and whose tab is not in front, stops its agent to free its memory. The question stays open, and its agent resumes its conversation when you open it.",
+                ))
+                .item(SettingItem::new("Close an open one after", {
+                    let (read, write) = (draft.clone(), draft.clone());
+                    SettingField::number_input(NumberFieldOptions { min: 0., max: 365., step: 1. }, move |_| f64::from(read.borrow().question_close_days), move |value, _| {
+                        write.borrow_mut().question_close_days = value as u32
+                    })
+                    .default_value(f64::from(state::Settings::default().question_close_days))
+                }).description(
+                    "Days; 0 means never. An open question with no message for this long, neither yours nor its agent's, goes to the closed ones, where it can be picked up again.",
+                )),
+        ).group(
             SettingGroup::new().title("Archived tasks")
                 .item(SettingItem::new("Restore with", restore_with).description(
                     "A restored task's agent either continues its whole conversation and is told what changed since, or starts a new session with only the task, the last messages and what changed: a shorter context.",

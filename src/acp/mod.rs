@@ -21,6 +21,16 @@ pub fn journal_path(root: &std::path::Path) -> std::path::PathBuf {
     let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     crate::state::state_dir().join("acp").join(format!("{name}-{:016x}.jsonl", h.finish()))
 }
+
+/// The conversation of one of a task's agents: a question's beside the
+/// task's own.
+pub fn journal_of(root: &std::path::Path, tag: Option<&str>) -> std::path::PathBuf {
+    let journal = journal_path(root);
+    match tag {
+        Some(tag) => journal.with_extension(format!("{tag}.jsonl")),
+        None => journal,
+    }
+}
 #[cfg(test)]
 pub mod fake;
 

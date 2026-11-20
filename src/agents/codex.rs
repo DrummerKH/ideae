@@ -37,9 +37,10 @@ fn notify_override(exe: &Path) -> Option<String> {
     }
     let var = |name: &str| if cfg!(windows) { format!("$env:{name}") } else { format!("${name}") };
     Some(format!(
-        "-c \"notify=['{exe}','--hook','Codex','--task={}','--sock={}']\"",
+        "-c \"notify=['{exe}','--hook','Codex','--task={}','--sock={}','--agent={}']\"",
         var(crate::agent::TASK_ENV),
-        var(crate::agent::SOCK_ENV)
+        var(crate::agent::SOCK_ENV),
+        var(crate::agent::AGENT_ENV)
     ))
 }
 
@@ -78,6 +79,15 @@ impl Adapter for Codex {
 
     fn events(&self) -> Events {
         Events::TurnEnd
+    }
+
+    /// Its sandbox lets it read; it asks to do more.
+    fn aside(&self, command: &str) -> String {
+        let cmd = if command.trim().is_empty() { "codex" } else { command.trim() };
+        if has_flag(cmd, &["-s", "--sandbox", "-a", "--ask-for-approval", "--yolo", "--dangerously-bypass-approvals-and-sandbox", "--full-auto"]) {
+            return cmd.to_string();
+        }
+        format!("{cmd} --sandbox read-only --ask-for-approval on-request")
     }
 
     fn tells_usage(&self) -> bool {
@@ -318,7 +328,7 @@ mod tests {
         let hooks = Hooks { exe: Some(PathBuf::from("/opt/ideae")), ..Default::default() };
         let with = Codex.command(&p, &Start::New(None), false, Some(&hooks));
         if cfg!(unix) {
-            assert!(with.contains(r#"-c "notify=['/opt/ideae','--hook','Codex','--task=$IDEAE_TASK','--sock=$IDEAE_SOCK']""#), "{with}");
+            assert!(with.contains(r#"-c "notify=['/opt/ideae','--hook','Codex','--task=$IDEAE_TASK','--sock=$IDEAE_SOCK','--agent=$IDEAE_AGENT']""#), "{with}");
         }
         assert!(with.contains("tui.notification_method=\"osc9\""), "{with}");
     }

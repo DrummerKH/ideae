@@ -69,6 +69,12 @@ impl Adapter for Claude {
         hooks.is_some_and(|h| h.claude_mcp.is_some())
     }
 
+    /// It asks before each change, as by default, and is told why.
+    fn aside(&self, command: &str) -> String {
+        let cmd = if command.trim().is_empty() { "claude" } else { command.trim() };
+        format!("{cmd} --append-system-prompt {}", quote(super::ASIDE))
+    }
+
     fn events(&self) -> Events {
         Events::All
     }

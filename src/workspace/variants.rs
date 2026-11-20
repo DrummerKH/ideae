@@ -398,7 +398,7 @@ impl Workspace {
             t.busy.is_none()
                 && t.view.as_ref().is_none_or(|v| {
                     let v = v.read(cx);
-                    matches!(v.agent_status, AgentStatus::Done | AgentStatus::Exited) && !v.has_queued_message()
+                    matches!(v.agent.status, AgentStatus::Done | AgentStatus::Exited) && !v.has_queued_message()
                 })
         })
     }
@@ -1032,7 +1032,7 @@ impl Workspace {
             Some(pick) => format!("All {} variants finished. The judge would keep {pick}.", members.len()),
             None => format!("All {} variants finished.", members.len()),
         };
-        let (tx, path) = (self.open_task_tx.clone(), head.path.clone());
+        let (tx, path) = (self.open_task_tx.clone(), (head.path.clone(), None));
         crate::desktop::notify_with(&format!("{} · {}", self.projects[pi].name, head.label()), &body, move || {
             let _ = tx.send_blocking(path);
         });
@@ -1350,15 +1350,15 @@ impl Workspace {
         }
         let Some(view) = &t.view else { return ("closed".into(), muted, None) };
         let v = view.read(cx);
-        let color = task::status_glyph(&v.agent_status).map_or(muted, |g| g.1);
-        match &v.agent_status {
+        let color = task::status_glyph(&v.agent.status).map_or(muted, |g| g.1);
+        match &v.agent.status {
             // A while with no word from it: it asks something first, to trust the folder say.
             AgentStatus::Unknown if t.created > 0 && state::now().saturating_sub(t.created) > 12 => {
                 ("waits for you: open its agent, it asks something before it starts (to trust the folder, say)".into(), hsla(0.08, 0.9, 0.55, 1.), None)
             }
             AgentStatus::Unknown => ("starting".into(), color, None),
             AgentStatus::Idle => ("idle".into(), color, None),
-            AgentStatus::Working => (v.agent_activity.clone().unwrap_or_else(|| "working".into()), color, None),
+            AgentStatus::Working => (v.agent.doing.clone().unwrap_or_else(|| "working".into()), color, None),
             AgentStatus::NeedsInput(question) => ("asks".into(), color, Some(question.clone())),
             AgentStatus::Done => ("done".into(), color, None),
             AgentStatus::Exited => ("ended".into(), color, None),
@@ -1374,7 +1374,7 @@ impl Workspace {
                 let t = &self.projects[pi].tasks[ti];
                 match &t.view {
                     _ if t.busy.is_some() => ("…", muted),
-                    Some(view) => task::status_glyph(&view.read(cx).agent_status).unwrap_or(("·", muted)),
+                    Some(view) => task::status_glyph(&view.read(cx).agent.status).unwrap_or(("·", muted)),
                     None => ("·", muted),
                 }
             })
@@ -1388,7 +1388,7 @@ impl Workspace {
         for &(pi, ti) in &members {
             let t = &self.projects[pi].tasks[ti];
             let Some(view) = &t.view else { continue };
-            match &view.read(cx).agent_status {
+            match &view.read(cx).agent.status {
                 // No word from it for a while: it asks something before it starts, to trust the folder say.
                 AgentStatus::Unknown if t.busy.is_none() && t.created > 0 && state::now().saturating_sub(t.created) > 12 => {
                     return (format!("{} waits for you: open its agent", letter(t.variant)), true);
@@ -1424,7 +1424,7 @@ impl Workspace {
             let t = &self.projects[pi].tasks[ti];
             let (path, here) = (t.path.clone(), t.path == current.path);
             let glyph = match &t.view {
-                Some(view) => task::status_glyph(&view.read(cx).agent_status),
+                Some(view) => task::status_glyph(&view.read(cx).agent.status),
                 None => None,
             };
             let hint = if t.note.is_empty() { format!("Variant {}", letter(t.variant)) } else { format!("Variant {}: {}", letter(t.variant), t.note) };
@@ -2205,7 +2205,7 @@ pub(crate) mod tests {
             cx.update_window(handle.into(), |_, window, cx| workspace.update(cx, |w, cx| act(w, window, cx))).unwrap();
             cx.run_until_parked();
         };
-        let hook = |task: &std::path::Path, event: &str| HookEvent { task: task.to_path_buf(), event: event.into(), message: None, kind: None, file: None, said: None, replayed: None, session: None, guessed: false, worktree: None };
+        let hook = |task: &std::path::Path, event: &str| HookEvent { task: task.to_path_buf(), agent: None, event: event.into(), message: None, kind: None, file: None, said: None, replayed: None, session: None, guessed: false, worktree: None };
 
         step(cx, &mut |w, window, cx| w.create_task(0, "Fix login".into(), "Make the file.".into(), vec![String::new(), "With the smallest patch.".into()], Vec::new(), window, cx));
         let (group, paths) = workspace.update(cx, |w, _| {
@@ -2594,7 +2594,7 @@ pub(crate) mod tests {
         .unwrap();
         // What the daemon heard before is told again on connect: new only
         // when it came after the task was last looked at.
-        let hook = |event: &str, replayed: Option<u64>| crate::agent::HookEvent { task: repo.clone(), event: event.into(), message: None, kind: None, file: None, said: None, replayed, session: None, guessed: false, worktree: None };
+        let hook = |event: &str, replayed: Option<u64>| crate::agent::HookEvent { task: repo.clone(), agent: None, event: event.into(), message: None, kind: None, file: None, said: None, replayed, session: None, guessed: false, worktree: None };
         let unseen_after = |cx: &mut TestAppContext, event: crate::agent::HookEvent| {
             cx.update_window(handle.into(), |_, window, cx| workspace.update(cx, |w, cx| w.on_hook(event, window, cx))).unwrap();
             workspace.update(cx, |w, cx| w.projects[0].tasks[0].view.as_ref().unwrap().read(cx).unseen)

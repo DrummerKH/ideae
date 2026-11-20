@@ -47,6 +47,13 @@ impl AssetSource for Assets {
             "side-icons/lock-open.svg" => include_bytes!("../../assets/side-icons/lock-open.svg"),
             "side-icons/variable.svg" => include_bytes!("../../assets/side-icons/variable.svg"),
             "side-icons/arrow-down-a-z.svg" => include_bytes!("../../assets/side-icons/arrow-down-a-z.svg"),
+            "side-icons/house.svg" => include_bytes!("../../assets/side-icons/house.svg"),
+            "side-icons/square-plus.svg" => include_bytes!("../../assets/side-icons/square-plus.svg"),
+            "side-icons/archive-restore.svg" => include_bytes!("../../assets/side-icons/archive-restore.svg"),
+            "side-icons/archive.svg" => include_bytes!("../../assets/side-icons/archive.svg"),
+            "side-icons/git-branch-minus.svg" => include_bytes!("../../assets/side-icons/git-branch-minus.svg"),
+            "side-icons/settings.svg" => include_bytes!("../../assets/side-icons/settings.svg"),
+            "side-icons/message-circle-question-mark.svg" => include_bytes!("../../assets/side-icons/message-circle-question-mark.svg"),
             _ => return gpui_kit::assets::Assets.load(path),
         };
         Ok(Some(ours.into()))
@@ -544,5 +551,18 @@ impl TaskView {
                 .child(self.render_panel(pane, cx))
                 .into_any_element(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit::AssetSource as _;
+
+    #[test]
+    fn the_menus_marks_are_there() {
+        for name in ["house", "square-plus", "archive-restore", "archive", "git-branch-minus", "settings", "message-circle-question-mark"] {
+            let path = format!("side-icons/{name}.svg");
+            assert!(super::Assets.load(&path).ok().flatten().is_some(), "{path}");
+        }
     }
 }

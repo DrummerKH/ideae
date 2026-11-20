@@ -102,6 +102,11 @@ pub struct Settings {
     /// Minutes a chat agent with nothing to do keeps running in a task out
     /// of view; 0: no end.
     pub agent_idle_minutes: u32,
+    /// Minutes a question's agent with nothing to do keeps running out of
+    /// sight, and days an open question nobody came back to stays open; 0:
+    /// no end.
+    pub question_sleep_minutes: u32,
+    pub question_close_days: u32,
     /// Minutes a chat agent's question waits before it is declined; 0: it
     /// waits for you.
     pub agent_unanswered_minutes: u32,
@@ -241,6 +246,8 @@ impl Default for Settings {
             lsp_separate: false,
             lsp_idle_minutes: 15,
             agent_idle_minutes: 30,
+            question_sleep_minutes: 15,
+            question_close_days: 3,
             agent_unanswered_minutes: 0,
             notifications: true,
             notify_said: true,
@@ -505,6 +512,38 @@ pub struct TaskState {
     /// is told when it is (workspace.rs, `TaskEntry::woke`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub woke: Option<String>,
+    /// Questions asked aside of its agent: open, and closed ones as history.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub questions: Vec<QuestionState>,
+    /// How many questions it was ever asked: the next one's number.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub asked: u32,
+}
+
+/// A question asked of an agent of its own beside a task's agent.
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq, Debug)]
+#[serde(default)]
+pub struct QuestionState {
+    /// Its number in the task, never taken again: `q-<id>` in its reports.
+    pub id: u32,
+    /// What it was asked, then the name its agent for quick questions gave it.
+    pub title: String,
+    /// The profile that answers, and its session, once known.
+    pub profile: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// Unix seconds.
+    pub created: u64,
+    /// When it was closed; open while 0.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub closed: u64,
+    /// When its last message was, yours or its agent's answer: to the minute.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub active: u64,
+    /// The files its agent wrote, in the task's folder: what it takes along
+    /// when it becomes a task of its own.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub wrote: Vec<String>,
 }
 
 /// A session of an agent in a task.
@@ -675,8 +714,8 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-fn is_zero(n: &u64) -> bool {
-    *n == 0
+fn is_zero<T: Default + PartialEq>(n: &T) -> bool {
+    *n == T::default()
 }
 
 pub fn now() -> u64 {

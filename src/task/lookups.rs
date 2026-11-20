@@ -44,7 +44,7 @@ impl TaskView {
             Some(tab) => match &tab.kind {
                 TabKind::Changes => 1,
                 TabKind::History => 2,
-                TabKind::Terminal(_) if tab.title != "agent" => 3,
+                TabKind::Terminal(_) if tab.agent.is_none() => 3,
                 _ => 0,
             },
             None => 0,

@@ -118,7 +118,7 @@ impl Workspace {
             .filter(|task| {
                 task.view.as_ref().is_some_and(|view| {
                     let view = view.read(cx);
-                    matches!(view.agent_status, AgentStatus::NeedsInput(_)) || view.unseen
+                    matches!(view.agent.status, AgentStatus::NeedsInput(_)) || view.unseen
                 })
             })
             .count()

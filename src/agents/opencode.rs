@@ -98,6 +98,18 @@ impl Adapter for OpenCode {
         Events::All
     }
 
+    /// Asks before it changes a file or runs a command.
+    fn aside_env(&self, profile: &Profile, hooks: Option<&Hooks>) -> Vec<(String, String)> {
+        let mut env = self.env(profile, hooks);
+        for (_, value) in env.iter_mut().filter(|(key, _)| key == CONTENT_ENV) {
+            if let Ok(mut config) = serde_json::from_str::<serde_json::Value>(value) {
+                config["permission"] = serde_json::json!({ "edit": "ask", "bash": "ask" });
+                *value = config.to_string();
+            }
+        }
+        env
+    }
+
     fn one_shot(&self, profile: &Profile, ask: &Ask) -> Option<OneShot> {
         let program = program(&profile.command);
         let program = if program.is_empty() { "opencode" } else { program }.to_string();

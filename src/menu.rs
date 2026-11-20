@@ -246,6 +246,7 @@ pub fn init(cx: &mut App) {
         });
     }
     cx.on_action(|_: &crate::NewTask, cx| opens(cx, |w, window, cx| w.new_task(window, cx)));
+    cx.on_action(|_: &crate::AskQuestion, cx| opens(cx, |w, window, cx| w.ask_question(window, cx)));
     cx.on_action(|_: &AddProject, cx| opens(cx, |w, window, cx| w.ask_for_project(window, cx)));
     cx.on_action(|_: &crate::OpenSettings, cx| opens(cx, |w, window, cx| w.open_settings(window, cx)));
     cx.on_action(|_: &KeyboardShortcuts, cx| opens(cx, |w, window, cx| w.open_settings_at(crate::settings_ui::KEYS_PAGE, window, cx)));
@@ -749,6 +750,7 @@ fn menus(shown: Shown) -> Vec<Menu> {
     let editing = |item: MenuItem| if mac || edit { item } else { off(item) };
     let mut file = vec![
         when(projects, key("New Task…", "new_task")),
+        when(projects, key("Ask a Question…", "ask_question")),
         sep(),
         when(!presenting, act("Add Project…", AddProject)),
         project_item(ProjectCommand::Remove),

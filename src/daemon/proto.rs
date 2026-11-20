@@ -64,10 +64,23 @@ pub struct Hook {
     /// A worktree the agent is about to make (`git worktree add`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<String>,
+    /// Which of the task's agents, when not its own (`q-<n>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     /// When the daemon heard it, Unix seconds: a window that hears it again
     /// on connect tells whether it came after the task was last looked at.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub at: u64,
+}
+
+impl Hook {
+    /// What the latest report is kept by: its task, and its agent there.
+    pub fn key(&self) -> String {
+        match &self.agent {
+            Some(agent) => format!("{}#{agent}", self.task),
+            None => self.task.clone(),
+        }
+    }
 }
 
 fn is_zero(n: &u64) -> bool {

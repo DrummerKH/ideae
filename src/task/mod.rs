@@ -74,6 +74,7 @@ pub use bookmarks::{NextBookmark, PrevBookmark, ShowBookmarks, ToggleBookmark};
 use change_tree::*;
 use pr::*;
 pub use auto::AutoAsk;
+pub use agent_tab::{AgentState, Asked, Question, Who};
 
 // ---------------------------------------------------------------- task
 
@@ -309,6 +310,8 @@ struct TabItem {
     /// When it was last brought to the front, for closing the file tabs
     /// left longest when there are more than the limit.
     used: u64,
+    /// The agent it runs: its terminal or its chat.
+    agent: Option<Who>,
 }
 
 fn use_tick() -> u64 {
@@ -330,8 +333,16 @@ impl TabItem {
             preview: false,
             pinned: false,
             used: use_tick(),
+            agent: None,
         }
     }
+}
+
+/// What a terminal is there for: its role, its session in the daemon, its title.
+pub(super) enum Term {
+    Agent(Who),
+    Shell { title: String, seq: usize },
+    Service { title: String, seq: usize, name: String, cwd: PathBuf },
 }
 
 struct ClosedTab {
@@ -375,6 +386,8 @@ pub enum TaskEvent {
     KeepBranch(String),
     /// A worktree was added, or this one put on another branch.
     Worktrees,
+    /// Of a question asked aside (agent_tab.rs).
+    Asked(Asked),
 }
 
 impl EventEmitter<TaskEvent> for TaskView {}
@@ -384,39 +397,23 @@ pub struct TaskView {
     pub main_thread: bool,
     /// The branches the main thread was asked to stay on, not the default.
     pub kept_branches: Vec<String>,
-    /// What the chat's agent was last reported doing, not to report it twice.
-    chat_told: Option<(String, Option<String>)>,
     pub root: PathBuf,
     pub branch: SharedString,
     /// The branch the task owns, and where its worktree is when not on it, in words.
     own_branch: String,
     off_own: Option<String>,
-    pub agent_status: crate::agent::AgentStatus,
-    /// What the working agent does now: its latest tool call, in words.
-    pub agent_activity: Option<String>,
-    /// The last words of the agent's last turn, and what it waits on now.
-    pub agent_said: Option<crate::said::Said>,
-    pub agent_asks: Option<crate::said::Said>,
-    /// What the latest tool call would do, for when it is asked about.
-    agent_pending: Option<String>,
+    /// The task's own agent.
+    pub agent: AgentState,
+    /// Agents asked a question aside, in the order they were.
+    pub questions: Vec<Question>,
+    /// It was ever asked one: its folder holds sessions other than its agent's.
+    pub asked: bool,
     /// The file the agent is writing to now, and those it wrote to since
     /// the last prompt: marked in the Changes and Files panels.
     agent_editing: Option<SharedString>,
     agent_touched: Rc<HashSet<SharedString>>,
     /// The paths of `files`, for the tree's marks.
     changed_paths: Rc<HashSet<SharedString>>,
-    /// What starts the agent, for Restart: its profile and session.
-    pub launch: Option<crate::agents::Launch>,
-    /// What tells, for an agent that reports no start of work, when it
-    /// works and when it went quiet (activity.rs).
-    activity: activity::Watch,
-    /// The status shown was guessed from the terminal, not reported.
-    pub status_guessed: bool,
-    /// Text for the agent's prompt once it is ready to take it, and whether
-    /// it is sent too.
-    pending_prompt: Option<(String, bool)>,
-    /// A message for an agent that was busy: sent when its turn ends.
-    queued_message: Option<String>,
     /// Changed files you marked viewed, with their diff's hash then: a new
     /// change to one unmarks it.
     viewed: BTreeMap<String, u64>,
@@ -598,6 +595,7 @@ impl TaskView {
         root: PathBuf,
         branch: String,
         launch: Option<crate::agents::Launch>,
+        start_agent: bool,
         hook_socket: Option<String>,
         port_slot: u32,
         window: &mut Window,
@@ -619,14 +617,11 @@ impl TaskView {
         let mut tabs = Vec::new();
         // The agent's terminal, or a shell when there is no agent; more shells
         // are a "+" away.
+        // Not started (a question asked of a task not running): a shell
+        // stands in its place until it is (`start_main_agent`).
         match &launch {
-            Some(launch) if launch.profile.acp => tabs.push(Self::make_chat(&root, launch, task_env.clone(), window, cx)),
-            Some(launch) => {
-                let mut env = task_env.clone();
-                env.extend(launch.env(&root));
-                tabs.push(Self::make_terminal(&root, hook_socket.as_ref(), "agent", 0, Some(launch.command()), env, None, None, window, cx))
-            }
-            None => tabs.push(Self::make_terminal(&root, hook_socket.as_ref(), "shell", 1, None, task_env.clone(), None, None, window, cx)),
+            Some(launch) if start_agent => tabs.push(Self::make_agent_tab(&root, hook_socket.as_ref(), Who::Main, launch, task_env.clone(), window, cx)),
+            _ => tabs.push(Self::make_terminal(&root, hook_socket.as_ref(), Term::Shell { title: "shell".into(), seq: 1 }, None, task_env.clone(), None, window, cx)),
         }
         // Changes and History open on demand: the Log button, a changed file,
         // Ctrl+2/3.
@@ -777,26 +772,18 @@ impl TaskView {
         });
 
         let mut this = Self {
-            chat_told: None,
             main_thread: false,
             kept_branches: Vec::new(),
             root,
             own_branch: branch.clone(),
             off_own: None,
             branch: branch.into(),
-            agent_status: crate::agent::AgentStatus::Unknown,
-            agent_activity: None,
-            agent_said: None,
-            agent_asks: None,
-            agent_pending: None,
+            agent: AgentState::new(launch),
+            questions: Vec::new(),
+            asked: false,
             agent_editing: None,
             agent_touched: Rc::default(),
             changed_paths: Rc::default(),
-            launch: launch.clone(),
-            activity: activity::Watch::default(),
-            status_guessed: false,
-            pending_prompt: None,
-            queued_message: None,
             recent: Vec::new(),
             pr: None,
             viewed: BTreeMap::new(),
@@ -896,18 +883,18 @@ impl TaskView {
         let first = std::env::var("IDEAE_TAB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
         this.active[0] = this.tabs.get(first).or(this.tabs.first()).map(|t| t.id);
         this.sync_visibility(cx);
-        this.watch_activity(cx);
+        if start_agent {
+            this.watch_activity(Who::Main, cx);
+        }
         this
     }
 
     fn make_terminal(
         root: &PathBuf,
         hook_socket: Option<&String>,
-        title: &str,
-        seq: usize,
+        term: Term,
         input: Option<String>,
         extra_env: Vec<(String, String)>,
-        service: Option<(String, PathBuf)>,
         cwd: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -920,14 +907,18 @@ impl TaskView {
             env.push((crate::agent::TASK_ENV.into(), root.display().to_string()));
         }
         // Set either way: an ideae started from an agent's terminal inherits "agent".
-        let role = if service.is_some() {
-            "service"
-        } else if input.is_some() {
-            "agent"
-        } else {
-            "terminal"
+        let role = match &term {
+            Term::Service { .. } => "service",
+            Term::Agent(_) => "agent",
+            Term::Shell { .. } => "terminal",
         };
-        let cwd = service.as_ref().map(|(_, cwd)| cwd.clone()).or(cwd).unwrap_or_else(|| root.clone());
+        if let Term::Agent(who) = &term {
+            env.extend(who.tag().map(|tag| (crate::agent::AGENT_ENV.to_string(), tag)));
+        }
+        let cwd = match &term {
+            Term::Service { cwd, .. } => cwd.clone(),
+            _ => cwd.unwrap_or_else(|| root.clone()),
+        };
         env.push((crate::agent::ROLE_ENV.into(), role.into()));
         // Enter is a carriage return; PowerShell's line editor takes a bare
         // newline for a line break inside the command and waits for more.
@@ -939,10 +930,11 @@ impl TaskView {
         let session = format!(
             "{}#{}",
             root.display(),
-            match (&service, role) {
-                (Some((name, _)), _) => format!("service-{name}"),
-                (None, "agent") => "agent".to_string(),
-                _ => format!("shell-{seq}"),
+            match &term {
+                Term::Service { name, .. } => format!("service-{name}"),
+                Term::Agent(Who::Main) => "agent".to_string(),
+                Term::Agent(Who::Question(n)) => format!("q-{n}"),
+                Term::Shell { seq, .. } => format!("shell-{seq}"),
             }
         );
         #[cfg(unix)]
@@ -978,13 +970,17 @@ impl TaskView {
                     TabKind::Terminal(v) => v.read(cx).state == *state,
                     _ => false,
                 });
-                match ix {
-                    Some(ix) if this.tabs[ix].title != "agent" => {
+                match ix.map(|ix| (ix, this.tabs[ix].agent)) {
+                    Some((ix, None)) => {
                         // Its thread and what it kept of the screen go with the tab.
                         state.update(cx, |state, cx| state.close(cx));
                         this.remove_tab(ix, window, cx)
                     }
-                    Some(_) => this.agent_status = crate::agent::AgentStatus::Exited,
+                    Some((_, Some(who))) => {
+                        if let Some(agent) = this.agent_of_mut(who) {
+                            agent.status = crate::agent::AgentStatus::Exited;
+                        }
+                    }
                     None => {}
                 }
                 cx.emit(TaskEvent::Changed);
@@ -992,34 +988,33 @@ impl TaskView {
             }
             // Claude Code that crashed or was killed sends no SessionEnd.
             TerminalEvent::ForegroundChanged => {
-                let ended = this.tabs.iter().any(|t| match &t.kind {
-                    TabKind::Terminal(v) if t.title == "agent" && v.read(cx).state == *state => v.read(cx).agent_ended(cx),
-                    _ => false,
+                let ended = this.tabs.iter().find_map(|t| match &t.kind {
+                    TabKind::Terminal(v) if v.read(cx).state == *state && v.read(cx).agent_ended(cx) => t.agent,
+                    _ => None,
                 });
-                if ended && this.agent_status != crate::agent::AgentStatus::Exited {
-                    this.agent_status = crate::agent::AgentStatus::Exited;
+                if let Some(agent) = ended.and_then(|who| this.agent_of_mut(who)).filter(|a| a.status != crate::agent::AgentStatus::Exited) {
+                    agent.status = crate::agent::AgentStatus::Exited;
                     cx.emit(TaskEvent::Changed);
                     cx.notify();
                 }
             }
             TerminalEvent::TitleChanged | TerminalEvent::Bell => {
                 let title = state.read(cx).title().clone();
-                let mut of_agent = false;
+                let mut of_agent = None;
                 if let Some(tab) = this.tabs.iter_mut().find(|t| matches!(&t.kind, TabKind::Terminal(v) if v.read(cx).state == *state)) {
                     tab.shown = title;
-                    of_agent = tab.title == "agent";
+                    of_agent = tab.agent;
                 }
-                if of_agent && *event == TerminalEvent::Bell {
-                    this.agent_signal(None, cx);
+                if let (Some(who), TerminalEvent::Bell) = (of_agent, event) {
+                    this.agent_signal(who, None, cx);
                 }
                 cx.emit(TaskEvent::Changed);
                 cx.notify();
             }
             TerminalEvent::Notification { title, body } => {
-                let of_agent = this.tabs.iter().any(|t| t.title == "agent" && matches!(&t.kind, TabKind::Terminal(v) if v.read(cx).state == *state));
-                if of_agent {
+                if let Some(who) = this.agent_of_terminal(state, cx) {
                     let words = if body.is_empty() { title.to_string() } else { body.to_string() };
-                    this.agent_signal(Some(&words), cx);
+                    this.agent_signal(who, Some(&words), cx);
                 }
             }
             TerminalEvent::OpenPath(target) => {
@@ -1032,12 +1027,19 @@ impl TaskView {
             _ => {}
         })
         .detach();
-        let id = SharedString::from(format!("{}-term-{seq}", root.display()));
-        let task = (role == "agent").then(|| cx.weak_entity());
-        let service_name = service.map(|(name, _)| name);
+        let (title, seq, agent, service_name) = match term {
+            Term::Agent(who) => (if who == Who::Main { "agent".to_string() } else { "?".to_string() }, 0, Some(who), None),
+            Term::Shell { title, seq } => (title, seq, None, None),
+            Term::Service { title, seq, name, .. } => (title, seq, None, Some(name)),
+        };
+        let id = SharedString::from(match agent {
+            Some(Who::Question(n)) => format!("{}-term-q{n}", root.display()),
+            _ => format!("{}-term-{seq}", root.display()),
+        });
+        let task = agent.is_some().then(|| cx.weak_entity());
         let shown = state.read(cx).title().clone();
         let view = cx.new(|cx| TermView::new(id, state, session, seq, task, service_name.clone(), cx));
-        TabItem { shown, service: service_name, ..TabItem::new(title.to_string(), TabKind::Terminal(view)) }
+        TabItem { shown, service: service_name, agent, ..TabItem::new(title, TabKind::Terminal(view)) }
     }
 
     fn ix_of(&self, id: usize) -> Option<usize> {
@@ -1046,15 +1048,16 @@ impl TaskView {
 
     /// What Restart Agent asks: its program is not running in its tab.
     pub fn agent_restartable(&self, cx: &App) -> bool {
-        self.has_agent()
-            && self.tabs.iter().any(|t| {
-                t.title == "agent"
-                    && match &t.kind {
-                        TabKind::Terminal(v) => v.read(cx).agent_at_prompt(cx),
-                        TabKind::Chat(chat) => !chat.read(cx).thread.status.live(),
-                        _ => false,
-                    }
-            })
+        self.has_agent() && (self.agent_ix(Who::Main).is_none() || self.agent_stopped(Who::Main, cx))
+    }
+
+    /// The agent's program is not running in its tab.
+    pub fn agent_stopped(&self, who: Who, cx: &App) -> bool {
+        self.agent_ix(who).is_some_and(|ix| match &self.tabs[ix].kind {
+            TabKind::Terminal(v) => v.read(cx).agent_at_prompt(cx),
+            TabKind::Chat(chat) => !chat.read(cx).thread.status.live(),
+            _ => false,
+        })
     }
 
     pub fn focus_mode(&self) -> bool {
@@ -1064,9 +1067,9 @@ impl TaskView {
     pub fn tabs_state(&self) -> TabsState {
         let focused = self.focused_ix();
         let front = focused.map(|ix| &self.tabs[ix]);
-        let agent = |t: &TabItem| t.title == "agent" && matches!(t.kind, TabKind::Terminal(_) | TabKind::Chat(_));
+        let agent = |t: &TabItem| t.agent == Some(Who::Main) && matches!(t.kind, TabKind::Terminal(_) | TabKind::Chat(_));
         // The terminal Shell goes to: another one in front is not it.
-        let shell = self.tabs.iter().position(|t| t.title != "agent" && matches!(t.kind, TabKind::Terminal(_)));
+        let shell = self.tabs.iter().position(|t| t.agent.is_none() && matches!(t.kind, TabKind::Terminal(_)));
         TabsState {
             closable: front.is_some_and(|t| !agent(t)),
             file: front.is_some_and(|t| matches!(t.kind, TabKind::File(_))),
@@ -1300,7 +1303,7 @@ impl TaskView {
     fn terminal_tab_in(&mut self, seq: usize, cwd: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> usize {
         self.terminal_seq = self.terminal_seq.max(seq);
         let env = self.terminal_env();
-        let tab = Self::make_terminal(&self.root, self.hook_socket.as_ref(), &format!("shell {seq}"), seq, None, env, None, cwd, window, cx);
+        let tab = Self::make_terminal(&self.root, self.hook_socket.as_ref(), Term::Shell { title: format!("shell {seq}"), seq }, None, env, cwd, window, cx);
         // After the last terminal, so terminals stay together left of the views.
         let at = self.tabs.iter().rposition(|t| matches!(t.kind, TabKind::Terminal(_))).map_or(0, |ix| ix + 1);
         self.tabs.insert(at, tab);
@@ -1310,7 +1313,7 @@ impl TaskView {
     /// The agent terminal's title, which Claude Code uses as a status line.
     pub fn agent_title(&self, _: &App) -> Option<SharedString> {
         self.tabs.iter().find_map(|tab| match &tab.kind {
-            TabKind::Terminal(_) if tab.title == "agent" => Some(tab.shown.clone()),
+            TabKind::Terminal(_) if tab.agent == Some(Who::Main) => Some(tab.shown.clone()),
             _ => None,
         })
     }
@@ -1370,66 +1373,40 @@ impl TaskView {
     /// What of the agent's work the task and its row show, to tell a report
     /// that changes it from one that does not.
     pub fn agent_shown(&self) -> (Option<SharedString>, Option<SharedString>, usize) {
-        (self.agent_activity.clone().map(SharedString::from), self.agent_editing.clone(), self.agent_touched.len())
+        (self.agent.doing.clone().map(SharedString::from), self.agent_editing.clone(), self.agent_touched.len())
     }
 
-    pub fn set_agent_status(&mut self, status: crate::agent::AgentStatus, seen: bool, cx: &mut Context<Self>) {
+    pub fn set_agent_status(&mut self, who: Who, status: crate::agent::AgentStatus, seen: bool, cx: &mut Context<Self>) {
+        let Some(agent) = self.agent_of(who) else { return };
         // An agent at work reports every tool it uses: drawn again only for
         // what shows another way than before.
-        let before = (self.unseen, self.agent_activity.is_some(), self.agent_editing.is_some());
-        // The same again (a recap, the reminder a minute later) tells nothing new:
-        // a task already looked at stays out of Needs you.
-        let again = status == self.agent_status && !self.unseen;
-        self.unseen = status.is_attention() && !seen && !again;
+        let was = agent.status.clone();
+        let before = (self.unseen, agent.doing.is_some(), self.agent_editing.is_some());
+        if who == Who::Main {
+            // The same again (a recap, the reminder a minute later) tells nothing new:
+            // a task already looked at stays out of Needs you.
+            let again = status == was && !self.unseen;
+            self.unseen = status.is_attention() && !seen && !again;
+        }
         if status != crate::agent::AgentStatus::Working {
-            self.agent_activity = None;
             self.agent_editing = None;
         }
-        let changed = status != self.agent_status || before != (self.unseen, self.agent_activity.is_some(), self.agent_editing.is_some());
-        self.agent_status = status;
+        if let Who::Question(n) = who
+            && let Some(q) = self.questions.iter_mut().find(|q| q.id == n)
+        {
+            let busy = matches!(status, crate::agent::AgentStatus::Working | crate::agent::AgentStatus::NeedsInput(_));
+            q.quiet_since = if busy { None } else { q.quiet_since.or(Some(std::time::Instant::now())) };
+        }
+        let Some(agent) = self.agent_of_mut(who) else { return };
+        if status != crate::agent::AgentStatus::Working {
+            agent.doing = None;
+        }
+        let doing = agent.doing.is_some();
+        agent.status = status.clone();
+        let changed = status != was || before != (self.unseen, doing, self.agent_editing.is_some());
         if changed {
             cx.emit(TaskEvent::Changed);
             cx.notify();
-        }
-    }
-
-    /// Keeps what the agent said: a turn's last words until the next
-    /// prompt, a question until it is answered. A report without words (the
-    /// reminder after a turn) leaves them as they were.
-    pub fn hear(&mut self, event: &crate::agent::HookEvent, status: &crate::agent::AgentStatus) {
-        use crate::said::Said;
-        match (event.event.as_str(), status) {
-            ("SessionStart" | "UserPromptSubmit", _) => {
-                self.agent_said = None;
-                self.agent_asks = None;
-                self.agent_pending = None;
-            }
-            // A question or a plan, which waits for the user.
-            ("PreToolUse", crate::agent::AgentStatus::NeedsInput(_)) => {
-                self.agent_asks = event.said.as_deref().and_then(Said::new);
-                self.agent_pending = None;
-            }
-            ("PostToolUse", _) => self.agent_asks = None,
-            ("PreToolUse", _) => {
-                self.agent_asks = None;
-                self.agent_pending = event.said.clone().or_else(|| event.message.clone());
-            }
-            ("Stop", _) => {
-                self.agent_asks = None;
-                if let Some(said) = event.said.as_deref().and_then(Said::new) {
-                    self.agent_said = Some(said);
-                }
-            }
-            ("Notification", crate::agent::AgentStatus::NeedsInput(_)) => {
-                // After a question's own PreToolUse, its words are kept.
-                if let Some(asks) = event.said.clone().or_else(|| self.agent_pending.take()) {
-                    self.agent_asks = Said::new(&asks);
-                }
-            }
-            ("Notification", crate::agent::AgentStatus::Done) if self.agent_said.is_none() => {
-                self.agent_said = event.said.as_deref().and_then(Said::new);
-            }
-            _ => {}
         }
     }
 
@@ -1447,6 +1424,14 @@ impl TaskView {
             }
             _ => {}
         }
+    }
+
+    /// A file a question's agent is about to write: marked as the task's
+    /// agent's are, without starting their list over.
+    pub fn mark_written(&mut self, file: &str) -> Option<String> {
+        let rel = path_in(&self.root, std::path::Path::new(file))?;
+        Rc::make_mut(&mut self.agent_touched).insert(SharedString::from(rel.clone()));
+        Some(rel)
     }
 
     /// "editing" by the file the agent writes to now, a dot by those it
@@ -1671,7 +1656,11 @@ impl TaskView {
                 self.remember_closed(ix, cx);
                 self.remove_tab(ix, window, cx)
             }
-            Some(TabKind::Terminal(_)) if self.tabs[ix].title == "agent" => {}
+            Some(TabKind::Terminal(_) | TabKind::Chat(_)) if self.tabs[ix].agent.is_some() => {
+                if let Some(Who::Question(n)) = self.tabs[ix].agent {
+                    self.hide_question(n, window, cx);
+                }
+            }
             Some(TabKind::Chat(_)) => {}
             Some(TabKind::Terminal(view)) => {
                 let state = view.read(cx).state.clone();
@@ -1774,6 +1763,11 @@ impl TaskView {
     }
 
     fn remove_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.take_tab(ix, window, cx);
+    }
+
+    /// Out of the tabs, and given back: a question's, kept while hidden.
+    fn take_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> TabItem {
         let removed = self.tabs.remove(ix);
         // The diff laid out and coloured goes with its tab; it is made
         // again from what the task keeps when the tab is next looked at.
@@ -1815,18 +1809,20 @@ impl TaskView {
         self.show_diff_if_seen(cx);
         self.focus_active(window, cx);
         cx.notify();
+        removed
     }
 
     pub fn show_view(&mut self, which: usize, window: &mut Window, cx: &mut Context<Self>) {
         match which {
             0 => {
-                if let Some(ix) = self.tabs.iter().position(|t| t.title == "agent") {
+                self.start_main_agent(window, cx);
+                if let Some(ix) = self.agent_ix(Who::Main).or_else(|| self.tabs.iter().position(|t| t.title == "shell")) {
                     self.activate(ix, window, cx);
                 }
             }
             1 => self.show_tab(|k| matches!(k, TabKind::Changes), window, cx),
             2 => self.show_tab(|k| matches!(k, TabKind::History), window, cx),
-            _ => match self.tabs.iter().position(|t| t.title != "agent" && matches!(t.kind, TabKind::Terminal(_))) {
+            _ => match self.tabs.iter().position(|t| t.agent.is_none() && matches!(t.kind, TabKind::Terminal(_))) {
                 Some(ix) => self.activate(ix, window, cx),
                 None => self.new_terminal(window, cx),
             },
@@ -2035,10 +2031,10 @@ impl TaskView {
         self.changes.update(cx, |c, cx| c.set_scope(DiffScope::Uncommitted, cx));
         // Beside the chat, as the files it follows, not over it.
         self.show_changed_file(rel.clone().into(), window, cx);
-        if let Some(ix) = self.tabs.iter().position(|t| matches!(t.kind, TabKind::Changes)) {
-            self.beside_chat(ix, window, cx);
+        if let (Some(ix), Some(chat)) = (self.tabs.iter().position(|t| matches!(t.kind, TabKind::Changes)), self.agent_chat(Who::Main)) {
+            self.beside_chat(&chat, ix, window, cx);
             self.show_changed_file(rel.clone().into(), window, cx);
-            if let Some(chat) = self.tabs.iter().position(|t| matches!(t.kind, TabKind::Chat(_))) {
+            if let Some(chat) = self.agent_ix(Who::Main) {
                 self.activate(chat, window, cx);
             }
         }
@@ -2675,7 +2671,7 @@ mod diff_update_tests {
 /// A tab's ×, a middle click on it and its Close: every tab but the agent's
 /// (a terminal or a chat).
 fn closable(tab: &TabItem) -> bool {
-    !(matches!(tab.kind, TabKind::Terminal(_)) && tab.title == "agent") && !matches!(tab.kind, TabKind::Chat(_))
+    !matches!(tab.agent, Some(Who::Main))
 }
 
 /// Close others, to the right and all close without asking: files, pictures,

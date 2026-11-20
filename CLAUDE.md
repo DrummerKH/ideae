@@ -14,12 +14,13 @@ src/workspace/spaces.rs    spaces: projects sorted into sets, one in the window 
 src/workspace/side.rs      worktrees an agent made for itself: told apart, folded under their task, no agent of their own
 src/workspace/automation.rs  a project's setup, teardown and check, the trust its .ideae.toml needs, hints, Project settings…
 src/workspace/agents_ui.rs choosing agents: the picker, a project's agent, Continue with another agent
+src/workspace/questions.rs questions asked aside: an agent of their own beside the main thread's (`Who::Question`), their rows, closing and asking again
 src/workspace/archive_ui.rs Archive (a task's everyday end), the archived list, Restore, an agent's worktree removed
 src/workspace/present.rs   presenting: only the tasks chosen stay in the window, the rest out of the list and the notifications
 src/sidebar.rs     left sidebar (inbox, projects, tasks, drag and drop)
 src/task/          one task, a module: what is private to it is seen by all of its files (`use super::*`)
   mod.rs           the task itself: its state, the refresh loop, tabs and panes
-  agent_tab.rs     what is sent to the agent, its restart, queued prompts
+  agent_tab.rs     the task's agents (its own and its questions', `Who`, `AgentState`): what is sent to them, their restart, queued prompts
   activity.rs      the status of an agent that reports little, guessed from its terminal
   open.rs          opening a file and giving it its language server
   refresh.rs       what a refresh read, applied: diffs, files, the branch
@@ -99,6 +100,7 @@ scripts/           Xvfb driver for UI checks, wayland.sh (the same in a headless
 - `cargo build`, `cargo test`. LSP tests are `#[ignore]` and need gopls / rust-analyzer.
 - Variants have an end-to-end test on a real repository with real terminals, `#[ignore]` too: `cargo test -- --ignored two_variants` after changing them.
 - So do agent profiles (two agents, session ids, guessed status, carrying a task on): `cargo test -- --ignored two_agents` after changing agents/ or how an agent is started.
+- And questions asked aside (their agent, its reports apart from the task's, the main thread's session kept): `cargo test -- --ignored a_question_beside` after changing questions or how a task's agents are told apart.
 - Saving a file and following it on disk have one too: `cargo test -- --ignored an_open_file` after changing how an open file is written, reloaded or refreshed.
 - So has the start: `cargo test -- --ignored the_tasks_of_the_last_run` after changing how the tasks of the last run are restored.
 - So has archiving and restoring: `cargo test -- --ignored an_archived_task` after changing either.

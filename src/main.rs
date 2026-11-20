@@ -358,15 +358,23 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &palette::RecentPlaces, window, cx| this.recent_tasks(window, cx)))
             .on_action(cx.listener(|this, _: &palette::NextWaiting, window, cx| this.next_waiting(window, cx)))
             .on_action(cx.listener(|this, _: &NewTask, window, cx| this.new_task(window, cx)))
+            .on_action(cx.listener(|this, _: &AskQuestion, window, cx| this.ask_question(window, cx)))
     }
 }
 
-actions!(ideae, [GoToFile, GoToSymbol, FindInFiles, ReplaceInFiles, NewTask, Quit, OpenSettings, LanguageServerSettings, SwitchTheme]);
+actions!(ideae, [GoToFile, GoToSymbol, FindInFiles, ReplaceInFiles, NewTask, AskQuestion, Quit, OpenSettings, LanguageServerSettings, SwitchTheme]);
 
 impl Workspace {
     pub fn new_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(project) = self.project_in_hand().or(self.first_project()) {
             self.new_task_dialog(project, window, cx);
+        }
+    }
+
+    /// A question about the project in hand, asked aside of its main thread.
+    pub fn ask_question(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(project) = self.project_in_hand().or(self.first_project()) {
+            self.ask_question_dialog(project, window, cx);
         }
     }
 

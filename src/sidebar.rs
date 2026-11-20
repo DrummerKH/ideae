@@ -153,9 +153,10 @@ impl Workspace {
                     let mut groups = std::collections::HashSet::new();
                     for (pi, ti) in active {
                         let t = &self.projects[pi].tasks[ti];
-                        let asks = t.view.as_ref().is_some_and(|v| matches!(v.read(cx).agent_status, AgentStatus::NeedsInput(_)));
+                        let asks = t.view.as_ref().is_some_and(|v| matches!(v.read(cx).agent.status, AgentStatus::NeedsInput(_)));
                         if t.group.is_empty() || asks {
                             list = list.child(self.render_task(pi, ti, true, cx));
+                            list = self.render_questions(list, pi, ti, true, cx);
                         } else if groups.insert(t.group.clone()) {
                             list = list.child(self.render_group_row(pi, &t.group, true, cx));
                         }
@@ -237,6 +238,7 @@ impl Workspace {
                     // A search lists its hits one by one.
                     if group.is_empty() || !query.is_empty() {
                         list = list.child(self.render_task(pi, ti, false, cx));
+                        list = self.render_questions(list, pi, ti, false, cx);
                         let under: Vec<usize> = sides.iter().copied().filter(|&s| side_parent(s) == Some(p.tasks[ti].path.as_path())).collect();
                         list = self.render_sides(list, pi, p.tasks[ti].path.clone(), "", under, cx);
                     } else if groups.insert(group.clone()) {
@@ -480,7 +482,7 @@ impl Workspace {
                 let (glyph, unseen) = match &task.view {
                     Some(view) => {
                         let view = view.read(cx);
-                        (crate::task::status_glyph(&view.agent_status), view.unseen)
+                        (crate::task::status_glyph(&view.agent.status), view.unseen)
                     }
                     None => (None, false),
                 };
@@ -590,14 +592,14 @@ impl Workspace {
         // Paused is told by the sign before the name and its color: of these there can be many, and they keep to one line.
         let view = task.view.as_ref()?;
         let view = view.read(cx);
-        if matches!(view.agent_status, AgentStatus::NeedsInput(_)) {
+        if matches!(view.agent.status, AgentStatus::NeedsInput(_)) {
             return Some(("asks".into(), Some(hsla(0.08, 0.9, 0.55, 1.))));
         }
         let marks = view.auto_marks();
         if let Some((failed, color)) = marks.iter().find(|(mark, _)| mark.starts_with('✗')) {
             return Some((failed.to_string(), Some(*color)));
         }
-        if let Some(activity) = view.agent_activity.clone().filter(|_| view.agent_status == AgentStatus::Working) {
+        if let Some(activity) = view.agent.doing.clone().filter(|_| view.agent.status == AgentStatus::Working) {
             return Some((activity, None));
         }
         if let Some((running, _)) = marks.iter().find(|(mark, _)| mark.ends_with('…')) {
@@ -657,7 +659,7 @@ impl Workspace {
         match &task.view {
             Some(view) => {
                 let view = view.read(cx);
-                if matches!(view.agent_status, AgentStatus::NeedsInput(_)) {
+                if matches!(view.agent.status, AgentStatus::NeedsInput(_)) {
                     notes.push(("asks".into(), Some(hsla(0.08, 0.9, 0.55, 1.))));
                 }
                 // How the project's setup and check went: a failure first of all.
@@ -723,7 +725,7 @@ impl Workspace {
             for (ti, t) in p.tasks.iter().enumerate() {
                 let waiting = t.view.as_ref().is_some_and(|v| {
                     let v = v.read(cx);
-                    let asks = matches!(v.agent_status, AgentStatus::NeedsInput(_));
+                    let asks = matches!(v.agent.status, AgentStatus::NeedsInput(_)) || v.question_asks().is_some();
                     // A variant that is done waits for the others: the group
                     // is looked at once, when all of it is ready.
                     asks || v.unseen && (t.group.is_empty() || self.group_settled(&t.group, cx))
@@ -744,10 +746,10 @@ impl Workspace {
     pub fn next_waiting(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut rows = self.active_rows(cx);
         let asks = |&(pi, ti): &(usize, usize), cx: &App| {
-            self.projects[pi].tasks[ti]
-                .view
-                .as_ref()
-                .is_some_and(|v| matches!(v.read(cx).agent_status, AgentStatus::NeedsInput(_)))
+            self.projects[pi].tasks[ti].view.as_ref().is_some_and(|v| {
+                let v = v.read(cx);
+                matches!(v.agent.status, AgentStatus::NeedsInput(_)) || v.question_asks().is_some()
+            })
         };
         rows.reverse();
         rows.sort_by_key(|row| !asks(row, cx));
@@ -756,6 +758,11 @@ impl Workspace {
             return;
         };
         let path = self.projects[pi].tasks[ti].path.clone();
+        // Its question, when the task's own agent does not ask.
+        let question = self.projects[pi].tasks[ti].view.as_ref().map(|v| v.read(cx)).filter(|v| !matches!(v.agent.status, AgentStatus::NeedsInput(_))).and_then(|v| v.question_asks());
+        if let Some(n) = question {
+            return self.show_question(&path, n, window, cx);
+        }
         self.switch(&path, window, cx);
         if let Some(view) = self.active_view() {
             view.update(cx, |t, cx| t.show_view(0, window, cx));
@@ -765,62 +772,50 @@ impl Workspace {
     /// What a project's menu offers: from its row in the list (a right click, and its +) and from the rail.
     fn project_menu(&self, pi: usize) -> impl Fn(PopupMenu, WeakEntity<Workspace>) -> PopupMenu + Clone + 'static {
         let p = &self.projects[pi];
-        let spaces: Vec<(String, String)> = self.spaces.iter().map(|s| (s.name.clone(), s.mark())).collect();
-        let in_space = p.space.clone();
         let merged = p.tasks.iter().filter(|t| !t.main && t.side.is_none() && t.busy.is_none() && t.pr.as_ref().is_some_and(|pr| pr.state == crate::pr::PrState::Merged)).count();
         // Which agent its new tasks run, when there is a choice.
         let profiles: Vec<(String, String)> = crate::state::with_settings(|s| if s.several_agents() { s.agents.iter().map(|a| (a.id.clone(), a.name.clone())).collect() } else { Vec::new() });
         let project_agent = p.agent.clone();
         let stale = if self.is_presenting() { 0 } else { p.merged_branches.len() };
+        let closed_questions = p.tasks.iter().any(|t| t.main && t.questions.iter().any(|q| q.closed > 0));
         let menu = move |menu: PopupMenu, this: WeakEntity<Workspace>| {
-            let (spaces, in_space) = (spaces.clone(), in_space.clone());
             let (profiles, project_agent, agent_w) = (profiles.clone(), project_agent.clone(), this.clone());
             let settings = this.clone();
-            let (a, b, c, d) = (this.clone(), this.clone(), this.clone(), this.clone());
-            let (archived, stale_w) = (this.clone(), this);
-            menu.item(PopupMenuItem::new("Open main thread").on_click(move |_, window, cx| {
+            let (a, b, d) = (this.clone(), this.clone(), this.clone());
+            let (archived, ask, asked, stale_w) = (this.clone(), this.clone(), this.clone(), this);
+            menu.item(PopupMenuItem::new("Open main thread").icon(menu_icon("house")).on_click(move |_, window, cx| {
                 let _ = a.update(cx, |w, cx| w.open_main(pi, window, cx));
             }))
-            .item(PopupMenuItem::new("New task…").on_click(move |_, window, cx| {
+            .item(PopupMenuItem::new("New task…").icon(menu_icon("square-plus")).on_click(move |_, window, cx| {
                 let _ = b.update(cx, |w, cx| w.new_task_dialog(pi, window, cx));
             }))
-            .item(PopupMenuItem::new("From an archived task…").on_click(move |_, window, cx| {
+            .item(PopupMenuItem::new("Ask a question…").icon(menu_icon("message-circle-question-mark")).on_click(move |_, window, cx| {
+                let _ = ask.update(cx, |w, cx| w.ask_question_dialog(pi, window, cx));
+            }))
+            .when(closed_questions, |menu| {
+                menu.item(PopupMenuItem::new("Closed questions…").icon(menu_icon("history")).on_click(move |_, window, cx| {
+                    let _ = asked.update(cx, |w, cx| w.closed_questions_dialog(pi, window, cx));
+                }))
+            })
+            .item(PopupMenuItem::new("From an archived task…").icon(menu_icon("archive-restore")).on_click(move |_, window, cx| {
                 let _ = archived.update(cx, |w, cx| w.archived_dialog(Some(pi), window, cx));
             }))
             // Only when there is something to clean up, and how much.
             .when(merged > 0, |menu| {
-                menu.item(PopupMenuItem::new(format!("Archive {merged} merged task{}…", if merged == 1 { "" } else { "s" })).on_click(move |_, window, cx| {
+                menu.item(PopupMenuItem::new(format!("Archive {merged} merged task{}…", if merged == 1 { "" } else { "s" })).icon(menu_icon("archive")).on_click(move |_, window, cx| {
                     let _ = d.update(cx, |w, cx| w.archive_merged(pi, window, cx));
                 }))
             })
             .when(stale > 0, |menu| {
-                menu.item(PopupMenuItem::new(format!("Delete remote branches of merged PRs ({stale})…")).on_click(move |_, window, cx| {
+                menu.item(PopupMenuItem::new(format!("Delete remote branches of merged PRs ({stale})…")).icon(menu_icon("git-branch-minus")).on_click(move |_, window, cx| {
                     let _ = stale_w.update(cx, |w, cx| w.merged_branches_dialog(pi, window, cx));
                 }))
             })
             .separator()
-            .item(PopupMenuItem::new("Project settings…").on_click(move |_, window, cx| {
+            .item(PopupMenuItem::new("Project settings…").icon(menu_icon("settings")).on_click(move |_, window, cx| {
                 let _ = settings.update(cx, |w, cx| w.project_settings(pi, window, cx));
             }))
             .separator()
-            // Which space it is of: one of them, or none, which is all.
-            .map(|mut menu| {
-                for (name, mark) in &spaces {
-                    let (to, w) = (name.clone(), c.clone());
-                    menu = menu.item(PopupMenuItem::new(format!("{mark}  In {name}")).checked(in_space.as_ref() == Some(name)).on_click(move |_, window, cx| {
-                        let to = to.clone();
-                        let _ = w.update(cx, |w, cx| w.set_project_space(pi, Some(to), window, cx));
-                    }));
-                }
-                if spaces.is_empty() {
-                    return menu;
-                }
-                let w = c.clone();
-                menu.item(PopupMenuItem::new("In no space").checked(in_space.is_none()).on_click(move |_, window, cx| {
-                    let _ = w.update(cx, |w, cx| w.set_project_space(pi, None, window, cx));
-                }))
-                .separator()
-            })
             .map(|mut menu| {
                 if profiles.is_empty() {
                     return menu;
@@ -1067,6 +1062,74 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// A task's open questions, a row each under it: what its agent does,
+    /// a click to its tab, × to close it.
+    /// In Needs you (`waiting`), only those that ask something.
+    fn render_questions(&self, mut list: Stateful<Div>, pi: usize, ti: usize, waiting: bool, cx: &mut Context<Self>) -> Stateful<Div> {
+        let t = &self.projects[pi].tasks[ti];
+        let Some(view) = t.view.as_ref() else { return list };
+        let muted = cx.theme().muted_foreground;
+        for q in t.questions.iter().filter(|q| q.closed == 0) {
+            let (n, path) = (q.id, t.path.clone());
+            let v = view.read(cx);
+            let agent = v.agent_of(crate::task::Who::Question(n));
+            if waiting && !agent.is_some_and(|a| matches!(a.status, AgentStatus::NeedsInput(_))) {
+                continue;
+            }
+            let glyph = agent.and_then(|a| task::status_glyph(&a.status));
+            let doing = agent.and_then(|a| match &a.status {
+                AgentStatus::Working => a.doing.clone(),
+                AgentStatus::NeedsInput(message) => Some(message.clone()),
+                _ => None,
+            });
+            let doing = if v.question_asleep(n) { Some("asleep".to_string()) } else { doing };
+            let group = SharedString::from(format!("{}question-{}-{n}", if waiting { "waiting-" } else { "" }, t.path.display()));
+            let (open, close) = (path.clone(), path);
+            list = list.child(
+                h_flex()
+                    .id(group.clone())
+                    .group(group.clone())
+                    .test_support()
+                    .pl(px(26.))
+                    .pr_1()
+                    .gap_1p5()
+                    .items_center()
+                    .text_xs()
+                    .text_color(muted)
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(cx.theme().foreground))
+                    .child(match glyph {
+                        Some((glyph, color)) => div().w(px(10.)).flex_none().text_color(color).child(glyph),
+                        None => div().w(px(10.)).flex_none().child("?"),
+                    })
+                    .child(div().flex_1().min_w_0().truncate().child(q.title.clone()))
+                    .children(doing.map(|doing| div().flex_shrink_0().max_w(px(140.)).truncate().child(doing)))
+                    .child(
+                        div().opacity(0.).group_hover(group, |s| s.opacity(1.)).child(
+                            Button::new(SharedString::from(format!("question-close-{n}")))
+                                .xsmall()
+                                .ghost()
+                                .child(svg().path("side-icons/x.svg").size(px(12.)).text_color(muted))
+                                .tooltip("Close the question")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.close_question(&close, n, window, cx)
+                                })),
+                        ),
+                    )
+                    .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("A question asked aside: a double click renames it").build(window, cx))
+                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        if event.click_count() > 1 {
+                            this.rename_question_dialog(&open, n, window, cx)
+                        } else {
+                            this.show_question(&open, n, window, cx)
+                        }
+                    })),
+            );
+        }
+        list
+    }
+
     /// The agents' worktrees of one task, or of the project for those in
     /// temporary places (`what`): one folded row, and theirs when opened.
     fn render_sides(&self, mut list: Stateful<Div>, pi: usize, key: PathBuf, what: &str, sides: Vec<usize>, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -1127,16 +1190,16 @@ impl Workspace {
         // With more than one agent: which one it runs, as a letter.
         let several = crate::state::with_settings(|s| s.several_agents());
         let agent_mark = if several && t.side.is_none() { self.task_profile_at(pi, ti, cx) } else { None };
-        let guessed = t.view.as_ref().is_some_and(|v| v.read(cx).status_guessed);
+        let guessed = t.view.as_ref().is_some_and(|v| v.read(cx).agent.guessed);
 
         let ((glyph, changes, unseen, needs), unpushed) = match &t.view {
             Some(view) => {
                 let v = view.read(cx);
-                let needs = match &v.agent_status {
+                let needs = match &v.agent.status {
                     AgentStatus::NeedsInput(message) => Some(message.clone()),
                     _ => None,
                 };
-                ((task::status_glyph(&v.agent_status), v.change_count(), v.unseen, needs), v.unpushed())
+                ((task::status_glyph(&v.agent.status), v.change_count(), v.unseen, needs), v.unpushed())
             }
             None => ((None, 0, false, None), 0),
         };
@@ -1147,7 +1210,7 @@ impl Workspace {
         // A working agent's latest step says more than when it last moved.
         let activity = t.view.as_ref().and_then(|v| {
             let v = v.read(cx);
-            (v.agent_status == AgentStatus::Working).then(|| v.agent_activity.clone()).flatten()
+            (v.agent.status == AgentStatus::Working).then(|| v.agent.doing.clone()).flatten()
         });
         // A deferred task come back on its own stays marked till it is opened.
         let woke = t.woke.is_some();
@@ -1212,9 +1275,9 @@ impl Workspace {
         // What its agent said: the start under the task in Needs you, the whole in its tooltip.
         let said = t.view.as_ref().and_then(|v| self.said_shown(v, cx));
         let lead = t.view.as_ref().filter(|_| in_active && said.is_some()).and_then(|v| {
-            let v = v.read(cx);
-            let asks = matches!(v.agent_status, AgentStatus::NeedsInput(_));
-            if asks { v.agent_asks.as_ref() } else { v.agent_said.as_ref() }.map(|said| (said.lead.clone(), asks))
+            let agent = &v.read(cx).agent;
+            let asks = matches!(agent.status, AgentStatus::NeedsInput(_));
+            agent.shown_said().map(|said| (said.lead.clone(), asks))
         });
         let pr = t.pr.clone().filter(|_| pr_status);
         let overlaps = self.overlaps(project, &path);
@@ -1544,4 +1607,9 @@ pub(crate) async fn menu_waited_out(cx: &mut AsyncApp) -> bool {
         cx.background_executor().timer(std::time::Duration::from_millis(200)).await;
     }
     waited
+}
+
+/// A menu item's mark: one of Lucide's drawings in assets/side-icons, by name.
+pub(crate) fn menu_icon(name: &str) -> gpui_kit::component::Icon {
+    gpui_kit::component::Icon::empty().path(SharedString::from(format!("side-icons/{name}.svg")))
 }

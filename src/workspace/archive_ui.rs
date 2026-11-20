@@ -220,7 +220,7 @@ impl Workspace {
         if t.main || t.side.is_some() || t.busy.is_some() {
             return;
         }
-        let said = t.view.as_ref().and_then(|v| v.read(cx).agent_said.as_ref().map(|s| s.whole.to_string()));
+        let said = t.view.as_ref().and_then(|v| v.read(cx).agent.said.as_ref().map(|s| s.whole.to_string()));
         self.stop(path, window, cx);
         let Some((pi, ti)) = self.find(path) else { return };
         let repo = self.projects[pi].path.clone();
@@ -1176,7 +1176,7 @@ exec cat > "$OUT/$name.told"
         assert!(out(&again, "args").contains(&format!("--resume {id}")), "{}", out(&again, "args"));
 
         // It is up: the note goes in first.
-        let up = HookEvent { task: again.clone(), event: "SessionStart".into(), message: None, kind: None, file: None, said: None, replayed: None, session: Some(id.clone()), guessed: false, worktree: None };
+        let up = HookEvent { task: again.clone(), agent: None, event: "SessionStart".into(), message: None, kind: None, file: None, said: None, replayed: None, session: Some(id.clone()), guessed: false, worktree: None };
         step(cx, &mut |w, window, cx| w.on_hook(up.clone(), window, cx));
         wait(cx, "the note to reach the agent", &mut |_| out(&again, "told").contains("comes in my next message"));
         let told = out(&again, "told");
@@ -1208,7 +1208,7 @@ exec cat > "$OUT/$name.told"
         step(cx, &mut |w, window, cx| w.switch(&woke, window, cx));
         wait(cx, "the agent to start", &mut |_| !out(&woke, "args").is_empty());
         assert!(out(&woke, "args").contains(&format!("--resume {id}")), "{}", out(&woke, "args"));
-        let up = HookEvent { task: woke.clone(), ..up.clone() };
+        let up = HookEvent { task: woke.clone(), agent: None, ..up.clone() };
         step(cx, &mut |w, window, cx| w.on_hook(up.clone(), window, cx));
         wait(cx, "the note to reach the agent", &mut |_| out(&woke, "told").contains("comes in my next message"));
         assert!(workspace.update(cx, |w, _| w.projects[0].tasks.iter().all(|t| t.woke.is_none())), "told once");

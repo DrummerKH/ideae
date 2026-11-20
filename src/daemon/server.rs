@@ -270,14 +270,14 @@ fn serve(shared: Shared, stream: UnixStream) {
                 // after a turn, or the question after a tool call, keeps
                 // what the agent said before it.
                 if hook.said.is_none() {
-                    hook.said = s.hooks.get(&hook.task).filter(|before| carries(before, &hook)).and_then(|before| before.said.clone());
+                    hook.said = s.hooks.get(&hook.key()).filter(|before| carries(before, &hook)).and_then(|before| before.said.clone());
                 }
-                let asked = s.hooks.get(&hook.task).and_then(|before| event_of(before).status()).is_some_and(|was| crate::agent::asked_again(&was, &event_of(&hook)));
+                let asked = s.hooks.get(&hook.key()).and_then(|before| event_of(before).status()).is_some_and(|was| crate::agent::asked_again(&was, &event_of(&hook)));
                 if s.clients.is_empty() && !asked {
                     notify(&hook);
                 }
                 s.broadcast(&proto::encode_msg(&Msg::Hook(hook.clone())));
-                s.hooks.insert(hook.task.clone(), hook);
+                s.hooks.insert(hook.key(), hook);
             }
             Frame::Msg(_) => {}
         }
@@ -466,10 +466,14 @@ fn kill(shared: &Shared, id: &str) {
     let Some(session) = s.sessions.remove(id) else { return };
     // A task with no terminal left has no agent to report: what it last
     // said is not handed to the next window.
-    if let Some((task, _)) = id.rsplit_once('#') {
+    if let Some((task, name)) = id.rsplit_once('#') {
         let prefix = format!("{task}#");
+        // A question's agent: its own report goes with it.
+        if let Some(agent) = name.strip_prefix("acp-").unwrap_or(name).strip_prefix("q-") {
+            s.hooks.remove(&format!("{task}#q-{agent}"));
+        }
         if !s.sessions.keys().any(|other| other.starts_with(&prefix)) {
-            s.hooks.remove(task);
+            s.hooks.retain(|_, hook| hook.task != task);
         }
     }
     drop(s);
@@ -505,6 +509,7 @@ fn event_of(hook: &Hook) -> crate::agent::HookEvent {
         session: hook.session.clone(),
         guessed: false,
         worktree: hook.worktree.clone(),
+        agent: hook.agent.clone(),
         replayed: None,
     }
 }
@@ -727,7 +732,7 @@ mod handover {
         let mut fds = receive_fds(&channel, count)?.into_iter();
         let mut s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for hook in state.hooks {
-            s.hooks.insert(hook.task.clone(), hook);
+            s.hooks.insert(hook.key(), hook);
         }
         for session in state.sessions {
             let (sink, detached) = ByteSink::detached();
@@ -780,9 +785,13 @@ mod tests {
             session: None,
             worktree: None,
             said: Some("x".into()),
+            agent: None,
             at: 0,
         };
         let (stop, tool) = (hook("Stop", None, None), hook("PreToolUse", None, Some("Running ls")));
+        // A question's agent is kept apart from the task's own.
+        let asked = Hook { agent: Some("q-2".into()), ..stop.clone() };
+        assert_eq!((stop.key().as_str(), asked.key().as_str()), ("/w/t", "/w/t#q-2"));
         let idle = hook("Notification", Some("idle_prompt"), Some("Claude is waiting for your input"));
         let asks = hook("Notification", Some("permission_prompt"), Some("Claude needs your permission to use Bash"));
         assert!(carries(&stop, &idle), "the reminder after a turn");

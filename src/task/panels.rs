@@ -99,14 +99,14 @@ impl TaskView {
                 if matches!(tab.kind, TabKind::Terminal(_)) && !tab.shown.is_empty() {
                     label = format!("{}: {}", tab.title, short_title(&tab.shown)).into();
                 }
-                if tab.title == "agent" {
+                if tab.agent == Some(Who::Main) {
                     // Which agent, when there are several.
                     if let Some(letter) = self.agent_letter() {
                         label = format!("[{letter}] {label}").into();
                     }
-                    if let Some((glyph, _)) = status_glyph(&self.agent_status) {
-                        label = format!("{glyph} {label}").into();
-                    }
+                }
+                if let Some((glyph, _)) = tab.agent.and_then(|who| self.agent_of(who)).and_then(|a| status_glyph(&a.status)) {
+                    label = format!("{glyph} {label}").into();
                 }
                 if matches!(tab.kind, TabKind::Browser(_)) && !tab.shown.is_empty() && tab.shown != "about:blank" {
                     label = short_title(&tab.shown).into();
@@ -121,9 +121,9 @@ impl TaskView {
                 }
                 let closable = closable(tab);
                 let dragged = DraggedTab { tab_id: tab.id, title: label.clone() };
-                let item = if tab.title == "agent" {
+                let item = if tab.agent == Some(Who::Main) {
                     let root = self.root.clone();
-                    let who = self.session_ref();
+                    let who = self.agent.session_ref();
                     let fill = self.context_fill;
                     let dialed = fill > 0. && crate::state::with_settings(|s| s.context_on_tab);
                     Tab::new().child(

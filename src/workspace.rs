@@ -79,6 +79,10 @@ pub struct TaskEntry {
     pub choices: Vec<(String, String)>,
     /// Its agents' sessions; the last is the one it runs.
     pub sessions: Vec<state::AgentSession>,
+    /// Questions asked aside of its agent, open and closed, and how many
+    /// it was ever asked (questions.rs).
+    pub questions: Vec<state::QuestionState>,
+    pub asked: u32,
     /// Made this run and not started yet, or its latest session recorded
     /// and not run: its agent starts a new session.
     pub fresh: bool,
@@ -96,6 +100,7 @@ pub mod archive_ui;
 mod merged_ui;
 pub mod automation;
 pub mod present;
+pub mod questions;
 pub mod side;
 pub mod spaces;
 pub mod variants;
@@ -108,9 +113,10 @@ impl TaskEntry {
         !self.main && self.created > 0 && !self.branch.is_empty() && !self.branch.starts_with('(')
     }
 
-    /// The agent's latest session, to find its file by.
+    /// The agent's latest session, to find its file by. Unknown, it is
+    /// the latest in the folder, unless questions asked there made others.
     pub fn session_ref(&self) -> Option<crate::agents::SessionRef> {
-        let session = self.sessions.last()?;
+        let session = self.sessions.last().filter(|s| s.id.is_some() || self.asked == 0)?;
         let profile = state::with_settings(|s| s.profile(&session.profile).cloned())?;
         Some(crate::agents::SessionRef { profile, id: session.id.clone() })
     }
@@ -238,11 +244,14 @@ pub struct Workspace {
     save_seq: u64,
     /// Tasks open in the last run and not loaded yet, the next one last.
     restoring: Vec<PathBuf>,
+    /// Started for a question alone: its own agent waits until it is opened.
+    quiet_start: std::collections::HashSet<PathBuf>,
     _subscriptions: Vec<Subscription>,
     _tick: Task<()>,
     pub build: crate::build_watch::BuildWatch,
     /// Clicked notifications send their task here.
-    open_task_tx: async_channel::Sender<PathBuf>,
+    /// A clicked notification: its task, and the question it was of.
+    open_task_tx: async_channel::Sender<(PathBuf, Option<u32>)>,
     /// Where the window is, to open there next time.
     window_place: Option<state::WindowPlace>,
     /// Where the window was asked to open, and when: some window managers
@@ -391,6 +400,7 @@ impl Workspace {
             let to_event = |h: crate::daemon::proto::Hook, replayed: bool| agent::HookEvent {
                 replayed: replayed.then_some(h.at),
                 task: h.task.into(),
+                agent: h.agent,
                 event: h.event,
                 message: h.message,
                 kind: h.kind,
@@ -530,12 +540,15 @@ impl Workspace {
         .detach();
 
         // A clicked notification brings the window up on its task.
-        let (open_task_tx, open_task_rx) = async_channel::unbounded::<PathBuf>();
+        let (open_task_tx, open_task_rx) = async_channel::unbounded::<(PathBuf, Option<u32>)>();
         cx.spawn_in(window, async move |this, cx| {
-            while let Ok(path) = open_task_rx.recv().await {
+            while let Ok((path, question)) = open_task_rx.recv().await {
                 if this.update_in(cx, |this, window, cx| {
                     window.activate_window();
-                    this.focus_task(&path, window, cx);
+                    match question {
+                        Some(n) => this.show_question(&path, n, window, cx),
+                        None => this.focus_task(&path, window, cx),
+                    }
                 }).is_err() {
                     break;
                 }
@@ -589,6 +602,7 @@ impl Workspace {
                     }
                     if n % 10 == 0 {
                         this.sleep_idle_language_servers(cx);
+                        this.tend_questions(window, cx);
                         this.refresh_prs(false, window, cx);
                         this.refresh_merged_branches(window, cx);
                     }
@@ -698,6 +712,7 @@ impl Workspace {
             last_saved: Default::default(),
             save_seq: 0,
             restoring: Vec::new(),
+            quiet_start: Default::default(),
             _subscriptions: subscriptions,
             _tick: tick,
             requested_origin: None,
@@ -909,6 +924,8 @@ impl Workspace {
                     archive: t.archive.clone(),
                     archive_keep: t.archive_keep,
                     woke: t.woke.clone(),
+                    questions: t.questions.clone(),
+                    asked: t.asked,
                 })
                 .collect();
             self.projects.push(project);
@@ -1034,6 +1051,8 @@ impl Workspace {
                             archive: t.archive.clone(),
                             archive_keep: t.archive_keep,
                             woke: t.woke.clone(),
+                            questions: t.questions.clone(),
+                            asked: t.asked,
                         })
                         .collect(),
                 })
@@ -1086,8 +1105,9 @@ impl Workspace {
         let main = self.entry_mut(path).is_some_and(|entry| entry.main);
         let kept: Vec<String> = self.find(path).map(|(pi, _)| self.projects[pi].hints_off.iter().filter_map(|key| key.strip_prefix(automation::KEPT_BRANCH)).map(str::to_string).collect()).unwrap_or_default();
         let lsp_off = self.find(path).is_some_and(|(pi, _)| self.projects[pi].lsp_off);
+        let quiet = self.quiet_start.contains(path);
         let view = cx.new(|cx| {
-            let mut t = TaskView::new(root, branch, launch, socket, slot, window, cx);
+            let mut t = TaskView::new(root, branch, launch, !quiet, socket, slot, window, cx);
             t.context_fill = fill;
             // Servers start when the task comes into view (switch).
             t.lsp_asleep = true;
@@ -1096,6 +1116,9 @@ impl Workspace {
             t.main_thread = main;
             t.kept_branches = kept;
             t.lsp_off = lsp_off;
+            if let Some(entry) = self.find(path).map(|(pi, ti)| &self.projects[pi].tasks[ti]) {
+                self.give_questions(entry, &mut t);
+            }
             t
         });
         cx.subscribe_in(&view, window, |this, view, event: &TaskEvent, window, cx| this.on_task_event(view, event, window, cx)).detach();
@@ -2221,6 +2244,9 @@ impl Workspace {
     // ------------------------------------------------------------ hooks
 
     fn on_hook(&mut self, event: agent::HookEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if let crate::task::Who::Question(n) = crate::task::Who::of_tag(event.agent.as_deref()) {
+            return self.question_heard(n, event, window, cx);
+        }
         // Which session the agent runs: what a restart, or the next run, resumes.
         if let Some(id) = event.session.as_deref().filter(|id| !id.is_empty()) {
             self.learn_session(&event.task, id, cx);
@@ -2244,7 +2270,7 @@ impl Workspace {
         let looked = in_view && window.is_window_active();
         // Heard again after a restart: new only when it came after the last look.
         let seen = looked || event.replayed.is_some_and(|at| at <= entry.seen_at);
-        let was = view.read(cx).agent_status.clone();
+        let was = view.read(cx).agent.status.clone();
         // The Notification about a question its PreToolUse told already: no second notice, the question kept.
         let status = if agent::asked_again(&was, &event) { was.clone() } else { status };
         if looked {
@@ -2255,15 +2281,15 @@ impl Workspace {
         // A message that waited for this goes out now: the agent is not done yet.
         let more_coming = turn_over && view.read(cx).has_queued_message();
         let heard = view.update(cx, |t, cx| {
-            let said = (t.agent_said.clone(), t.agent_asks.clone());
-            t.hear(&event, &status);
-            t.status_guessed = event.guessed;
-            t.set_agent_status(status.clone(), seen, cx);
+            let said = (t.agent.said.clone(), t.agent.asks.clone());
+            t.agent.hear(&event, &status);
+            t.agent.guessed = event.guessed;
+            t.set_agent_status(crate::task::Who::Main, status.clone(), seen, cx);
             let before = t.agent_shown();
             t.follow_agent(&event.event, event.file.as_deref());
             match event.event.as_str() {
-                "PreToolUse" if status == agent::AgentStatus::Working => t.agent_activity = event.message.clone(),
-                "UserPromptSubmit" => t.agent_activity = Some("Thinking".into()),
+                "PreToolUse" if status == agent::AgentStatus::Working => t.agent.doing = event.message.clone(),
+                "UserPromptSubmit" => t.agent.doing = Some("Thinking".into()),
                 _ => {}
             }
             if t.agent_shown() != before {
@@ -2271,10 +2297,10 @@ impl Workspace {
                 cx.notify();
             }
             if turn_over && event.replayed.is_none() {
-                t.deliver_queued(window, cx);
+                t.deliver_queued(crate::task::Who::Main, window, cx);
                 t.reload_own_pages(cx);
             }
-            said != (t.agent_said.clone(), t.agent_asks.clone())
+            said != (t.agent.said.clone(), t.agent.asks.clone())
         });
         // A variant at work again: what the judge said is of before.
         if let (Some(group), "UserPromptSubmit") = (&group, event.event.as_str()) {
@@ -2323,7 +2349,7 @@ impl Workspace {
             if let Some(body) = body {
                 let (tx, path) = (self.open_task_tx.clone(), event.task.clone());
                 crate::desktop::notify_with(&label, &body, move || {
-                    let _ = tx.send_blocking(path);
+                    let _ = tx.send_blocking((path, None));
                 });
             }
         }
@@ -2343,7 +2369,7 @@ impl Workspace {
         }
         session.id = Some(id.to_string());
         if let Some(view) = entry.view.clone() {
-            view.update(cx, |t, _| t.learned_session(id));
+            view.update(cx, |t, _| t.agent.learned_session(id));
         }
     }
 
@@ -2353,12 +2379,7 @@ impl Workspace {
         if self.is_presenting() || !state::with_settings(|s| s.show_said) {
             return None;
         }
-        let v = view.read(cx);
-        match v.agent_status {
-            agent::AgentStatus::NeedsInput(_) => v.agent_asks.as_ref(),
-            _ => v.agent_said.as_ref(),
-        }
-        .map(|said| said.whole.clone())
+        view.read(cx).agent.shown_said().map(|said| said.whole.clone())
     }
 
     /// Power saving: stops every language server and starts none until
@@ -2540,9 +2561,12 @@ impl Workspace {
         let start = if t.fresh && same {
             // Recorded already and never run (Continue with another agent).
             Start::New(t.sessions.last().and_then(|s| s.id.clone()))
+        } else if same && t.asked > 0 && t.sessions.last().is_some_and(|s| s.id.is_none()) {
+            // The latest session in the folder may be a question's.
+            Start::New(None)
         } else if same {
             crate::agents::start_of(t.sessions.last())
-        } else if !t.fresh && t.sessions.is_empty() {
+        } else if !t.fresh && t.sessions.is_empty() && t.asked == 0 {
             // A task of before sessions were kept: as then, and its id is learned from the agent.
             t.sessions.push(state::AgentSession { profile: profile.id.clone(), id: None, started: state::now() });
             Start::Last
@@ -2552,7 +2576,7 @@ impl Workspace {
             Start::New(id)
         };
         t.fresh = false;
-        Some(Launch { profile, start, unasked, options: t.choices.clone() })
+        Some(Launch { profile, start, unasked, aside: false, options: t.choices.clone() })
     }
 
     /// New settings: they go to the state, and what they change now
@@ -2631,7 +2655,7 @@ impl Workspace {
         // A group that is done is looked at as a whole; a variant that asks
         // something is answered in its own agent.
         let entry = &self.projects[pi].tasks[ti];
-        let asks = entry.view.as_ref().is_some_and(|v| matches!(v.read(cx).agent_status, agent::AgentStatus::NeedsInput(_)));
+        let asks = entry.view.as_ref().is_some_and(|v| matches!(v.read(cx).agent.status, agent::AgentStatus::NeedsInput(_)));
         if !entry.group.is_empty() && !asks {
             let group = entry.group.clone();
             return self.open_group(&group, window, cx);

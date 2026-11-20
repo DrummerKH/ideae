@@ -21,8 +21,9 @@ impl TaskView {
                 let mut s = TabSession { right: tab.pane.right, below: tab.pane.below, preview: tab.preview, pinned: tab.pinned, ..Default::default() };
                 match &tab.kind {
                     // The task's first terminal: the agent, or the shell without one.
-                    TabKind::Terminal(_) if tab.title == "agent" || tab.title == "shell" => s.kind = "agent".into(),
-                    TabKind::Chat(_) => s.kind = "agent".into(),
+                    TabKind::Terminal(_) | TabKind::Chat(_) if tab.agent == Some(Who::Main) || tab.title == "shell" => s.kind = "agent".into(),
+                    TabKind::Terminal(_) | TabKind::Chat(_) if tab.agent.is_some() => s.kind = "question".into(),
+                    TabKind::Chat(_) => {}
                     TabKind::Terminal(view) if view.read(cx).service.is_some() => {
                         s.kind = "service".into();
                         s.path = view.read(cx).service.clone();
@@ -82,7 +83,7 @@ impl TaskView {
             let before: HashSet<usize> = self.tabs.iter().map(|t| t.id).collect();
             match saved.kind.as_str() {
                 "agent" => {
-                    ids.push(self.tabs.iter().find(|t| t.title == "agent" || t.title == "shell").map(|t| t.id));
+                    ids.push(self.tabs.iter().find(|t| t.agent == Some(Who::Main) || t.title == "shell").map(|t| t.id));
                     continue;
                 }
                 // `line` holds the shell's number, for its session.
@@ -152,19 +153,19 @@ impl TaskView {
     /// The daemon sessions of this task's terminals.
     #[cfg_attr(not(unix), allow(dead_code))]
     pub fn sessions(&self, cx: &App) -> Vec<String> {
-        self.tabs
-            .iter()
+        self.all_tabs()
             .filter_map(|t| match &t.kind {
                 TabKind::Terminal(view) => view.read(cx).session().map(str::to_string),
                 TabKind::Chat(chat) => chat.read(cx).session().map(str::to_string),
                 _ => None,
             })
+            .chain(self.unshown_sessions())
             .collect()
     }
 
     /// The agent is in the middle of a turn.
     pub fn agent_busy(&self) -> bool {
-        self.agent_status == crate::agent::AgentStatus::Working
+        self.agent.status == crate::agent::AgentStatus::Working
     }
 
     /// Stops every terminal and browser of the task before it is dropped,
@@ -182,12 +183,15 @@ impl TaskView {
     pub(super) fn end(&mut self, strays: bool, cx: &mut Context<Self>) {
         self.save_all_now(cx);
         self.auto.stop();
-        if let Some(chat) = self.agent_chat() {
+        // Questions not shown since a restart, whose agents may run on in the daemon.
+        let unshown: Vec<String> = self.unshown_sessions().collect();
+        agent_tab::end_sessions(&unshown);
+        for chat in self.chats().collect::<Vec<_>>() {
             chat.update(cx, |c, _| c.end());
         }
         let task = self.root.display().to_string();
         let socket = self.hook_socket.clone().filter(|_| strays);
-        let terminals: Vec<Entity<TermView>> = self.tabs.iter().filter_map(|tab| if let TabKind::Terminal(view) = &tab.kind { Some(view.clone()) } else { None }).collect();
+        let terminals: Vec<Entity<TermView>> = self.all_tabs().filter_map(|tab| if let TabKind::Terminal(view) = &tab.kind { Some(view.clone()) } else { None }).collect();
         let Some(socket) = socket else {
             for view in &terminals {
                 TermView::end(view, cx);

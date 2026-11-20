@@ -19,6 +19,8 @@ use serde_json::{Value, json};
 
 pub const SOCK_ENV: &str = "IDEAE_SOCK";
 pub const TASK_ENV: &str = "IDEAE_TASK";
+/// Which of the task's agents, when not its own: `q-<n>`, a question.
+pub const AGENT_ENV: &str = "IDEAE_AGENT";
 /// Set to `agent` in the agent tab's terminal, for the process monitor.
 pub const ROLE_ENV: &str = "IDEAE_ROLE";
 
@@ -64,6 +66,8 @@ impl AgentStatus {
 pub struct HookEvent {
     /// The task's worktree root.
     pub task: PathBuf,
+    /// Which of its agents, when not its own (`q-<n>`, [`AGENT_ENV`]).
+    pub agent: Option<String>,
     pub event: String,
     pub message: Option<String>,
     /// Of a Notification: permission_prompt, idle_prompt, …
@@ -340,6 +344,7 @@ fn parse_line(line: &str) -> Option<HookEvent> {
     let v: Value = serde_json::from_str(line).ok()?;
     Some(HookEvent {
         task: PathBuf::from(v["task"].as_str()?),
+        agent: v["agent"].as_str().filter(|a| !a.is_empty()).map(str::to_string),
         event: v["event"].as_str()?.to_string(),
         message: v["message"].as_str().map(str::to_string),
         kind: v["kind"].as_str().map(str::to_string),
@@ -525,6 +530,7 @@ pub fn run_hook(args: &[String]) {
     let (Some(socket), Some(task)) = (given("sock").or_else(|| std::env::var(SOCK_ENV).ok()), given("task").or_else(|| std::env::var(TASK_ENV).ok())) else {
         return;
     };
+    let agent = given("agent").or_else(|| std::env::var(AGENT_ENV).ok()).filter(|a| !a.is_empty());
     let asks_user = event == "PreToolUse" && asks_user(&payload);
     // Before a tool runs the message says what the agent is doing.
     let message = match event {
@@ -542,6 +548,7 @@ pub fn run_hook(args: &[String]) {
     }
     let line = json!({
         "task": task,
+        "agent": agent,
         "event": event,
         "message": message,
         "kind": if asks_user { Some(ASKS_USER) } else { payload["notification_type"].as_str() },
@@ -561,6 +568,7 @@ pub fn run_hook(args: &[String]) {
             said,
             session: line["session"].as_str().map(str::to_string),
             worktree: line["worktree"].as_str().map(str::to_string),
+            agent,
             at: 0,
         });
         return;
@@ -649,7 +657,7 @@ mod tests {
     }
 
     fn note(message: &str, kind: Option<&str>) -> Option<AgentStatus> {
-        HookEvent { task: PathBuf::new(), event: "Notification".into(), message: Some(message.into()), kind: kind.map(Into::into), file: None, said: None, replayed: None, session: None, guessed: false, worktree: None }
+        HookEvent { task: PathBuf::new(), agent: None, event: "Notification".into(), message: Some(message.into()), kind: kind.map(Into::into), file: None, said: None, replayed: None, session: None, guessed: false, worktree: None }
             .status()
     }
 
@@ -692,6 +700,7 @@ mod tests {
         assert_eq!(asking(&plan).as_deref(), Some("Waits for you to approve its plan"));
         let event = |name: &str, kind: Option<&str>, message: Option<&str>| HookEvent {
             task: PathBuf::new(),
+            agent: None,
             event: name.into(),
             message: message.map(Into::into),
             kind: kind.map(Into::into),

@@ -123,7 +123,7 @@ impl Workspace {
     /// As `task_profile`, for a row the list has in hand.
     pub fn task_profile_at(&self, pi: usize, ti: usize, cx: &App) -> Option<agents::Profile> {
         let t = self.projects.get(pi)?.tasks.get(ti)?;
-        if let Some(launch) = t.view.as_ref().and_then(|v| v.read(cx).launch.clone()) {
+        if let Some(launch) = t.view.as_ref().and_then(|v| v.read(cx).agent.launch.clone()) {
             return Some(launch.profile);
         }
         let last = t.sessions.last().map(|s| s.profile.clone()).unwrap_or_default();
@@ -176,7 +176,7 @@ impl Workspace {
     fn task_session(&self, path: &Path, cx: &App) -> Option<String> {
         let (pi, ti) = self.find(path)?;
         let t = &self.projects[pi].tasks[ti];
-        let launched = t.view.as_ref().and_then(|v| v.read(cx).launch.as_ref().and_then(|l| l.session_id()));
+        let launched = t.view.as_ref().and_then(|v| v.read(cx).agent.launch.as_ref().and_then(|l| l.session_id()));
         launched.or_else(|| t.sessions.last().and_then(|s| s.id.clone()))
     }
 
@@ -190,7 +190,7 @@ impl Workspace {
         let Some((pi, ti)) = self.find(path) else { return };
         let t = &self.projects[pi].tasks[ti];
         let (title, prompt, base) = (t.label(), t.prompt.clone(), Some(t.base.clone()).filter(|b| !b.is_empty()));
-        let said = t.view.as_ref().and_then(|v| v.read(cx).agent_said.as_ref().map(|s| s.whole.to_string()));
+        let said = t.view.as_ref().and_then(|v| v.read(cx).agent.said.as_ref().map(|s| s.whole.to_string()));
         let who = t.session_ref();
         let unasked = !t.group.is_empty();
         let before_name = before.map_or_else(|| "another agent".to_string(), |p| p.name);
@@ -215,7 +215,7 @@ impl Workspace {
                     }
                 };
                 entry.sessions.push(state::AgentSession { profile: profile.id.clone(), id: session.clone(), started: state::now() });
-                let launch = agents::Launch { profile: profile.clone(), start, unasked, options: Vec::new() };
+                let launch = agents::Launch { profile: profile.clone(), start, unasked, aside: false, options: Vec::new() };
                 let view = match entry.view.clone() {
                     Some(view) => view,
                     None => {
@@ -228,7 +228,7 @@ impl Workspace {
                         }
                     }
                 };
-                let fresh = view.read(cx).launch.as_ref() != Some(&launch);
+                let fresh = view.read(cx).agent.launch.as_ref() != Some(&launch);
                 view.update(cx, |t, cx| {
                     if fresh {
                         t.switch_agent(launch, window, cx);
@@ -364,23 +364,23 @@ mod tests {
 
         // Claude Code says it runs another session (a /clear): a restart resumes that one.
         step(cx, &mut |w, window, cx| {
-            let event = HookEvent { task: a.clone(), event: "SessionStart".into(), message: None, kind: None, file: None, said: None, replayed: None, session: Some("after-clear".into()), guessed: false, worktree: None };
+            let event = HookEvent { task: a.clone(), agent: None, event: "SessionStart".into(), message: None, kind: None, file: None, said: None, replayed: None, session: Some("after-clear".into()), guessed: false, worktree: None };
             w.on_hook(event, window, cx);
         });
         workspace.update(cx, |w, cx| {
             let t = &w.projects[0].work()[0];
             assert_eq!(t.sessions[0].id.as_deref(), Some("after-clear"));
-            let again = t.view.as_ref().unwrap().read(cx).launch.as_ref().unwrap().again().command();
+            let again = t.view.as_ref().unwrap().read(cx).agent.launch.as_ref().unwrap().again().command();
             assert!(again.contains("--resume after-clear"), "{again}");
             assert_eq!(w.snapshot(cx).projects[0].tasks.iter().find(|t| !t.main).unwrap().sessions[0].id.as_deref(), Some("after-clear"), "kept in the state");
         });
 
         // B tells nothing: it is seen to work while it writes, and to be done at the bell.
-        wait(cx, "B guessed at work", &mut |cx| workspace.update(cx, |w, cx| w.projects[0].work()[1].view.as_ref().unwrap().read(cx).agent_status == AgentStatus::Working));
+        wait(cx, "B guessed at work", &mut |cx| workspace.update(cx, |w, cx| w.projects[0].work()[1].view.as_ref().unwrap().read(cx).agent.status == AgentStatus::Working));
         wait(cx, "B guessed done", &mut |cx| {
             workspace.update(cx, |w, cx| {
                 let v = w.projects[0].work()[1].view.as_ref().unwrap().read(cx);
-                v.agent_status == AgentStatus::Done && v.status_guessed
+                v.agent.status == AgentStatus::Done && v.agent.guessed
             })
         });
 

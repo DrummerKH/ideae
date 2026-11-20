@@ -34,11 +34,9 @@ impl TaskView {
         let tab = Self::make_terminal(
             &self.root,
             self.hook_socket.as_ref(),
-            &format!("▶ {name}"),
-            seq,
+            Term::Service { title: format!("▶ {name}"), seq, name: name.to_string(), cwd },
             Some(command),
             env,
-            Some((name.to_string(), cwd)),
             None,
             window,
             cx,
