@@ -618,7 +618,8 @@ fn decode_uri_path(uri: &str) -> Option<String> {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(b) = u8::from_str_radix(&raw[i + 1..i + 3], 16) {
+            // `get`: a `%` not followed by two hex digits may be before a letter of more bytes.
+            if let Some(b) = raw.get(i + 1..i + 3).and_then(|hex| u8::from_str_radix(hex, 16).ok()) {
                 out.push(b);
                 i += 3;
                 continue;
@@ -2122,6 +2123,9 @@ mod tests {
         let uri = path_to_uri(&path);
         assert!(!uri.contains(' ') && !uri.contains('\\'), "{uri}");
         assert_eq!(uri_to_path(&uri), Some(path));
+        if !cfg!(windows) {
+            assert_eq!(uri_to_path("file:///tmp/50%_\u{441}\u{43a}.rs"), Some(PathBuf::from("/tmp/50%_\u{441}\u{43a}.rs")), "a bare % before a letter of two bytes");
+        }
         if cfg!(windows) {
             assert_eq!(uri, "file:///C:/Users/A%20B/src/main.rs");
             assert_eq!(uri_to_path("file:///c%3A/Users/x.rs"), Some(PathBuf::from(r"C:\Users\x.rs")));

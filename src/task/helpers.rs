@@ -503,10 +503,12 @@ pub(super) fn toggle_comment_lines(path: &std::path::Path, text: &str, range: st
     };
     let all = lines.iter().filter(|l| !l.trim().is_empty()).all(|l| commented(l))
         && lines.iter().any(|l| !l.trim().is_empty());
+    // Spaces and tabs alone: a wider blank (a no-break space pasted from the
+    // web) counted here would put the cut of another line inside a letter.
     let indent = lines
         .iter()
         .filter(|l| !l.trim().is_empty())
-        .map(|l| l.len() - l.trim_start().len())
+        .map(|l| l.len() - l.trim_start_matches([' ', '\t']).len())
         .min()
         .unwrap_or(0);
     let out: Vec<String> = lines
@@ -547,6 +549,13 @@ mod editing_tests {
         let commented = format!("{}{}{}", &text[..s], out, &text[e..]);
         let (s2, e2, back) = toggle_comment_lines(Path::new("x.rs"), &commented, s..s + out.len()).unwrap();
         assert_eq!(format!("{}{}{}", &commented[..s2], back, &commented[e2..]), text);
+    }
+
+    #[test]
+    fn a_line_led_by_a_wider_blank_is_commented_whole() {
+        let text = "\u{a0}a\n b";
+        let (_, _, out) = toggle_comment_lines(Path::new("x.rs"), text, 0..text.len()).unwrap();
+        assert_eq!(out, "// \u{a0}a\n//  b");
     }
 
     #[test]

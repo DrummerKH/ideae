@@ -598,7 +598,8 @@ fn render_preview(preview: &Preview, cx: &App) -> impl IntoElement {
             let here = number == preview.line;
             let mut colors = colors.clone();
             if here {
-                for range in preview.ranges.iter().filter(|r| r.end <= text.len()) {
+                // Found in the line as it was: the file may have changed under it since.
+                for range in preview.ranges.iter().filter(|r| r.end <= text.len() && text.is_char_boundary(r.start) && text.is_char_boundary(r.end)) {
                     colors.push((range.clone(), lit));
                 }
                 colors.sort_by_key(|(r, _)| r.start);
