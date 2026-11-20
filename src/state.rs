@@ -184,6 +184,10 @@ pub struct Settings {
     pub diff_files: bool,
     /// Its width, as last dragged.
     pub diff_files_width: f32,
+    /// How much of a file's room its text takes beside its drawing, by what
+    /// it is drawn as ("markdown", "svg", "table", "mermaid"), as last dragged.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub split_shares: std::collections::BTreeMap<String, f32>,
     /// Changed files as a list of paths, not a tree of folders: in the
     /// Changes panel and beside a diff.
     pub changes_flat: bool,
@@ -288,6 +292,7 @@ impl Default for Settings {
             structure_no_fields: false,
             structure_sorted: false,
             diff_files_width: 240.,
+            split_shares: std::collections::BTreeMap::new(),
             conflicts_to_agent: true,
             present_rail: true,
             present_veil: true,
@@ -625,6 +630,9 @@ pub struct TabSession {
     /// How a Web tab shows its page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web: Option<WebLook>,
+    /// A file shown drawn, beside its text or instead of it: "split", "preview".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub look: Option<String>,
 }
 
 /// A Web tab's screen, colors and DevTools, kept with the session.

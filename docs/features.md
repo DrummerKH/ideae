@@ -228,7 +228,11 @@ all: what is removed stays under `refs/ideae/variants` for two weeks.
 - Find in files lists matches in code before those in comments and prose
   (Markdown, text), within a file and among files.
 - Replace in files (Ctrl+Shift+R) shows every match with what it becomes.
-- Autosave when you leave a file; Markdown has a Preview.
+- Autosave when you leave a file.
+- Markdown (with Mermaid diagrams), SVG, Mermaid files and CSV/TSV (a
+  sortable table) are shown as text, drawn, or side by side (Ctrl+Shift+V),
+  the drawing following what you type; diagrams and `currentColor` icons
+  take the theme's colors. An HTML file opens in a Web tab.
 
 ## The side
 
@@ -260,8 +264,8 @@ task until it leaves.
   with no commits of their own (only merges into them) left out; both are
   kept in the repository's git config.
 - Stash, and the stashes listed to look into, bring back or drop.
-- A changed image shows in diffs as it was and as it is; any other binary
-  file with its size before and after.
+- A changed image shows in diffs as it was and as it is, an SVG above its
+  text; any other binary file with its size before and after.
 
 ## Terminals and browser tabs
 

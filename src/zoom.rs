@@ -126,7 +126,7 @@ impl Global for Pending {}
 
 /// Points to step for one wheel event: a wheel notch is a point, a touchpad
 /// accumulates pixels.
-fn steps(delta: &ScrollDelta, cx: &mut App) -> f32 {
+pub fn steps(delta: &ScrollDelta, cx: &mut App) -> f32 {
     match delta {
         ScrollDelta::Lines(lines) if lines.y > 0. => 1.,
         ScrollDelta::Lines(lines) if lines.y < 0. => -1.,

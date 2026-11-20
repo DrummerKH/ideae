@@ -190,7 +190,8 @@ impl DiffAnnotation {
 type FileRenderer = Rc<dyn Fn(&DiffFile, &mut Window, &mut App) -> AnyElement>;
 type AnnotationRenderer = Rc<dyn Fn(&DiffAnnotation, &mut Window, &mut App) -> AnyElement>;
 /// ideae patch: what a binary file shows in place of the notice, told whether
-/// the diff is side by side; None keeps the notice.
+/// the diff is side by side; None keeps the notice. Asked of a text file too,
+/// for what is shown under its header.
 type BinaryRenderer = Rc<dyn Fn(&DiffFile, bool, &mut Window, &mut App) -> Option<AnyElement>>;
 type RangeHandler = Rc<dyn Fn(&DiffLineRange, &mut Window, &mut App)>;
 type ClickHandler = Rc<dyn Fn(&DiffLinePosition, &ClickEvent, &mut Window, &mut App)>;
@@ -1367,6 +1368,11 @@ fn render_file_header(
                 .child(div().flex_1().min_w_0().child(content)),
         )
         .when(!sticky, |this| this.children(file_annotations(file, code, window, cx)))
+        // ideae patch: a text file the application also shows drawn (an SVG's two versions), while it is open.
+        .when(!sticky && !collapsed && !document.is_binary(), |this| {
+            let shown = code.binary_content.clone().and_then(|render| render(document, code.mode == DiffMode::Split, window, cx));
+            this.children(shown.map(|shown| div().w(code.viewport_width).child(shown)))
+        })
         .into_any_element()
 }
 

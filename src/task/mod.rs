@@ -45,6 +45,8 @@ mod helpers;
 mod term;
 mod chat;
 mod file;
+mod preview;
+pub(crate) use preview::{ink, rasterize as rasterize_svg};
 mod changes;
 mod session;
 mod change_tree;
@@ -69,6 +71,7 @@ pub use file::*;
 pub use changes::*;
 pub use session::*;
 pub use annotate::ToggleBlame;
+pub use preview::{CycleLook, PREVIEW_CONTEXT};
 pub use git_ui::GitCommand;
 pub use bookmarks::{NextBookmark, PrevBookmark, ShowBookmarks, ToggleBookmark};
 use change_tree::*;
@@ -117,32 +120,56 @@ pub(crate) enum FrontTab {
 pub struct BinaryView {
     path: PathBuf,
     reason: String,
-    /// Shown as a picture, fit in the tab, with what it is below.
-    image: bool,
+    /// An image: shown as a picture, with what it is below.
+    picture: Option<Entity<crate::picture::PictureView>>,
+}
+
+impl BinaryView {
+    /// An image file, shown when its size is read off this thread.
+    fn image(path: PathBuf, kind: &'static str, cx: &mut Context<Self>) -> Self {
+        let picture = cx.new(crate::picture::PictureView::new);
+        let read = path.clone();
+        let image = ImageSource::from(path.clone());
+        let caption = move |dims: Option<(u32, u32)>, bytes: Option<u64>| {
+            let dims = dims.map(|(w, h)| format!(" · {w} × {h}")).unwrap_or_default();
+            SharedString::from(format!("{kind}{dims}{}", bytes.map(|b| format!(" · {}", helpers::human_size(b))).unwrap_or_default()))
+        };
+        picture.update(cx, |v, cx| v.show(0, image.clone(), None, None, caption(None, None), cx));
+        let shown = picture.downgrade();
+        cx.spawn(async move |_, cx| {
+            let (dims, bytes) = cx
+                .background_spawn(async move {
+                    let dims = image::ImageReader::open(&read).ok().and_then(|r| r.with_guessed_format().ok()).and_then(|r| r.into_dimensions().ok());
+                    (dims, std::fs::metadata(&read).ok().map(|m| m.len()))
+                })
+                .await;
+            let own = dims.map(|(w, h)| size(px(w as f32), px(h as f32)));
+            // Fit, a picture grows no larger than its own size.
+            let _ = shown.update(cx, |v, cx| v.show(0, image, own, own, caption(dims, bytes), cx));
+        })
+        .detach();
+        BinaryView { path, reason: String::new(), picture: Some(picture) }
+    }
 }
 
 impl Render for BinaryView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (path, reveal) = (self.path.clone(), self.path.clone());
-        if self.image {
+        if let Some(picture) = &self.picture {
             return v_flex()
                 .size_full()
-                .p_4()
-                .gap_2()
-                .items_center()
-                .child(
-                    div().flex_1().min_h_0().w_full().flex().items_center().justify_center().child(
-                        img(self.path.clone()).size_full().object_fit(gpui::ObjectFit::ScaleDown),
-                    ),
-                )
                 .child(
                     h_flex()
-                        .gap_3()
-                        .items_center()
-                        .child(div().text_sm().text_color(cx.theme().muted_foreground).child(self.reason.clone()))
+                        .justify_end()
+                        .gap_1()
+                        .px_3()
+                        .py_1()
+                        .border_b_1()
+                        .border_color(cx.theme().border)
                         .child(Button::new("open-system").xsmall().ghost().label("Open in the system app").on_click(move |_, _, cx| cx.open_with_system(&path)))
                         .child(Button::new("reveal").xsmall().ghost().label("Reveal in file manager").on_click(move |_, _, cx| file_tree::reveal(reveal.clone(), false, cx))),
-                );
+                )
+                .child(div().flex_1().min_h_0().child(picture.clone()));
         }
         v_flex()
             .size_full()
@@ -1546,8 +1573,13 @@ impl TaskView {
                 let handle = chat.read(cx).focus_handle(cx);
                 handle.focus(window, cx)
             }
-            Some(TabKind::File(file)) => {
-                file.read(cx).editor.read(cx).focus_handle(cx).focus(window, cx)
+            Some(TabKind::File(file)) => file.update(cx, |f, cx| f.focus(window, cx)),
+            Some(TabKind::Binary(view)) => {
+                if let Some(picture) = &view.read(cx).picture {
+                    picture.read(cx).focus_handle().clone().focus(window, cx)
+                } else {
+                    self.focus.focus(window, cx)
+                }
             }
             Some(TabKind::Browser(view)) => view.focus_handle(cx).focus(window, cx),
             // Its keys (J, K, N, V…) are the diff's.
@@ -2267,7 +2299,7 @@ mod open_file_scenario {
     use super::{FileView, TabKind, TaskView};
     use crate::state::{ProjectState, State};
     use crate::workspace::Workspace;
-    use gpui_kit::{App, AppContext as _, Bounds, Entity, Point, TestAppContext, WindowBounds, WindowOptions, px, size};
+    use gpui_kit::{App, AppContext as _, Bounds, Entity, Point, TestAppContext, WindowBounds, WindowOptions, point, px, size};
     use gpui_kit::test::TestWindowExt as _;
     use std::time::Duration;
 
@@ -2590,6 +2622,215 @@ mod open_file_scenario {
         task.update(cx, |t, _| assert!(!t.has(lower_left)));
         // The left column emptied of all but the agent's tab, the right one stays.
         assert_eq!(pane_of(cx, "c.txt"), Some(upper_right));
+
+        task.update(cx, |t, cx| t.shut_down(cx));
+        cx.update_window(handle.into(), |_, window, _| window.remove_window()).ok();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Markdown, an SVG and a CSV drawn beside their text and instead of
+    /// it, the drawing following what is typed once typing pauses.
+    #[gpui_kit::test]
+    #[ignore]
+    fn an_open_file_is_drawn_beside_its_text(cx: &mut TestAppContext) {
+        use super::preview::{Drawn, Look};
+        use gpui_kit::test::TestWindowExt as _;
+        let _one = crate::workspace::variants::tests::ONE_WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+        cx.executor().allow_parking();
+        let dir = std::env::temp_dir().join(format!("ideae-drawn-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("repo");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("a.md"), "# Title\n\ntext\n\n```mermaid\nflowchart LR\n  A --> B\n```\n").unwrap();
+        std::fs::write(base.join("f.mmd"), "flowchart LR\n  A --> B\n").unwrap();
+        image::RgbaImage::new(300, 200).save(base.join("p.png")).unwrap();
+        let long: String = (0..120).map(|i| format!("## Part {i}\n\nText of part {i}.\n\n")).collect();
+        std::fs::write(base.join("long.md"), long).unwrap();
+        std::fs::write(base.join("t.csv"), "n,v\n1,\"x, y\"\n2,3\n").unwrap();
+        std::fs::write(base.join("i.svg"), r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="12"/>"#).unwrap();
+        let script = "cd repo; git init -q -b main; git config user.email t@t; git config user.name t; git add .; git commit -qm base";
+        assert!(std::process::Command::new("sh").arg("-ec").arg(script).current_dir(&dir).status().unwrap().success());
+        let repo = dir.join("repo").canonicalize().unwrap();
+        // SAFETY: set before anything of the app reads them.
+        unsafe {
+            std::env::set_var("IDEAE_STATE", dir.join("state.json"));
+            std::env::set_var("IDEAE_NO_DAEMON", "1");
+        }
+        let saved = State { projects: vec![ProjectState { path: repo.clone(), ..Default::default() }], ..Default::default() };
+        std::fs::write(dir.join("state.json"), serde_json::to_string(&saved).unwrap()).unwrap();
+        crate::state::set_settings(crate::state::Settings { notifications: false, pr_status: false, ..Default::default() });
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            gpui_cn::init(cx);
+            crate::theme::init(cx);
+        });
+        let (handle, workspace) = cx.update(|cx| {
+            let bounds = Bounds { origin: Point::default(), size: size(px(1300.), px(800.)) };
+            let options = WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() };
+            gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| Workspace::new(Vec::new(), Some(None), None, window, cx))).expect("a test window")
+        });
+        cx.update_window(handle.into(), |_, window, cx| workspace.update(cx, |w, cx| w.open_main(0, window, cx))).unwrap();
+        cx.run_until_parked();
+        let task: Entity<TaskView> = workspace.update(cx, |w, _| w.active_view().expect("the main checkout in view"));
+        let open = |cx: &mut TestAppContext, name: &str, look: Look| -> Entity<FileView> {
+            let path = repo.join(name);
+            cx.update_window(handle.into(), |_, window, cx| task.update(cx, |t, cx| t.open_file(path.clone(), 0, window, cx))).unwrap();
+            let file = task.update(cx, |t, _| {
+                t.tabs.iter().find_map(|tab| match &tab.kind {
+                    TabKind::File(f) => Some(f.clone()),
+                    _ => None,
+                })
+            });
+            let file = task.update(cx, |t, cx| {
+                t.tabs.iter().find_map(|tab| match &tab.kind {
+                    TabKind::File(f) if f.read(cx).path == path => Some(f.clone()),
+                    _ => None,
+                })
+            }).or(file).expect("the file's tab");
+            cx.update_window(handle.into(), |_, _, cx| file.update(cx, |f, cx| f.set_look(look, cx))).unwrap();
+            cx.run_until_parked();
+            file
+        };
+        let frame = |cx: &mut TestAppContext, check: &dyn Fn(&mut gpui_kit::Window)| {
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                check(window);
+            })
+            .unwrap();
+        };
+
+        let svg = open(cx, "i.svg", Look::Split);
+        frame(cx, &|window| {
+            let (editor, picture) = (window.find("file-editor"), window.find("svg-picture"));
+            assert!(editor.visible() && picture.visible(), "the text and the picture");
+            assert!(editor.bounds().right() <= picture.bounds().left(), "side by side: {:?} {:?}", editor.bounds(), picture.bounds());
+        });
+        svg.update(cx, |f, _| assert!(matches!(&f.preview.drawn, Some((0, Drawn::Svg(Some(p), None))) if p.size == (24., 12.))));
+        // Broken while typing: the last picture stays, with why.
+        cx.update_window(handle.into(), |_, window, cx| svg.update(cx, |f, cx| f.editor.update(cx, |e, cx| e.insert("<", window, cx)))).unwrap();
+        cx.run_until_parked();
+        svg.update(cx, |f, _| assert!(matches!(&f.preview.drawn, Some((0, _))), "not drawn again while typing"));
+        cx.executor().advance_clock(Duration::from_millis(400));
+        cx.run_until_parked();
+        svg.update(cx, |f, _| assert!(matches!(&f.preview.drawn, Some((1, Drawn::Svg(Some(_), Some(_)))))));
+
+        // The line between them dragged: the share kept for SVGs, a double click puts it back in the middle.
+        cx.update_window(handle.into(), |_, window, cx| {
+            let (split, line) = (window.find("file-split").bounds(), window.find("split-handle").bounds());
+            let to = point(split.left() + split.size.width * 0.3, line.center().y);
+            window.drag(line.center(), to, cx);
+            window.render_frame(cx);
+            let share = window.find("file-editor").bounds().size.width / split.size.width;
+            assert!((share - 0.3).abs() < 0.02, "the text takes what it was dragged to: {share}");
+            window.double_click("split-handle", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        assert_eq!(crate::state::with_settings(|s| s.split_shares.get("svg").copied()), Some(0.5));
+
+        // Zoomed and moved back to fit.
+        frame(cx, &|window| assert!(window.find("picture-zoom").visible()));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("picture-actual", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("picture").bounds().size.width, px(24.), "an SVG at its own size");
+            window.click("picture-fit", cx);
+            window.render_frame(cx);
+            assert!(window.find("picture").bounds().size.width > px(100.), "fit, larger than it is");
+        })
+        .unwrap();
+
+        // An image file: fit no larger than it is, and at its own size, once its size is read.
+        cx.update_window(handle.into(), |_, window, cx| task.update(cx, |t, cx| t.open_file(repo.join("p.png"), 0, window, cx))).unwrap();
+        cx.run_until_parked();
+        frame(cx, &|window| assert!(window.find("picture").bounds().size.width <= px(300.)));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("picture-actual", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("picture").bounds().size, size(px(300.), px(200.)));
+            // Its keys are its zoom while it has the keyboard, over Fold and Unfold, which are the editor's.
+            crate::keymap::bind_all(cx);
+            window.click("picture", cx);
+            window.press(if cfg!(target_os = "macos") { "cmd--" } else { "ctrl--" }, cx);
+            window.render_frame(cx);
+            assert!(window.find("picture").bounds().size.width < px(300.), "smaller by its key");
+            window.press(if cfg!(target_os = "macos") { "cmd-9" } else { "ctrl-9" }, cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("picture").bounds().size.width, px(300.), "fit by its key: no larger than it is, as the room is larger");
+        })
+        .unwrap();
+
+        let csv = open(cx, "t.csv", Look::Preview);
+        frame(cx, &|window| {
+            assert!(window.try_find("file-editor").is_none_or(|e| !e.visible()), "the table only");
+            assert!(window.find("sheet").visible());
+        });
+        csv.update(cx, |f, _| match &f.preview.drawn {
+            Some((_, Drawn::Table(sheet))) => assert_eq!((sheet.rows(), sheet.cell(1, 1).as_ref()), (2, "x, y")),
+            _ => panic!("a table"),
+        });
+
+        let mmd = open(cx, "f.mmd", Look::Split);
+        frame(cx, &|window| assert!(window.find("svg-picture").visible(), "a Mermaid file drawn as a picture"));
+        mmd.update(cx, |f, _| assert!(matches!(&f.preview.drawn, Some((_, Drawn::Svg(Some(_), None))))));
+
+        let md = open(cx, "a.md", Look::Preview);
+        frame(cx, &|window| assert!(window.find("file-preview").visible()));
+        // Its diagram is drawn off this thread, then shown.
+        cx.run_until_parked();
+        frame(cx, &|_| {});
+        frame(cx, &|window| assert!(window.find("diagram").visible(), "the Markdown's diagram as a picture"));
+        let saved = task.update(cx, |t, cx| t.session(cx));
+        let look_of = |name: &str| saved.tabs.iter().find(|tab| tab.path.as_deref() == Some(name)).and_then(|tab| tab.look.clone());
+        assert_eq!((look_of("a.md").as_deref(), look_of("i.svg").as_deref()), (Some("preview"), Some("split")), "kept with the session");
+        // Its keys work while the text is not shown: Ctrl+Shift+V goes on to the text.
+        cx.update_window(handle.into(), |_, window, cx| {
+            md.update(cx, |f, cx| f.pick_look(Look::Preview, window, cx));
+            window.dispatch_action(Box::new(super::CycleLook), cx);
+        })
+        .unwrap();
+        md.update(cx, |f, _| assert_eq!(f.preview.look, Look::Code));
+        md.update(cx, |f, _| assert!(f.preview.drawn.is_none(), "nothing kept for the text alone"));
+        let saved = task.update(cx, |t, cx| t.session(cx));
+        assert!(saved.tabs.iter().any(|tab| tab.path.as_deref() == Some("a.md") && tab.look.is_none()));
+        frame(cx, &|window| assert!(window.try_find("file-preview").is_none_or(|p| !p.visible())));
+
+        // Markdown beside its text follows it as it scrolls: the line at its top, at the drawing's top.
+        let long = open(cx, "long.md", Look::Split);
+        frame(cx, &|_| {});
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.scroll("file-editor", gpui_kit::ScrollDelta::Lines(point(0., -60.)), cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        frame(cx, &|_| {});
+        let (top, block) = long.update(cx, |f, cx| {
+            let top = f.preview.followed.expect("followed");
+            let (state, _) = f.preview.markdown.clone().expect("Markdown's view");
+            (top, state.read(cx).list_state().logical_scroll_top().item_ix)
+        });
+        // Four lines a part, two blocks a part (its heading, its text).
+        assert!(top > 20, "the text scrolled: {top}");
+        assert!(block.abs_diff(top / 2) <= 1, "the drawing at the text's line {top}: block {block}");
+
+        // And the other way: the drawing scrolled by hand, the text follows it.
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.scroll("file-preview", gpui_kit::ScrollDelta::Lines(point(0., -40.)), cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        frame(cx, &|_| {});
+        let (block, line) = long.update(cx, |f, cx| {
+            let (state, _) = f.preview.markdown.clone().expect("Markdown's view");
+            let editor = f.editor.read(cx);
+            let line = (-editor.scroll_offset().y / editor.line_height().unwrap()).round() as usize;
+            (state.read(cx).list_state().logical_scroll_top().item_ix, line)
+        });
+        assert!(block > top / 2 + 3, "the drawing scrolled on: block {block}");
+        assert!(line.abs_diff(block * 2) <= 2, "the text at the drawing's block {block}: line {line}");
 
         task.update(cx, |t, cx| t.shut_down(cx));
         cx.update_window(handle.into(), |_, window, _| window.remove_window()).ok();

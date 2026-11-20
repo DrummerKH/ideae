@@ -835,6 +835,38 @@ impl TextViewState {
     }
 
     #[doc(hidden)]
+    /// ideae patch: scrolls a scrollable Markdown view to where `offset` of
+    /// its source is drawn: the block it is in at the top, as far into it as
+    /// the offset is into the block's source. Source between blocks goes to
+    /// the block after it.
+    pub fn scroll_to_source(&mut self, offset: usize, cx: &mut Context<Self>) {
+        if !self.scrollable || self.format != TextViewFormat::Markdown {
+            return;
+        }
+        let blocks = &self.parsed_content.document.blocks;
+        let ix = blocks.iter().position(|block| block.span().is_some_and(|span| span.end > offset)).unwrap_or(blocks.len().saturating_sub(1));
+        let into = blocks.get(ix).and_then(|block| block.span()).filter(|span| span.end > span.start && offset > span.start).map_or(0., |span| {
+            (offset - span.start) as f32 / (span.end - span.start) as f32
+        });
+        let height = self.list_state.bounds_for_item(ix).map_or(px(0.), |bounds| bounds.size.height);
+        let top = gpui::ListOffset { item_ix: ix, offset_in_item: height * into.clamp(0., 1.) };
+        if self.list_state.logical_scroll_top() != top {
+            self.list_state.scroll_to(top);
+            cx.notify();
+        }
+    }
+
+    /// ideae patch: where the top of a scrollable Markdown view is in its
+    /// source: the block at the top, as far into its source as the view is
+    /// into the block. The other way of [`Self::scroll_to_source`].
+    pub fn source_at_top(&self) -> Option<usize> {
+        let top = self.list_state.logical_scroll_top();
+        let span = self.parsed_content.document.blocks.get(top.item_ix)?.span()?;
+        let height = self.list_state.bounds_for_item(top.item_ix).map(|bounds| bounds.size.height).filter(|h| *h > px(0.));
+        let into = height.map_or(0., |height| (top.offset_in_item / height).clamp(0., 1.));
+        Some(span.start + ((span.end.saturating_sub(span.start)) as f32 * into) as usize)
+    }
+
     pub fn list_state(&self) -> &ListState {
         &self.list_state
     }

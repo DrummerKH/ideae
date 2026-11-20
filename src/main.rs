@@ -21,6 +21,7 @@ mod indent;
 mod grammars;
 mod history;
 mod image_diff;
+mod picture;
 mod ide;
 mod keymap;
 mod keys;

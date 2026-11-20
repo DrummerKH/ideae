@@ -18,6 +18,8 @@ grep-regex = "0.1.14"
 grep-searcher = "0.1.17"
 ignore = "0.4.34"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+resvg = { version = "0.46", default-features = false, features = ["text", "system-fonts", "raster-images"] }
+mermaid-rs-renderer = { version = "0.3.1", default-features = false }
 lsp-types = { version = "0.97", features = ["proposed"] }
 notify = "8"
 serde = { version = "1", features = ["derive"] }

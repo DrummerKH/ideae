@@ -72,11 +72,8 @@ pub struct FileView {
     pub(super) lsp_attach: u64,
     /// Its server runs without the licence that would give it more.
     pub(super) lsp_unlicensed: bool,
-    /// Markdown shown as it reads instead of its source.
-    pub(super) preview: bool,
-    /// The text the preview was drawn from, by edit version: the same
-    /// string each frame, which the preview knows without comparing it.
-    pub(super) preview_text: Option<(u64, SharedString)>,
+    /// How a file that can be drawn (Markdown, SVG, a table) is shown, and the drawing.
+    pub(super) preview: super::preview::Preview,
     /// Git ignores it: while presenting it is not shown until asked for.
     pub(super) veiled: bool,
     /// The text whose next occurrence was added to the selection last,
@@ -332,6 +329,7 @@ impl FileView {
         self.edit_version += 1;
         self.change_popup = None;
         self.mark_changes(true, cx);
+        self.refresh_preview(true, cx);
         let typed = {
             let state = self.editor.read(cx);
             let (text, cursor) = (state.text(), state.cursor());
@@ -990,58 +988,9 @@ impl FileView {
     }
 }
 
-/// A picture of a Markdown preview: a path is a file beside the one shown
-/// (README's `docs/images/a.png`); one with a scheme is fetched.
-fn preview_image(dir: &std::path::Path, uri: &gpui_kit::SharedUri) -> gpui_kit::ImageSource {
-    let link: &str = uri.as_ref();
-    if link.contains("://") {
-        return gpui_kit::ImageSource::from(uri.clone());
-    }
-    let path = link.split(['#', '?']).next().unwrap_or_default();
-    gpui_kit::ImageSource::from(dir.join(path))
-}
-
 impl FileView {
     pub(super) fn is_busy(&self) -> bool {
         self.lsp_client.as_ref().is_some_and(|c| c.busy_for(&self.path).is_some())
-    }
-
-    pub(super) fn is_markdown(&self) -> bool {
-        self.path.extension().and_then(|e| e.to_str()).is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "md" | "markdown" | "mdx"))
-    }
-
-    /// The text as it is in the editor, unsaved edits too, drawn as
-    /// Markdown. A link to another file of the worktree opens it here.
-    pub(super) fn render_preview(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        use gpui_kit::component::text::TextView;
-        let text = match &self.preview_text {
-            Some((version, text)) if *version == self.edit_version => text.clone(),
-            _ => {
-                let text = self.editor.read(cx).value();
-                self.preview_text = Some((self.edit_version, text.clone()));
-                text
-            }
-        };
-        let (task, dir) = (self.task.clone(), self.path.parent().map(PathBuf::from).unwrap_or_default());
-        let images = dir.clone();
-        div().id("markdown-preview").flex_1().min_h_0().bg(cx.theme().background).child(
-            TextView::markdown("markdown", text)
-                .image_source(move |uri| preview_image(&images, uri))
-                .scrollable(true)
-                .selectable(true)
-                .on_link_click(move |link, _, window, cx| {
-                    let (target, _) = link.split_once('#').unwrap_or((link.as_ref(), ""));
-                    let file = dir.join(target);
-                    if !target.is_empty() && !target.contains("://") && file.is_file() {
-                        let _ = task.update(cx, |t, cx| t.open_file(file, 0, window, cx));
-                    } else if link.contains("://") {
-                        cx.open_url(link);
-                    }
-                })
-                .size_full()
-                .px_6()
-                .py_4(),
-        )
     }
 
     /// The server runs, but its import of the build failed.
@@ -1066,7 +1015,7 @@ impl FileView {
 }
 
 impl Render for FileView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let veil = self.veiled && crate::workspace::present::on() && crate::state::with_settings(|s| s.present_veil);
         let warning = hsla(0.08, 0.9, 0.55, 1.);
         v_flex()
@@ -1099,6 +1048,7 @@ impl Render for FileView {
             .on_action(cx.listener(|this, _: &FoldAll, _, cx| this.fold(true, true, cx)))
             .on_action(cx.listener(|this, _: &UnfoldAll, _, cx| this.fold(false, true, cx)))
             .on_action(cx.listener(|this, _: &ToggleBlame, _, cx| this.toggle_blame(cx)))
+            .on_action(cx.listener(|this, _: &CycleLook, window, cx| this.cycle_look(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleBookmark, _, cx| this.toggle_bookmark(cx)))
             .on_action(cx.listener(|this, _: &NextBookmark, window, cx| this.go_to_bookmark(false, window, cx)))
             .on_action(cx.listener(|this, _: &PrevBookmark, window, cx| this.go_to_bookmark(true, window, cx)))
@@ -1120,24 +1070,8 @@ impl Render for FileView {
                             .child(self.path.strip_prefix(&self.root).unwrap_or(&self.path).display().to_string()),
                     )
                     .children(self.render_blame(cx))
-                    .when(self.is_markdown(), |header| {
-                        header.child(
-                            Button::new("preview")
-                                .xsmall()
-                                .ghost()
-                                .label("Preview")
-                                .selected(self.preview)
-                                .tooltip("The Markdown as it reads, or its source")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.preview = !this.preview;
-                                    if !this.preview {
-                                        this.preview_text = None;
-                                        this.editor.read(cx).focus_handle(cx).focus(window, cx);
-                                    }
-                                    cx.notify();
-                                })),
-                        )
-                    })
+                    .children(self.render_look_switch(cx))
+                    .children(self.render_page_button())
                     .when(!crate::ide::installed().is_empty(), |header| {
                         let path = self.path.clone();
                         let line = self.cursor_line + 1;
@@ -1257,12 +1191,24 @@ impl Render for FileView {
                         }))),
                 )
             })
-            .when(self.preview && !veil, |this| this.child(self.render_preview(cx)))
-            .when(!self.preview && !veil, |this| this.child(
+            .when(!veil, |this| {
+                let look = if self.preview_kind().is_some() { self.preview.look } else { super::preview::Look::Code };
+                let preview = (look != super::preview::Look::Code).then(|| self.render_preview(window, cx));
+                if look == super::preview::Look::Preview {
+                    return this.children(preview);
+                }
+                let kind = self.preview_kind();
+                let share = kind.filter(|_| look == super::preview::Look::Split).map(super::preview::split_share);
+                this.child(h_flex().id("file-split").test_support().flex_1().min_h_0().items_stretch()
+                .on_drag_move(cx.listener(|this, event: &DragMoveEvent<super::preview::SplitDrag>, _, cx| this.drag_split(event, cx)))
+                .child(
                 div()
                     .id("file-editor")
+                    .test_support()
                     .relative()
                     .flex_1()
+                    .when_some(share, |editor, share| editor.flex_none().w(relative(share)))
+                    .min_w_0()
                     .min_h_0()
                     .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                         if !hovered && this.blame_hover.take().is_some() {
@@ -1311,7 +1257,11 @@ impl Render for FileView {
                         .font_family(cx.theme().mono_font_family.clone())
                         .text_size(crate::zoom::size(crate::zoom::Kind::Editor, cx)),
                 ),
-            ))
+                )
+                .when_some(kind.zip(preview), |split, (kind, preview)| {
+                    split.child(super::preview::split_handle(kind, cx)).child(div().flex_1().min_w_0().flex().child(preview))
+                }))
+            })
     }
 }
 
@@ -1584,7 +1534,7 @@ mod preview_tests {
     #[test]
     fn a_preview_s_picture_is_beside_the_file_unless_it_has_a_scheme() {
         let dir = std::path::Path::new("/repo");
-        let of = |link: &str| super::preview_image(dir, &SharedUri::from(link.to_string()));
+        let of = |link: &str| super::super::preview::preview_image(dir, &SharedUri::from(link.to_string()));
         assert!(matches!(of("docs/images/a.png?raw=1"), ImageSource::Resource(Resource::Path(p)) if p.as_ref() == std::path::Path::new("/repo/docs/images/a.png")));
         assert!(matches!(of("https://example.com/a.png"), ImageSource::Resource(Resource::Uri(_))));
     }

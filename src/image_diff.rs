@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use gpui_kit::{AnyElement, App, AppContext as _, InteractiveElement as _, TestSupportExt as _, Image, ImageFormat, IntoElement, ObjectFit, ParentElement, SharedString, Styled, StyledImage as _, Window, div, img, px};
+use gpui_kit::{AnyElement, App, AppContext as _, InteractiveElement as _, TestSupportExt as _, Image, ImageFormat, ImageSource, IntoElement, ObjectFit, ParentElement, SharedString, Styled, StyledImage as _, Window, div, img, px};
 use gpui_kit::component::{ActiveTheme, diff::DiffFile, h_flex, v_flex};
 
 /// What kind of image a file is, by its name: its name for people and its
@@ -41,9 +41,24 @@ fn blobs(headers: &[SharedString]) -> (Option<String>, Option<String>) {
 /// One side's picture, loaded.
 #[derive(Clone)]
 struct Picture {
-    image: Arc<Image>,
-    size: Option<(u32, u32)>,
+    image: Drawn,
+    size: Option<(f32, f32)>,
     bytes: usize,
+}
+
+#[derive(Clone)]
+enum Drawn {
+    Image(Arc<Image>),
+    Pixels(Arc<gpui_kit::RenderImage>),
+}
+
+/// How a side is drawn: a picture's own format, or an SVG drawn here,
+/// sharp however small it is.
+#[derive(Clone)]
+enum Format {
+    Image(ImageFormat),
+    /// With what its `currentColor` is.
+    Svg(String),
 }
 
 #[derive(Clone)]
@@ -57,6 +72,9 @@ enum Slot {
 /// worked out for it). Bounded: past this many it starts again.
 static KEPT: Mutex<Option<HashMap<String, Slot>>> = Mutex::new(None);
 const MOST_KEPT: usize = 48;
+/// An SVG's side is drawn this large on its longer side: twice the box it is
+/// shown in, less than 1 MB.
+const SVG_PIXELS: std::ops::RangeInclusive<f32> = 480.0..=480.0;
 /// Larger files are not drawn.
 const MOST_BYTES: u64 = 24 << 20;
 
@@ -100,16 +118,26 @@ impl Source {
     }
 }
 
-fn picture(bytes: Vec<u8>, format: ImageFormat) -> Picture {
-    let size = image::ImageReader::new(std::io::Cursor::new(&bytes)).with_guessed_format().ok().and_then(|reader| reader.into_dimensions().ok());
+fn picture(bytes: Vec<u8>, format: Format, dir: &Path) -> Option<Picture> {
     let len = bytes.len();
-    Picture { image: Arc::new(Image::from_bytes(format, bytes)), size, bytes: len }
+    let format = match format {
+        Format::Image(format) => format,
+        Format::Svg(ink) => {
+            let drawn = crate::task::rasterize_svg(&String::from_utf8_lossy(&bytes), dir, SVG_PIXELS, Some(&ink)).ok()?;
+            return Some(Picture { image: Drawn::Pixels(drawn.image), size: Some(drawn.size), bytes: len });
+        }
+    };
+    let size = image::ImageReader::new(std::io::Cursor::new(&bytes)).with_guessed_format().ok().and_then(|reader| reader.into_dimensions().ok());
+    Some(Picture { image: Drawn::Image(Arc::new(Image::from_bytes(format, bytes))), size: size.map(|(w, h)| (w as f32, h as f32)), bytes: len })
 }
 
 /// The picture of a side if it is read; else starts reading it and has the
 /// windows drawn again when it is.
-fn side(source: Source, format: ImageFormat, cx: &mut App) -> Slot {
-    let key = source.key();
+fn side(source: Source, format: Format, cx: &mut App) -> Slot {
+    let key = match &format {
+        Format::Svg(ink) => format!("{}\0{ink}", source.key()),
+        Format::Image(_) => source.key(),
+    };
     {
         let mut kept = KEPT.lock().unwrap();
         let kept = kept.get_or_insert_with(HashMap::new);
@@ -121,7 +149,7 @@ fn side(source: Source, format: ImageFormat, cx: &mut App) -> Slot {
         }
         kept.insert(key.clone(), Slot::Loading);
     }
-    let read = cx.background_spawn(async move { source.read().map(|bytes| picture(bytes, format)) });
+    let read = cx.background_spawn(async move { source.read().and_then(|bytes| picture(bytes, format, &source.root)) });
     cx.spawn(async move |cx| {
         let slot = read.await.map_or(Slot::Missing, Slot::Ready);
         if let Some(kept) = KEPT.lock().unwrap().as_mut() {
@@ -214,11 +242,18 @@ fn sizes_told(before: Size, after: Size) -> String {
 pub fn render(file: &DiffFile, split: bool, root: &Path, worktree: bool, window: &mut Window, cx: &mut App) -> Option<AnyElement> {
     let _ = window;
     let path = file.path().to_string();
-    let Some((name, format)) = kind(Path::new(&path)) else { return Some(sizes(file, root, worktree, cx)) };
+    let svg = Path::new(&path).extension().is_some_and(|e| e.eq_ignore_ascii_case("svg"));
+    let (name, format) = match kind(Path::new(&path)) {
+        Some((name, format)) if file.is_binary() => (name, Format::Image(format)),
+        // A text file has its diff; an SVG its pictures above it too.
+        _ if svg && !file.is_binary() => ("SVG", Format::Svg(crate::task::ink(cx))),
+        _ if file.is_binary() => return Some(sizes(file, root, worktree, cx)),
+        _ => return None,
+    };
     let (old_blob, new_blob) = blobs(file.extended_headers());
     let status = file.status();
     use gpui_kit::component::diff::DiffFileStatus as S;
-    let before = (status != S::Added && old_blob.is_some()).then(|| side(Source { root: root.to_path_buf(), blob: old_blob, file: None }, format, cx));
+    let before = (status != S::Added && old_blob.is_some()).then(|| side(Source { root: root.to_path_buf(), blob: old_blob, file: None }, format.clone(), cx));
     let after = (status != S::Deleted).then(|| {
         let modified = file.modified_path().map(|p| root.join(p.as_ref()));
         side(Source { root: root.to_path_buf(), blob: new_blob, file: modified.filter(|_| worktree) }, format, cx)
@@ -238,9 +273,13 @@ pub fn render(file: &DiffFile, split: bool, root: &Path, worktree: bool, window:
             Some(Slot::Loading) => (div().text_color(muted).child("Reading…").into_any_element(), String::new()),
             Some(Slot::Missing) => (div().text_color(muted).child("Not found").into_any_element(), String::new()),
             Some(Slot::Ready(p)) => {
-                let size = p.size.map(|(w, h)| format!(" · {w}×{h}")).unwrap_or_default();
+                let size = p.size.map(|(w, h)| format!(" · {}×{}", w.round(), h.round())).unwrap_or_default();
                 (
-                    img(p.image.clone()).size_full().object_fit(ObjectFit::ScaleDown).into_any_element(),
+                    img(match p.image.clone() {
+                        Drawn::Image(image) => ImageSource::from(image),
+                        Drawn::Pixels(pixels) => ImageSource::Render(pixels),
+                    })
+                    .size_full().object_fit(ObjectFit::ScaleDown).into_any_element(),
                     format!("{name}{size} · {}", crate::task::human_size(p.bytes as u64)),
                 )
             }
@@ -323,28 +362,42 @@ mod tests {
         shows_both(gpui_kit::component::diff::DiffMode::Unified, cx);
     }
 
+    /// An SVG is text, and its diff is: its two pictures are above it.
+    #[gpui_kit::test]
+    fn a_changed_svg_shows_both_versions_above_its_text(cx: &mut gpui_kit::TestAppContext) {
+        shows_both_of("a.svg", gpui_kit::component::diff::DiffMode::Split, cx);
+    }
+
     fn shows_both(mode: gpui_kit::component::diff::DiffMode, cx: &mut gpui_kit::TestAppContext) {
+        shows_both_of("a.png", mode, cx);
+    }
+
+    fn shows_both_of(name: &str, mode: gpui_kit::component::diff::DiffMode, cx: &mut gpui_kit::TestAppContext) {
         use gpui_kit::test::TestWindowExt as _;
         use gpui_kit::{AppContext as _, Bounds, Point, WindowBounds, WindowOptions, size};
-        let dir = std::env::temp_dir().join(format!("ideae-image-diff-ui-{}-{mode:?}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ideae-image-diff-ui-{}-{mode:?}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let git = |args: &[&str]| std::process::Command::new("git").arg("-C").arg(&dir).args(["-c", "user.name=t", "-c", "user.email=t@example.com"]).args(args).output().unwrap();
+        let svg = name.ends_with(".svg");
         let png = |w: u32| {
+            if svg {
+                return format!("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"4\">\n<rect width=\"{w}\" height=\"4\"/>\n</svg>\n").into_bytes();
+            }
             let mut out = Vec::new();
             image::RgbaImage::new(w, 4).write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).unwrap();
             out
         };
         git(&["init", "-q"]);
-        std::fs::write(dir.join("a.png"), png(3)).unwrap();
+        std::fs::write(dir.join(name), png(3)).unwrap();
         std::fs::write(dir.join("b.txt"), "short\n").unwrap();
-        git(&["add", "a.png", "b.txt"]);
+        git(&["add", name, "b.txt"]);
         git(&["commit", "-qm", "a"]);
-        std::fs::write(dir.join("a.png"), png(5)).unwrap();
+        std::fs::write(dir.join(name), png(5)).unwrap();
         std::fs::write(dir.join("b.txt"), format!("{}\n", "wide ".repeat(400))).unwrap();
         let patch = String::from_utf8(git(&["diff"]).stdout).unwrap();
         let files = DiffFile::parse(&patch).unwrap();
-        assert!(files[0].is_binary(), "{patch}");
+        assert_eq!(files[0].is_binary(), !svg, "{patch}");
         cx.update(gpui_kit::init);
         let root = dir.clone();
         let handle = cx.update(|cx| {

@@ -31,8 +31,7 @@ impl TaskView {
 
         if let Some((kind, _)) = crate::image_diff::kind(&path) {
             let title = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let size = std::fs::metadata(&path).map(|m| super::helpers::human_size(m.len())).unwrap_or_default();
-            let view = cx.new(|_| BinaryView { path: path.clone(), reason: format!("{kind} image, {size}"), image: true });
+            let view = cx.new(|cx| BinaryView::image(path.clone(), kind, cx));
             self.place_tab(TabItem::new(title, TabKind::Binary(view)), how, window, cx);
             return;
         }
@@ -40,7 +39,7 @@ impl TaskView {
             Ok(content) => content,
             Err(reason) => {
                 let title = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let view = cx.new(|_| BinaryView { path: path.clone(), reason, image: false });
+                let view = cx.new(|_| BinaryView { path: path.clone(), reason, picture: None });
                 self.place_tab(TabItem::new(title, TabKind::Binary(view)), how, window, cx);
                 return;
             }
@@ -74,6 +73,7 @@ impl TaskView {
         let file = cx.new(|cx| {
             // The editor notifies on cursor moves too: follow the line for blame.
             cx.observe(&editor, |this: &mut FileView, editor, cx| {
+                this.follow_scroll(cx);
                 let Position { line, character } = editor.read(cx).cursor_position();
                 this.cursor_col = character;
                 // The popup of a change follows its line as the editor scrolls.
@@ -84,6 +84,14 @@ impl TaskView {
                         this.show_line_blame(cx);
                     }
                     cx.notify();
+                }
+            })
+            .detach();
+            // A diagram is drawn in the theme's colors.
+            cx.observe_global::<gpui_kit::component::Theme>(|this: &mut FileView, cx| {
+                // An SVG's currentColor is the theme's text.
+                if matches!(this.preview_kind(), Some(super::preview::Kind::Mermaid | super::preview::Kind::Svg)) {
+                    this.refresh_preview(false, cx);
                 }
             })
             .detach();
@@ -132,8 +140,7 @@ impl TaskView {
             lsp_missing: None,
             lsp_attach: 0,
             lsp_unlicensed: false,
-            preview: false,
-            preview_text: None,
+            preview: Default::default(),
             veiled,
             occurrence: None,
             committed: None,
@@ -185,6 +192,10 @@ impl TaskView {
                 }
             }),
         }});
+        // Debug aid for screenshots: IDEAE_LOOK=split or preview shows a file that can be drawn so.
+        if let Some(look) = std::env::var("IDEAE_LOOK").ok().and_then(|look| super::preview::Look::named(&look)) {
+            file.update(cx, |f, cx| f.set_look(look, cx));
+        }
         // The tab label shows whether the file has unsaved edits.
         // The cursor moving a line is the file's own to draw, except for the
         // Structure panel, which marks where it is.

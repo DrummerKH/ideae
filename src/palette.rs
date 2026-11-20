@@ -357,6 +357,7 @@ impl Workspace {
             keyed("Fold all", "fold_all", "editor"),
             keyed("Unfold all", "unfold_all", "editor"),
             keyed("Annotate with Git Blame", "annotate", "editor: who changed each line; again to close"),
+            keyed("Code, split, preview", "cycle_look", "editor: Markdown, SVG, a table or a diagram as text, drawn, or both"),
             keyed("Toggle bookmark", "bookmark", "editor: the cursor's line"),
             keyed("Bookmarks", "bookmarks", "go to: the task's bookmarked lines"),
             keyed("Next bookmark", "next_bookmark", "go to: in the file"),

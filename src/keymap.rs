@@ -15,12 +15,16 @@ enum Scope {
     /// Anywhere a terminal does not take it first.
     App,
     Editor,
+    /// An open file: its editor, or the file drawn instead of its text.
+    File,
     Terminal,
     /// The Changes tab's diff, while it has the keyboard: single letters, as
     /// nothing is typed there.
     Review,
     /// A Web tab: a browser's keys, over the window's where they clash.
     Browser,
+    /// A picture with the keyboard: its zoom, over the same keys elsewhere.
+    Picture,
 }
 
 pub struct Shortcut {
@@ -109,6 +113,8 @@ pub static SHORTCUTS: &[Shortcut] = &[
     shortcut!("prev_bookmark", "Previous bookmark", "alt-pageup", Editor, task::PrevBookmark),
     // No keys of its own, as in JetBrains IDEs: the gutter's menu has it.
     shortcut!("annotate", "Annotate with Git Blame", "", Editor, task::ToggleBlame),
+    // VS Code's key for a Markdown preview.
+    shortcut!("cycle_look", "Code, split, preview", "ctrl-shift-v", File, task::CycleLook),
     shortcut!("parameter_info", "Parameter info", "ctrl-p", Editor, task::ParameterInfo),
     // Ctrl+Y is the line's: the editor's own Redo moves here.
     shortcut!("redo", "Redo", "ctrl-shift-z", Editor, gpui_kit::component::input::Redo),
@@ -121,6 +127,11 @@ pub static SHORTCUTS: &[Shortcut] = &[
     shortcut!("web_zoom_in", "Zoom in", "ctrl-=", Browser, crate::browser::BrowserZoomIn),
     shortcut!("web_zoom_out", "Zoom out", "ctrl--", Browser, crate::browser::BrowserZoomOut),
     shortcut!("web_zoom_reset", "Actual size", "ctrl-0", Browser, crate::browser::BrowserZoomReset),
+    shortcut!("picture_zoom_in", "Zoom in", "ctrl-=", Picture, crate::picture::PictureZoomIn),
+    shortcut!("picture_zoom_out", "Zoom out", "ctrl--", Picture, crate::picture::PictureZoomOut),
+    shortcut!("picture_actual_size", "Actual size", "ctrl-0", Picture, crate::picture::PictureActualSize),
+    // As macOS Preview has it.
+    shortcut!("picture_fit", "Fit", "ctrl-9", Picture, crate::picture::PictureFit),
     shortcut!("web_devtools", "DevTools", "f12", Browser, crate::browser::BrowserDevTools),
     // No keys of its own: a theme is seldom changed, and the menu has it.
     shortcut!("theme", "Switch theme", "", Everywhere, SwitchTheme),
@@ -140,10 +151,11 @@ impl Shortcut {
     /// The heading Settings lists it under.
     pub fn area(&self) -> &'static str {
         match self.scope {
-            Scope::Editor => "Editor",
+            Scope::Editor | Scope::File => "Editor",
             Scope::Terminal => "Terminal",
             Scope::Review => "Changes",
             Scope::Browser => "Web",
+            Scope::Picture => "Picture",
             _ => "Window",
         }
     }
@@ -173,9 +185,11 @@ impl Shortcut {
             Scope::NotInTerminal => vec![bind(None, action()), bind(terminal, Box::new(NoAction))],
             Scope::App => vec![bind(None, action())],
             Scope::Editor => vec![bind(Some("Input"), action())],
+            Scope::File => vec![bind(Some("Input"), action()), bind(Some(crate::task::PREVIEW_CONTEXT), action())],
             Scope::Terminal => vec![bind(terminal, action())],
             Scope::Review => vec![bind(Some("Changes > Diff"), action())],
             Scope::Browser => vec![bind(Some(crate::browser::KEY_CONTEXT), action())],
+            Scope::Picture => vec![bind(Some(crate::picture::KEY_CONTEXT), action())],
         };
         made.into_iter().filter_map(Result::ok).collect()
     }
