@@ -888,25 +888,35 @@ mod tests {
         proto::write_msg(&mut stream, &Msg::Kill { id: "pipe-flood".into() }).unwrap();
 
         // Attached again at the size it has, a program is not told of one;
-        // at another, it is told that one.
+        // at another, it is told that one. Waited for by what it writes and
+        // what the daemon answers, not by time: a loaded machine is slow.
         let sizes = dir.join("sizes");
+        let lines = || std::fs::read_to_string(&sizes).unwrap_or_default().lines().map(str::to_string).collect::<Vec<_>>();
+        let until = |done: &dyn Fn(&[String]) -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while !done(&lines()) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            lines()
+        };
         // Not the interactive shell: with job control the signal goes to the foreground job alone.
-        let input = format!("exec bash --norc -c \"trap 'stty size >> {}' WINCH; while :; do sleep 0.05; done\"\n", sizes.display());
+        let input = format!("exec bash --norc -c \"trap 'stty size >> {0}' WINCH; echo ready > {0}; while :; do sleep 0.05; done\"\n", sizes.display());
         let spec = Spec { cwd: dir.clone(), env: Vec::new(), input: Some(input), program: Vec::new() };
         proto::write_msg(&mut stream, &Msg::Open { id: "sizes".into(), spec: spec.clone(), size }).unwrap();
-        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(until(&|l| !l.is_empty()), ["ready"], "the program set its trap");
+        // Attached once the daemon has sent the replay: the open is done.
         let attach = |size: Size| {
             let mut again = UnixStream::connect(&path).unwrap();
             proto::write_msg(&mut again, &Msg::Hello { protocol: proto::PROTOCOL, version: crate::build_watch::build_id() }).unwrap();
             proto::write_msg(&mut again, &Msg::Open { id: "sizes".into(), spec: spec.clone(), size }).unwrap();
-            std::thread::sleep(Duration::from_millis(300));
+            again.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+            let replayed = (0..50).any(|_| matches!(proto::read_frame(&mut again), Ok(Frame::Bytes { kind: KIND_REPLAY, .. })));
+            assert!(replayed, "attached");
             again
         };
         drop(attach(size));
-        let big = Size { cols: 120, rows: 40, ..size };
-        let mut again = attach(big);
-        let told = std::fs::read_to_string(&sizes).unwrap_or_default();
-        assert_eq!(told.lines().collect::<Vec<_>>(), ["40 120"]);
+        let mut again = attach(Size { cols: 120, rows: 40, ..size });
+        assert_eq!(until(&|l| l.len() > 1), ["ready", "40 120"], "told the new size alone");
         proto::write_msg(&mut again, &Msg::Kill { id: "sizes".into() }).unwrap();
         std::thread::sleep(Duration::from_millis(200));
         let _ = std::fs::remove_file(&path);
