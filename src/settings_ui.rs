@@ -261,6 +261,15 @@ fn pages(
     });
     vec![
         SettingPage::new("General").default_open(true).group(
+            SettingGroup::new().title("Look")
+                .item(SettingItem::new("Light theme", light_theme).description(
+                    "Theme… in the menu previews each theme as you move through the list.",
+                ))
+                .item(SettingItem::new("Dark theme", dark_theme))
+                .item(SettingItem::new("Light or dark", appearance).description(format!(
+                    "Auto follows the system's setting, which is {now} now. Light and Dark stay fixed.",
+                ))),
+        ).group(
             SettingGroup::new().title("Notices")
                 .item(switch(
                     draft,
@@ -271,53 +280,36 @@ fn pages(
                 ))
                 .item(switch(
                     draft,
-                    "Show what the agent said in notifications",
+                    "What the agent said, in notifications",
                     "The notification includes the agent's last answer or its question. When off, it says only Finished or Needs your answer, with the task's name. Never while presenting.",
                     |s| s.notify_said,
                     |s, v| s.notify_said = v,
                 ))
+                .item(switch(
+                    draft,
+                    "What the agent said, in Needs you",
+                    "In Needs you, a finished task shows the start of its agent's last answer, and a waiting one shows its question. The task's tooltip shows it too. Never while presenting.",
+                    |s| s.show_said,
+                    |s, v| s.show_said = v,
+                ))
                 .item(SettingItem::new("Where notices show", notices_at).description(
                     "The corner of the window for the app's own notices, such as a finished task, a failed check or an update.",
-                ))
-                .item(switch(
-                    draft,
-                    "Check for updates",
-                    "From time to time the app checks GitHub for a newer release. Release builds only.",
-                    |s| s.check_updates,
-                    |s, v| s.check_updates = v,
                 )),
         ).group(
-            SettingGroup::new().title("Look")
-                .item(SettingItem::new("Light theme", light_theme).description(
-                    "Theme… in the menu previews each theme as you move through the list.",
+            SettingGroup::new().title("Sidebar")
+                .item(switch(
+                    draft,
+                    "Worktrees made by agents",
+                    "Worktrees an agent creates for itself (Claude Code's subagents, a try in a temporary folder) are listed under the task they came from and open without an agent. When off, they are hidden.",
+                    |s| s.show_side_worktrees,
+                    |s, v| s.show_side_worktrees = v,
                 ))
-                .item(SettingItem::new("Dark theme", dark_theme))
-                .item(SettingItem::new("Light or dark", appearance).description(format!(
-                    "Auto follows the system's setting, which is {now} now. Light and Dark stay fixed.",
-                ))),
+                .item(
+                    SettingItem::new("The narrow sidebar opens after", rail_open)
+                        .description("Dragged to its narrowest, the sidebar becomes a rail of tasks. Rest the pointer on the rail this long and the full sidebar opens over the task."),
+                ),
         ).group(
             SettingGroup::new().title("Title bar")
-                .item(switch(
-                    draft,
-                    "Say when the battery runs low",
-                    "Once, when the battery drops to 30% while unplugged: a notice suggesting Power Save Mode, with a button to turn it on.",
-                    |s| s.battery_hint,
-                    |s, v| s.battery_hint = v,
-                ))
-                .item(switch(
-                    draft,
-                    "Keep the system awake while agents work",
-                    "While an agent works, or a setup or a check runs, the system does not go to sleep for being left alone; the screen still dims and locks. A closed lid sleeps all the same.",
-                    |s| s.keep_awake,
-                    |s, v| s.keep_awake = v,
-                ))
-                .item(switch(
-                    draft,
-                    "Also on the battery",
-                    "Off: only while plugged in.",
-                    |s| s.keep_awake_on_battery,
-                    |s, v| s.keep_awake_on_battery = v,
-                ))
                 .item(switch(
                     draft,
                     "Load",
@@ -341,32 +333,36 @@ fn pages(
                     |s, v| s.menu_bar_shown = v,
                 ))),
         ).group(
-            SettingGroup::new().title("Sidebar")
+            SettingGroup::new().title("Power")
                 .item(switch(
                     draft,
-                    "Context dial on tasks",
-                    "A dial next to each task in the sidebar showing how full its agent's context is.",
-                    |s| s.context_dial,
-                    |s, v| s.context_dial = v,
+                    "Keep the system awake while agents work",
+                    "While an agent works, or a setup or a check runs, the system does not go to sleep for being left alone; the screen still dims and locks. A closed lid sleeps all the same.",
+                    |s| s.keep_awake,
+                    |s, v| s.keep_awake = v,
                 ))
                 .item(switch(
                     draft,
-                    "Context dial on the agent's tab",
-                    "A dial on the agent tab of the open task showing how full its context is.",
-                    |s| s.context_on_tab,
-                    |s, v| s.context_on_tab = v,
+                    "Also on the battery",
+                    "Off: only while plugged in.",
+                    |s| s.keep_awake_on_battery,
+                    |s, v| s.keep_awake_on_battery = v,
                 ))
                 .item(switch(
                     draft,
-                    "Worktrees made by agents",
-                    "Worktrees an agent creates for itself (Claude Code's subagents, a try in a temporary folder) are listed under the task they came from and open without an agent. When off, they are hidden.",
-                    |s| s.show_side_worktrees,
-                    |s, v| s.show_side_worktrees = v,
-                ))
-                .item(
-                    SettingItem::new("The narrow sidebar opens after", rail_open)
-                        .description("Dragged to its narrowest, the sidebar becomes a rail of tasks. Rest the pointer on the rail this long and the full sidebar opens over the task."),
-                ),
+                    "Say when the battery runs low",
+                    "Once, when the battery drops to 30% while unplugged: a notice suggesting Power Save Mode, with a button to turn it on.",
+                    |s| s.battery_hint,
+                    |s, v| s.battery_hint = v,
+                )),
+        ).group(
+            SettingGroup::new().title("Updates").item(switch(
+                draft,
+                "Check for updates",
+                "From time to time the app checks GitHub for a newer release. Release builds only.",
+                |s| s.check_updates,
+                |s, v| s.check_updates = v,
+            )),
         ),
         agents_page(
             draft,
@@ -377,7 +373,80 @@ fn pages(
                 |s| s.agent_lsp,
                 |s, v| s.agent_lsp = v,
             ),
+            [
+                switch(
+                    draft,
+                    "Context dial on tasks",
+                    "A dial next to each task in the sidebar showing how full its agent's context is.",
+                    |s| s.context_dial,
+                    |s, v| s.context_dial = v,
+                ),
+                switch(
+                    draft,
+                    "Context dial on the agent's tab",
+                    "A dial on the agent tab of the open task showing how full its context is.",
+                    |s| s.context_on_tab,
+                    |s, v| s.context_on_tab = v,
+                ),
+            ],
             token_warn,
+        ),
+        SettingPage::new("Tasks").default_open(true).group(
+            SettingGroup::new().title("New tasks")
+                .item(switch(
+                    draft,
+                    "Copy .env files",
+                    "New worktrees get copies of the main checkout's ignored .env* files, unless the project's settings list other files to copy.",
+                    |s| s.copy_env,
+                    |s, v| s.copy_env = v,
+                ))
+                .item({
+                    let (read, write) = (draft.clone(), draft.clone());
+                    SettingItem::new(
+                        "Worktrees in",
+                        SettingField::input(
+                            move |_| read.borrow().worktrees_dir.clone().into(),
+                            move |value: SharedString, _| write.borrow_mut().worktrees_dir = value.trim().to_string(),
+                        ),
+                    )
+                    .description("Empty: beside each repository, in <repository>.worktrees, where the tools of the folders above it still apply. A folder (~/worktrees): one of each project's name in it, as for a repository in a synced folder. New tasks only; a project's settings can name its own.")
+                }),
+        ).group(
+            SettingGroup::new().title("Questions aside")
+                .item(SettingItem::new("Stop an idle one's agent after", {
+                    let (read, write) = (draft.clone(), draft.clone());
+                    SettingField::number_input(NumberFieldOptions { min: 0., max: 24. * 60., step: 5. }, move |_| f64::from(read.borrow().question_sleep_minutes), move |value, _| {
+                        write.borrow_mut().question_sleep_minutes = value as u32
+                    })
+                    .default_value(f64::from(state::Settings::default().question_sleep_minutes))
+                }).description(
+                    "Minutes; 0 means never. A question whose agent is neither working nor waiting for an answer, and whose tab is not in front, stops its agent to free its memory. The question stays open, and its agent resumes its conversation when you open it.",
+                ))
+                .item(SettingItem::new("Close an open one after", {
+                    let (read, write) = (draft.clone(), draft.clone());
+                    SettingField::number_input(NumberFieldOptions { min: 0., max: 365., step: 1. }, move |_| f64::from(read.borrow().question_close_days), move |value, _| {
+                        write.borrow_mut().question_close_days = value as u32
+                    })
+                    .default_value(f64::from(state::Settings::default().question_close_days))
+                }).description(
+                    "Days; 0 means never. An open question with no message for this long, neither yours nor its agent's, goes to the closed ones, where it can be picked up again.",
+                )),
+        ).group(
+            SettingGroup::new().title("Archived tasks")
+                .item(SettingItem::new("Restore with", restore_with).description(
+                    "A restored task's agent either continues its whole conversation and is told what changed since, or starts a new session with only the task, the last messages and what changed: a shorter context.",
+                ))
+                .item(SettingItem::new("Delete archived tasks after", archive_keep).description(
+                    "Archives older than this are deleted, along with their agent's conversation and any commits or changes in them that were never pushed.",
+                )),
+        ).group(
+            SettingGroup::new().title("Web tabs").item(switch(
+                draft,
+                "Reload the task's site after the agent's turn",
+                "A Web tab showing the task's own site (a port of its services, or one its processes listen on) reloads when the agent finishes a turn. Other pages are left alone. Turn it off if the site reloads by itself and should keep its state.",
+                |s| s.web_reload_after_turn,
+                |s, v| s.web_reload_after_turn = v,
+            )),
         ),
         SettingPage::new("Editor").default_open(true).group(
             SettingGroup::new().title("Typing")
@@ -441,77 +510,8 @@ fn pages(
                     |s, v| s.gutter_since_base = v,
                 )),
         ),
-        SettingPage::new("Tasks").default_open(true).group(
-            SettingGroup::new().title("Agents")
-                .item(switch(
-                    draft,
-                    "What the agent said",
-                    "In Needs you, a finished task shows the start of its agent's last answer, and a waiting one shows its question. The task's tooltip and the notification show it too. Never while presenting.",
-                    |s| s.show_said,
-                    |s, v| s.show_said = v,
-                )),
-        ).group(
-            SettingGroup::new().title("New tasks")
-                .item(switch(
-                    draft,
-                    "Copy .env files",
-                    "New worktrees get copies of the main checkout's ignored .env* files, unless the project's settings list other files to copy.",
-                    |s| s.copy_env,
-                    |s, v| s.copy_env = v,
-                ))
-                .item({
-                    let (read, write) = (draft.clone(), draft.clone());
-                    SettingItem::new(
-                        "Worktrees in",
-                        SettingField::input(
-                            move |_| read.borrow().worktrees_dir.clone().into(),
-                            move |value: SharedString, _| write.borrow_mut().worktrees_dir = value.trim().to_string(),
-                        ),
-                    )
-                    .description("Empty: beside each repository, in <repository>.worktrees, where the tools of the folders above it still apply. A folder (~/worktrees): one of each project's name in it, as for a repository in a synced folder. New tasks only; a project's settings can name its own.")
-                }),
-        ).group(
-            SettingGroup::new().title("Questions asked aside")
-                .item(SettingItem::new("Stop an idle one's agent after", {
-                    let (read, write) = (draft.clone(), draft.clone());
-                    SettingField::number_input(NumberFieldOptions { min: 0., max: 24. * 60., step: 5. }, move |_| f64::from(read.borrow().question_sleep_minutes), move |value, _| {
-                        write.borrow_mut().question_sleep_minutes = value as u32
-                    })
-                    .default_value(f64::from(state::Settings::default().question_sleep_minutes))
-                }).description(
-                    "Minutes; 0 means never. A question whose agent is neither working nor waiting for an answer, and whose tab is not in front, stops its agent to free its memory. The question stays open, and its agent resumes its conversation when you open it.",
-                ))
-                .item(SettingItem::new("Close an open one after", {
-                    let (read, write) = (draft.clone(), draft.clone());
-                    SettingField::number_input(NumberFieldOptions { min: 0., max: 365., step: 1. }, move |_| f64::from(read.borrow().question_close_days), move |value, _| {
-                        write.borrow_mut().question_close_days = value as u32
-                    })
-                    .default_value(f64::from(state::Settings::default().question_close_days))
-                }).description(
-                    "Days; 0 means never. An open question with no message for this long, neither yours nor its agent's, goes to the closed ones, where it can be picked up again.",
-                )),
-        ).group(
-            SettingGroup::new().title("Archived tasks")
-                .item(SettingItem::new("Restore with", restore_with).description(
-                    "A restored task's agent either continues its whole conversation and is told what changed since, or starts a new session with only the task, the last messages and what changed: a shorter context.",
-                ))
-                .item(SettingItem::new("Delete archived tasks after", archive_keep).description(
-                    "Archives older than this are deleted, along with their agent's conversation and any commits or changes in them that were never pushed.",
-                )),
-        ).group(
-            SettingGroup::new().title("Git in the background")
-                .item(SettingItem::new("Fetch the base branch", fetch).description(
-                    "Keeps origin's main branch up to date in the background, so each task can show how far behind it is.",
-                ))
-                .item(switch(
-                    draft,
-                    "Pull request status",
-                    "Asks gh about each task's pull request and shows its status on the task's row.",
-                    |s| s.pr_status,
-                    |s, v| s.pr_status = v,
-                )),
-        ).group(
-            SettingGroup::new().title("Changes")
+        SettingPage::new("Git").default_open(true).group(
+            SettingGroup::new().title("Diffs")
                 .item(switch(
                     draft,
                     "Unified diff",
@@ -525,20 +525,26 @@ fn pages(
                     "Diffs hide changes to spaces, tabs, line endings and blank lines, like GitHub's \"Hide whitespace\". Staging or reverting a single change then applies only what you see.",
                     |s| s.diff_ignore_whitespace,
                     |s, v| s.diff_ignore_whitespace = v,
+                )),
+        ).group(
+            SettingGroup::new().title("Conflicts").item(switch(
+                draft,
+                "Conflicts go to the agent",
+                "A pull, rebase, cherry-pick or revert that would conflict is not started; the agent is asked to do it and resolve the conflicts instead. When off, you are only told.",
+                |s| s.conflicts_to_agent,
+                |s, v| s.conflicts_to_agent = v,
+            )),
+        ).group(
+            SettingGroup::new().title("In the background")
+                .item(SettingItem::new("Fetch the base branch", fetch).description(
+                    "Keeps origin's main branch up to date in the background, so each task can show how far behind it is.",
                 ))
                 .item(switch(
                     draft,
-                    "Conflicts go to the agent",
-                    "A pull, rebase, cherry-pick or revert that would conflict is not started; the agent is asked to do it and resolve the conflicts instead. When off, you are only told.",
-                    |s| s.conflicts_to_agent,
-                    |s, v| s.conflicts_to_agent = v,
-                ))
-                .item(switch(
-                    draft,
-                    "Reload the task's site after the agent's turn",
-                    "A Web tab showing the task's own site (a port of its services, or one its processes listen on) reloads when the agent finishes a turn. Other pages are left alone. Turn it off if the site reloads by itself and should keep its state.",
-                    |s| s.web_reload_after_turn,
-                    |s, v| s.web_reload_after_turn = v,
+                    "Pull request status",
+                    "Asks gh about each task's pull request and shows its status on the task's row.",
+                    |s| s.pr_status,
+                    |s, v| s.pr_status = v,
                 )),
         ),
         SettingPage::new("Language servers").default_open(true).groups([
@@ -615,12 +621,12 @@ fn pages(
 }
 
 /// Where the shortcuts are among the pages.
-pub const KEYS_PAGE: usize = 5;
+pub const KEYS_PAGE: usize = 6;
 pub const AGENTS_PAGE: usize = 1;
-pub const LSP_PAGE: usize = 4;
+pub const LSP_PAGE: usize = 5;
 
 /// The Agents page: the profiles, the default, the one for quick questions.
-fn agents_page(draft: &Draft, lsp_switch: SettingItem, token_warn: SettingField<SharedString>) -> SettingPage {
+fn agents_page(draft: &Draft, lsp_switch: SettingItem, dials: [SettingItem; 2], token_warn: SettingField<SharedString>) -> SettingPage {
     let list = {
         let draft = draft.clone();
         SettingItem::render(move |_, _, cx| {
@@ -746,7 +752,7 @@ fn agents_page(draft: &Draft, lsp_switch: SettingItem, token_warn: SettingField<
         )
         .group(SettingGroup::new().title("Claude Code").item(lsp_switch))
         .group(
-            SettingGroup::new().title("Tokens").item(
+            SettingGroup::new().title("Context and tokens").items(dials).item(
                 SettingItem::new("Tell me when a session has used", token_warn)
                     .description("A notification, once per session, when its agent has used this many tokens: input not read from the cache, plus output. The agent is not stopped."),
             ),
@@ -1195,7 +1201,9 @@ fn open(
     let recording: Rc<Cell<Option<&'static str>>> = Rc::default();
     let catcher: Rc<RefCell<Option<Subscription>>> = Rc::default();
     let save = Rc::new(save);
-    window.open_dialog(cx, move |dialog, _, _| {
+    window.open_dialog(cx, move |dialog, window, _| {
+        // Room for the longer titles of the pages' list, as the window allows.
+        let wide = (window.viewport_size().width - px(64.)).clamp(px(640.), px(1000.));
         let (draft, look, recording, catcher) = (draft.clone(), look.clone(), recording.clone(), catcher.clone());
         let save = {
             let (draft, look, save) = (draft.clone(), look.clone(), save.clone());
@@ -1209,7 +1217,7 @@ fn open(
         };
         dialog
             .title("Settings")
-            .w(px(900.))
+            .w(wide)
             .content(move |content, window, cx| {
                 let dark_now = matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark);
                 // The dialog is as tall as the window lets it; the pages scroll inside.
@@ -1223,7 +1231,7 @@ fn open(
                         .overflow_hidden()
                         .child(
                             Settings::new("settings")
-                                .sidebar_width(px(200.))
+                                .sidebar_width(px(240.))
                                 .default_selected_index(SelectIndex { page_ix: first, group_ix: None })
                                 .pages(pages(&draft, &look, dark_now, &recording, &catcher)),
                         ),
@@ -1405,7 +1413,7 @@ mod tests {
             let mut current = state::Settings::default();
             current.agents[0].command = "mine".into();
             let saved = saved.clone();
-            open(current, Appearance::Auto, 5, window, cx, move |settings, _, _, _| *saved.borrow_mut() = Some(settings));
+            open(current, Appearance::Auto, super::KEYS_PAGE, window, cx, move |settings, _, _, _| *saved.borrow_mut() = Some(settings));
             window.render_frame(cx);
             let before = window.find("key-row-recent").bounds();
             assert!(window.try_find("key-row-comment").is_none_or(|row| !row.visible()), "the last keys start below the fold");

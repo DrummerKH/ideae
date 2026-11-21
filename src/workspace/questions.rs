@@ -657,8 +657,10 @@ mod tests {
         assert!(std::process::Command::new("sh").arg("-ec").arg("git init -q -b main repo; cd repo; git config user.email t@t; git config user.name t; echo one > f.txt; git add f.txt; git commit -qm base").current_dir(&dir).status().unwrap().success());
         let repo = dir.join("repo").canonicalize().unwrap();
         // Claude Code's stand-in: how it was started, by which agent, then it waits.
+        // Asked once (`-p`, a question's title), it says nothing: it runs where
+        // the tests do, in the app's own checkout.
         let claude = dir.join("bin").join("claude");
-        std::fs::write(&claude, "#!/bin/sh\necho \"$@\" > \"$PWD/.args-$IDEAE_AGENT\"\nexec sleep 60\n").unwrap();
+        std::fs::write(&claude, "#!/bin/sh\n[ \"$1\" = -p ] && exit 0\necho \"$@\" > \"$PWD/.args-$IDEAE_AGENT\"\nexec sleep 60\n").unwrap();
         std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
         // The main thread's session of before, in Claude Code's folder for the repository.
         let config = dir.join("claude-config");

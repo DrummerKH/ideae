@@ -112,7 +112,7 @@ report what they can, and the rest is guessed from their terminal: see
 do. The sidebar shows working / needs input / done, and a desktop notification fires when a task out of view wants you.
 A question Claude Code asks (AskUserQuestion) or a plan it waits to have
 approved counts as needing you. Notifications carry the agent's last answer
-or its question; Settings → General → "Show what the agent said in
+or its question; Settings → General → "What the agent said, in
 notifications" off, they say only Finished or Needs your answer.
 The Changes and Files panels mark the file the agent is writing to and those
 it wrote to since your last prompt.
@@ -120,7 +120,7 @@ it wrote to since your last prompt.
 By a task in the sidebar, a small dial shows how full its agent's context is
 (yellow from three quarters, red from nine tenths; the numbers when the
 pointer rests on the task). The title bar can show what all the agents took
-in the last 24 hours (Settings → Title bar). A session that has used more than a limit you set is told
+in the last 24 hours (Settings → General → Title bar). A session that has used more than a limit you set is told
 of once (Settings → Agents).
 
 ## Questions aside
@@ -243,6 +243,9 @@ one, Structure and Run of the lower, and a mark dragged to the other end of
 the strip moves its panel there. With nothing shown the strip is all there
 is of the side, and the pointer resting on a mark brings its panel over the
 task until it leaves.
+The Files panel and Go to file leave out what the system writes into folders
+for itself (.DS_Store, Thumbs.db, desktop.ini and the like); Changes still
+lists one git does not ignore.
 
 ## Git
 
@@ -288,7 +291,7 @@ take the whole page; say what to do with them and send them all in one prompt.
   prompt.
 - The task's own site is a page of this machine at a port of the task: one
   of its services', or one its processes listen on. A tab showing it loads
-  it again when the agent's turn ends (Settings → Agent; off for a site that
+  it again when the agent's turn ends (Settings → Tasks → Web tabs; off for a site that
   reloads by itself and should keep its state); a page of elsewhere is left
   alone. The address bar offers the task's own addresses.
 - A page of this machine that could not be loaded (a dev server still
@@ -322,7 +325,7 @@ take the whole page; say what to do with them and send them all in one prompt.
 
 - One menu bar on every system: File, Edit, View, Navigate, Task, Git, Window
   and Help. macOS has it at the top of the screen; on Linux and Windows it is
-  behind ☰ in the title bar, or Alt pressed alone (Settings → Title bar can
+  behind ☰ in the title bar, or Alt pressed alone (Settings → General → Title bar can
   keep it shown).
 - Themes: Ayu, Catppuccin, Gruvbox, Solarized, Everforest, Flexoki, GitHub, One,
   Rosé Pine, Tokyo Night and JetBrains' Islands, each light and dark. Settings has

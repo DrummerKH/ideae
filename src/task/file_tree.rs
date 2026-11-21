@@ -210,7 +210,9 @@ fn list(folder: &std::path::Path) -> Vec<(SharedString, bool)> {
         .into_iter()
         .flatten()
         .flatten()
-        .map(|entry| (entry.file_name().to_string_lossy().into_owned().into(), entry.file_type().is_ok_and(|t| t.is_dir())))
+        .map(|entry| (entry.file_name().to_string_lossy().into_owned(), entry.file_type().is_ok_and(|t| t.is_dir())))
+        .filter(|(name, _)| !git::is_junk(name))
+        .map(|(name, folder)| (name.into(), folder))
         .collect();
     entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     entries

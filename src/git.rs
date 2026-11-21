@@ -608,6 +608,15 @@ pub fn first_changed_lines(patch: &str) -> std::collections::HashMap<String, u32
     lines
 }
 
+/// What the system leaves in folders for itself (Finder's, Explorer's,
+/// Dolphin's): not shown among a task's files unless committed. The Changes
+/// panel still lists one not ignored, as what a commit of all would take.
+pub fn is_junk(path: &str) -> bool {
+    let name = path.trim_end_matches('/').rsplit('/').next().unwrap_or(path);
+    matches!(name, ".DS_Store" | ".localized" | ".Spotlight-V100" | ".Trashes" | ".fseventsd" | "Thumbs.db" | "ehthumbs.db" | "desktop.ini" | "Desktop.ini" | "$RECYCLE.BIN" | ".directory")
+        || name.starts_with("._")
+}
+
 /// Tracked and untracked-but-not-ignored files, relative to `root`.
 #[cfg(test)]
 pub fn files(root: &Path) -> Vec<String> {
@@ -1015,16 +1024,18 @@ pub fn refresh(root: &Path, picked: Option<String>, light: bool, known: &mut Kno
     let raw = git(root, &light_args(light, &["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all", "--ignored=matching"])).unwrap_or_default();
     // A status has its branch lines at the least.
     let failed = raw.is_empty();
-    let Status { mut info, oid, states, untracked, changed, ignored } = parse_status(&raw);
+    let Status { mut info, oid, states, untracked, changed, mut ignored } = parse_status(&raw);
+    ignored.retain(|path| !is_junk(path));
 
     // Every file: the tracked ones and, from the status, those that are new.
     let tracked = known.tracked(root);
     if !known.listed.as_ref().is_some_and(|listed| Arc::ptr_eq(&listed.tracked, &tracked) && listed.untracked == untracked) {
         // With nothing new the tracked files are all of them, as git lists them: in order.
-        let files = if untracked.is_empty() && tracked.is_sorted() {
+        let shown = untracked.iter().filter(|path| !is_junk(path));
+        let files = if shown.clone().next().is_none() && tracked.is_sorted() {
             tracked.clone()
         } else {
-            let mut files: Vec<String> = tracked.iter().chain(&untracked).cloned().collect();
+            let mut files: Vec<String> = tracked.iter().chain(shown).cloned().collect();
             files.sort();
             files.dedup();
             Arc::new(files)
@@ -2302,6 +2313,21 @@ mod pull_tests {
         assert!(patch.contains("diff --git a/real.rs b/real.rs") && patch.contains("-y") && patch.contains("+Y") && !patch.contains("-x"), "{patch}");
         assert!(patch.contains("Binary files a/blob.bin and b/blob.bin differ"), "{patch}");
         assert_eq!(gpui_kit::component::diff::DiffFile::parse(&patch).unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// What Finder and Explorer leave in folders is not among the files, in
+    /// a folder git knows or one it ignores; a file of the project is.
+    #[test]
+    fn the_system_s_leavings_are_not_files_of_the_task() {
+        let base = setup("junk");
+        let b = base.join("b");
+        sh(&b, "mkdir -p out src; touch .DS_Store src/.DS_Store src/._f.txt src/Thumbs.db out/.DS_Store out/a.o src/kept.txt; echo out/ > .gitignore");
+        let read = refresh(&b, None, false, &mut Known::default());
+        assert!(read.files.iter().all(|f| !super::is_junk(f)), "{:?}", read.files);
+        assert!(read.files.iter().any(|f| f == "src/kept.txt"), "{:?}", read.files);
+        assert!(read.ignored.iter().all(|f| !super::is_junk(f)), "{:?}", read.ignored);
+        assert!(super::is_junk("a/b/desktop.ini") && super::is_junk(".Spotlight-V100/") && !super::is_junk("DS_Store.md") && !super::is_junk("src/main.rs"));
         let _ = std::fs::remove_dir_all(&base);
     }
 

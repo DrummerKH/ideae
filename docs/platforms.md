@@ -34,7 +34,7 @@ Not there yet: the Kotlin language server install.
 ## Updates
 
 Release builds ask GitHub for this repository's latest release at start and
-every six hours (Settings → Check for updates turns that off). A newer one
+every six hours (Settings → General → Updates turns that off). A newer one
 shows "↑ update" in the title bar: it downloads that release's build next to
 the running one, puts it in its place and restarts. On Linux the agents
 keep running through the restart.
