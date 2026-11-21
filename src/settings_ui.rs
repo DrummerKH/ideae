@@ -306,6 +306,20 @@ fn pages(
                 ))
                 .item(switch(
                     draft,
+                    "Keep the system awake while agents work",
+                    "While an agent works, or a setup or a check runs, the system does not go to sleep for being left alone; the screen still dims and locks. A closed lid sleeps all the same.",
+                    |s| s.keep_awake,
+                    |s, v| s.keep_awake = v,
+                ))
+                .item(switch(
+                    draft,
+                    "Also on the battery",
+                    "Off: only while plugged in.",
+                    |s| s.keep_awake_on_battery,
+                    |s, v| s.keep_awake_on_battery = v,
+                ))
+                .item(switch(
+                    draft,
                     "Load",
                     "CPU and memory, and how much of it the app and its tasks use. Hover it to see every process.",
                     |s| s.show_load,

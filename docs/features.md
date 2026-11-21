@@ -337,3 +337,6 @@ take the whole page; say what to do with them and send them all in one prompt.
   is doing and what it holds, and opens whole when the pointer rests on it.
 - Power save mode stops the language servers, the background fetch and the
   load readout; on a battery running low the app suggests it once.
+- While an agent works, or a setup or a check runs, the system does not go to
+  sleep for being left alone (the screen still dims and locks); Settings can
+  keep it to the times the machine is plugged in, or turn it off.

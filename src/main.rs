@@ -5,6 +5,7 @@ mod acp;
 mod agent;
 mod battery;
 mod agents;
+mod awake;
 mod archive;
 mod browser;
 mod crash;

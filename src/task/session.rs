@@ -172,6 +172,17 @@ impl TaskView {
         self.agent.status == crate::agent::AgentStatus::Working
     }
 
+    /// Something of the task works that the machine should stay up for:
+    /// one of its agents in a turn, its setup or its check.
+    pub fn at_work(&self) -> bool {
+        use crate::agent::AgentStatus::Working;
+        use super::auto::RunState::Running;
+        self.agent.status == Working
+            || self.questions.iter().any(|q| q.agent.status == Working)
+            || self.auto.setup == Some(Running)
+            || self.auto.check.as_ref().is_some_and(|c| c.state == Running)
+    }
+
     /// Stops every terminal and browser of the task before it is dropped,
     /// and what they started that left their sessions.
     pub fn shut_down(&mut self, cx: &mut Context<Self>) {

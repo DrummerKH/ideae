@@ -228,6 +228,7 @@ pub struct Workspace {
     pub(crate) peek_moved: std::time::Instant,
     /// Told that the battery runs low, this time it runs down.
     battery_told: bool,
+    awake: crate::awake::Awake,
     /// When the window last lost the keyboard; None while it has it.
     window_left: Option<std::time::Instant>,
     /// In the GNOME dash; asked once, not while the menu opens.
@@ -597,6 +598,7 @@ impl Workspace {
                     if n % 40 == 5 {
                         this.look_at_battery(window, cx);
                     }
+                    this.keep_awake(cx);
                     if n % 2 == 0 {
                         this.restart_lost_language_servers(cx);
                     }
@@ -650,6 +652,7 @@ impl Workspace {
             peek_hovered: false,
             peek_moved: std::time::Instant::now(),
             battery_told: false,
+            awake: Default::default(),
             window_left: None,
             desk: Default::default(),
             told_unlisted: saved.told_unlisted,
@@ -2473,6 +2476,13 @@ impl Workspace {
             }
         });
         by.into_iter().filter(|(_, n)| *n > 0).collect()
+    }
+
+    /// The system kept from sleeping while a task works, as the settings say.
+    fn keep_awake(&mut self, cx: &mut Context<Self>) {
+        let (on, battery) = state::with_settings(|s| (s.keep_awake, s.keep_awake_on_battery));
+        let working = on && self.projects.iter().flat_map(|p| &p.tasks).any(|t| t.view.as_ref().is_some_and(|v| v.read(cx).at_work()));
+        self.awake.want(working, !battery);
     }
 
     /// The battery low and in use, and power not saved: said once as it

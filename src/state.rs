@@ -195,6 +195,11 @@ pub struct Settings {
     pub web_reload_after_turn: bool,
     /// Said once as the battery runs low: there is a power save mode.
     pub battery_hint: bool,
+    /// The system does not go to sleep while an agent works, a setup or a
+    /// check runs; the screen still dims and locks.
+    pub keep_awake: bool,
+    /// Nor while on the battery; off, only while plugged in.
+    pub keep_awake_on_battery: bool,
     /// The Files panel goes to the file in the editor by itself.
     pub tree_follows: bool,
     /// What the Structure panel leaves out, and whether it is in the
@@ -287,6 +292,8 @@ impl Default for Settings {
             changes_flat: false,
             web_reload_after_turn: true,
             battery_hint: true,
+            keep_awake: true,
+            keep_awake_on_battery: true,
             tree_follows: false,
             structure_public: false,
             structure_no_fields: false,
