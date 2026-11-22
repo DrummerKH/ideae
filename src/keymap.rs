@@ -25,6 +25,8 @@ enum Scope {
     Browser,
     /// A picture with the keyboard: its zoom, over the same keys elsewhere.
     Picture,
+    /// The editor of a `.sql` file, over what the same keys do in any editor.
+    Sql,
 }
 
 pub struct Shortcut {
@@ -115,6 +117,10 @@ pub static SHORTCUTS: &[Shortcut] = &[
     shortcut!("annotate", "Annotate with Git Blame", "", Editor, task::ToggleBlame),
     // VS Code's key for a Markdown preview.
     shortcut!("cycle_look", "Code, split, preview", "ctrl-shift-v", File, task::CycleLook),
+    shortcut!("sql_run", "Run the SQL statement", "ctrl-enter", Sql, task::RunStatement),
+    shortcut!("sql_run_file", "Run the whole SQL file", "ctrl-shift-enter", Sql, task::RunFile),
+    shortcut!("sql_definition", "SQL: definition, alias or schema", "ctrl-b", Sql, task::SqlDefinition),
+    shortcut!("sql_stop", "Stop the SQL statement", "ctrl-f2", Sql, task::StopStatement),
     shortcut!("parameter_info", "Parameter info", "ctrl-p", Editor, task::ParameterInfo),
     // Ctrl+Y is the line's: the editor's own Redo moves here.
     shortcut!("redo", "Redo", "ctrl-shift-z", Editor, gpui_kit::component::input::Redo),
@@ -151,7 +157,7 @@ impl Shortcut {
     /// The heading Settings lists it under.
     pub fn area(&self) -> &'static str {
         match self.scope {
-            Scope::Editor | Scope::File => "Editor",
+            Scope::Editor | Scope::File | Scope::Sql => "Editor",
             Scope::Terminal => "Terminal",
             Scope::Review => "Changes",
             Scope::Browser => "Web",
@@ -190,6 +196,7 @@ impl Shortcut {
             Scope::Review => vec![bind(Some("Changes > Diff"), action())],
             Scope::Browser => vec![bind(Some(crate::browser::KEY_CONTEXT), action())],
             Scope::Picture => vec![bind(Some(crate::picture::KEY_CONTEXT), action())],
+            Scope::Sql => vec![bind(Some(crate::task::SQL_INPUT_CONTEXT), action())],
         };
         made.into_iter().filter_map(Result::ok).collect()
     }

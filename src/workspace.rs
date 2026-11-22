@@ -511,6 +511,7 @@ impl Workspace {
                 crate::procs::end_child_sessions();
                 crate::browser::quit();
                 crate::predict::quit();
+                crate::db::quit();
                 async {}
             }),
         ];
@@ -559,9 +560,13 @@ impl Workspace {
 
         // Closing the window the window manager's way is the same as ×.
         let closing = cx.weak_entity();
-        window.on_window_should_close(cx, move |_, cx| {
-            let _ = closing.update(cx, |w, cx| w.close_window(cx));
-            true
+        window.on_window_should_close(cx, move |window, cx| {
+            // Open transactions end with the window: asked first, the window stays meanwhile.
+            let asked = closing.update(cx, |w, cx| w.ask_about_sql(window, cx, |w, _, cx| w.close_window(cx))).unwrap_or(false);
+            if !asked {
+                let _ = closing.update(cx, |w, cx| w.close_window(cx));
+            }
+            !asked
         });
 
         // Saves now and then, and picks up worktrees made outside the app.
@@ -1480,6 +1485,11 @@ impl Workspace {
         let Some(view) = self.find(path).and_then(|(pi, ti)| self.projects[pi].tasks[ti].view.clone()) else {
             return;
         };
+        let files = view.read(cx).sql_at_risk(cx);
+        let again = path.to_path_buf();
+        if self.ask_losing_sql(files, window, cx, move |w, window, cx| w.stop(&again, window, cx)) {
+            return;
+        }
         if view.read(cx).agent_busy() {
             let this = cx.weak_entity();
             let path = path.to_path_buf();
@@ -2725,18 +2735,58 @@ impl Workspace {
         cx.quit();
     }
 
+    /// What every open task's databases would lose.
+    fn sql_at_risk(&self, cx: &App) -> Vec<String> {
+        self.views().iter().flat_map(|v| v.read(cx).sql_at_risk(cx)).collect()
+    }
+
+    /// Asks before `then` when a transaction is open or cell changes wait
+    /// anywhere; true when it asked, and `then` waits for the answer.
+    pub fn ask_about_sql(&mut self, window: &mut Window, cx: &mut Context<Self>, then: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static) -> bool {
+        let files = self.sql_at_risk(cx);
+        self.ask_losing_sql(files, window, cx, then)
+    }
+
+    pub(crate) fn ask_losing_sql(&mut self, files: Vec<String>, window: &mut Window, cx: &mut Context<Self>, then: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static) -> bool {
+        if files.is_empty() {
+            return false;
+        }
+        let this = cx.weak_entity();
+        let then = Rc::new(then);
+        let description = format!("{}: an uncommitted transaction or cell changes not saved will be lost.", files.join(", "));
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            let (this, then) = (this.clone(), then.clone());
+            dialog.confirm().title("Lose database changes?").description(description.clone()).ok_text("Lose them").on_ok(move |_, window, cx| {
+                let then = then.clone();
+                let _ = this.update(cx, |w, cx| then(w, window, cx));
+                true
+            })
+        });
+        true
+    }
+
     /// The window's ×, from the menu bar: without a daemon to keep the
     /// agents, that is a quit, and asks as one.
     pub fn close_or_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         #[cfg(unix)]
         if crate::daemon::client::get().is_some() {
-            return self.close_window(cx);
+            if !self.ask_about_sql(window, cx, |w, _, cx| w.close_window(cx)) {
+                self.close_window(cx);
+            }
+            return;
         }
         self.request_quit(window, cx)
     }
 
     /// Exit: ends every agent and terminal, after a word when any run.
     pub fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.ask_about_sql(window, cx, |w, _, cx| {
+            w.keep_terminals = false;
+            w.save(cx);
+            cx.quit();
+        }) {
+            return;
+        }
         let running = self.views().len();
         if running == 0 {
             self.save(cx);

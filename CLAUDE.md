@@ -23,6 +23,10 @@ src/task/          one task, a module: what is private to it is seen by all of i
   agent_tab.rs     the task's agents (its own and its questions', `Who`, `AgentState`): what is sent to them, their restart, queued prompts
   activity.rs      the status of an agent that reports little, guessed from its terminal
   open.rs          opening a file and giving it its language server
+  sql.rs           a `.sql` or `.redis` file that runs: its line of connection and database, Output, results, transactions, export, filter and pages, editing a cell
+  sql_grid.rs      a result's typed rows for the table
+  sql_schema.rs    its Schema tab and the editor's completions from it
+  sql_dialog.rs    a connection's form, import from DataGrip
   preview.rs       a file drawn beside or instead of its text: Markdown, SVG, CSV/TSV; HTML in a Web tab
   refresh.rs       what a refresh read, applied: diffs, files, the branch
   git_ui.rs        the commit box, the changed files, stashes, single changes, git actions
@@ -62,6 +66,10 @@ src/acp/           agents that speak ACP, shown as a chat (docs/agents.md)
   terminal.rs      commands an agent runs through the app (`terminal/*`)
   fake.rs          a stand-in agent for the tests: the test binary run again
 src/mcp.rs         ideae as an MCP server for a chat agent (`ideae --mcp`): its task's open files, problems, check; asked of the window with a worktree's token
+src/db/            databases, no UI: connections (connections.json), passwords in the system's keyring, bastions shared by connections, a tunnel by the system's ssh, a session on its own thread (docs/databases.md)
+  backend.rs       what a session asks of a server; mysql_backend.rs postgres_backend.rs redis_backend.rs
+  statement.rs value.rs schema.rs schema_cache.rs export.rs csv.rs format.rs history.rs import.rs scratch.rs tls.rs   statements and parameters, typed cells, completions, what a schema held, writers, CSV, layout, what ran, DataGrip's sources, files of no project, what an encrypted connection trusts
+  fake.rs live.rs  a stand-in server and ssh for the check; real servers behind a real bastion, by hand
 src/secrets.rs     agents' keys out of the state: sealed for this machine in secrets.json, no keyring
 src/agent.rs       agents' reports bridge: Claude Code hooks, Codex notify, OpenCode plugin (unix socket, `ideae --hook`)
 src/agents/        agent profiles and adapters (docs/agents.md): how each kind starts, resumes, reports, is asked once
@@ -110,6 +118,7 @@ scripts/           Xvfb driver for UI checks, wayland.sh (the same in a headless
 - And a project's setup, check and teardown: `cargo test -- --ignored a_task_is_set_up_checked_and_torn_down` after changing them.
 - And Web tabs (needs Chrome): `cargo test -- --ignored a_page_tells_the_tab a_task_s_browser_wakes_when_called` after changing browser.rs: a page's dialog, select, pickers, cursor, errors, title, user agent, DevTools and the pages it opens; a task's Chrome started again by a call at its port.
 - And tasks sharing a language server: `cargo test -- --ignored two_tasks_share_one_rust_analyzer` after changing lsp_share.rs or how a task holds its servers; `an_agent_asks_the_language_server` after changing the MCP server's code questions (tell.rs). Both need rust-analyzer.
+- And databases: `cargo test -- --ignored a_sql_file_runs` after changing `src/db` (a stand-in MySQL and ssh). Against real servers: `a_real_` with `IDEAE_LIVE_SSH_PORT`, `IDEAE_LIVE_SSH_KEY`, `IDEAE_LIVE_SSH_PROGRAM` (see `src/db/live.rs`).
 - `scripts/check.sh` runs all of these and the Windows check: before every push, and again after merging main. A new end-to-end test goes into it; none of them waits on real time except for a timeout it is about, and together they stay under a minute.
 - UI can be tested without a display: `#[gpui_kit::test]` with `gpui_kit::test` (find, click, scroll by element id; mark elements with `.test_support()`), as `settings_ui.rs` does.
 - A debug build is the separate app `ideae-dev`: own state, sockets, window class, launcher. Keep that split for anything new that has an identity on the system.

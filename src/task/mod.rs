@@ -46,6 +46,10 @@ mod term;
 mod chat;
 mod file;
 mod preview;
+mod sql;
+mod sql_dialog;
+mod sql_grid;
+mod sql_schema;
 pub(crate) use preview::{ink, rasterize as rasterize_svg};
 mod changes;
 mod session;
@@ -72,6 +76,8 @@ pub use changes::*;
 pub use session::*;
 pub use annotate::ToggleBlame;
 pub use preview::{CycleLook, PREVIEW_CONTEXT};
+pub use sql::{RunFile, RunStatement, SQL_INPUT_CONTEXT, SqlDefinition, StopStatement};
+pub use sql_dialog::{bastion_dialog, connection_dialog, import_dialog};
 pub use git_ui::GitCommand;
 pub use bookmarks::{NextBookmark, PrevBookmark, ShowBookmarks, ToggleBookmark};
 use change_tree::*;
@@ -1360,6 +1366,16 @@ impl TaskView {
 
     /// The open files with edits not on disk, but for the one that asks
     /// (which is being updated, and cannot be read).
+    /// Files with an open transaction or cell changes not saved: what ending this task would lose.
+    pub fn sql_at_risk(&self, cx: &App) -> Vec<String> {
+        self.all_tabs()
+            .filter_map(|tab| match &tab.kind {
+                TabKind::File(file) if file.read(cx).sql_holds(cx) => Some(tab.title.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn unsaved_files(&self, but: EntityId, cx: &App) -> Vec<PathBuf> {
         self.tabs
             .iter()
@@ -1659,8 +1675,13 @@ impl TaskView {
 
     fn close_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         match self.tabs.get(ix).map(|t| &t.kind) {
-            Some(TabKind::File(file)) if file.read(cx).dirty => {
+            Some(TabKind::File(file)) if file.read(cx).dirty || file.read(cx).sql_holds(cx) => {
                 let title = self.tabs[ix].title.clone();
+                let description = match (file.read(cx).sql_holds(cx), file.read(cx).dirty) {
+                    (true, true) => "The unsaved edits will be lost, and so will its uncommitted transaction or cell changes not applied.",
+                    (true, false) => "Its uncommitted transaction or cell changes not applied will be lost.",
+                    _ => "The unsaved edits will be lost.",
+                };
                 let task = cx.weak_entity();
                 let file_id = file.entity_id();
                 window.open_alert_dialog(cx, move |dialog, _, _| {
@@ -1668,7 +1689,7 @@ impl TaskView {
                     dialog
                         .confirm()
                         .title(format!("Discard changes to {title}?"))
-                        .description("The unsaved edits will be lost.")
+                        .description(description)
                         .ok_text("Discard")
                         .on_ok(move |_, window, cx| {
                             let _ = task.update(cx, |t, cx| {
@@ -1816,6 +1837,10 @@ impl TaskView {
         if let TabKind::File(file) = &removed.kind {
             self.keep_bookmarks(file, cx);
             let f = file.read(cx);
+            // A scratch file left empty is nothing to keep; what is on disk decides.
+            if f.sql.is_some() && f.editor.read(cx).text().len() == 0 && crate::db::scratch::is_scratch(&f.path) {
+                crate::db::scratch::drop_if_empty(f.path.clone());
+            }
             if let Some(client) = f.lsp_client.clone() {
                 let path = f.path.clone();
                 cx.background_spawn(crate::procs::on_thread(move || {
@@ -2980,7 +3005,7 @@ fn closable(tab: &TabItem) -> bool {
 fn closed_in_bulk(tab: &TabItem, cx: &App) -> bool {
     !tab.pinned
         && match &tab.kind {
-            TabKind::File(f) => !f.read(cx).dirty && f.read(cx).saving.is_none(),
+            TabKind::File(f) => !f.read(cx).dirty && f.read(cx).saving.is_none() && !f.read(cx).sql_busy() && !f.read(cx).sql_holds(cx),
             TabKind::Binary(_) | TabKind::Browser(_) | TabKind::Diff(_) | TabKind::Changes | TabKind::History => true,
             TabKind::Terminal(_) | TabKind::Chat(_) => false,
         }

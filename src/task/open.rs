@@ -59,7 +59,7 @@ impl TaskView {
             state.set_value(content.clone(), window, cx);
             state.jump_to_position(Position::new(line, col), JUMP_AT, window, cx);
         });
-        let predict = crate::predict::provider(None, &path, &self.root, editor.read(cx).text().clone(), cx);
+        let predict = crate::predict::provider(super::sql_schema::completions(&path), &path, &self.root, editor.read(cx).text().clone(), cx);
         editor.update(cx, |state, _| {
             let lsp = state.lsp_mut();
             lsp.completion_provider = Some(predict);
@@ -73,6 +73,9 @@ impl TaskView {
         let file = cx.new(|cx| {
             // The editor notifies on cursor moves too: follow the line for blame.
             cx.observe(&editor, |this: &mut FileView, editor, cx| {
+                if this.sql.is_some() {
+                    this.sql_cursor_moved(cx);
+                }
                 let Position { line, character } = editor.read(cx).cursor_position();
                 this.cursor_col = character;
                 // The popup of a change follows its line as the editor scrolls.
@@ -140,6 +143,7 @@ impl TaskView {
             lsp_attach: 0,
             lsp_unlicensed: false,
             preview: Default::default(),
+            sql: super::sql::is_sql(&path).then(|| super::sql::SqlFile::new(&path)),
             veiled,
             occurrence: None,
             committed: None,
@@ -206,10 +210,12 @@ impl TaskView {
         // Structure panel, which marks where it is.
         cx.observe(&file, |this, file, cx| {
             let dirty = file.read(cx).dirty;
+            // A file with a query under way is not replaced by the next one opened.
+            let held = dirty || file.read(cx).sql_busy() || file.read(cx).sql_holds(cx);
             let structure = this.panel_shown(RightPane::Structure);
             let Some(tab) = this.tabs.iter_mut().find(|t| matches!(&t.kind, TabKind::File(f) if *f == file)) else { return };
             let follows = structure && this.structure_file == Some(tab.id);
-            let kept = dirty && std::mem::take(&mut tab.preview);
+            let kept = held && std::mem::take(&mut tab.preview);
             if std::mem::replace(&mut tab.dirty, dirty) != dirty || follows || kept {
                 cx.notify();
             }
@@ -280,7 +286,7 @@ impl TaskView {
             }
             let shown = [self.active[0], self.active[1], self.active[2], self.active[3], Some(opened)];
             let busy = |t: &TabItem| match &t.kind {
-                TabKind::File(f) => f.read(cx).dirty || f.read(cx).saving.is_some(),
+                TabKind::File(f) => f.read(cx).dirty || f.read(cx).saving.is_some() || f.read(cx).sql_busy() || f.read(cx).sql_holds(cx),
                 _ => false,
             };
             let Some(oldest) = files

@@ -84,6 +84,12 @@ pub fn day_and_hour(secs: u64, now: u64) -> String {
     format!("{}, {:02}:{:02}", day(secs, now), tm.tm_hour, tm.tm_min)
 }
 
+/// "09:05:12".
+pub fn clock(secs: u64) -> String {
+    let tm = tm_of(secs);
+    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

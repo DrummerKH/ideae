@@ -274,6 +274,13 @@ pub struct TableState<D: TableDelegate> {
     right_clicked_cell: Option<(usize, usize)>,
     selected_col: Option<usize>,
     selected_cell: Option<(usize, usize)>,
+    /// ideae patch: where a range of cells began; `selected_cell` is its moving end.
+    cell_anchor: Option<(usize, usize)>,
+    /// ideae patch: the cell the left button went down on, and whether it was dragged from.
+    cell_press: Option<(usize, usize)>,
+    cell_dragged: bool,
+    /// ideae patch: this right click was a cell's; its row is not to take it over.
+    cell_right_click: bool,
 
     /// The column index that is being resized.
     resizing_col: Option<usize>,
@@ -316,6 +323,10 @@ where
             right_clicked_cell: None,
             selected_col: None,
             selected_cell: None,
+            cell_anchor: None,
+            cell_press: None,
+            cell_dragged: false,
+            cell_right_click: false,
             resizing_col: None,
             fitted_col: None,
             col_drag_gap: None,
@@ -621,6 +632,7 @@ where
     pub fn set_selected_cell(&mut self, row_ix: usize, col_ix: usize, cx: &mut Context<Self>) {
         self.selection_mode = SelectionMode::Cell;
         self.selected_cell = Some((row_ix, col_ix));
+        self.cell_anchor = None;
         self.right_clicked_cell = None;
 
         // Scroll to the cell
@@ -651,8 +663,142 @@ where
         self.selected_row = None;
         self.selected_col = None;
         self.selected_cell = None;
+        self.cell_anchor = None;
         cx.emit(TableEvent::ClearSelection);
         cx.notify();
+    }
+
+    /// ideae patch: the rows and columns of the cells selected.
+    pub fn selected_cells(&self) -> Option<(Range<usize>, Range<usize>)> {
+        let (row, col) = self.selected_cell()?;
+        let (from_row, from_col) = self.cell_anchor.unwrap_or((row, col));
+        Some((row.min(from_row)..row.max(from_row) + 1, col.min(from_col)..col.max(from_col) + 1))
+    }
+
+    fn cell_in_selection(&self, row_ix: usize, col_ix: usize) -> bool {
+        self.selected_cells().is_some_and(|(rows, cols)| rows.contains(&row_ix) && cols.contains(&col_ix))
+    }
+
+    /// ideae patch: the range goes on to this cell, from where it began.
+    pub fn extend_selection(&mut self, row_ix: usize, col_ix: usize, scroll: bool, cx: &mut Context<Self>) {
+        let Some(from) = self.selected_cell() else {
+            return self.set_selected_cell(row_ix, col_ix, cx);
+        };
+        self.cell_anchor.get_or_insert(from);
+        self.selected_cell = Some((row_ix, col_ix));
+        self.right_clicked_cell = None;
+        if scroll {
+            self.vertical_scroll_handle.scroll_to_item(row_ix, ScrollStrategy::Center);
+            self.scroll_to_col(col_ix, cx);
+        }
+        cx.notify();
+    }
+
+    fn on_cell_press(&mut self, row_ix: usize, col_ix: usize) {
+        self.cell_press = Some((row_ix, col_ix));
+        self.cell_dragged = false;
+    }
+
+    fn on_cell_drag(&mut self, e: &gpui::MouseMoveEvent, row_ix: usize, col_ix: usize, cx: &mut Context<Self>) {
+        let Some(press) = self.cell_press.filter(|_| e.dragging()) else { return };
+        if !self.cell_dragged {
+            if press == (row_ix, col_ix) {
+                return;
+            }
+            self.cell_dragged = true;
+            self.selection_mode = SelectionMode::Cell;
+            self.selected_cell = Some(press);
+            self.cell_anchor = None;
+        }
+        if self.selected_cell != Some((row_ix, col_ix)) {
+            self.extend_selection(row_ix, col_ix, false, cx);
+        }
+    }
+
+    fn extend_by(&mut self, rows: isize, cols: isize, cx: &mut Context<Self>) {
+        if !self.cell_selectable {
+            return cx.propagate();
+        }
+        let (row_count, col_count) = (self.delegate.rows_count(cx), self.delegate.columns_count(cx));
+        let Some((row, col)) = self.selected_cell().filter(|_| row_count > 0 && col_count > 0) else { return };
+        let row = row.saturating_add_signed(rows).min(row_count - 1);
+        let col = col.saturating_add_signed(cols).min(col_count - 1);
+        self.extend_selection(row, col, true, cx);
+    }
+
+    pub(super) fn action_extend_up(&mut self, _: &ExtendUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.extend_by(-1, 0, cx);
+    }
+
+    pub(super) fn action_extend_down(&mut self, _: &ExtendDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.extend_by(1, 0, cx);
+    }
+
+    pub(super) fn action_extend_left(&mut self, _: &ExtendLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.extend_by(0, -1, cx);
+    }
+
+    pub(super) fn action_extend_right(&mut self, _: &ExtendRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.extend_by(0, 1, cx);
+    }
+
+    pub(super) fn action_select_all_cells(&mut self, _: &SelectAllCells, _: &mut Window, cx: &mut Context<Self>) {
+        let (rows, cols) = (self.delegate.rows_count(cx), self.delegate.columns_count(cx));
+        if !self.cell_selectable || rows == 0 || cols == 0 {
+            return cx.propagate();
+        }
+        self.selection_mode = SelectionMode::Cell;
+        self.cell_anchor = Some((0, 0));
+        self.selected_cell = Some((rows - 1, cols - 1));
+        cx.notify();
+    }
+
+    pub(super) fn action_first_cell(&mut self, _: &SelectFirstCell, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.cell_selectable || self.delegate.rows_count(cx) == 0 {
+            return cx.propagate();
+        }
+        self.set_selected_cell(0, 0, cx);
+    }
+
+    pub(super) fn action_last_cell(&mut self, _: &SelectLastCell, _: &mut Window, cx: &mut Context<Self>) {
+        let (rows, cols) = (self.delegate.rows_count(cx), self.delegate.columns_count(cx));
+        if !self.cell_selectable || rows == 0 || cols == 0 {
+            return cx.propagate();
+        }
+        self.set_selected_cell(rows - 1, cols - 1, cx);
+    }
+
+    /// Tabs between cells and lines between rows, as spreadsheets paste them;
+    /// a value holding either is quoted.
+    pub(super) fn action_copy_cells(&mut self, _: &CopyCells, _: &mut Window, cx: &mut Context<Self>) {
+        match self.selected_text(cx) {
+            Some(text) => cx.write_to_clipboard(gpui::ClipboardItem::new_string(text)),
+            None => cx.propagate(),
+        }
+    }
+
+    /// ideae patch: the cells selected, as a copy has them.
+    pub fn selected_text(&self, cx: &gpui::App) -> Option<String> {
+        let (rows, cols) = self.selected_cells().filter(|_| self.cell_selectable)?;
+        let mut out = String::new();
+        for row in rows {
+            for col in cols.clone() {
+                if col > cols.start {
+                    out.push('\t');
+                }
+                let text = self.delegate.cell_text(row, col, cx);
+                if text.contains(['\t', '\n', '\r', '"']) {
+                    out.push('"');
+                    out.push_str(&text.replace('"', "\"\""));
+                    out.push('"');
+                } else {
+                    out.push_str(&text);
+                }
+            }
+            out.push('\n');
+        }
+        out.pop();
+        Some(out)
     }
 
     /// Returns the visible range of the rows and columns.
@@ -823,6 +969,9 @@ where
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if std::mem::take(&mut self.cell_right_click) {
+            return;
+        }
         self.right_clicked_row = row_ix;
         self.right_clicked_cell = None;
         cx.emit(TableEvent::RightClickedRow(row_ix));
@@ -833,14 +982,23 @@ where
         _: &MouseDownEvent,
         row_ix: usize,
         col_ix: usize,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if !self.cell_selectable {
             return;
         }
 
-        cx.stop_propagation();
+        // ideae patch: it goes on up to the table's context menu; the row leaves it to the cell.
+        self.cell_right_click = true;
+        // The menu acts on the selection, so a click outside it moves it here.
+        self.focus_handle.focus(window, cx);
+        if !self.cell_in_selection(row_ix, col_ix) {
+            self.selection_mode = SelectionMode::Cell;
+            self.selected_cell = Some((row_ix, col_ix));
+            self.cell_anchor = None;
+            cx.notify();
+        }
         self.right_clicked_cell = Some((row_ix, col_ix));
         self.right_clicked_row = None;
         cx.emit(TableEvent::RightClickedCell(row_ix, col_ix));
@@ -902,6 +1060,15 @@ where
         }
 
         cx.stop_propagation();
+
+        // ideae patch: the end of a drag is not a click, and Shift goes on from the selection.
+        self.cell_press = None;
+        if std::mem::take(&mut self.cell_dragged) {
+            return;
+        }
+        if e.modifiers().shift && self.selected_cell().is_some() {
+            return self.extend_selection(row_ix, col_ix, false, cx);
+        }
 
         let is_double_click = e.click_count() == 2;
 
@@ -1776,15 +1943,20 @@ where
         is_head: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        // ideae patch: a row header can hold the row's number.
+        let width = self.delegate.row_header_width();
+        let number = (!is_head).then(|| self.delegate.row_header_text(row_ix)).flatten();
         div()
             .id(("row-header", row_ix))
             .w_3()
+            .when_some(width, |this, width| this.w(width))
             .h_full()
             .border_r_1()
             .border_color(cx.theme().table_row_border)
             .bg(cx.theme().tokens.table_head)
             .flex_shrink_0()
             .table_cell_size(self.options.size)
+            .when_some(number, |this, number| this.flex().justify_end().text_xs().text_color(cx.theme().muted_foreground).child(number))
             .when(!is_head, |this| {
                 this.when(self.row_selectable, |this| {
                     this.on_click(cx.listener(move |table, e: &ClickEvent, _window, cx| {
@@ -2262,8 +2434,7 @@ where
                                 let mut items = Vec::with_capacity(left_columns_count);
 
                                 (0..left_columns_count).for_each(|col_ix| {
-                                    let is_cell_selected =
-                                        self.selected_cell() == Some((row_ix, col_ix));
+                                    let is_cell_selected = self.cell_in_selection(row_ix, col_ix);
                                     let is_cell_right_clicked =
                                         self.right_clicked_cell == Some((row_ix, col_ix));
 
@@ -2323,6 +2494,11 @@ where
                                                         },
                                                     ))
                                                     .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(move |table, _, _, _| table.on_cell_press(row_ix, col_ix)),
+                                                    )
+                                                    .on_mouse_move(cx.listener(move |table, e, _, cx| table.on_cell_drag(e, row_ix, col_ix, cx)))
+                                                    .on_mouse_down(
                                                         MouseButton::Right,
                                                         cx.listener(move |table, e, window, cx| {
                                                             table.on_cell_right_click(
@@ -2368,8 +2544,7 @@ where
 
                                         visible_range.for_each(|col_ix| {
                                             let col_ix = col_ix + left_columns_count;
-                                            let is_cell_selected =
-                                                table.selected_cell() == Some((row_ix, col_ix));
+                                            let is_cell_selected = table.cell_in_selection(row_ix, col_ix);
                                             let is_cell_right_clicked =
                                                 table.right_clicked_cell == Some((row_ix, col_ix));
 
@@ -2434,6 +2609,11 @@ where
                                                                     );
                                                                 },
                                                             ))
+                                                            .on_mouse_down(
+                                                                MouseButton::Left,
+                                                                cx.listener(move |table, _, _, _| table.on_cell_press(row_ix, col_ix)),
+                                                            )
+                                                            .on_mouse_move(cx.listener(move |table, e, _, cx| table.on_cell_drag(e, row_ix, col_ix, cx)))
                                                             .on_mouse_down(
                                                                 MouseButton::Right,
                                                                 cx.listener(
@@ -2712,6 +2892,11 @@ where
                     if let Some(row_ix) = view.read(cx).right_clicked_row {
                         view.update(cx, |menu, cx| {
                             menu.delegate_mut().context_menu(row_ix, this, window, cx)
+                        })
+                    } else if let Some((row_ix, col_ix)) = view.read(cx).right_clicked_cell {
+                        // ideae patch: a right click on a cell has a menu too.
+                        view.update(cx, |menu, cx| {
+                            menu.delegate_mut().cell_context_menu(row_ix, col_ix, this, window, cx)
                         })
                     } else {
                         this

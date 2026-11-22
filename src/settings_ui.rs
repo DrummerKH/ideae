@@ -8,7 +8,7 @@ use std::{
 };
 
 use gpui_kit::component::{
-    ActiveTheme as _, Selectable as _, Sizable as _, WindowExt as _,
+    ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     setting::{NumberFieldOptions, SelectIndex, SettingField, SettingGroup, SettingItem, SettingPage, Settings},
@@ -617,7 +617,84 @@ fn pages(
                         |s, v| s.present_hide_readouts = v,
                     )),
             ),
+        databases_page(),
     ]
+}
+
+/// The connections `.sql` files run against. Kept apart from the settings
+/// (`db::config`), so a change here does not wait for Save.
+fn databases_page() -> SettingPage {
+    let list = SettingItem::render(|_, _, cx| {
+        let muted = cx.theme().muted_foreground;
+        let connections = crate::db::config::list();
+        let empty = connections.is_empty();
+        let rows = connections.into_iter().enumerate().map(|(ix, c)| {
+            let through = c.ssh.as_ref().map(|hop| format!(" · through {}", hop.host)).unwrap_or_default();
+            let about = format!("{} · {}@{}:{}{through}", c.driver.name(), c.user, c.host, c.port);
+            let (edit, remove) = (c.id.clone(), c.id.clone());
+            h_flex()
+                .id(SharedString::from(format!("db-connection-{ix}")))
+                .test_support()
+                .gap_2()
+                .py_1()
+                .items_center()
+                .child(gpui_kit::component::v_flex().flex_1().min_w_0().child(div().text_sm().child(c.name)).child(div().text_xs().text_color(muted).truncate().child(about)))
+                .child(Button::new(SharedString::from(format!("db-edit-{ix}"))).xsmall().ghost().label("Edit…").on_click(move |_, window, cx| {
+                    crate::task::connection_dialog(Some(edit.clone()), Some(Rc::new(|_, window, _| window.refresh())), window, cx);
+                }))
+                .child(Button::new(SharedString::from(format!("db-remove-{ix}"))).xsmall().ghost().label("Remove").on_click(move |_, window, cx| {
+                    crate::db::config::remove(&remove);
+                    crate::db::password::delete(&remove, cx).detach();
+                    crate::db::history::clear(Some(remove.clone()));
+                    crate::db::schema_cache::forget(&remove);
+                    window.refresh();
+                }))
+        });
+        gpui_kit::component::v_flex()
+            .gap_1()
+            .children(rows)
+            .when(empty, |s| s.child(div().text_xs().text_color(muted).child("No connection yet. A .sql file runs against one, chosen in the line over its text.")))
+            .child(
+                h_flex()
+                    .pt_1()
+                    .gap_2()
+                    .child(Button::new("db-add").small().outline().label("Add connection…").on_click(|_, window, cx| {
+                        crate::task::connection_dialog(None, Some(Rc::new(|_, window, _| window.refresh())), window, cx);
+                    }))
+                    .child(Button::new("db-import").small().outline().label("Import from DataGrip…").on_click(|_, window, cx| crate::task::import_dialog(window, cx))),
+            )
+    });
+    let bastions = SettingItem::render(|_, _, cx| {
+        let muted = cx.theme().muted_foreground;
+        let list = crate::db::config::bastions();
+        let empty = list.is_empty();
+        let rows = list.into_iter().enumerate().map(|(ix, b)| {
+            let uses = crate::db::config::bastion_uses(&b.id);
+            let about = format!("{}@{}:{} · {}", b.hop.user, b.hop.host, b.hop.port, if uses == 1 { "1 connection".to_string() } else { format!("{uses} connections") });
+            let (edit, remove) = (b.id.clone(), b.id.clone());
+            h_flex()
+                .id(SharedString::from(format!("db-bastion-{ix}")))
+                .gap_2()
+                .py_1()
+                .items_center()
+                .child(gpui_kit::component::v_flex().flex_1().min_w_0().child(div().text_sm().child(b.name)).child(div().text_xs().text_color(muted).truncate().child(about)))
+                .child(Button::new(SharedString::from(format!("db-bastion-edit-{ix}"))).xsmall().ghost().label("Edit…").on_click(move |_, window, cx| {
+                    crate::task::bastion_dialog(Some(edit.clone()), Some(Rc::new(|_, window, _| window.refresh())), window, cx);
+                }))
+                .child(Button::new(SharedString::from(format!("db-bastion-remove-{ix}"))).xsmall().ghost().label("Remove").disabled(uses > 0).tooltip("Only when no connection goes through it").on_click(move |_, window, _| {
+                    crate::db::config::remove_bastion(&remove);
+                    window.refresh();
+                }))
+        });
+        gpui_kit::component::v_flex()
+            .gap_1()
+            .children(rows)
+            .when(empty, |s| s.child(div().text_xs().text_color(muted).child("None needed for a database you can reach directly.")))
+            .child(h_flex().pt_1().child(Button::new("db-bastion-add").small().outline().label("Add bastion…").on_click(|_, window, cx| {
+                crate::task::bastion_dialog(None, Some(Rc::new(|_, window, _| window.refresh())), window, cx);
+            })))
+    });
+    SettingPage::new("Databases").default_open(true).groups([SettingGroup::new().title("Connections").item(list), SettingGroup::new().title("SSH bastions").item(bastions)])
 }
 
 /// Where the shortcuts are among the pages.
@@ -1393,7 +1470,7 @@ mod tests {
     #[gpui_kit::test]
     fn every_page_draws(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
-        for page in 0..8 {
+        for page in 0..10 {
             let handle = window(cx);
             cx.update_window(handle, |_, window, cx| {
                 open(state::Settings::default(), Appearance::Auto, page, window, cx, |_, _, _, _| {});

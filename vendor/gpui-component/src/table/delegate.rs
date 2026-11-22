@@ -133,6 +133,30 @@ pub trait TableDelegate: Sized + 'static {
         menu
     }
 
+    /// ideae patch: how wide the row header is, when it holds more than a mark.
+    fn row_header_width(&self) -> Option<Pixels> {
+        None
+    }
+
+    /// ideae patch: what the row header of a row says.
+    fn row_header_text(&self, row_ix: usize) -> Option<SharedString> {
+        let _ = row_ix;
+        None
+    }
+
+    /// ideae patch: the context menu of a cell, in cell selection.
+    fn cell_context_menu(
+        &mut self,
+        row_ix: usize,
+        col_ix: usize,
+        menu: PopupMenu,
+        window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> PopupMenu {
+        let _ = (row_ix, col_ix, window, cx);
+        menu
+    }
+
     /// Render cell at the given row and column.
     fn render_td(
         &mut self,

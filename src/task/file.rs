@@ -74,6 +74,9 @@ pub struct FileView {
     pub(super) lsp_unlicensed: bool,
     /// How a file that can be drawn (Markdown, SVG, a table) is shown, and the drawing.
     pub(super) preview: super::preview::Preview,
+    /// A `.sql` file's connection and results. Not in `preview`, whose task
+    /// each edit replaces: typing must not stop a query.
+    pub(super) sql: Option<super::sql::SqlFile>,
     /// Git ignores it: while presenting it is not shown until asked for.
     pub(super) veiled: bool,
     /// The text whose next occurrence was added to the selection last,
@@ -999,6 +1002,10 @@ impl FileView {
     }
 
     pub(super) fn status_text(&self) -> String {
+        // SQL has no server to offer: the line over its text says what it is connected to.
+        if self.sql.is_some() && self.lsp_program.is_empty() {
+            return String::new();
+        }
         let busy = self.lsp_client.as_ref().and_then(|c| c.busy_for(&self.path));
         match (self.lsp_program.is_empty(), self.lsp_ok, busy) {
             (true, _, _) => self.lsp_status.to_string(),
@@ -1041,7 +1048,12 @@ impl Render for FileView {
             .on_action(cx.listener(|this, _: &RenameSymbol, window, cx| this.rename_dialog(window, cx)))
             .on_action(cx.listener(|this, _: &NextProblem, window, cx| this.go_to_problem(true, window, cx)))
             .on_action(cx.listener(|this, _: &PrevProblem, window, cx| this.go_to_problem(false, window, cx)))
-            .on_action(cx.listener(|this, _: &FormatFile, window, cx| this.format(window, cx)))
+            .on_action(cx.listener(|this, _: &FormatFile, window, cx| {
+                if this.sql.is_some() && this.lsp_client.is_none() {
+                    return this.format_sql(window, cx);
+                }
+                this.format(window, cx)
+            }))
             .on_action(cx.listener(|this, _: &ParameterInfo, _, cx| this.parameter_info(cx)))
             .on_action(cx.listener(|this, _: &Fold, _, cx| this.fold(true, false, cx)))
             .on_action(cx.listener(|this, _: &Unfold, _, cx| this.fold(false, false, cx)))
@@ -1049,6 +1061,13 @@ impl Render for FileView {
             .on_action(cx.listener(|this, _: &UnfoldAll, _, cx| this.fold(false, true, cx)))
             .on_action(cx.listener(|this, _: &ToggleBlame, _, cx| this.toggle_blame(cx)))
             .on_action(cx.listener(|this, _: &CycleLook, window, cx| this.cycle_look(window, cx)))
+            .on_action(cx.listener(|this, _: &super::sql::RunStatement, window, cx| this.run_statement(window, cx)))
+            .on_action(cx.listener(|this, _: &super::sql::RunFile, window, cx| this.run_file(window, cx)))
+            .on_action(cx.listener(|this, _: &super::sql::ExplainStatement, window, cx| this.explain_statement(window, cx)))
+            .on_action(cx.listener(|this, _: &super::sql::SqlDefinition, window, cx| this.sql_definition(window, cx)))
+            .on_action(cx.listener(|this, _: &super::sql::ShowTableData, window, cx| this.show_table_data(window, cx)))
+            .on_action(cx.listener(|this, _: &super::sql::ShowTableDefinition, _, cx| this.show_ddl_at_cursor(cx)))
+            .on_action(cx.listener(|this, _: &super::sql::StopStatement, _, cx| this.stop_statement(cx)))
             .on_action(cx.listener(|this, _: &ToggleBookmark, _, cx| this.toggle_bookmark(cx)))
             .on_action(cx.listener(|this, _: &NextBookmark, window, cx| this.go_to_bookmark(false, window, cx)))
             .on_action(cx.listener(|this, _: &PrevBookmark, window, cx| this.go_to_bookmark(true, window, cx)))
@@ -1067,7 +1086,11 @@ impl Render for FileView {
                             .flex_none()
                             .max_w(relative(0.45))
                             .truncate()
-                            .child(self.path.strip_prefix(&self.root).unwrap_or(&self.path).display().to_string()),
+                            .child(if crate::db::scratch::is_scratch(&self.path) {
+                                format!("Scratch: {}", self.path.file_name().unwrap_or_default().to_string_lossy())
+                            } else {
+                                self.path.strip_prefix(&self.root).unwrap_or(&self.path).display().to_string()
+                            }),
                     )
                     .children(self.render_blame(cx))
                     .children(self.render_look_switch(cx))
@@ -1199,15 +1222,23 @@ impl Render for FileView {
                 }
                 let kind = self.preview_kind();
                 let share = kind.filter(|_| look == super::preview::Look::Split).map(super::preview::split_share);
-                this.child(h_flex().id("file-split").test_support().flex_1().min_h_0().items_stretch()
+                let is_sql = self.sql.is_some();
+                let sql_share = self.sql_panel_open().then(super::sql::text_share);
+                let sql_results = self.render_sql_results(cx);
+                this.children(self.render_sql_bar(cx))
+                .child(h_flex().id("file-split").test_support().flex_1().min_h_0().items_stretch()
+                .when(sql_share.is_some(), |split| split.flex_col())
                 .on_drag_move(cx.listener(|this, event: &DragMoveEvent<super::preview::SplitDrag>, _, cx| this.drag_split(event, cx)))
+                .on_drag_move(cx.listener(|this, event: &DragMoveEvent<super::sql::SqlSplitDrag>, _, cx| this.drag_sql_split(event, cx)))
                 .child(
                 div()
                     .id("file-editor")
                     .test_support()
+                    .when(is_sql, |editor| editor.key_context(super::sql::SQL_CONTEXT))
                     .relative()
                     .flex_1()
                     .when_some(share, |editor, share| editor.flex_none().w(relative(share)))
+                    .when_some(sql_share, |editor, share| editor.flex_none().w_full().h(relative(share)))
                     .min_w_0()
                     .min_h_0()
                     .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
@@ -1228,7 +1259,7 @@ impl Render for FileView {
                     Editor::new(&self.editor)
                         // Replaces the built-in menu, so its items are listed again.
                         .context_menu({
-                            let (editor, annotating) = (self.editor.clone(), self.annotate);
+                            let (editor, annotating, sql_file) = (self.editor.clone(), self.annotate, self.sql.is_some());
                             move |menu, _, cx| {
                             // On the line numbers: what is about the lines.
                             if editor.read(cx).gutter_press().is_some() {
@@ -1236,10 +1267,22 @@ impl Render for FileView {
                                 return menu.menu(blame, Box::new(ToggleBlame)).menu("Toggle Bookmark", Box::new(ToggleBookmark));
                             }
                             use gpui_kit::component::input::{Copy, Cut, GoToDefinition, Paste, SelectAll};
-                            // Ctrl+B on a declaration lists its usages.
-                            menu.menu("Go to Definition / Usages", Box::new(GoToDefinition))
-                                .menu("Implementations and Usages", Box::new(ShowUsages))
-                                .separator()
+                            // What a name is in SQL: there are no implementations to list.
+                            let menu = if sql_file {
+                                menu.menu("Run", Box::new(super::sql::RunStatement))
+                                    .menu("Explain", Box::new(super::sql::ExplainStatement))
+                                    .menu("Format", Box::new(FormatFile))
+                                    .separator()
+                                    .menu("Go to Definition / Schema", Box::new(super::sql::SqlDefinition))
+                                    .menu("Find Usages", Box::new(ShowUsages))
+                                    .menu("Show Table Data", Box::new(super::sql::ShowTableData))
+                                    .menu("Show Table DDL", Box::new(super::sql::ShowTableDefinition))
+                            } else {
+                                // Ctrl+B on a declaration lists its usages.
+                                menu.menu("Go to Definition / Usages", Box::new(GoToDefinition))
+                                    .menu("Implementations and Usages", Box::new(ShowUsages))
+                            };
+                            menu.separator()
                                 .menu("Cut", Box::new(Cut))
                                 .menu("Copy", Box::new(Copy))
                                 .menu("Paste", Box::new(Paste))
@@ -1260,6 +1303,9 @@ impl Render for FileView {
                 )
                 .when_some(kind.zip(preview), |split, (kind, preview)| {
                     split.child(super::preview::split_handle(kind, cx)).child(div().flex_1().min_w_0().flex().child(preview))
+                })
+                .when_some(sql_results, |split, results| {
+                    split.child(super::sql::sql_handle(cx)).child(div().flex_1().min_h_0().min_w_0().w_full().child(results))
                 })
                 .children(self.scroll_watch(cx)))
             })

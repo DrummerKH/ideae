@@ -663,7 +663,7 @@ impl TaskView {
     }
 
     /// After a rename: open tabs of it, or in it, follow, as does the tree.
-    fn renamed(&mut self, from: PathBuf, to: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn renamed(&mut self, from: PathBuf, to: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let title = |path: &std::path::Path| SharedString::from(path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
         for ix in 0..self.tabs.len() {
             match &self.tabs[ix].kind {

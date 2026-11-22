@@ -198,6 +198,11 @@ impl TaskView {
     pub(super) fn end(&mut self, strays: bool, cx: &mut Context<Self>) {
         self.save_all_now(cx);
         self.auto.stop();
+        for tab in self.all_tabs() {
+            if let TabKind::File(file) = &tab.kind {
+                file.update(cx, |f, cx| f.end_sql(cx));
+            }
+        }
         // Questions not shown since a restart, whose agents may run on in the daemon.
         let unshown: Vec<String> = self.unshown_sessions().collect();
         agent_tab::end_sessions(&unshown);
@@ -242,7 +247,7 @@ impl TaskView {
         );
         let task_weak = cx.weak_entity();
         let this_path = path.clone();
-        let predict = replace.then(|| crate::predict::provider(None, path, &self.root, editor.read(cx).text().clone(), cx));
+        let predict = replace.then(|| crate::predict::provider(super::sql_schema::completions(path), path, &self.root, editor.read(cx).text().clone(), cx));
         editor.update(cx, |state, cx| {
             let lsp = state.lsp_mut();
             if replace {

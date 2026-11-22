@@ -21,6 +21,7 @@ cargo build
 cargo test
 cargo test -- --ignored \
   an_acp_agent \
+  a_sql_file_runs \
   an_open_file \
   two_variants \
   two_agents \

@@ -12,6 +12,7 @@ mod crash;
 mod build_watch;
 #[cfg(unix)]
 mod daemon;
+mod db;
 mod desktop;
 mod edit;
 mod file_icons;
@@ -103,8 +104,12 @@ impl Render for Workspace {
                 TitleBar::new()
                     .on_close_window({
                         let this = cx.weak_entity();
-                        move |_, _, cx| {
-                            let _ = this.update(cx, |w, cx| w.close_window(cx));
+                        move |_, window, cx| {
+                            let _ = this.update(cx, |w, cx| {
+                                if !w.ask_about_sql(window, cx, |w, _, cx| w.close_window(cx)) {
+                                    w.close_window(cx);
+                                }
+                            });
                         }
                     })
                     .child(
@@ -579,6 +584,9 @@ fn main() {
         return;
     }
     secrets::preload();
+    db::config::preload();
+    db::tls::install_provider();
+    db::scratch::start();
     mcp::preload();
     acp::spend::preload();
     let mut repos = Vec::new();

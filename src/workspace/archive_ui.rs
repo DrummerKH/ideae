@@ -149,6 +149,12 @@ impl Workspace {
         if t.main || t.side.is_some() || t.busy.is_some() {
             return;
         }
+        let files = t.view.as_ref().map(|v| v.read(cx).sql_at_risk(cx)).unwrap_or_default();
+        let again = path.to_path_buf();
+        if self.ask_losing_sql(files, window, cx, move |w, window, cx| w.archive_now(&again, None, window, cx)) {
+            return;
+        }
+        let t = &self.projects[pi].tasks[ti];
         if t.view.as_ref().is_some_and(|v| v.read(cx).agent_busy()) {
             let (this, path) = (cx.weak_entity(), path.to_path_buf());
             window.open_alert_dialog(cx, move |dialog, _, _| {
@@ -177,9 +183,13 @@ impl Workspace {
             return;
         }
         let busy = t.view.as_ref().is_some_and(|v| v.read(cx).agent_busy());
+        let at_risk = t.view.as_ref().map(|v| v.read(cx).sql_at_risk(cx)).unwrap_or_default();
         let mut told = "Its worktree goes, as with Archive; its goal and its agent's conversation are kept and not cleaned up. On the day, it comes back paused, from the current origin or its open PR's branch, its agent told what changed when you open it.".to_string();
         if busy {
             told.push_str(" Its agent is in the middle of a turn: it is stopped.");
+        }
+        if !at_risk.is_empty() {
+            told.push_str(&format!(" {}: an uncommitted transaction or cell changes not saved will be lost.", at_risk.join(", ")));
         }
         let (this, path) = (cx.weak_entity(), path.to_path_buf());
         let title = format!("Defer \"{}\"", t.label());

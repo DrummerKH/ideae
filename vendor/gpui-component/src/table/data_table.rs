@@ -12,9 +12,20 @@ use gpui::{
 };
 use gpui_base::TestSupportExt as _;
 
+// ideae patch: a range of cells, and copying it.
+gpui::actions!(data_table, [ExtendUp, ExtendDown, ExtendLeft, ExtendRight, SelectAllCells, SelectFirstCell, SelectLastCell, CopyCells]);
+
 const CONTEXT: &'static str = "DataTable";
 pub(super) fn init(cx: &mut App) {
     cx.bind_keys([
+        KeyBinding::new("shift-up", ExtendUp, Some(CONTEXT)),
+        KeyBinding::new("shift-down", ExtendDown, Some(CONTEXT)),
+        KeyBinding::new("shift-left", ExtendLeft, Some(CONTEXT)),
+        KeyBinding::new("shift-right", ExtendRight, Some(CONTEXT)),
+        KeyBinding::new(if cfg!(target_os = "macos") { "cmd-a" } else { "ctrl-a" }, SelectAllCells, Some(CONTEXT)),
+        KeyBinding::new(if cfg!(target_os = "macos") { "cmd-c" } else { "ctrl-c" }, CopyCells, Some(CONTEXT)),
+        KeyBinding::new(if cfg!(target_os = "macos") { "cmd-up" } else { "ctrl-home" }, SelectFirstCell, Some(CONTEXT)),
+        KeyBinding::new(if cfg!(target_os = "macos") { "cmd-down" } else { "ctrl-end" }, SelectLastCell, Some(CONTEXT)),
         KeyBinding::new("escape", Cancel, Some(CONTEXT)),
         KeyBinding::new("up", SelectUp, Some(CONTEXT)),
         KeyBinding::new("down", SelectDown, Some(CONTEXT)),
@@ -210,6 +221,14 @@ where
             .key_context(CONTEXT)
             .track_focus(&focus_handle)
             .on_action(window.listener_for(&self.state, TableState::action_cancel))
+            .on_action(window.listener_for(&self.state, TableState::action_extend_up))
+            .on_action(window.listener_for(&self.state, TableState::action_extend_down))
+            .on_action(window.listener_for(&self.state, TableState::action_extend_left))
+            .on_action(window.listener_for(&self.state, TableState::action_extend_right))
+            .on_action(window.listener_for(&self.state, TableState::action_select_all_cells))
+            .on_action(window.listener_for(&self.state, TableState::action_first_cell))
+            .on_action(window.listener_for(&self.state, TableState::action_last_cell))
+            .on_action(window.listener_for(&self.state, TableState::action_copy_cells))
             .on_action(window.listener_for(&self.state, TableState::action_select_next))
             .on_action(window.listener_for(&self.state, TableState::action_select_prev))
             .on_action(window.listener_for(&self.state, TableState::action_select_next_col))
