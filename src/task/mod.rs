@@ -2758,6 +2758,33 @@ mod open_file_scenario {
             window.press(if cfg!(target_os = "macos") { "cmd-9" } else { "ctrl-9" }, cx);
             window.render_frame(cx);
             assert_eq!(window.find("picture").bounds().size.width, px(300.), "fit by its key: no larger than it is, as the room is larger");
+            // Larger than the room: its left edge can be reached, and its right one by scrolling.
+            for _ in 0..30 {
+                window.click("picture-larger", cx);
+            }
+            window.render_frame(cx);
+            let (room, picture) = (window.find("picture-scroll").bounds(), window.find("picture").bounds());
+            assert!(picture.size.width > room.size.width, "wider than its room");
+            assert!(picture.left() >= room.left() && picture.top() >= room.top(), "nothing out of reach: {picture:?} in {room:?}");
+            let left = picture.left();
+            window.scroll("picture-scroll", gpui_kit::ScrollDelta::Pixels(point(px(-500.), px(0.))), cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("picture").bounds().left(), left - px(500.), "scrolled sideways");
+            // Shift and the wheel of a mouse, which only turns one way.
+            window.dispatch_event(
+                gpui_kit::PlatformInput::Scroll(gpui_kit::ScrollEvent {
+                    position: room.center(),
+                    delta: gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-100.))),
+                    modifiers: gpui_kit::Modifiers::shift(),
+                    ..Default::default()
+                }),
+                cx,
+            );
+            window.render_frame(cx);
+            let moved = window.find("picture").bounds();
+            assert_eq!((moved.left(), moved.top()), (left - px(600.), picture.top()), "Shift+wheel goes sideways only");
+            window.click("picture-fit", cx);
+            window.render_frame(cx);
         })
         .unwrap();
 
@@ -2831,6 +2858,38 @@ mod open_file_scenario {
         });
         assert!(block > top / 2 + 3, "the drawing scrolled on: block {block}");
         assert!(line.abs_diff(block * 2) <= 2, "the text at the drawing's block {block}: line {line}");
+
+        // By its scrollbar, which sends no wheel: the text follows too.
+        long.update(cx, |f, cx| {
+            let (state, _) = f.preview.markdown.clone().expect("Markdown's view");
+            state.read(cx).list_state().scroll_to(gpui_kit::ListOffset { item_ix: 10, offset_in_item: px(0.) });
+            cx.notify();
+        });
+        for _ in 0..3 {
+            frame(cx, &|_| {});
+            cx.run_until_parked();
+        }
+        let line = long.update(cx, |f, cx| {
+            let editor = f.editor.read(cx);
+            (-editor.scroll_offset().y / editor.line_height().unwrap()).round() as usize
+        });
+        assert!(line.abs_diff(20) <= 2, "the text at the drawing's block 10: line {line}");
+
+        // The look chosen is what the next file of the kind opens in, and is not what a restored tab has.
+        std::fs::write(repo.join("next.md"), "# next\n").unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            long.update(cx, |f, cx| f.pick_look(Look::Split, window, cx));
+            long.update(cx, |f, cx| f.pick_look(Look::Preview, window, cx));
+            task.update(cx, |t, cx| t.open_file(repo.join("next.md"), 0, window, cx));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let next = task.update(cx, |t, cx| t.tabs.iter().find_map(|tab| match &tab.kind {
+            TabKind::File(f) if f.read(cx).path.ends_with("next.md") => Some(f.read(cx).preview.look),
+            _ => None,
+        }));
+        assert_eq!(next, Some(Look::Preview));
+        crate::state::set_settings(crate::state::Settings { file_looks: Default::default(), ..crate::state::settings() });
 
         task.update(cx, |t, cx| t.shut_down(cx));
         cx.update_window(handle.into(), |_, window, _| window.remove_window()).ok();

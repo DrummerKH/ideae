@@ -73,7 +73,6 @@ impl TaskView {
         let file = cx.new(|cx| {
             // The editor notifies on cursor moves too: follow the line for blame.
             cx.observe(&editor, |this: &mut FileView, editor, cx| {
-                this.follow_scroll(cx);
                 let Position { line, character } = editor.read(cx).cursor_position();
                 this.cursor_col = character;
                 // The popup of a change follows its line as the editor scrolls.
@@ -193,7 +192,13 @@ impl TaskView {
             }),
         }});
         // Debug aid for screenshots: IDEAE_LOOK=split or preview shows a file that can be drawn so.
-        if let Some(look) = std::env::var("IDEAE_LOOK").ok().and_then(|look| super::preview::Look::named(&look)) {
+        let asked = std::env::var("IDEAE_LOOK").ok().and_then(|look| super::preview::Look::named(&look));
+        // A restored tab has its own, set by the session. Sent to a line, the text has to be in view.
+        let remembered = (how != OpenAs::Restored).then(|| super::preview::remembered_look(&path)).flatten().map(|look| match look {
+            super::preview::Look::Preview if line > 0 => super::preview::Look::Split,
+            look => look,
+        });
+        if let Some(look) = asked.or(remembered) {
             file.update(cx, |f, cx| f.set_look(look, cx));
         }
         // The tab label shows whether the file has unsaved edits.

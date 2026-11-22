@@ -4,7 +4,7 @@
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use gpui_kit::component::{ActiveTheme as _, Selectable as _, Sizable as _, button::{Button, ButtonGroup, ButtonVariants as _}, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Selectable as _, Sizable as _, button::{Button, ButtonGroup, ButtonVariants as _}, h_flex, scroll::Scrollbar, v_flex};
 use gpui_kit::{prelude::FluentBuilder as _, *};
 
 actions!(ideae_picture, [PictureZoomIn, PictureZoomOut, PictureActualSize, PictureFit]);
@@ -73,7 +73,21 @@ impl PictureView {
 
     fn zoom_to(&mut self, zoom: Option<f32>, cx: &mut Context<Self>) {
         self.zoom = zoom.map(|z| z.clamp(LEAST_ZOOM, MOST_ZOOM));
+        if self.zoom.is_none() {
+            self.scroll.set_offset(point(px(0.), px(0.)));
+        }
         cx.notify();
+    }
+
+    /// By the wheel: the point of the picture under the pointer stays under it.
+    fn zoom_at(&mut self, steps: f32, pointer: Point<Pixels>, cx: &mut Context<Self>) {
+        let before = self.zoom;
+        self.zoom_by(steps, cx);
+        let (Some(before), Some(after)) = (before, self.zoom) else { return };
+        let at = pointer - self.scroll.bounds().origin;
+        let offset = self.scroll.offset();
+        let ratio = after / before;
+        self.scroll.set_offset(point(at.x - (at.x - offset.x) * ratio, at.y - (at.y - offset.y) * ratio));
     }
 
     /// From the zoom shown, by steps of a tenth; from fit, from the scale it fits at.
@@ -159,6 +173,29 @@ fn checker(cx: &App) -> impl IntoElement {
     .size_full()
 }
 
+/// Shift+wheel goes sideways: a mouse has no other way to.
+fn sideways(scroll: ScrollHandle, view: WeakEntity<PictureView>) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            window.on_mouse_event(move |event: &ScrollEvent, phase, _, cx| {
+                if phase != DispatchPhase::Capture || !event.modifiers.shift || event.modifiers.control || !bounds.contains(&event.position) {
+                    return;
+                }
+                cx.stop_propagation();
+                let delta = event.delta.pixel_delta(px(20.));
+                let (now, most) = (scroll.offset(), scroll.max_offset());
+                scroll.set_offset(point((now.x + delta.x + delta.y).clamp(-most.x, px(0.)), now.y));
+                let _ = view.update(cx, |_, cx| cx.notify());
+            });
+        },
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full()
+}
+
 impl Render for PictureView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(image) = self.image.clone() else { return v_flex().size_full().into_any_element() };
@@ -172,8 +209,9 @@ impl Render for PictureView {
         let area = match (self.zoom, self.size) {
             (Some(zoom), Some(own)) => {
                 let shown = size(own.width * zoom, own.height * zoom);
-                div().id("picture-scroll").size_full().overflow_scroll().track_scroll(&self.scroll).child(
-                    div().min_w_full().min_h_full().p_4().flex().items_center().justify_center().child(
+                // Its own size, not the room's: centered in the room, what is larger would stick out to the left and the top, out of reach.
+                div().id("picture-scroll").test_support().size_full().flex().items_start().overflow_scroll().track_scroll(&self.scroll).child(
+                    div().flex_none().min_w_full().min_h_full().p_4().flex().items_center().justify_center().child(
                         behind(div().id("picture").relative().flex_none().w(shown.width).h(shown.height), cx).test_support().child(picture),
                     ),
                 )
@@ -199,7 +237,7 @@ impl Render for PictureView {
                     ),
                     _ => pic.child(picture),
                 };
-                div().id("picture-scroll").size_full().p_4().flex().items_center().justify_center().child(pic)
+                div().id("picture-scroll").test_support().size_full().p_4().flex().items_center().justify_center().child(pic)
             }
         };
         let focus = self.focus.clone();
@@ -230,10 +268,13 @@ impl Render for PictureView {
                         cx.stop_propagation();
                         let steps = crate::zoom::steps(&event.delta, cx);
                         if steps != 0. {
-                            this.zoom_by(steps, cx);
+                            this.zoom_at(steps, event.position, cx);
                         }
                     }))
-                    .child(area),
+                    .child(area)
+                    .when(self.zoom.is_some(), |this| {
+                        this.child(div().absolute().inset_0().child(Scrollbar::new(&self.scroll))).child(sideways(self.scroll.clone(), cx.entity().downgrade()))
+                    }),
             )
             .child(self.render_bar(cx))
             .into_any_element()

@@ -118,6 +118,18 @@ pub(super) fn split_handle(kind: Kind, cx: &App) -> impl IntoElement {
         })
 }
 
+/// How a file of this path opens, as last chosen for its kind.
+pub(super) fn remembered_look(path: &std::path::Path) -> Option<Look> {
+    let kind = Kind::of(path)?;
+    crate::state::with_settings(|s| s.file_looks.get(kind.name()).and_then(|look| Look::named(look)))
+}
+
+fn remember_look(kind: Kind, look: Look) {
+    let mut settings = crate::state::settings();
+    settings.file_looks.insert(kind.name().to_string(), look.name().unwrap_or("code").to_string());
+    crate::state::set_settings(settings);
+}
+
 fn set_share(kind: Kind, share: f32) {
     let mut settings = crate::state::settings();
     settings.split_shares.insert(kind.name().to_string(), share.clamp(LEAST_SHARE, 1. - LEAST_SHARE));
@@ -169,14 +181,25 @@ pub(super) struct Preview {
     pub markdown: Option<(Entity<gpui_kit::component::text::TextViewState>, u64)>,
     /// The text's top line the drawing was last scrolled to, beside it.
     pub followed: Option<usize>,
-    /// When the drawing last scrolled the text: the text's scroll is not
-    /// followed back until its new place is laid out.
-    pub led: Option<std::time::Instant>,
+    /// Where the text and the drawing were at the last frame, and the
+    /// drawing's room: what moved since is what was scrolled.
+    pub seen: Option<(Pixels, gpui_kit::ListOffset, Size<Pixels>)>,
+    /// The side moved to follow the other: its move is not followed back.
+    pub quiet: Option<Side>,
+    /// The line the text goes to once it is laid out, back from the drawing alone.
+    pub to_line: Option<usize>,
+}
+
+/// One side of Markdown shown beside its text.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Side {
+    Text,
+    Drawing,
 }
 
 impl Default for Preview {
     fn default() -> Self {
-        Preview { look: Look::Code, drawn: None, table: None, task: Task::ready(()), focus: None, picture: None, markdown: None, followed: None, led: None }
+        Preview { look: Look::Code, drawn: None, table: None, task: Task::ready(()), focus: None, picture: None, markdown: None, followed: None, seen: None, quiet: None, to_line: None }
     }
 }
 
@@ -188,6 +211,9 @@ impl FileView {
     /// Asked for: the text, when it is shown, has the keyboard.
     pub(super) fn pick_look(&mut self, look: Look, window: &mut Window, cx: &mut Context<Self>) {
         self.set_look(look, cx);
+        if let Some(kind) = self.preview_kind() {
+            remember_look(kind, look);
+        }
         self.focus(window, cx);
     }
 
@@ -219,6 +245,12 @@ impl FileView {
         if self.preview.look == look {
             return;
         }
+        // Back from the drawing alone, the text is where the reading got to.
+        if self.preview.look == Look::Preview {
+            self.preview.to_line = self.line_at_drawing(cx);
+            self.preview.followed = self.preview.to_line;
+        }
+        (self.preview.seen, self.preview.quiet) = (None, None);
         self.preview.look = look;
         if look == Look::Code {
             // A picture can be large; it is drawn again when asked for.
@@ -336,33 +368,11 @@ impl FileView {
             }
         };
         let focus = self.preview.focus.get_or_insert_with(|| cx.focus_handle()).clone();
-        let leads = (self.preview.look == Look::Split && self.preview_kind() == Some(Kind::Markdown)).then(|| cx.weak_entity());
         div()
             .id("file-preview")
             .test_support()
             .relative()
             .key_context(PREVIEW_CONTEXT)
-            // The wheel over Markdown beside its text: once the drawing has scrolled, the text follows.
-            .when_some(leads, |this, file| {
-                this.child(
-                    canvas(
-                        |_, _, _| (),
-                        move |bounds, _, window, _| {
-                            let file = file.clone();
-                            window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
-                                if phase == DispatchPhase::Capture && bounds.contains(&event.position) && !event.modifiers.control {
-                                    let file = file.clone();
-                                    window.defer(cx, move |_, cx| {
-                                        let _ = file.update(cx, |f, cx| f.lead_from_preview(cx));
-                                    });
-                                }
-                            });
-                        },
-                    )
-                    .absolute()
-                    .size_full(),
-                )
-            })
             .track_focus(&focus)
             .on_mouse_down(gpui_kit::MouseButton::Left, move |_, window, cx| {
                 if !focus.contains_focused(window, cx) {
@@ -379,6 +389,7 @@ impl FileView {
             Some((state, shown)) => {
                 if shown != version {
                     state.update(cx, |s, cx| s.set_text(&text, cx));
+                    self.preview.quiet = Some(Side::Drawing);
                     self.preview.markdown = Some((state.clone(), version));
                 }
                 state.clone()
@@ -457,16 +468,62 @@ impl FileView {
 }
 
 impl FileView {
-    /// Markdown drawn beside its text follows it: the line at the text's top
-    /// is at the drawing's top, as near as its blocks tell.
-    pub(super) fn follow_scroll(&mut self, cx: &mut Context<Self>) {
-        if self.preview.look != Look::Split || self.preview_kind() != Some(Kind::Markdown) {
+    /// Watches the scroll of Markdown beside its text, frame by frame: a
+    /// scrollbar's drag, the wheel and the keys all move it, and only some tell.
+    pub(super) fn scroll_watch(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let watched = self.preview_kind() == Some(Kind::Markdown) && (self.preview.look == Look::Split || self.preview.to_line.is_some());
+        watched.then(|| {
+            let file = cx.weak_entity();
+            canvas(
+                |_, _, _| (),
+                move |_, _, window, cx| {
+                    let file = file.clone();
+                    window.defer(cx, move |_, cx| {
+                        let _ = file.update(cx, |f, cx| f.sync_scroll(cx));
+                    });
+                },
+            )
+            .absolute()
+            .size_0()
+            .into_any_element()
+        })
+    }
+
+    /// The side that moved since the last frame leads, the other follows.
+    fn sync_scroll(&mut self, cx: &mut Context<Self>) {
+        if let Some(line) = self.preview.to_line {
+            let Some(height) = self.editor.read(cx).line_height().filter(|h| *h > px(0.)) else { return };
+            self.preview.to_line = None;
+            self.editor.update(cx, |e, cx| {
+                let x = e.scroll_offset().x;
+                e.set_scroll_offset(point(x, -(height * line as f32)), cx);
+            });
+            return;
+        }
+        if self.preview.look != Look::Split {
             return;
         }
         let Some((state, _)) = self.preview.markdown.clone() else { return };
-        if self.preview.led.is_some_and(|at| at.elapsed() < Duration::from_millis(200)) {
+        let list = state.read(cx).list_state();
+        let now = (self.editor.read(cx).scroll_offset().y, list.logical_scroll_top(), list.viewport_bounds().size);
+        let seen = self.preview.seen.replace(now);
+        let quiet = self.preview.quiet.take();
+        // A resize moves the drawing's top at its end; nobody scrolled.
+        let Some(seen) = seen.filter(|seen| seen.2 == now.2) else { return };
+        if now.0 != seen.0 && quiet != Some(Side::Text) {
+            self.follow_scroll(cx);
+        } else if now.1 != seen.1 && quiet != Some(Side::Drawing) {
+            self.lead_from_preview(cx);
+        }
+    }
+
+    /// Markdown drawn beside its text follows it: the line at the text's top
+    /// is at the drawing's top, as near as its blocks tell.
+    pub(super) fn follow_scroll(&mut self, cx: &mut Context<Self>) {
+        if self.preview.look == Look::Code || self.preview_kind() != Some(Kind::Markdown) {
             return;
         }
+        let Some((state, _)) = self.preview.markdown.clone() else { return };
         let editor = self.editor.read(cx);
         // From the scroll itself, not the last layout's rows, which are a frame behind it.
         let Some(line_height) = editor.line_height().filter(|h| *h > px(0.)) else { return };
@@ -477,27 +534,30 @@ impl FileView {
         self.preview.followed = Some(top);
         let text = editor.text();
         let offset = text.line_start_offset(top.min(text.lines_len().saturating_sub(1)));
+        let before = state.read(cx).list_state().logical_scroll_top();
         state.update(cx, |s, cx| s.scroll_to_source(offset, cx));
-    }
-}
-
-impl FileView {
-    /// The other way: the drawing scrolled by hand, the text follows it.
-    pub(super) fn lead_from_preview(&mut self, cx: &mut Context<Self>) {
-        if self.preview.look != Look::Split || self.preview_kind() != Some(Kind::Markdown) {
-            return;
+        if state.read(cx).list_state().logical_scroll_top() != before {
+            self.preview.quiet = Some(Side::Drawing);
         }
-        let Some((state, _)) = self.preview.markdown.clone() else { return };
-        let Some(offset) = state.read(cx).source_at_top() else { return };
-        let editor = self.editor.read(cx);
-        let Some(line_height) = editor.line_height().filter(|h| *h > px(0.)) else { return };
-        let text = editor.text();
-        let line = text.offset_to_point(offset.min(text.len())).row as usize;
+    }
+
+    /// The line of the text at the drawing's top.
+    fn line_at_drawing(&self, cx: &App) -> Option<usize> {
+        let (state, _) = self.preview.markdown.as_ref()?;
+        let offset = state.read(cx).source_at_top()?;
+        let text = self.editor.read(cx).text();
+        Some(text.offset_to_point(offset.min(text.len())).row as usize)
+    }
+
+    /// The other way: the drawing scrolled by hand, the text follows it.
+    fn lead_from_preview(&mut self, cx: &mut Context<Self>) {
+        let Some(line) = self.line_at_drawing(cx) else { return };
+        let Some(line_height) = self.editor.read(cx).line_height().filter(|h| *h > px(0.)) else { return };
         if self.preview.followed == Some(line) {
             return;
         }
         self.preview.followed = Some(line);
-        self.preview.led = Some(std::time::Instant::now());
+        self.preview.quiet = Some(Side::Text);
         self.editor.update(cx, |e, cx| {
             let x = e.scroll_offset().x;
             e.set_scroll_offset(point(x, -(line_height * line as f32)), cx);

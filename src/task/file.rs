@@ -1260,7 +1260,8 @@ impl Render for FileView {
                 )
                 .when_some(kind.zip(preview), |split, (kind, preview)| {
                     split.child(super::preview::split_handle(kind, cx)).child(div().flex_1().min_w_0().flex().child(preview))
-                }))
+                })
+                .children(self.scroll_watch(cx)))
             })
     }
 }

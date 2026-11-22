@@ -188,6 +188,10 @@ pub struct Settings {
     /// it is drawn as ("markdown", "svg", "table", "mermaid"), as last dragged.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub split_shares: std::collections::BTreeMap<String, f32>,
+    /// How a file is shown when it opens, by what it is drawn as, as last
+    /// chosen: "code", "split", "preview".
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub file_looks: std::collections::BTreeMap<String, String>,
     /// Changed files as a list of paths, not a tree of folders: in the
     /// Changes panel and beside a diff.
     pub changes_flat: bool,
@@ -300,6 +304,7 @@ impl Default for Settings {
             structure_sorted: false,
             diff_files_width: 240.,
             split_shares: std::collections::BTreeMap::new(),
+            file_looks: std::collections::BTreeMap::new(),
             conflicts_to_agent: true,
             present_rail: true,
             present_veil: true,
