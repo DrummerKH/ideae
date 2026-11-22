@@ -75,9 +75,12 @@ pub fn work_beyond(path: &Path, base: &str) -> (u32, bool) {
 }
 
 /// Every worktree of the repository containing `path`, main one first.
+/// The branch of a folder git cannot read: `worktrees` gives it alone.
+pub const NO_GIT: &str = "(no git)";
+
 pub fn worktrees(path: &Path) -> Vec<Worktree> {
     let Some(out) = git(path, &["worktree", "list", "--porcelain"]) else {
-        return vec![Worktree { path: path.to_path_buf(), branch: "(no git)".into(), locked: None }];
+        return vec![Worktree { path: path.to_path_buf(), branch: NO_GIT.into(), locked: None }];
     };
     let mut result = Vec::new();
     for block in out.split("\n\n") {
@@ -649,6 +652,8 @@ pub struct BranchInfo {
     pub pull_conflicts: Vec<String>,
     /// The repository's own checkout is on another branch than the default.
     pub off_default: Option<OffDefault>,
+    /// A folder without git: nothing here has a branch.
+    pub plain: bool,
 }
 
 /// The repository's own checkout on a branch other than the default one.
@@ -1016,6 +1021,100 @@ pub fn stash_patch(root: &Path, name: &str) -> String {
     git(root, &args).unwrap_or_default()
 }
 
+/// Entries of a folder without git that are listed and watched: one opened
+/// by mistake (a home directory) must not take the machine's inotify watches.
+const PLAIN_FOLDER_LIMIT: usize = 50_000;
+
+/// Where version control keeps itself: not a project's files.
+const VCS_DIRS: [&str; 5] = [".git", ".svn", ".hg", ".bzr", "CVS"];
+/// What tells a Perforce workspace, which keeps no folder of its own.
+const VCS_FILES: [&str; 3] = [".p4config", ".p4ignore", "P4CONFIG"];
+/// A build's output, which a folder without a .gitignore does not name.
+const OUTPUT_DIRS: [&str; 8] = ["node_modules", "target", "__pycache__", ".venv", "venv", ".gradle", ".cache", ".next"];
+
+pub fn is_repository(path: &Path) -> bool {
+    git(path, &["rev-parse", "--git-dir"]).is_some()
+}
+
+/// Whether a folder may become a repository unasked: git is there, no other
+/// version control has it, and it is not a whole home or disk.
+fn may_init(root: &Path) -> bool {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from);
+    root.parent().is_some()
+        && home.as_deref() != Some(root)
+        && !root.ancestors().any(|folder| VCS_DIRS.iter().chain(&VCS_FILES).any(|mark| folder.join(mark).exists()))
+        && crate::procs::command("git").arg("--version").output().is_ok_and(|out| out.status.success())
+}
+
+/// Makes `root` a repository if it may be one. Whether a task can have a
+/// worktree of it: that takes a commit, and the first is the user's to make.
+pub fn adopt(root: &Path) -> bool {
+    if !is_repository(root) && (!may_init(root) || make_repository(root).is_err()) {
+        return false;
+    }
+    git(root, &["rev-parse", "--verify", "-q", "HEAD^{commit}"]).is_some_and(|hash| !hash.trim().is_empty())
+}
+
+/// `git init`, nothing committed. The project gets no file of ours: what to
+/// leave out is in .git/info.
+pub fn make_repository(root: &Path) -> Result<String, String> {
+    let out = git_status(root, &["init", "-q"])?;
+    let exclude = VCS_DIRS.iter().chain(&OUTPUT_DIRS).map(|dir| format!("{dir}/\n")).collect::<String>();
+    let at = root.join(".git/info");
+    std::fs::create_dir_all(&at).and_then(|()| std::fs::write(at.join("exclude"), exclude)).map_err(|e| e.to_string())?;
+    Ok(out)
+}
+
+/// A project that is a plain folder: its files from the disk, no changes.
+fn refresh_plain_folder(root: &Path, known: &mut Known) -> Refreshed {
+    // With no .gitignore to say so: a build's output is shown as ignored, read
+    // when opened, or every build would walk it again.
+    fn is_output(name: &str) -> bool {
+        OUTPUT_DIRS.contains(&name)
+    }
+    // A `git init` here is seen at the next refresh, not thirty later.
+    known.age = 0;
+    let mut files = Vec::new();
+    let mut ignored = Vec::new();
+    let mut flat = std::collections::BTreeSet::from([root.to_path_buf()]);
+    let walk = ignore::WalkBuilder::new(root)
+        .hidden(false)
+        .require_git(false)
+        .filter_entry(|entry| {
+            let in_output = entry.depth() > 1 && entry.path().parent().and_then(Path::file_name).and_then(|name| name.to_str()).is_some_and(is_output);
+            !in_output && !entry.file_name().to_str().is_some_and(|name| VCS_DIRS.contains(&name) || is_junk(name))
+        })
+        .build();
+    for entry in walk.flatten().skip(1).take(PLAIN_FOLDER_LIMIT) {
+        let Some(path) = entry.path().strip_prefix(root).ok().and_then(Path::to_str).map(|path| path.replace('\\', "/")) else { continue };
+        if !entry.file_type().is_some_and(|kind| kind.is_dir()) {
+            files.push(path);
+        } else if entry.file_name().to_str().is_some_and(is_output) {
+            ignored.push(path + "/");
+        } else {
+            flat.insert(entry.into_path());
+        }
+    }
+    files.sort();
+    ignored.sort();
+    let same = known.listed.as_ref().is_some_and(|listed| *listed.files == files && *listed.flat == flat);
+    if !same {
+        known.listed = Some(Listed { tracked: Arc::default(), untracked: Vec::new(), files: Arc::new(files), flat: Arc::new(flat) });
+    }
+    let (files, flat) = known.listed.as_ref().map(|listed| (listed.files.clone(), listed.flat.clone())).unwrap_or_default();
+    Refreshed {
+        files,
+        ignored,
+        watch: (flat, Vec::new()),
+        info: BranchInfo { plain: true, ..Default::default() },
+        states: Default::default(),
+        base: None,
+        patches: None,
+        stashes: Vec::new(),
+        failed: false,
+    }
+}
+
 /// `picked`: the branch to compare with when not the one work starts from.
 /// `light`: for a task out of view, see `light_args`.
 pub fn refresh(root: &Path, picked: Option<String>, light: bool, known: &mut Known) -> Refreshed {
@@ -1024,6 +1123,9 @@ pub fn refresh(root: &Path, picked: Option<String>, light: bool, known: &mut Kno
     let raw = git(root, &light_args(light, &["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all", "--ignored=matching"])).unwrap_or_default();
     // A status has its branch lines at the least.
     let failed = raw.is_empty();
+    if failed && known.git_dir.is_none() {
+        return refresh_plain_folder(root, known);
+    }
     let Status { mut info, oid, states, untracked, changed, mut ignored } = parse_status(&raw);
     ignored.retain(|path| !is_junk(path));
 
@@ -2237,6 +2339,51 @@ mod pull_tests {
             printf 'one\\ntwo\\nthree\\n' > f.txt; git add f.txt; git commit -qm base; git push -q origin main
             cd ..; git clone -q remote.git b; cd b; git config user.email t@t; git config user.name t");
         base
+    }
+
+    #[test]
+    fn a_folder_becomes_a_repository_tasks_can_start_from() {
+        let dir = std::env::temp_dir().join(format!("ideae-adopt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("plain/node_modules")).unwrap();
+        std::fs::create_dir_all(dir.join("svn/.svn")).unwrap();
+        sh(&dir, "echo 1 > plain/dump.sql; echo 2 > plain/node_modules/i.js");
+        assert!(!super::adopt(&dir.join("svn")));
+        assert!(!dir.join("svn/.git").exists());
+        sh(&dir, "mkdir -p svn/inner p4/inner; echo P4PORT=x > p4/.p4config");
+        for inside in ["svn/inner", "p4", "p4/inner"] {
+            assert!(!super::adopt(&dir.join(inside)), "{inside}");
+            assert!(!dir.join(inside).join(".git").exists(), "{inside}");
+        }
+        let plain = dir.join("plain");
+        assert!(!super::adopt(&plain), "no commit yet, no worktree");
+        assert!(super::is_repository(&plain));
+        assert_eq!(super::git(&plain, &["ls-files"]).unwrap(), "");
+        assert_eq!(super::git(&plain, &["status", "--porcelain"]).unwrap().trim(), "?? dump.sql");
+        sh(&plain, "git add -A; git -c user.name=t -c user.email=t@t commit -qm first");
+        assert!(super::adopt(&plain));
+        let task = dir.join("task");
+        super::git_status(&plain, &["worktree", "add", "-q", "-b", "t", &task.to_string_lossy(), "HEAD"]).unwrap();
+        assert!(task.join("dump.sql").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_folder_without_git_lists_its_files() {
+        let dir = std::env::temp_dir().join(format!("ideae-plain-folder-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        sh(&dir, "mkdir -p sub/empty .svn node_modules/pkg; echo 0 > .svn/entries; echo 6 > node_modules/pkg/i.js; echo 1 > dump.sql; echo 2 > sub/b.sql; echo 3 > .env; echo 4 > .DS_Store; echo skipped.log > .gitignore; echo 5 > skipped.log");
+        let mut known = Known::default();
+        let read = refresh(&dir, None, false, &mut known);
+        assert!(!read.failed);
+        assert_eq!(*read.files, [".env", ".gitignore", "dump.sql", "sub/b.sql"]);
+        assert_eq!(read.ignored, ["node_modules/"]);
+        assert!(read.watch.0.contains(&dir.join("sub/empty")));
+        assert!(!read.watch.0.iter().any(|watched| watched.starts_with(dir.join("node_modules"))));
+        let again = refresh(&dir, None, false, &mut known);
+        assert!(std::sync::Arc::ptr_eq(&read.files, &again.files));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -1224,7 +1224,7 @@ impl Workspace {
         if in_active {
             details.push(project.name.clone());
         } else if t.main {
-            fixed.push(format!("⌂ {}", t.branch));
+            fixed.push(if t.branch.is_empty() { "⌂".to_string() } else { format!("⌂ {}", t.branch) });
         } else if !listed && !branch_follows(label.as_ref(), &t.branch) {
             // A branch named after the task says nothing its title does not.
             fixed.push(t.branch.clone());

@@ -1878,7 +1878,33 @@ impl Workspace {
     /// `notes` has what each variant's agent alone is told: two or more
     /// make as many variants of the task (variants.rs). `agents`: the
     /// profile each runs; none given, the project's.
+    /// A task has a worktree of its own. A folder without git becomes a
+    /// repository for it; while there is no commit to start from, or it
+    /// cannot be one (no git, another version control), the work is done in
+    /// the folder, by the project's main task.
     fn create_task(&mut self, project: usize, title: String, prompt: String, notes: Vec<String>, agents: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repo) = self.projects.get(project).map(|p| p.path.clone()) else { return };
+        cx.spawn_in(window, async move |this, cx| {
+            let folder = repo.clone();
+            let has_commit = cx.background_spawn(async move { git::adopt(&folder) }).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let Some(project) = this.projects.iter().position(|p| p.path == repo) else { return };
+                if has_commit {
+                    return this.create_worktree_task(project, title, prompt, notes, agents, window, cx);
+                }
+                this.open_main(project, window, cx);
+                let view = this.entry_mut(&repo).and_then(|entry| entry.view.clone());
+                if let (false, Some(view)) = (prompt.is_empty(), view) {
+                    view.update(cx, |t, cx| t.queue_prompt(prompt, false, window, cx));
+                }
+                let told = "Tasks get a worktree of their own from a git commit. There is none here yet, so this one works right in the folder.";
+                window.push_notification(Notification::info(told).title("Working in the folder"), cx);
+            });
+        })
+        .detach();
+    }
+
+    fn create_worktree_task(&mut self, project: usize, title: String, prompt: String, notes: Vec<String>, agents: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
         if notes.len() > 1 {
             return self.create_variants(project, title, prompt, notes, agents, window, cx);
         }
@@ -2045,7 +2071,7 @@ impl Workspace {
                 }
             };
             let picked_any = !paths.is_empty();
-            let roots = cx.background_spawn(async move { paths.iter().filter_map(|path| project_root(path)).collect::<Vec<_>>() }).await;
+            let roots = cx.background_spawn(async move { paths.iter().filter_map(|path| project_root(path)).inspect(|root| { git::adopt(root); }).collect::<Vec<_>>() }).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 if picked_any && roots.is_empty() {
                     window.push_notification(Notification::error("Not in a git repository: a project is a git repository's folder.").title("Add project"), cx);
@@ -2150,6 +2176,14 @@ impl Workspace {
                     }
                     // Not readable now (unmounted, git missing): leave it be.
                     if worktrees.first().is_none_or(|w| w.path != repo) {
+                        continue;
+                    }
+                    // Not a repository, or git cannot read it now: its tasks stay.
+                    if worktrees[0].branch == git::NO_GIT {
+                        match p.tasks.iter_mut().find(|t| t.main) {
+                            Some(main) => main.branch.clear(),
+                            None => p.tasks.insert(0, TaskEntry { path: p.path.clone(), main: true, ..Default::default() }),
+                        }
                         continue;
                     }
                     // Worktrees locked by a live process (Claude Code subagents)

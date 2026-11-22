@@ -60,19 +60,34 @@ impl TaskView {
                         })),
                 )
             })
-            .child(
-                div()
-                    .id("branch-name")
-                    .font_semibold()
-                    .cursor_pointer()
-                    .hover(|s| s.text_color(cx.theme().primary))
-                    .child(format!("⎇ {}", if b.head.is_empty() { "…" } else { &b.head }))
-                    .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("The repository's branches: open one as a task, compare, delete").build(window, cx))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.branches_dialog(window, cx)
-                    })),
-            )
+            .when(b.plain, |bar| {
+                bar.child(div().text_color(cx.theme().muted_foreground).child("No git here: tasks share this folder, with no diffs and no undo of an agent's edits")).child(
+                    Button::new("make-repository")
+                        .xsmall()
+                        .outline()
+                        .label("Make it one")
+                        .tooltip("git init, nothing committed: after your first commit tasks get worktrees of their own")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.run_action("Make repository", |root| git::make_repository(&root), false, window, cx)
+                        })),
+                )
+            })
+            .when(!b.plain, |bar| {
+                bar.child(
+                    div()
+                        .id("branch-name")
+                        .font_semibold()
+                        .cursor_pointer()
+                        .hover(|s| s.text_color(cx.theme().primary))
+                        .child(format!("⎇ {}", if b.head.is_empty() { "…" } else { &b.head }))
+                        .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("The repository's branches: open one as a task, compare, delete").build(window, cx))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.branches_dialog(window, cx)
+                        })),
+                )
+            })
             .when_some(b.upstream.clone(), |this, up| {
                 this.child(div().text_color(cx.theme().muted_foreground).child(format!("→ {up}")))
                     .when(b.ahead > 0, |this| this.child(div().text_color(gpui_kit::green()).child(format!("↑{}", b.ahead))))
@@ -105,7 +120,7 @@ impl TaskView {
                     .truncate()
                     .text_color(cx.theme().muted_foreground)
                     .cursor_pointer()
-                    .child(format!("· {} {}", b.last_hash, b.last_subject)),
+                    .when(!b.last_hash.is_empty(), |line| line.child(format!("· {} {}", b.last_hash, b.last_subject))),
             )
             .when(!b.last_hash.is_empty(), |bar| {
                 bar.child(
@@ -122,17 +137,19 @@ impl TaskView {
             })
             .children(self.render_auto_badges(cx))
             .children(self.render_pr_feedback(cx))
-            .child(
-                Button::new("log")
-                    .xsmall()
-                    .ghost()
-                    .label("History")
-                    .tooltip("The branch's history (Ctrl+3)")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.show_tab(|k| matches!(k, TabKind::History), window, cx)
-                    })),
-            )
+            .when(!b.plain, |bar| {
+                bar.child(
+                    Button::new("log")
+                        .xsmall()
+                        .ghost()
+                        .label("History")
+                        .tooltip("The branch's history (Ctrl+3)")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.show_tab(|k| matches!(k, TabKind::History), window, cx)
+                        })),
+                )
+            })
             .when(b.upstream.is_some(), |bar| {
                 let busy = self.busy.is_some();
                 bar.child(

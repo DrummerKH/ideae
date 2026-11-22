@@ -217,7 +217,7 @@ impl TaskView {
             self.branch = info.head.clone().into();
         }
         // Put on another branch or none, by an agent or in a terminal: the task says so now, not at the next look.
-        if !self.branch_info.head.is_empty() && info.head != self.branch_info.head {
+        if (!self.branch_info.head.is_empty() && info.head != self.branch_info.head) || info.plain != self.branch_info.plain {
             cx.emit(TaskEvent::Worktrees);
         }
         self.history.update(cx, |h, cx| h.sync_head(&info.last_hash, cx));
