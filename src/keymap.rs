@@ -52,7 +52,7 @@ pub static SHORTCUTS: &[Shortcut] = &[
     shortcut!("recent", "Recent tasks, then files", "ctrl-e", Everywhere, palette::RecentPlaces),
     shortcut!("next_waiting", "Next waiting task", "alt-down", Everywhere, palette::NextWaiting),
     shortcut!("new_task", "New task", "ctrl-shift-t", Everywhere, NewTask),
-    shortcut!("ask_question", "Ask a question", "", Everywhere, AskQuestion),
+    shortcut!("ask_question", "Ask a question", "ctrl-i", Everywhere, AskQuestion),
     shortcut!("go_to_file", "Go to file", "ctrl-shift-n", Everywhere, GoToFile),
     shortcut!("branches", "Branches", "ctrl-shift-`", NotInTerminal, task::ShowBranches),
     shortcut!("go_to_symbol", "Go to class or symbol", "ctrl-n", NotInTerminal, GoToSymbol),

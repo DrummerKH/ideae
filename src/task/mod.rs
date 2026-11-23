@@ -90,6 +90,9 @@ pub use agent_tab::{AgentState, Asked, Question, Who};
 
 enum TabKind {
     Terminal(Entity<TermView>),
+    /// The place of an agent that is not running (`TabItem::agent`): opened,
+    /// a question's goes on; the task's own waits to be started.
+    Asleep,
     /// An agent that speaks ACP: its conversation and a prompt.
     Chat(Entity<ChatView>),
     Changes,
@@ -446,6 +449,8 @@ pub struct TaskView {
     /// the last prompt: marked in the Changes and Files panels.
     agent_editing: Option<SharedString>,
     agent_touched: Rc<HashSet<SharedString>>,
+    /// What questions' agents wrote, by the question.
+    question_touched: Rc<HashMap<SharedString, u32>>,
     /// The paths of `files`, for the tree's marks.
     changed_paths: Rc<HashSet<SharedString>>,
     /// Changed files you marked viewed, with their diff's hash then: a new
@@ -651,10 +656,11 @@ impl TaskView {
         let mut tabs = Vec::new();
         // The agent's terminal, or a shell when there is no agent; more shells
         // are a "+" away.
-        // Not started (a question asked of a task not running): a shell
-        // stands in its place until it is (`start_main_agent`).
+        // Not started (a question opened in a task not running): its tab
+        // holds its place, first, until it is (`start_main_agent`).
         match &launch {
             Some(launch) if start_agent => tabs.push(Self::make_agent_tab(&root, hook_socket.as_ref(), Who::Main, launch, task_env.clone(), window, cx)),
+            Some(launch) => tabs.push(TabItem { agent: Some(Who::Main), ..TabItem::new(launch.profile.name.clone(), TabKind::Asleep) }),
             _ => tabs.push(Self::make_terminal(&root, hook_socket.as_ref(), Term::Shell { title: "shell".into(), seq: 1 }, None, task_env.clone(), None, window, cx)),
         }
         // Changes and History open on demand: the Log button, a changed file,
@@ -817,6 +823,7 @@ impl TaskView {
             asked: false,
             agent_editing: None,
             agent_touched: Rc::default(),
+            question_touched: Rc::default(),
             changed_paths: Rc::default(),
             recent: Vec::new(),
             pr: None,
@@ -1101,7 +1108,7 @@ impl TaskView {
     pub fn tabs_state(&self) -> TabsState {
         let focused = self.focused_ix();
         let front = focused.map(|ix| &self.tabs[ix]);
-        let agent = |t: &TabItem| t.agent == Some(Who::Main) && matches!(t.kind, TabKind::Terminal(_) | TabKind::Chat(_));
+        let agent = |t: &TabItem| t.agent == Some(Who::Main);
         // The terminal Shell goes to: another one in front is not it.
         let shell = self.tabs.iter().position(|t| t.agent.is_none() && matches!(t.kind, TabKind::Terminal(_)));
         TabsState {
@@ -1440,6 +1447,9 @@ impl TaskView {
         {
             let busy = matches!(status, crate::agent::AgentStatus::Working | crate::agent::AgentStatus::NeedsInput(_));
             q.quiet_since = if busy { None } else { q.quiet_since.or(Some(std::time::Instant::now())) };
+            if status == crate::agent::AgentStatus::Done {
+                self.question_talked(n);
+            }
         }
         let Some(agent) = self.agent_of_mut(who) else { return };
         if status != crate::agent::AgentStatus::Working {
@@ -1472,18 +1482,27 @@ impl TaskView {
 
     /// A file a question's agent is about to write: marked as the task's
     /// agent's are, without starting their list over.
-    pub fn mark_written(&mut self, file: &str) -> Option<String> {
+    pub fn mark_written(&mut self, n: u32, file: &str) -> Option<String> {
         let rel = path_in(&self.root, std::path::Path::new(file))?;
-        Rc::make_mut(&mut self.agent_touched).insert(SharedString::from(rel.clone()));
+        Rc::make_mut(&mut self.question_touched).insert(SharedString::from(rel.clone()), n);
         Some(rel)
+    }
+
+    /// A new prompt starts a question's list over, as the task's agent's; so does its end.
+    pub fn forget_written(&mut self, n: u32) {
+        if self.question_touched.values().any(|of| *of == n) {
+            Rc::make_mut(&mut self.question_touched).retain(|_, of| *of != n);
+        }
     }
 
     /// "editing" by the file the agent writes to now, a dot by those it
     /// wrote to since the last prompt.
     fn agent_mark(&self, path: &str) -> Option<Div> {
         let editing = self.agent_editing.as_deref() == Some(path);
-        (editing || self.agent_touched.contains(path))
-            .then(|| div().text_xs().text_color(gpui_kit::blue()).child(if editing { "editing" } else { "●" }))
+        // What a question's agent wrote, told from what the task's did.
+        let asked = self.question_touched.get(path).is_some_and(|n| self.questions.iter().any(|q| q.id == *n));
+        (editing || self.agent_touched.contains(path) || asked)
+            .then(|| div().text_xs().text_color(gpui_kit::blue()).child(if editing { "editing" } else if asked { "?" } else { "●" }))
     }
 
     /// The open files look again at what they differ from: after the
@@ -1610,6 +1629,12 @@ impl TaskView {
         if ix >= self.tabs.len() {
             return;
         }
+        if let (TabKind::Asleep, Some(Who::Question(n))) = (&self.tabs[ix].kind, self.tabs[ix].agent) {
+            return self.show_question(n, window, cx);
+        }
+        if let (Some(Who::Question(n)), true) = (self.tabs[ix].agent, self.visible) {
+            cx.emit(TaskEvent::Asked(Asked::Seen(n)));
+        }
         if self.focused_ix() != Some(ix) {
             self.record_nav(cx);
             self.note_recent(cx);
@@ -1709,6 +1734,11 @@ impl TaskView {
             Some(TabKind::File(_) | TabKind::Browser(_) | TabKind::Binary(_) | TabKind::Diff(_) | TabKind::Changes | TabKind::History) => {
                 self.remember_closed(ix, cx);
                 self.remove_tab(ix, window, cx)
+            }
+            Some(TabKind::Asleep) => {
+                if matches!(self.tabs[ix].agent, Some(Who::Question(_))) {
+                    self.remove_tab(ix, window, cx);
+                }
             }
             Some(TabKind::Terminal(_) | TabKind::Chat(_)) if self.tabs[ix].agent.is_some() => {
                 if let Some(Who::Question(n)) = self.tabs[ix].agent {
@@ -3007,6 +3037,6 @@ fn closed_in_bulk(tab: &TabItem, cx: &App) -> bool {
         && match &tab.kind {
             TabKind::File(f) => !f.read(cx).dirty && f.read(cx).saving.is_none() && !f.read(cx).sql_busy() && !f.read(cx).sql_holds(cx),
             TabKind::Binary(_) | TabKind::Browser(_) | TabKind::Diff(_) | TabKind::Changes | TabKind::History => true,
-            TabKind::Terminal(_) | TabKind::Chat(_) => false,
+            TabKind::Terminal(_) | TabKind::Chat(_) | TabKind::Asleep => false,
         }
 }

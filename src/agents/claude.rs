@@ -62,7 +62,13 @@ impl Adapter for Claude {
             // Never begun (it was quit before a first prompt): begun now, under its id.
             Start::Resume(id) => or_else(&format!("{cmd} --resume {id}"), &format!("{cmd} --session-id {id}")),
             Start::Last => or_else(&format!("{cmd} --continue"), &cmd),
+            Start::Fork { from, id: Some(id) } => format!("{cmd} --resume {from} --fork-session --session-id {id}"),
+            Start::Fork { from, id: None } => format!("{cmd} --resume {from} --fork-session"),
         }
+    }
+
+    fn forks(&self) -> bool {
+        true
     }
 
     fn takes_mcp(&self, hooks: Option<&Hooks>) -> bool {
@@ -216,6 +222,28 @@ mod tests {
         assert_eq!(judge.read_answer(r#"{"result":" Keep B. ","usage":{"input_tokens":10,"cache_creation_input_tokens":5,"output_tokens":3}}"#), ("Keep B.".to_string(), 18));
         let quick = Claude.one_shot(&Profile::claude_code(), &Ask::Quick).unwrap();
         assert_eq!(quick.args, ["-p", "--model", "haiku", "--tools", "", "--strict-mcp-config", "--no-session-persistence"]);
+    }
+
+    #[test]
+    fn a_session_is_not_taken_for_the_latest_in_its_folder() {
+        let dir = std::env::temp_dir().join(format!("ideae-own-transcript-{}", std::process::id()));
+        let root = dir.join("repo");
+        let folder = dir.join("config").join("projects").join(project_dir(&root));
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("other.jsonl"), "{}\n").unwrap();
+        let mut profile = Profile::claude_code();
+        profile.env.insert("CLAUDE_CONFIG_DIR".into(), dir.join("config").display().to_string());
+        let who = |id: Option<&str>| crate::agents::SessionRef { profile: profile.clone(), id: id.map(str::to_string) };
+        assert!(who(Some("mine")).own_transcript(&root).is_none());
+        assert!(who(Some("other")).own_transcript(&root).is_some());
+        assert!(who(None).own_transcript(&root).is_some(), "no id: the latest, as for a task of before ids");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_conversation_starts_from_another() {
+        let fork = Start::Fork { from: "from".into(), id: Some("new".into()) };
+        assert!(command("claude", fork, false).ends_with("--resume from --fork-session --session-id new"));
     }
 
     #[test]

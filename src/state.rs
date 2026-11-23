@@ -565,6 +565,15 @@ pub struct QuestionState {
     /// question is opened, not with the task.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub asleep: bool,
+    /// Its agent has answered and the answer was not looked at.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub unread: bool,
+    /// Its agent's last answer, to read from its row.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub answer: String,
+    /// When its tab was last brought up: how recent it is among the tasks.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub opened: u64,
 }
 
 /// A session of an agent in a task.

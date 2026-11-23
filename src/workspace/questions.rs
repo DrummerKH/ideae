@@ -10,11 +10,64 @@ use super::*;
 use gpui_kit::component::ActiveTheme as _;
 use crate::agents::{Launch, Start};
 use crate::task::{Asked, Who};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 
 /// How many closed questions a task keeps, the latest.
 const CLOSED_KEPT: usize = 50;
+/// How much of an answer its row can show.
+const ANSWER_KEPT: usize = 1200;
+
+/// An agent of the project a question can start from.
+#[derive(Clone)]
+struct QuestionSource {
+    label: String,
+    profile: String,
+    session: String,
+    root: PathBuf,
+}
+
+/// What a question was given of that agent's conversation.
+enum Given {
+    Nothing,
+    /// Its agent starts from it; `copies` were put where it looks for it.
+    Fork { from: String, copies: Vec<PathBuf> },
+    /// A file it can read.
+    Read(PathBuf),
+}
+
+/// Not for the UI thread: it reads and copies the conversation's files.
+fn give_context(source: &QuestionSource, asked: Option<&str>, to: &Path) -> Given {
+    let Some(profile) = state::with_settings(|s| s.profile(&source.profile).cloned()) else { return Given::Nothing };
+    if asked == Some(source.profile.as_str()) && profile.adapter().forks() {
+        let copies = if source.root == to { Vec::new() } else { carry_session(&profile, &source.root, to, Some(&source.session), None) };
+        return Given::Fork { from: source.session.clone(), copies };
+    }
+    let who = crate::agents::SessionRef { profile, id: Some(source.session.clone()) };
+    who.own_transcript(&source.root).map_or(Given::Nothing, Given::Read)
+}
 
 impl Workspace {
+    /// The agents of a project with a conversation to start a question from.
+    fn question_sources(&self, pi: usize) -> Vec<QuestionSource> {
+        let Some(p) = self.projects.get(pi) else { return Vec::new() };
+        let usable = |id: &str| state::with_settings(|s| s.profile(id).is_some_and(|profile| !profile.acp && (profile.adapter().forks() || profile.adapter().session_base(profile, &p.path).is_some())));
+        let mut sources = Vec::new();
+        for t in p.tasks.iter().filter(|t| t.busy.is_none()) {
+            if let Some(who) = t.session_ref().filter(|who| usable(&who.profile.id)) {
+                if let Some(session) = who.id {
+                    let label = if t.main { format!("{} · main thread", who.profile.name) } else { format!("{} · {}", who.profile.name, t.label()) };
+                    sources.push(QuestionSource { label, profile: who.profile.id, session, root: t.path.clone() });
+                }
+            }
+            for q in t.questions.iter().filter(|q| q.closed == 0 && usable(&q.profile)) {
+                if let Some(session) = &q.session {
+                    sources.push(QuestionSource { label: format!("? {}", q.title), profile: q.profile.clone(), session: session.clone(), root: t.path.clone() });
+                }
+            }
+        }
+        sources
+    }
+
     /// Asks what the question is, and of which agent when there is a choice.
     pub fn ask_question_dialog(&mut self, pi: usize, window: &mut Window, cx: &mut Context<Self>) {
         use gpui_kit::component::input::{Textarea, TextareaState};
@@ -22,36 +75,38 @@ impl Workspace {
         let name = p.name.clone();
         let prompt = cx.new(|cx| TextareaState::new(window, cx).auto_grow(4, 14).placeholder("What do you want to know? It is answered beside the main thread's agent, which goes on with its work."));
         let agent = Rc::new(RefCell::new(self.project_agent(pi)));
+        let sources = Rc::new(self.question_sources(pi));
+        let source: Rc<RefCell<Option<QuestionSource>>> = Rc::default();
         let this = cx.weak_entity();
         let submit = {
-            let (prompt, agent, this) = (prompt.clone(), agent.clone(), this.clone());
+            let (prompt, agent, source, this) = (prompt.clone(), agent.clone(), source.clone(), this.clone());
             move |window: &mut Window, cx: &mut App| {
                 let text = prompt.read(cx).value().trim().to_string();
                 if text.is_empty() {
                     return;
                 }
                 window.close_dialog(cx);
-                let profile = agent.borrow().clone();
-                let _ = this.update(cx, |this, cx| this.ask(pi, text, profile, window, cx));
+                let (profile, source) = (agent.borrow().clone(), source.borrow().clone());
+                let _ = this.update(cx, |this, cx| this.ask(pi, text, profile, source, window, cx));
             }
         };
         // Runs inside this entity's update, so it cannot go through `submit`.
         let on_enter = {
-            let agent = agent.clone();
+            let (agent, source) = (agent.clone(), source.clone());
             move |this: &mut Self, prompt: &Entity<TextareaState>, event: &InputEvent, window: &mut Window, cx: &mut Context<Self>| {
                 let InputEvent::PressEnter { secondary: true, .. } = event else { return };
                 let text = prompt.read(cx).value().trim().to_string();
                 if !text.is_empty() {
                     window.close_dialog(cx);
-                    let profile = agent.borrow().clone();
-                    this.ask(pi, text, profile, window, cx);
+                    let (profile, source) = (agent.borrow().clone(), source.borrow().clone());
+                    this.ask(pi, text, profile, source, window, cx);
                 }
             }
         };
         let listening = Rc::new(cx.subscribe_in(&prompt, window, on_enter));
         let focused = Rc::new(std::cell::Cell::new(false));
         window.open_dialog(cx, move |dialog, _, cx| {
-            let (prompt, submit, agent, focused) = (prompt.clone(), submit.clone(), agent.clone(), focused.clone());
+            let (prompt, submit, agent, focused, source, sources) = (prompt.clone(), submit.clone(), agent.clone(), focused.clone(), source.clone(), sources.clone());
             let _ = &listening;
             let muted = cx.theme().muted_foreground;
             let several = state::with_settings(|s| s.several_agents());
@@ -67,6 +122,9 @@ impl Workspace {
                         v_flex()
                             .gap_2()
                             .child(Textarea::new(&prompt))
+                            .when(!sources.is_empty(), |form| {
+                                form.child(h_flex().gap_2().items_center().child(div().text_sm().child("Context")).child(context_picker(sources.clone(), source.clone())))
+                            })
                             .when(several, |form| {
                                 form.child(
                                     h_flex()
@@ -92,22 +150,29 @@ impl Workspace {
 
     /// A question of the project's main thread: its agent starts there (the
     /// main thread's own only when it is opened), told `prompt`.
-    fn ask(&mut self, pi: usize, prompt: String, profile: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn ask(&mut self, pi: usize, prompt: String, profile: String, source: Option<QuestionSource>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(p) = self.projects.get(pi) else { return };
         let path = p.path.clone();
         let Some(ti) = p.tasks.iter().position(|t| t.main) else {
             self.open_main(pi, window, cx);
-            return self.ask(pi, prompt, profile, window, cx);
+            return self.ask(pi, prompt, profile, source, window, cx);
         };
         let entry = &p.tasks[ti];
         // The first question: the main thread's own session, when its id is
         // not known, is found now, while it is the latest in the folder.
         let unpinned = (entry.asked == 0).then(|| entry.session_ref()).flatten().filter(|who| who.id.is_none());
         let root = path.clone();
+        let settings = state::settings();
+        let asked = crate::agents::resolve(&settings.agents, &[&profile], p.agent.as_deref(), &settings.default_agent).map(|profile| profile.id.clone());
+        let to = path.clone();
         cx.spawn_in(window, async move |this, cx| {
             let pinned = match unpinned {
                 Some(who) => cx.background_spawn(async move { who.transcript(&root).and_then(|file| file.file_stem().map(|s| s.to_string_lossy().into_owned())) }).await,
                 None => None,
+            };
+            let given = match source {
+                Some(source) => cx.background_spawn(async move { give_context(&source, asked.as_deref(), &to) }).await,
+                None => Given::Nothing,
             };
             let _ = this.update_in(cx, |this, window, cx| {
                 if let (Some(id), Some(entry)) = (pinned, this.entry_mut(&path)) {
@@ -118,13 +183,13 @@ impl Workspace {
                         view.update(cx, |t, _| t.agent.learned_session(&id));
                     }
                 }
-                this.ask_now(pi, &path, prompt, profile, window, cx);
+                this.ask_now(pi, &path, prompt, profile, given, window, cx);
             });
         })
         .detach();
     }
 
-    fn ask_now(&mut self, pi: usize, path: &Path, prompt: String, profile: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn ask_now(&mut self, pi: usize, path: &Path, prompt: String, profile: String, given: Given, window: &mut Window, cx: &mut Context<Self>) {
         let settings = state::settings();
         let project_agent = self.projects[pi].agent.clone();
         let Some(profile) = crate::agents::resolve(&settings.agents, &[&profile], project_agent.as_deref(), &settings.default_agent).cloned() else {
@@ -139,11 +204,21 @@ impl Workspace {
         let n = entry.asked;
         let title = first_line(&prompt);
         entry.questions.push(state::QuestionState { id: n, title: title.clone(), profile: profile.id.clone(), session: id.clone(), created: state::now(), ..Default::default() });
-        let launch = Launch { profile, start: Start::New(id), unasked: false, aside: true, options: Vec::new() };
+        let (start, told) = match given {
+            Given::Nothing => (Start::New(id), prompt.clone()),
+            Given::Fork { from, copies } => {
+                if !copies.is_empty() {
+                    self.fork_copies.insert((path.to_path_buf(), n), copies);
+                }
+                (Start::Fork { from, id }, prompt.clone())
+            }
+            Given::Read(file) => (Start::New(id), format!("Another agent of this project has a conversation in {}. Read what you need of it for this question.\n\n{prompt}", file.display())),
+        };
+        let launch = Launch { profile, start, unasked: false, aside: true, options: Vec::new() };
         if let Some(view) = self.entry_mut(path).and_then(|e| e.view.clone()) {
             view.update(cx, |t, cx| {
                 t.asked = true;
-                t.ask(n, title.clone().into(), launch, Some(prompt.clone()), window, cx);
+                t.ask(n, title.clone().into(), launch, Some(told), window, cx);
             });
         }
         self.sync_worktrees(window, cx);
@@ -232,6 +307,9 @@ impl Workspace {
                 if q.asleep {
                     view.question_sleeps(q.id);
                 }
+                if q.active > 0 {
+                    view.question_talked(q.id);
+                }
             }
         }
     }
@@ -255,7 +333,7 @@ impl Workspace {
         if sleep > 0 {
             for view in self.views() {
                 if !view.read(cx).questions.is_empty() {
-                    view.update(cx, |t, cx| t.sleep_idle_questions(std::time::Duration::from_secs(sleep), window, cx));
+                    view.update(cx, |t, cx| t.sleep_idle_questions(std::time::Duration::from_secs(sleep), cx));
                 }
             }
         }
@@ -270,7 +348,7 @@ impl Workspace {
             .flat_map(|t| {
                 // Not one at work or asking, whatever its age.
                 let busy = |n: u32| t.view.as_ref().and_then(|v| v.read(cx).agent_of(Who::Question(n)).map(|a| matches!(a.status, agent::AgentStatus::Working | agent::AgentStatus::NeedsInput(_)))).unwrap_or(false);
-                t.questions.iter().filter(move |q| q.closed == 0 && q.active.max(q.created) < before).filter(move |q| !busy(q.id)).map(move |q| (t.path.clone(), q.id))
+                t.questions.iter().filter(move |q| q.closed == 0 && !q.unread && q.active.max(q.created) < before).filter(move |q| !busy(q.id)).map(move |q| (t.path.clone(), q.id))
             })
             .collect();
         for (path, n) in old {
@@ -286,10 +364,30 @@ impl Workspace {
         }
     }
 
+    /// The pointer on a row with an answer: left there a moment, it was read.
+    pub(crate) fn hover_answer(&mut self, path: &Path, n: u32, on: bool, cx: &mut Context<Self>) {
+        if !on {
+            self.answer_hover = Task::ready(());
+            return;
+        }
+        let path = path.to_path_buf();
+        self.answer_hover = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(q) = this.entry_mut(&path).and_then(|e| e.questions.iter_mut().find(|q| q.id == n)).filter(|q| q.unread && !q.answer.is_empty()) {
+                    q.unread = false;
+                    this.save_later(cx);
+                    cx.notify();
+                }
+            });
+        });
+    }
+
     /// A question's row clicked: its task in view, its tab in front.
     pub fn show_question(&mut self, path: &Path, n: u32, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(q) = self.entry_mut(path).and_then(|e| e.questions.iter_mut().find(|q| q.id == n)) {
             q.asleep = false;
+            q.opened = state::now();
         }
         self.switch_quietly(path, window, cx);
         if let Some(view) = self.entry_mut(path).and_then(|e| e.view.clone()) {
@@ -465,6 +563,14 @@ impl Workspace {
         match asked {
             Asked::Closed(n) => self.close_question(&root, *n, window, cx),
             Asked::ToTask(n) => self.question_to_task(&root, *n, window, cx),
+            Asked::Seen(n) => {
+                if let Some(q) = self.entry_mut(&root).and_then(|e| e.questions.iter_mut().find(|q| q.id == *n)) {
+                    q.unread = false;
+                    q.opened = state::now();
+                    self.save_later(cx);
+                    cx.notify();
+                }
+            }
         }
     }
 
@@ -474,6 +580,15 @@ impl Workspace {
     pub(super) fn question_heard(&mut self, n: u32, event: agent::HookEvent, window: &mut Window, cx: &mut Context<Self>) {
         let who = Who::Question(n);
         let Some((pi, ti)) = self.find(&event.task) else { return };
+        // It has read what it started from: the copy is not left among the folder's sessions.
+        if let Some(files) = self.fork_copies.remove(&(event.task.clone(), n)) {
+            cx.background_spawn(async move {
+                for file in files {
+                    let _ = std::fs::remove_file(file);
+                }
+            })
+            .detach();
+        }
         if let Some(made) = event.worktree.as_deref().map(PathBuf::from).filter(|made| *made != event.task) {
             self.projects[pi].made_by_agents.insert(made, event.task.clone());
         }
@@ -486,7 +601,7 @@ impl Workspace {
         // What it writes, for its row in Changes and for taking along.
         if let (Some(file), Some(view)) = (event.file.as_deref().filter(|_| event.event == "PreToolUse"), entry.view.clone()) {
             let rel = view.update(cx, |t, cx| {
-                let rel = t.mark_written(file);
+                let rel = t.mark_written(n, file);
                 cx.notify();
                 rel
             });
@@ -515,6 +630,12 @@ impl Workspace {
         let status = if agent::asked_again(&was, &event) { was.clone() } else { status };
         let turn_over = status == agent::AgentStatus::Done && matches!(was, agent::AgentStatus::Working | agent::AgentStatus::NeedsInput(_));
         let seen = self.active.as_deref() == Some(event.task.as_path()) && window.is_window_active();
+        if turn_over && event.replayed.is_none() && !(seen && view.read(cx).questions_in_front().contains(&n)) {
+            if let Some(q) = self.entry_mut(&event.task).and_then(|e| e.questions.iter_mut().find(|q| q.id == n)) {
+                q.unread = true;
+            }
+            self.save_later(cx);
+        }
         view.update(cx, |t, cx| {
             if let Some(agent) = t.agent_of_mut(who) {
                 agent.hear(&event, &status);
@@ -540,6 +661,15 @@ impl Workspace {
                 let _ = tx.send_blocking((path, Some(n)));
             });
         }
+        if turn_over && event.replayed.is_none() {
+            let said = view.read(cx).agent_of(who).and_then(|a| a.shown_said().map(|said| said.whole.to_string()));
+            if let (Some(said), Some(q)) = (said, self.entry_mut(&event.task).and_then(|e| e.questions.iter_mut().find(|q| q.id == n))) {
+                q.answer = said.chars().take(ANSWER_KEPT).collect();
+            }
+        }
+        if event.event == "UserPromptSubmit" && event.replayed.is_none() {
+            view.update(cx, |t, _| t.forget_written(n));
+        }
         if status != was || turn_over {
             cx.notify();
         }
@@ -549,29 +679,54 @@ impl Workspace {
 /// A question's session where its agent looks for it in the task's
 /// worktree: Claude Code keeps them by folder; a chat's conversation is the
 /// app's own. What is there already stays. Not for the UI thread.
-fn carry_session(profile: &crate::agents::Profile, from: &Path, to: &Path, session: Option<&str>, tag: Option<&str>) {
-    let copy = |from: &Path, to: &Path| {
+fn carry_session(profile: &crate::agents::Profile, from: &Path, to: &Path, session: Option<&str>, tag: Option<&str>) -> Vec<PathBuf> {
+    let mut made = Vec::new();
+    let mut copy = |from: &Path, to: &Path| {
         if to.exists() {
             return;
         }
         if let Some(dir) = to.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let _ = std::fs::copy(from, to);
+        if std::fs::copy(from, to).is_ok() {
+            made.push(to.to_path_buf());
+        }
     };
     if profile.acp {
         copy(&crate::acp::journal_of(from, tag), &crate::acp::journal_path(to));
-        return;
+        return made;
     }
     let adapter = profile.adapter();
-    let (Some(found), Some(base)) = (session.and_then(|id| adapter.session_files(profile, from, Some(id))), adapter.session_base(profile, to)) else { return };
+    let (Some(found), Some(base)) = (session.and_then(|id| adapter.session_files(profile, from, Some(id))), adapter.session_base(profile, to)) else { return made };
     // Kept in one place for every folder (Codex): nothing to carry.
     if found.base == base {
-        return;
+        return made;
     }
     for rel in &found.files {
         copy(&found.base.join(rel), &base.join(rel));
     }
+    made
+}
+
+/// What a question starts from: nothing, or an agent of the project.
+fn context_picker(sources: Rc<Vec<QuestionSource>>, chosen: Rc<RefCell<Option<QuestionSource>>>) -> impl IntoElement {
+    let name = chosen.borrow().as_ref().map_or("Start empty".to_string(), |source| source.label.clone());
+    Button::new("question-context").xsmall().outline().label(format!("{name} ▾")).tooltip("What the question's agent knows when it starts").dropdown_menu(move |menu, _, _| {
+        let empty = chosen.clone();
+        let mut menu = menu.scrollable(true).max_h(px(320.)).item(PopupMenuItem::new("Start empty").checked(chosen.borrow().is_none()).on_click(move |_, window, _| {
+            *empty.borrow_mut() = None;
+            window.refresh();
+        }));
+        for source in sources.iter() {
+            let (picked, pick) = (source.clone(), chosen.clone());
+            let checked = chosen.borrow().as_ref().is_some_and(|c| c.session == source.session);
+            menu = menu.item(PopupMenuItem::new(source.label.clone()).checked(checked).on_click(move |_, window, _| {
+                *pick.borrow_mut() = Some(picked.clone());
+                window.refresh();
+            }));
+        }
+        menu
+    })
 }
 
 /// What a question's agent is told in the task it became: where it is
@@ -810,7 +965,7 @@ mod tests {
             let view = main_entry(w).view.clone().unwrap();
             view.update(cx, |t, cx| {
                 t.hide_question(1, window, cx);
-                t.sleep_idle_questions(std::time::Duration::ZERO, window, cx);
+                t.sleep_idle_questions(std::time::Duration::ZERO, cx);
                 assert!(t.question_asleep(1) && t.agent_of(Who::Question(1)).is_some(), "asleep, still open");
             });
         });
@@ -845,6 +1000,94 @@ mod tests {
         assert!(args("q-1").contains(&format!("--resume {id}")), "{}", args("q-1"));
         assert!(args("").is_empty(), "the main thread's agent still paused");
         workspace.update(cx, |w, _| assert!(!main_entry(w).questions[0].asleep));
+        let tabs = |cx: &mut gpui_kit::TestAppContext| workspace.update(cx, |w, cx| main_entry(w).view.as_ref().unwrap().read(cx).agent_tabs());
+        assert_eq!(tabs(cx), [(Who::Main, true), (Who::Question(1), false)], "the task's agent keeps the first place, not started");
+        workspace.update(cx, |w, cx| assert!(!main_entry(w).view.as_ref().unwrap().read(cx).runs_own_agent(), "a question opened does not make it run"));
+
+        // Its answer, with another tab in front, waits to be read: in Needs
+        // you and under the project folded, and read when its tab is opened.
+        step(cx, &mut |w, window, cx| {
+            let view = main_entry(w).view.clone().unwrap();
+            view.update(cx, |t, cx| t.show_view(1, window, cx));
+            w.on_hook(hook("UserPromptSubmit", Some("q-1")), window, cx);
+            w.on_hook(hook("Stop", Some("q-1")), window, cx);
+            assert!(main_entry(w).questions[0].unread, "not in front");
+            w.projects[0].collapsed = true;
+            cx.notify();
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            use gpui_kit::test::TestWindowExt as _;
+            window.render_frame(cx);
+            assert!(window.try_find(SharedString::from(format!("waiting-question-{}-1", repo.display()))).is_some(), "in Needs you");
+            assert!(window.try_find(SharedString::from(format!("folded-question-{}-1", repo.display()))).is_some(), "under the folded project");
+        })
+        .unwrap();
+        // The sidebar narrowed to its rail lists them too.
+        step(cx, &mut |w, _, cx| {
+            w.sidebar_rail = true;
+            cx.notify();
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            use gpui_kit::test::TestWindowExt as _;
+            window.render_frame(cx);
+            assert!(window.try_find(SharedString::from(format!("rail-question-project-{}-1", repo.display()))).is_some(), "in the rail");
+            assert!(window.try_find(SharedString::from(format!("rail-question-waiting-{}-1", repo.display()))).is_some(), "in the rail's Needs you");
+        })
+        .unwrap();
+        step(cx, &mut |w, _, cx| {
+            w.sidebar_rail = false;
+            cx.notify();
+        });
+        step(cx, &mut |w, window, cx| {
+            w.projects[0].collapsed = false;
+            w.show_question(&repo, 1, window, cx);
+        });
+        workspace.update(cx, |w, _| assert!(!main_entry(w).questions[0].unread, "read"));
+
+        // What it wrote is told as its own, until its next prompt.
+        step(cx, &mut |w, window, cx| {
+            let wrote = HookEvent { file: Some(repo.join("note.md").display().to_string()), message: Some("Writing".into()), ..hook("PreToolUse", Some("q-1")) };
+            w.on_hook(wrote, window, cx);
+            assert!(main_entry(w).view.as_ref().unwrap().read(cx).question_wrote("note.md"));
+            w.on_hook(hook("UserPromptSubmit", Some("q-1")), window, cx);
+            assert!(!main_entry(w).view.as_ref().unwrap().read(cx).question_wrote("note.md"));
+            w.on_hook(hook("Stop", Some("q-1")), window, cx);
+        });
+
+        // Asleep, it keeps its place among the tabs, and goes on in it.
+        step(cx, &mut |w, window, cx| {
+            let view = main_entry(w).view.clone().unwrap();
+            view.update(cx, |t, cx| {
+                t.show_view(1, window, cx);
+                t.sleep_idle_questions(std::time::Duration::ZERO, cx);
+            });
+        });
+        assert_eq!(tabs(cx)[1], (Who::Question(1), true));
+        let _ = std::fs::remove_file(repo.join(".args-q-1"));
+        step(cx, &mut |w, window, cx| w.show_question(&repo, 1, window, cx));
+        wait(cx, "the question woken in its tab", &mut |_| !args("q-1").is_empty());
+        assert_eq!(tabs(cx)[1], (Who::Question(1), false));
+
+        // Started late, the task's agent takes the first tab; a tab dragged
+        // goes where it is dropped, not before it.
+        step(cx, &mut |w, window, cx| {
+            let view = main_entry(w).view.clone().unwrap();
+            view.update(cx, |t, cx| {
+                t.show_view(0, window, cx);
+                let (first, question) = (t.tab_id(0), t.tab_id(1));
+                t.reorder_tab(question, first, window, cx);
+            });
+        });
+        wait(cx, "the task's own agent", &mut |_| !args("").is_empty());
+        assert_eq!(tabs(cx), [(Who::Main, false), (Who::Question(1), false)]);
+
+        // A pause and back: the question's tab is where it was, its agent not started.
+        step(cx, &mut |w, window, cx| {
+            w.on_hook(hook("Stop", Some("q-1")), window, cx);
+            w.stop(&repo, window, cx);
+            w.switch(&repo, window, cx);
+        });
+        assert_eq!(tabs(cx), [(Who::Main, false), (Who::Question(1), true)]);
 
         // Left for days, it is closed by itself.
         step(cx, &mut |w, window, cx| {
@@ -856,7 +1099,7 @@ mod tests {
         });
 
         // Another question writes a note, then goes on as a task of its own.
-        step(cx, &mut |w, window, cx| w.ask(0, "Sketch a plan for reading f.txt".into(), String::new(), window, cx));
+        step(cx, &mut |w, window, cx| w.ask(0, "Sketch a plan for reading f.txt".into(), String::new(), None, window, cx));
         wait(cx, "the second question's agent", &mut |_| !args("q-2").is_empty());
         let second = workspace.update(cx, |w, _| main_entry(w).questions.iter().find(|q| q.id == 2).and_then(|q| q.session.clone()).expect("its id"));
         std::fs::write(transcripts.join(format!("{second}.jsonl")), "{\"second\":1}\n").unwrap();

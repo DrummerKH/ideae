@@ -142,6 +142,32 @@ impl TaskView {
                         None => StyledText::new(label),
                     };
                     Tab::new().child(h_flex().gap_1p5().child(crate::file_icons::icon(crate::file_icons::file_kept(&tab.title), cx)).child(name)).when(tab.preview, |tab| tab.italic())
+                } else if matches!(tab.agent, Some(Who::Question(_))) {
+                    // Its own name, not what its terminal calls itself; what it does by a mark of its own.
+                    let name: SharedString = tab.title.trim_start_matches("? ").to_string().into();
+                    let asleep = matches!(tab.kind, TabKind::Asleep);
+                    let color = cx.theme().muted_foreground;
+                    let status = tab.agent.and_then(|who| self.agent_of(who)).and_then(|a| status_glyph(&a.status)).filter(|_| !asleep);
+                    // As on the agent's tab, for whoever keeps the dial there: a question started
+                    // from a long conversation is full from its first message.
+                    let fill = match tab.agent {
+                        Some(Who::Question(n)) => self.questions.iter().find(|q| q.id == n).map_or(0., |q| q.context_fill),
+                        _ => 0.,
+                    };
+                    let dialed = fill > 0. && crate::state::with_settings(|s| s.context_on_tab);
+                    let (root, who) = (self.root.clone(), tab.agent.and_then(|who| self.agent_of(who)).and_then(|a| a.session_ref()));
+                    Tab::new().child(
+                        h_flex()
+                            .id(("question-usage", tab.id))
+                            .tooltip(move |_, cx| cx.new(|cx| crate::usage::UsageTooltip::new(root.clone(), who.clone(), cx)).into())
+                            .gap_1p5()
+                            .child(svg().path("side-icons/message-circle-question-mark.svg").size(px(14.)).flex_none().text_color(color))
+                            .children(status.map(|(glyph, mark)| div().text_color(mark).child(glyph)))
+                            .child(div().when(asleep, |d| d.text_color(color)).child(name))
+                            .when(dialed, |tab| tab.child(crate::sidebar::context_dial(fill, cx))),
+                    )
+                } else if matches!(tab.kind, TabKind::Asleep) {
+                    Tab::new().child(div().text_color(cx.theme().muted_foreground).child(label))
                 } else {
                     Tab::new().label(label).when(tab.preview, |tab| tab.italic())
                 };
@@ -161,7 +187,9 @@ impl TaskView {
                     .on_drag(dragged, |dragged, _, _, cx| {
                         start_drag(Drag::Tab);
                         cx.new(|_| dragged.clone())
-                    });
+                    })
+                    .drag_over::<DraggedTab>(|style, _, _, cx| style.bg(cx.theme().accent))
+                    .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| this.reorder_tab(dragged.tab_id, id, window, cx)));
                 if closable {
                     // The cross is there under the pointer only, over the tab's end: it keeps no room
                     // of its own, so the tabs are as wide as their names and the row is quieter.

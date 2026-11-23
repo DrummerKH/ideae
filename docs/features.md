@@ -125,8 +125,8 @@ of once (Settings → Agents).
 
 ## Questions aside
 
-**Ask a question…** (a project's +, the File menu and the command palette,
-for the project in hand; a key of your own in Settings → Keys) is for something to find out, not to
+**Ask a question…** (Ctrl+I, a project's +, the File menu and the command
+palette, for the project in hand) is for something to find out, not to
 change: it goes to an agent of its own in the main thread, beside the main
 thread's agent, which goes on with what it was doing. No branch, no worktree,
 no title to think of: its first line names it, and the agent for quick
@@ -135,9 +135,16 @@ thread is, told to change nothing unless asked (Claude Code asks before each
 change, Codex has a read-only sandbox, OpenCode asks), which it may still do
 with your leave: notes for thinking it over, say.
 
+A question can start from what an agent of the project knows: **Context** in
+its dialog is empty by default, or names any of them. An agent of the same kind
+goes on from a copy of that conversation, which itself stays as it was; another
+kind is pointed to its file to read.
+
 Each open question is a row under the main thread, with what its agent does
-(a double click renames it), and a tab with `?`. One that asks you something
-is in Needs you under its task, Alt+Down goes to it, and its notification
+(a double click renames it), and a tab with its mark, after the agent's, that
+can be dragged among the others. One that asks you something or has answered
+while you were elsewhere is in Needs you under its task, stays visible under a
+folded project; the sidebar narrowed to a rail lists them too. Alt+Down goes to it, and its notification
 opens it. The tab's × only hides it, the agent going on; its row
 brings it back. **Close question** above the tab (or the row's ×) ends its
 agent; **Closed questions…** in the project's + lists them, and one picked
@@ -147,15 +154,16 @@ archived tasks. **Make a task** (above its tab) carries a question on in a
 task of its own: a worktree and a branch named after it, its conversation
 resumed there, and its agent told the files it wrote in the main thread, to
 move them over. Asked while the main thread is not running,
-only the question's agent starts; the main thread's starts when you open its
-tab (Ctrl+1). Pausing the main thread stops its questions' agents too (it says
-so if one is at work), their rows stay, marked asleep, and opening one starts
-only that agent, its conversation going on. Questions come back after a restart, their agents running on
+only the question's agent starts, and the main thread's first tab waits with a
+button (or Ctrl+1), through a restart too. Pausing the main thread stops its
+questions' agents as well, saying first what that would cost one; their rows and
+tabs stay, marked asleep, and opening one starts only that agent, its
+conversation going on, or says so if it was not found. Questions come back after a restart, their agents running on
 in the background. A question's agent with nothing to do for a while, its
 tab not in front, stops (Settings → Tasks, 15 minutes): the row says asleep,
-and the agent resumes the conversation when the question is opened. An open
-one with no message for days (3), yours or its agent's, goes to the closed
-ones. Once a question was asked, every agent there is resumed by its own
+its tab keeps its place, and the agent resumes the conversation when it is
+opened. An open one with no message for days (3), yours or its agent's, goes
+to the closed ones, unless its answer was not read. Once a question was asked, every agent there is resumed by its own
 session: the main thread's session, if its id was never told, is found when
 the first question is asked.
 

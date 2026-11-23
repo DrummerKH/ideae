@@ -21,9 +21,17 @@ impl TaskView {
                 let mut s = TabSession { right: tab.pane.right, below: tab.pane.below, preview: tab.preview, pinned: tab.pinned, ..Default::default() };
                 match &tab.kind {
                     // The task's first terminal: the agent, or the shell without one.
+                    // Not started: a restart leaves it so.
+                    TabKind::Asleep if tab.agent == Some(Who::Main) => s.kind = "paused-agent".into(),
                     TabKind::Terminal(_) | TabKind::Chat(_) if tab.agent == Some(Who::Main) || tab.title == "shell" => s.kind = "agent".into(),
-                    TabKind::Terminal(_) | TabKind::Chat(_) if tab.agent.is_some() => s.kind = "question".into(),
-                    TabKind::Chat(_) => {}
+                    TabKind::Terminal(_) | TabKind::Chat(_) | TabKind::Asleep if tab.agent.is_some() => {
+                        s.kind = "question".into();
+                        // `line` holds its number, as a shell's.
+                        if let Some(Who::Question(n)) = tab.agent {
+                            s.line = n;
+                        }
+                    }
+                    TabKind::Chat(_) | TabKind::Asleep => {}
                     TabKind::Terminal(view) if view.read(cx).service.is_some() => {
                         s.kind = "service".into();
                         s.path = view.read(cx).service.clone();
@@ -84,10 +92,11 @@ impl TaskView {
         for saved in &session.tabs {
             let before: HashSet<usize> = self.tabs.iter().map(|t| t.id).collect();
             match saved.kind.as_str() {
-                "agent" => {
+                "agent" | "paused-agent" => {
                     ids.push(self.tabs.iter().find(|t| t.agent == Some(Who::Main) || t.title == "shell").map(|t| t.id));
                     continue;
                 }
+                "question" => self.restore_question_tab(saved.line),
                 // `line` holds the shell's number, for its session.
                 "shell" if saved.line > 0 => {
                     self.terminal_tab(saved.line as usize, window, cx);
@@ -142,6 +151,8 @@ impl TaskView {
         }
         self.current = Pane { right: session.focus_right, below: session.focus_below };
         self.normalize();
+        // In front and still running in the daemon: there, not its place.
+        self.attach_questions_in_front(window, cx);
         self.expanded = session.expanded.iter().map(|e| SharedString::from(e.clone())).collect();
         self.viewed = session.viewed.clone();
         let review = session.review.clone();
@@ -179,6 +190,22 @@ impl TaskView {
     /// One of its questions' agents is.
     pub fn question_busy(&self) -> bool {
         self.questions.iter().any(|q| q.agent.status == crate::agent::AgentStatus::Working)
+    }
+
+    /// What a pause would cost its questions, to say before it.
+    pub fn question_pause_note(&self) -> Option<&'static str> {
+        use crate::agent::AgentStatus::{NeedsInput, Working};
+        let running = |q: &Question| !q.asleep && (q.has_parked() || self.agent_ix(Who::Question(q.id)).is_some());
+        if self.questions.iter().any(|q| running(q) && q.agent.launch.as_ref().is_some_and(|l| l.session_id().is_none())) {
+            return Some("A question's conversation has no known session and could not be continued.");
+        }
+        if self.questions.iter().any(|q| q.agent.has_queued_message()) {
+            return Some("A message waiting to be sent to a question's agent would be lost.");
+        }
+        if self.questions.iter().any(|q| matches!(q.agent.status, NeedsInput(_))) {
+            return Some("A question's agent is waiting for your answer. The question stays and goes on when you open it.");
+        }
+        self.questions.iter().any(|q| q.agent.status == Working).then_some("A question's agent is in the middle of a turn. The question stays and goes on when you open it.")
     }
 
     /// Something of the task works that the machine should stay up for:

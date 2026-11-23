@@ -433,12 +433,12 @@ impl Workspace {
                 for q in &t.questions {
                     let closed = q.closed > 0;
                     let status = view.filter(|_| !closed).and_then(|v| v.agent_of(task::Who::Question(q.id))).and_then(|a| task::status_glyph(&a.status));
-                    let when = if closed { q.closed } else { q.created };
+                    let when = if closed { q.closed } else { q.created.max(q.active).max(q.opened) };
                     let mut detail = format!("question · {}", p.name);
                     if !t.main {
                         detail.push_str(&format!(" · {}", self.task_title(pi, ti, cx)));
                     }
-                    detail.push_str(&if closed { format!(" · closed {}", crate::sidebar::ago(q.closed)) } else { format!(" · {}", crate::sidebar::ago(q.created)) });
+                    detail.push_str(&if closed { format!(" · closed {}", crate::sidebar::ago(q.closed)) } else { format!(" · {}", crate::sidebar::ago(when)) });
                     let mark = status.or(Some(("?", hsla(0., 0., 0.55, 1.))));
                     tasks.push(Row { when, path: t.path.clone(), title: format!("? {}", q.title), detail, mark, paused: closed, question: Some((q.id, closed)) });
                 }

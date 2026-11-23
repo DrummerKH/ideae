@@ -126,6 +126,27 @@ fn clean_title(title: &str) -> String {
     title.trim_start_matches(|c: char| !c.is_alphanumeric()).trim().to_string()
 }
 
+/// A question's answer as its row's tooltip has it: the first lines.
+fn answer_shown(answer: &str) -> Option<String> {
+    let all: Vec<&str> = answer.lines().filter(|l| !l.trim().is_empty()).collect();
+    if all.is_empty() {
+        return None;
+    }
+    let whole = all[..all.len().min(10)].join("\n");
+    let short: String = whole.chars().take(700).collect();
+    Some(if all.len() > 10 || short.len() < whole.len() { format!("{}…", short.trim_end()) } else { short })
+}
+
+/// Which of a task's open questions get a row.
+#[derive(Clone, Copy, PartialEq)]
+enum QuestionRows {
+    All,
+    /// In Needs you: those that ask something or have answered.
+    Needed,
+    /// Under a folded project: those too, and those at work.
+    Live,
+}
+
 impl Workspace {
     pub fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let query = self.search.read(cx).value().trim().to_lowercase();
@@ -156,7 +177,7 @@ impl Workspace {
                         let asks = t.view.as_ref().is_some_and(|v| matches!(v.read(cx).agent.status, AgentStatus::NeedsInput(_)));
                         if t.group.is_empty() || asks {
                             list = list.child(self.render_task(pi, ti, true, cx));
-                            list = self.render_questions(list, pi, ti, true, cx);
+                            list = self.render_questions(list, pi, ti, QuestionRows::Needed, cx);
                         } else if groups.insert(t.group.clone()) {
                             list = list.child(self.render_group_row(pi, &t.group, true, cx));
                         }
@@ -238,7 +259,7 @@ impl Workspace {
                     // A search lists its hits one by one.
                     if group.is_empty() || !query.is_empty() {
                         list = list.child(self.render_task(pi, ti, false, cx));
-                        list = self.render_questions(list, pi, ti, false, cx);
+                        list = self.render_questions(list, pi, ti, QuestionRows::All, cx);
                         let under: Vec<usize> = sides.iter().copied().filter(|&s| side_parent(s) == Some(p.tasks[ti].path.as_path())).collect();
                         list = self.render_sides(list, pi, p.tasks[ti].path.clone(), "", under, cx);
                     } else if groups.insert(group.clone()) {
@@ -252,6 +273,11 @@ impl Workspace {
                 }
                 let elsewhere: Vec<usize> = sides.iter().copied().filter(|&s| side_parent(s).is_none()).collect();
                 list = self.render_sides(list, pi, p.path.clone(), "temporary ", elsewhere, cx);
+            } else {
+                // Folded, what works, asks or has answered is still there.
+                for ti in tasks {
+                    list = self.render_questions(list, pi, ti, QuestionRows::Live, cx);
+                }
             }
         }
         // Dropping below the last project moves it to the end.
@@ -378,6 +404,7 @@ impl Workspace {
             rail = rail.child(heading("NEEDS YOU", hsla(0.08, 0.9, 0.55, 1.)));
             for &(pi, ti) in &waiting {
                 rail = rail.child(self.render_rail_row(pi, ti, "waiting", dialed, cx));
+                rail = self.render_rail_questions(rail, pi, ti, QuestionRows::Needed, "waiting", cx);
             }
         }
         let starred: Vec<(usize, usize)> = self
@@ -452,6 +479,7 @@ impl Workspace {
             );
             for ti in tasks {
                 rail = rail.child(self.render_rail_row(pi, ti, "project", dialed, cx));
+                rail = self.render_rail_questions(rail, pi, ti, QuestionRows::All, "project", cx);
             }
         }
         rail.test_support()
@@ -465,6 +493,65 @@ impl Workspace {
                     this.peek_sidebar(true, window, cx);
                 }
             }))
+    }
+
+    /// A task's open questions in the rail: its mark, what it does, as much
+    /// of its name as there is room for; all of it in the tooltip.
+    fn render_rail_questions(&self, mut rail: Stateful<Div>, pi: usize, ti: usize, rows: QuestionRows, section: &'static str, cx: &mut Context<Self>) -> Stateful<Div> {
+        let t = &self.projects[pi].tasks[ti];
+        let muted = cx.theme().muted_foreground;
+        let in_hand = self.active.as_deref() == Some(t.path.as_path());
+        let front = t.view.as_ref().filter(|_| in_hand).map_or_else(Vec::new, |v| v.read(cx).questions_in_front());
+        for q in t.questions.iter().filter(|q| q.closed == 0) {
+            let n = q.id;
+            let v = t.view.as_ref().map(|view| view.read(cx));
+            let agent = v.and_then(|v| v.agent_of(crate::task::Who::Question(n)));
+            let asks = agent.is_some_and(|a| matches!(a.status, AgentStatus::NeedsInput(_)));
+            if rows == QuestionRows::Needed && !asks && !q.unread {
+                continue;
+            }
+            let asleep = v.is_none_or(|v| v.question_asleep(n));
+            let glyph = agent.and_then(|a| task::status_glyph(&a.status)).filter(|_| !asleep && !q.unread);
+            let state = if q.unread && !asks {
+                "answered".to_string()
+            } else if asleep {
+                "asleep".to_string()
+            } else {
+                agent.and_then(|a| a.doing.clone()).unwrap_or_default()
+            };
+            let told: SharedString = match (answer_shown(&q.answer), state.is_empty()) {
+                (Some(answer), _) => format!("{}\n\n{answer}", q.title).into(),
+                (None, true) => q.title.clone().into(),
+                (None, false) => format!("{}\n{state}", q.title).into(),
+            };
+            let color = if front.contains(&n) { cx.theme().foreground } else { muted };
+            let icon = if q.unread { cx.theme().primary } else { muted };
+            let path = t.path.clone();
+            rail = rail.child(
+                h_flex()
+                    .id(SharedString::from(format!("rail-question-{section}-{}-{n}", t.path.display())))
+                    .test_support()
+                    .w_full()
+                    .pl(px(12.))
+                    .pr_1()
+                    .gap_1()
+                    .items_center()
+                    .text_size(px(10.))
+                    .text_color(color)
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(cx.theme().foreground))
+                    .child(svg().path("side-icons/message-circle-question-mark.svg").size(px(11.)).flex_none().text_color(icon))
+                    .children(glyph.map(|(glyph, mark)| div().flex_none().text_color(mark).child(glyph)))
+                    .child(div().flex_1().min_w_0().truncate().child(q.title.clone()))
+                    .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(told.clone()).build(window, cx))
+                    .when(q.unread, |row| {
+                        let path = t.path.clone();
+                        row.on_hover(cx.listener(move |this, on: &bool, _, cx| this.hover_answer(&path, n, *on, cx)))
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| this.show_question(&path, n, window, cx))),
+            );
+        }
+        rail
     }
 
     /// A task's row in the rail. `section`: which part of the rail it is in,
@@ -723,7 +810,8 @@ impl Workspace {
         let mut rows: Vec<(usize, usize)> = Vec::new();
         for (pi, p) in self.projects.iter().enumerate() {
             for (ti, t) in p.tasks.iter().enumerate() {
-                let waiting = t.view.as_ref().is_some_and(|v| {
+                let unread = t.questions.iter().any(|q| q.closed == 0 && q.unread);
+                let waiting = unread || t.view.as_ref().is_some_and(|v| {
                     let v = v.read(cx);
                     let asks = matches!(v.agent.status, AgentStatus::NeedsInput(_)) || v.question_asks().is_some();
                     // A variant that is done waits for the others: the group
@@ -732,7 +820,7 @@ impl Workspace {
                 });
                 let in_view = self.active.as_deref() == Some(t.path.as_path())
                     || (!t.group.is_empty() && self.active_group.as_deref() == Some(t.group.as_str()));
-                if waiting && !in_view && self.shows(pi, ti) {
+                if waiting && (!in_view || unread) && self.shows(pi, ti) {
                     rows.push((pi, ti));
                 }
             }
@@ -760,6 +848,7 @@ impl Workspace {
         let path = self.projects[pi].tasks[ti].path.clone();
         // Its question, when the task's own agent does not ask.
         let question = self.projects[pi].tasks[ti].view.as_ref().map(|v| v.read(cx)).filter(|v| !matches!(v.agent.status, AgentStatus::NeedsInput(_))).and_then(|v| v.question_asks());
+        let question = question.or_else(|| self.projects[pi].tasks[ti].questions.iter().find(|q| q.closed == 0 && q.unread).map(|q| q.id));
         if let Some(n) = question {
             return self.show_question(&path, n, window, cx);
         }
@@ -913,7 +1002,8 @@ impl Workspace {
     fn render_project(&self, pi: usize, first: bool, cx: &mut Context<Self>) -> AnyElement {
         let p = &self.projects[pi];
         let name: SharedString = p.name.clone().into();
-        let running = p.tasks.iter().filter(|t| t.view.is_some()).count();
+        let running = p.tasks.iter().filter(|t| t.view.as_ref().is_some_and(|v| v.read(cx).runs_own_agent())).count();
+        let questions = p.tasks.iter().flat_map(|t| &t.questions).filter(|q| q.closed == 0).count();
         let group = SharedString::from(format!("project-group-{pi}"));
         let muted = cx.theme().muted_foreground;
         let this = cx.weak_entity();
@@ -934,7 +1024,7 @@ impl Workspace {
             .text_color(muted)
             .child(div().flex_1().min_w_0().truncate().child(name.clone()))
             .when(p.collapsed, |s| {
-                s.child(div().text_xs().child(if running > 0 { format!("{running} running ▸") } else { "▸".into() }))
+                s.when(questions > 0, |s| s.child(div().text_xs().child(format!("? {questions}")))).child(div().text_xs().child(if running > 0 { format!("{running} running ▸") } else { "▸".into() }))
             })
             .child(
                 h_flex()
@@ -1065,19 +1155,23 @@ impl Workspace {
     /// A task's open questions, a row each under it: what its agent does,
     /// a click to its tab, × to close it.
     /// In Needs you (`waiting`), only those that ask something.
-    fn render_questions(&self, mut list: Stateful<Div>, pi: usize, ti: usize, waiting: bool, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn render_questions(&self, mut list: Stateful<Div>, pi: usize, ti: usize, rows: QuestionRows, cx: &mut Context<Self>) -> Stateful<Div> {
         let t = &self.projects[pi].tasks[ti];
         // A paused task's are listed too: each goes on when it is opened.
         let view = t.view.as_ref();
-        if waiting && view.is_none() {
-            return list;
-        }
         let muted = cx.theme().muted_foreground;
         for q in t.questions.iter().filter(|q| q.closed == 0) {
             let (n, path) = (q.id, t.path.clone());
             let v = view.map(|view| view.read(cx));
             let agent = v.and_then(|v| v.agent_of(crate::task::Who::Question(n)));
-            if waiting && !agent.is_some_and(|a| matches!(a.status, AgentStatus::NeedsInput(_))) {
+            let asks = agent.is_some_and(|a| matches!(a.status, AgentStatus::NeedsInput(_)));
+            let works = agent.is_some_and(|a| a.status == AgentStatus::Working);
+            let wanted = match rows {
+                QuestionRows::All => true,
+                QuestionRows::Needed => asks || q.unread,
+                QuestionRows::Live => asks || works || q.unread,
+            };
+            if !wanted {
                 continue;
             }
             let glyph = agent.and_then(|a| task::status_glyph(&a.status));
@@ -1086,8 +1180,14 @@ impl Workspace {
                 AgentStatus::NeedsInput(message) => Some(message.clone()),
                 _ => None,
             });
-            let doing = if v.is_none_or(|v| v.question_asleep(n)) { Some("asleep".to_string()) } else { doing };
-            let group = SharedString::from(format!("{}question-{}-{n}", if waiting { "waiting-" } else { "" }, t.path.display()));
+            let doing = if q.unread && !asks && !works {
+                Some("answered".to_string())
+            } else if v.is_none_or(|v| v.question_asleep(n)) {
+                Some("asleep".to_string())
+            } else {
+                doing
+            };
+            let group = SharedString::from(format!("{}question-{}-{n}", match rows { QuestionRows::All => "", QuestionRows::Needed => "waiting-", QuestionRows::Live => "folded-" }, t.path.display()));
             let (open, close) = (path.clone(), path);
             list = list.child(
                 h_flex()
@@ -1102,10 +1202,8 @@ impl Workspace {
                     .text_color(muted)
                     .cursor_pointer()
                     .hover(|s| s.text_color(cx.theme().foreground))
-                    .child(match glyph {
-                        Some((glyph, color)) => div().w(px(10.)).flex_none().text_color(color).child(glyph),
-                        None => div().w(px(10.)).flex_none().child("?"),
-                    })
+                    .child(svg().path("side-icons/message-circle-question-mark.svg").size(px(12.)).flex_none().text_color(if q.unread { cx.theme().primary } else { muted }))
+                    .children(glyph.filter(|(_, _)| !q.unread).map(|(glyph, color)| div().flex_none().text_color(color).child(glyph)))
                     .child(div().flex_1().min_w_0().truncate().child(q.title.clone()))
                     .children(doing.map(|doing| div().flex_shrink_0().max_w(px(140.)).truncate().child(doing)))
                     .child(
@@ -1121,7 +1219,14 @@ impl Workspace {
                                 })),
                         ),
                     )
-                    .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("A question asked aside: a double click renames it").build(window, cx))
+                    .tooltip({
+                        let told: SharedString = answer_shown(&q.answer).unwrap_or_else(|| "A question asked aside: a double click renames it".to_string()).into();
+                        move |window, cx| gpui_kit::component::tooltip::Tooltip::new(told.clone()).build(window, cx)
+                    })
+                    .when(q.unread, |row| {
+                        let path = t.path.clone();
+                        row.on_hover(cx.listener(move |this, on: &bool, _, cx| this.hover_answer(&path, n, *on, cx)))
+                    })
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                         if event.click_count() > 1 {
                             this.rename_question_dialog(&open, n, window, cx)
@@ -1190,7 +1295,8 @@ impl Workspace {
             self.task_title(pi, ti, cx).into()
         };
         let is_active = self.active.as_deref() == Some(path.as_path());
-        let running = t.view.is_some();
+        // A question opened in a paused task does not make its own agent run.
+        let running = t.view.as_ref().is_some_and(|v| v.read(cx).runs_own_agent());
         // With more than one agent: which one it runs, as a letter.
         let several = crate::state::with_settings(|s| s.several_agents());
         let agent_mark = if several && t.side.is_none() { self.task_profile_at(pi, ti, cx) } else { None };

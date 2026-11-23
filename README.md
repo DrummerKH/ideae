@@ -100,6 +100,7 @@ More in [docs/features.md](docs/features.md); notes for each system in
 | Ctrl+Shift+N, Ctrl+Shift+F, Ctrl+Shift+R | Go to file, find in files, replace in files |
 | Ctrl+B / Ctrl+click | Go to definition; on a declaration, its usages |
 | Ctrl+Alt+B | Implementations, then usages |
+| Ctrl+I | Ask a question aside |
 | Ctrl+F12 | File structure |
 | F2 / Shift+F2 | Next / previous problem |
 | F11 / Shift+F11 | Bookmark the line / the task's bookmarks |

@@ -245,8 +245,16 @@ pub struct Workspace {
     save_seq: u64,
     /// Tasks open in the last run and not loaded yet, the next one last.
     restoring: Vec<PathBuf>,
+    /// Tasks open when the app last stopped and not loaded yet, the one in view too.
+    last_run: std::collections::HashSet<PathBuf>,
     /// Started for a question alone: its own agent waits until it is opened.
     quiet_start: std::collections::HashSet<PathBuf>,
+    /// Conversations copied for a question to start from, until it has.
+    fork_copies: std::collections::HashMap<(PathBuf, u32), Vec<PathBuf>>,
+    /// What questions' sessions were last read at, for how full they are.
+    question_usage: std::collections::HashMap<(PathBuf, u32), Option<std::time::SystemTime>>,
+    /// An answer read from its row: the pointer stayed on it.
+    answer_hover: Task<()>,
     _subscriptions: Vec<Subscription>,
     _tick: Task<()>,
     pub build: crate::build_watch::BuildWatch,
@@ -720,7 +728,11 @@ impl Workspace {
             last_saved: Default::default(),
             save_seq: 0,
             restoring: Vec::new(),
+            last_run: Default::default(),
             quiet_start: Default::default(),
+            fork_copies: Default::default(),
+            question_usage: Default::default(),
+            answer_hover: Task::ready(()),
             _subscriptions: subscriptions,
             _tick: tick,
             requested_origin: None,
@@ -946,6 +958,7 @@ impl Workspace {
             .map(|t| t.path.clone())
             .collect();
         // The one in view now; the rest after the window is up (`restoring`).
+        self.last_run = open.iter().cloned().collect();
         self.restoring = open.into_iter().rev().collect();
         if let Some(active) = saved.active_task.as_ref().filter(|p| self.find(p).is_some()) {
             self.restoring.retain(|p| p != active);
@@ -1113,20 +1126,22 @@ impl Workspace {
         let main = self.entry_mut(path).is_some_and(|entry| entry.main);
         let kept: Vec<String> = self.find(path).map(|(pi, _)| self.projects[pi].hints_off.iter().filter_map(|key| key.strip_prefix(automation::KEPT_BRANCH)).map(str::to_string).collect()).unwrap_or_default();
         let lsp_off = self.find(path).is_some_and(|(pi, _)| self.projects[pi].lsp_off);
-        let quiet = self.quiet_start.contains(path);
+        // Its own agent was not running when the app last stopped.
+        let quiet = self.quiet_start.contains(path) || (self.last_run.remove(path) && session.tabs.iter().any(|tab| tab.kind == "paused-agent"));
         let view = cx.new(|cx| {
             let mut t = TaskView::new(root, branch, launch, !quiet, socket, slot, window, cx);
             t.context_fill = fill;
             // Servers start when the task comes into view (switch).
             t.lsp_asleep = true;
+            // Before the tabs: a question's is restored by what is known of it.
+            if let Some(entry) = self.find(path).map(|(pi, ti)| &self.projects[pi].tasks[ti]) {
+                self.give_questions(entry, &mut t);
+            }
             t.restore(&session, window, cx);
             t.pr = pr;
             t.main_thread = main;
             t.kept_branches = kept;
             t.lsp_off = lsp_off;
-            if let Some(entry) = self.find(path).map(|(pi, ti)| &self.projects[pi].tasks[ti]) {
-                self.give_questions(entry, &mut t);
-            }
             t
         });
         cx.subscribe_in(&view, window, |this, view, event: &TaskEvent, window, cx| this.on_task_event(view, event, window, cx)).detach();
@@ -1222,6 +1237,13 @@ impl Workspace {
             t.wake_agent(cx);
             t.set_visible(true, window, cx)
         });
+        // A question in front is read by coming into view.
+        let front = view.read(cx).questions_in_front();
+        if let Some(entry) = self.entry_mut(path) {
+            for q in entry.questions.iter_mut().filter(|q| front.contains(&q.id)) {
+                q.unread = false;
+            }
+        }
         self.refresh_prs(true, window, cx);
         cx.notify();
     }
@@ -1454,6 +1476,7 @@ impl Workspace {
         if self.window_left.is_some_and(|left| left.elapsed() >= Self::lsp_idle())
             && let Some(view) = self.active_view()
             && !view.read(cx).agent_busy()
+            && !view.read(cx).question_busy()
             && !view.read(cx).asked_of_lately(Self::lsp_idle())
             && view.read(cx).has_language_servers()
         {
@@ -1467,7 +1490,7 @@ impl Workspace {
                         view.update(cx, |t, cx| t.put_language_servers_to_sleep(cx));
                     }
                     // Its browser too, unless its agent may be driving a page right now.
-                    if !view.read(cx).agent_busy() {
+                    if !view.read(cx).agent_busy() && !view.read(cx).question_busy() {
                         view.update(cx, |t, cx| t.put_pages_to_sleep(cx));
                     }
                 }
@@ -1490,13 +1513,18 @@ impl Workspace {
         if self.ask_losing_sql(files, window, cx, move |w, window, cx| w.stop(&again, window, cx)) {
             return;
         }
-        let (own, asked) = (view.read(cx).agent_busy(), view.read(cx).question_busy());
-        if own || asked {
-            let told = match (own, asked) {
-                (true, false) => "It is in the middle of a turn. The task's terminals are stopped too.",
-                (true, true) => "It and a question's agent are in the middle of a turn. The task's terminals are stopped too; the question stays, and goes on when you open it.",
-                _ => "A question's agent is in the middle of a turn. The task's terminals are stopped too; the question stays, and goes on when you open it.",
-            };
+        let (own, note) = (view.read(cx).agent_busy(), view.read(cx).question_pause_note());
+        if own || note.is_some() {
+            let mut told = String::new();
+            if own {
+                told.push_str("It is in the middle of a turn. ");
+            }
+            told.push_str("The task's terminals are stopped too.");
+            if let Some(note) = note {
+                told.push(' ');
+                told.push_str(note);
+            }
+            let told = SharedString::from(told);
             let this = cx.weak_entity();
             let path = path.to_path_buf();
             window.open_alert_dialog(cx, move |dialog, _, _| {
@@ -1504,7 +1532,7 @@ impl Workspace {
                 dialog
                     .confirm()
                     .title("Stop the agent?")
-                    .description(told)
+                    .description(told.clone())
                     .ok_text("Stop")
                     .on_ok(move |_, window, cx| {
                         let _ = this.update(cx, |this, cx| this.stop(&path, window, cx));
@@ -2455,13 +2483,38 @@ impl Workspace {
             .filter(|t| t.view.is_some())
             .filter_map(|t| Some((t.path.clone(), t.session_ref()?, self.usage.get(&t.path).and_then(|(written, _)| *written))))
             .collect();
+        // Questions by their own sessions: how full each is, for its tab.
+        let asked: Vec<(PathBuf, u32, crate::agents::SessionRef, Option<std::time::SystemTime>)> = self
+            .projects
+            .iter()
+            .flat_map(|p| &p.tasks)
+            .filter(|t| t.view.is_some())
+            .flat_map(|t| t.questions.iter().filter(|q| q.closed == 0).map(move |q| (t, q)))
+            .filter_map(|(t, q)| {
+                let profile = state::with_settings(|s| s.profile(&q.profile).cloned())?;
+                let who = crate::agents::SessionRef { profile, id: Some(q.session.clone()?) };
+                Some((t.path.clone(), q.id, who, self.question_usage.get(&(t.path.clone(), q.id)).copied().flatten()))
+            })
+            .collect();
         cx.spawn_in(window, async move |this, cx| {
+            let fills = cx
+                .background_spawn(async move {
+                    asked
+                        .into_iter()
+                        .filter_map(|(path, n, who, before)| {
+                            let transcript = who.own_transcript(&path)?;
+                            let written = std::fs::metadata(&transcript).and_then(|m| m.modified()).ok();
+                            (written != before).then(|| who.profile.adapter().usage(&transcript)).flatten().map(|usage| (path, n, written, usage.fill()))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
             let read = cx
                 .background_spawn(async move {
                     known
                         .into_iter()
                         .filter_map(|(path, who, before)| {
-                            let transcript = who.transcript(&path)?;
+                            let transcript = who.own_transcript(&path)?;
                             let written = std::fs::metadata(&transcript).and_then(|m| m.modified()).ok();
                             (written != before).then(|| who.profile.adapter().usage(&transcript)).flatten().map(|usage| (path, written, usage))
                         })
@@ -2479,6 +2532,13 @@ impl Workspace {
                 this.usage_warned.retain(|path| listed.contains(path));
                 crate::project_config::retain_tasks(&listed);
                 this.last_in_space.retain(|_, path| listed.contains(path));
+                this.question_usage.retain(|(path, n), _| this.projects.iter().flat_map(|p| &p.tasks).any(|t| t.path == *path && t.questions.iter().any(|q| q.id == *n && q.closed == 0)));
+                for (path, n, written, fill) in fills {
+                    if let Some(view) = this.find(&path).and_then(|(pi, ti)| this.projects[pi].tasks[ti].view.clone()) {
+                        view.update(cx, |t, cx| t.set_question_fill(n, fill, cx));
+                    }
+                    this.question_usage.insert((path, n), written);
+                }
                 let limit = u64::from(state::with_settings(|s| s.token_warn_k)) * 1000;
                 for (path, written, usage) in read {
                     // A new session of the task starts its count again.
@@ -2803,7 +2863,7 @@ impl Workspace {
             self.save(cx);
             return cx.quit();
         }
-        let busy = self.views().iter().filter(|v| v.read(cx).agent_busy()).count();
+        let busy = self.views().iter().filter(|v| v.read(cx).agent_busy() || v.read(cx).question_busy()).count();
         let mut description = format!(
             "Stops the agents and terminals of {running} running task{}",
             if running == 1 { "" } else { "s" }

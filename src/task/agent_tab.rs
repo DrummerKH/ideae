@@ -149,6 +149,20 @@ pub struct Question {
     pub(super) quiet_since: Option<std::time::Instant>,
     /// Its agent stopped for being idle: it resumes when shown.
     pub asleep: bool,
+    /// It has messages: an agent that does not find them has lost them.
+    talked: bool,
+    /// How full its context is, 0 to 1.
+    pub(super) context_fill: f32,
+    /// Being looked for, before it starts again.
+    waking: bool,
+    /// Its conversation was not found when it woke: it started over.
+    lost: bool,
+}
+
+impl Question {
+    pub(super) fn has_parked(&self) -> bool {
+        self.parked.is_some()
+    }
 }
 
 /// A question's agent's names in the daemon: as a terminal, as a chat.
@@ -174,6 +188,8 @@ pub enum Asked {
     Closed(u32),
     /// To go on as a task of its own.
     ToTask(u32),
+    /// Its tab came to the front: its answer is read.
+    Seen(u32),
 }
 
 // ---------------------------------------------------------------- questions
@@ -194,43 +210,190 @@ impl TaskView {
         if self.questions.iter().any(|q| q.id == id) {
             return;
         }
-        self.questions.push(Question { id, title, agent: AgentState::new(Some(launch)), parked: None, quiet_since: Some(std::time::Instant::now()), asleep: false });
+        self.questions.push(Question { id, title, agent: AgentState::new(Some(launch)), parked: None, quiet_since: Some(std::time::Instant::now()), asleep: false, talked: false, context_fill: 0., waking: false, lost: false });
     }
 
-    /// Its agent is not running, and not to be looked for in the daemon.
-    pub fn question_sleeps(&mut self, id: u32) {
-        if let Some(q) = self.questions.iter_mut().find(|q| q.id == id) {
-            q.asleep = true;
+    /// The question's tab in front, its agent running. One asleep whose
+    /// conversation had messages is looked for first: an agent that does not
+    /// find it starts an empty one, which is to be said.
+    pub fn show_question(&mut self, id: u32, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(q) = self.questions.iter_mut().find(|q| q.id == id) else { return };
+        let look = (q.asleep && q.talked).then(|| q.agent.session_ref()).flatten().filter(|who| who.id.is_some() && !who.profile.acp && who.profile.adapter().session_base(&who.profile, &self.root).is_some());
+        let Some(who) = look else { return self.open_question(id, window, cx) };
+        if std::mem::replace(&mut q.waking, true) {
+            return;
+        }
+        let root = self.root.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let found = cx.background_spawn(async move { who.own_transcript(&root).is_some_and(|file| file.is_file()) }).await;
+            let _ = this.update_in(cx, |t, window, cx| {
+                if let Some(q) = t.questions.iter_mut().find(|q| q.id == id) {
+                    q.waking = false;
+                    q.lost = !found;
+                    t.open_question(id, window, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn open_question(&mut self, id: u32, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix) = self.question_tab(id, window, cx) {
+            self.activate(ix, window, cx);
+            cx.emit(TaskEvent::Changed);
         }
     }
 
-    /// The question's tab in front: back from hiding, or made, which starts
-    /// its agent (in the daemon, a restart attaches to it again).
-    pub fn show_question(&mut self, id: u32, window: &mut Window, cx: &mut Context<Self>) {
+    /// Its tab with its agent in it: where it stood, else after the agents'.
+    fn question_tab(&mut self, id: u32, window: &mut Window, cx: &mut Context<Self>) -> Option<usize> {
         let who = Who::Question(id);
         if let Some(ix) = self.agent_ix(who) {
-            return self.activate(ix, window, cx);
+            return Some(ix);
         }
-        let Some(q) = self.questions.iter_mut().find(|q| q.id == id) else { return };
+        let q = self.questions.iter_mut().find(|q| q.id == id)?;
         let title = q.title.clone();
         q.asleep = false;
         q.quiet_since = Some(std::time::Instant::now());
         let tab = match q.parked.take() {
             Some(tab) => tab,
             None => {
-                let Some(launch) = q.agent.launch.clone() else { return };
+                let launch = q.agent.launch.clone()?;
                 let mut tab = self.agent_tab(who, &launch, self.terminal_env(), window, cx);
                 tab.title = format!("? {}", crate::said::cap(&title, 40)).into();
                 self.watch_activity(who, cx);
                 tab
             }
         };
-        // After the agents' tabs, so they stay together.
+        if let Some(ix) = self.asleep_ix(who) {
+            let (id, pane) = (self.tabs[ix].id, self.tabs[ix].pane);
+            self.tabs[ix] = TabItem { id, pane, ..tab };
+            return Some(ix);
+        }
         let at = self.tabs.iter().rposition(|t| t.agent.is_some()).map_or(0, |ix| ix + 1);
         let pane = self.current;
         self.tabs.insert(at, TabItem { pane, ..tab });
-        self.activate(at, window, cx);
-        cx.emit(TaskEvent::Changed);
+        Some(at)
+    }
+
+    /// The tab holding an agent's place while it does not run.
+    pub(super) fn asleep_ix(&self, who: Who) -> Option<usize> {
+        self.tabs.iter().position(|t| t.agent == Some(who) && matches!(t.kind, TabKind::Asleep))
+    }
+
+    /// A question's tab of the last run: its place, its agent not started.
+    pub(super) fn restore_question_tab(&mut self, id: u32) {
+        let who = Who::Question(id);
+        let Some(q) = self.questions.iter().find(|q| q.id == id) else { return };
+        if self.asleep_ix(who).is_none() && self.agent_ix(who).is_none() {
+            let title: SharedString = format!("? {}", crate::said::cap(&q.title, 40)).into();
+            self.tabs.push(TabItem { agent: Some(who), ..TabItem::new(title, TabKind::Asleep) });
+        }
+    }
+
+    /// Those in front that may run on in the daemon, attached to.
+    pub(super) fn attach_questions_in_front(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let front: Vec<u32> = self.active.iter().flatten().filter_map(|id| self.tabs.iter().find(|t| t.id == *id)).filter(|t| matches!(t.kind, TabKind::Asleep)).filter_map(|t| match t.agent {
+            Some(Who::Question(n)) => Some(n),
+            _ => None,
+        }).filter(|n| !self.question_asleep(*n)).collect();
+        for n in front {
+            self.question_tab(n, window, cx);
+        }
+    }
+
+    /// Those whose tab is in front of a pane.
+    pub fn questions_in_front(&self) -> Vec<u32> {
+        self.active.iter().flatten().filter_map(|id| self.tabs.iter().find(|t| t.id == *id)).filter_map(|t| match t.agent {
+            Some(Who::Question(n)) => Some(n),
+            _ => None,
+        }).collect()
+    }
+
+    #[cfg(test)]
+    pub fn question_wrote(&self, path: &str) -> bool {
+        self.question_touched.contains_key(path)
+    }
+
+    #[cfg(test)]
+    pub fn tab_id(&self, ix: usize) -> usize {
+        self.tabs[ix].id
+    }
+
+    /// Who each tab is the agent of, and whether it is only its place.
+    #[cfg(test)]
+    pub fn agent_tabs(&self) -> Vec<(Who, bool)> {
+        self.tabs.iter().filter_map(|t| t.agent.map(|who| (who, matches!(t.kind, TabKind::Asleep)))).collect()
+    }
+
+    /// Its own agent has been started, or it has none to start.
+    pub fn runs_own_agent(&self) -> bool {
+        self.agent.launch.is_none() || self.agent_ix(Who::Main).is_some()
+    }
+
+    /// A question's agent is not running: told at once, not looked for.
+    pub fn question_sleeps(&mut self, id: u32) {
+        if let Some(q) = self.questions.iter_mut().find(|q| q.id == id) {
+            q.asleep = true;
+        }
+    }
+
+    pub fn set_question_fill(&mut self, id: u32, fill: f32, cx: &mut Context<Self>) {
+        if let Some(q) = self.questions.iter_mut().find(|q| q.id == id).filter(|q| q.context_fill != fill) {
+            q.context_fill = fill;
+            cx.notify();
+        }
+    }
+
+    /// It has had a conversation to go on with.
+    pub fn question_talked(&mut self, id: u32) {
+        if let Some(q) = self.questions.iter_mut().find(|q| q.id == id) {
+            q.talked = true;
+        }
+    }
+
+    /// A branch change under a question's agent at work is asked about: it
+    /// would go on reading another version of the files.
+    pub(super) fn mind_questions(&mut self, act: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.question_busy() {
+            return act(self, window, cx);
+        }
+        let (this, act) = (cx.weak_entity(), Rc::new(std::cell::RefCell::new(Some(act))));
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            let (this, act) = (this.clone(), act.clone());
+            dialog
+                .confirm()
+                .title("Change the branch?")
+                .description("A question's agent is at work in this folder and would go on with the files of the other branch.")
+                .ok_text("Change it")
+                .on_ok(move |_, window, cx| {
+                    if let Some(act) = act.borrow_mut().take() {
+                        let _ = this.update(cx, |t, cx| act(t, window, cx));
+                    }
+                    true
+                })
+        });
+    }
+
+    /// What stands in a tab whose agent is not running.
+    pub(super) fn render_asleep(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let who = self.tabs[ix].agent;
+        let (text, label) = match who {
+            Some(Who::Question(_)) => ("This question's agent is asleep. Its conversation goes on when it starts.", "Continue"),
+            _ => ("The agent is paused. Its conversation goes on when it starts.", "Start the agent"),
+        };
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .child(text)
+            .child(Button::new("asleep-start").primary().small().label(label).on_click(cx.listener(move |this, _, window, cx| match who {
+                Some(Who::Question(n)) => this.show_question(n, window, cx),
+                _ => this.show_view(0, window, cx),
+            })))
+            .into_any_element()
     }
 
     /// Its tab out of sight; the question stays open, its agent at work.
@@ -252,7 +415,7 @@ impl TaskView {
     /// sight, stop it: their conversation resumes when they are shown.
     /// Not one that asks something, which would be lost, nor one whose
     /// session is not known, which could not be resumed.
-    pub fn sleep_idle_questions(&mut self, idle: Duration, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn sleep_idle_questions(&mut self, idle: Duration, cx: &mut Context<Self>) {
         use crate::agent::AgentStatus::*;
         let in_front: Vec<usize> = self.active.iter().flatten().copied().collect();
         let sleepy: Vec<u32> = self
@@ -265,8 +428,13 @@ impl TaskView {
             .map(|q| q.id)
             .collect();
         for id in sleepy {
+            // Its tab stays where it is, holding its place.
             let tab = match self.agent_ix(Who::Question(id)) {
-                Some(ix) => Some(self.take_tab(ix, window, cx)),
+                Some(ix) => {
+                    let (tab_id, pane, title) = (self.tabs[ix].id, self.tabs[ix].pane, self.tabs[ix].title.clone());
+                    let asleep = TabItem { id: tab_id, pane, agent: Some(Who::Question(id)), ..TabItem::new(title, TabKind::Asleep) };
+                    Some(std::mem::replace(&mut self.tabs[ix], asleep))
+                }
                 None => self.questions.iter_mut().find(|q| q.id == id).and_then(|q| q.parked.take()),
             };
             match tab.map(|t| t.kind) {
@@ -302,6 +470,10 @@ impl TaskView {
         }
         let Some(pos) = self.questions.iter().position(|q| q.id == id) else { return };
         let mut question = self.questions.remove(pos);
+        self.forget_written(id);
+        if let Some(ix) = self.asleep_ix(Who::Question(id)) {
+            self.remove_tab(ix, window, cx);
+        }
         let tab = match self.agent_ix(Who::Question(id)) {
             Some(ix) => Some(self.take_tab(ix, window, cx)),
             None => question.parked.take(),
@@ -323,7 +495,7 @@ impl TaskView {
                 tab.title = short.clone();
             }
         }
-        if let Some(ix) = self.agent_ix(Who::Question(id)) {
+        if let Some(ix) = self.agent_ix(Who::Question(id)).or_else(|| self.asleep_ix(Who::Question(id))) {
             self.tabs[ix].title = short;
         }
         cx.notify();
@@ -338,7 +510,7 @@ impl TaskView {
         let Some(launch) = self.agent.launch.clone() else { return };
         let tab = self.agent_tab(Who::Main, &launch, self.terminal_env(), window, cx);
         // In the shell's place, which stood for it.
-        match self.tabs.iter().position(|t| t.title == "shell" && t.agent.is_none()) {
+        match self.tabs.iter().position(|t| (t.title == "shell" && t.agent.is_none()) || (t.agent == Some(Who::Main) && matches!(t.kind, TabKind::Asleep))) {
             Some(ix) => {
                 if let TabKind::Terminal(old) = &self.tabs[ix].kind {
                     TermView::end(old, cx);
@@ -355,7 +527,8 @@ impl TaskView {
     /// Above a question's tab: what it is, and its ends.
     pub(super) fn render_question_bar(&self, ix: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
         let Some(Who::Question(id)) = self.tabs.get(ix)?.agent else { return None };
-        let title = self.questions.iter().find(|q| q.id == id)?.title.clone();
+        let question = self.questions.iter().find(|q| q.id == id)?;
+        let (title, lost) = (question.title.clone(), question.lost);
         Some(
             h_flex()
                 .flex_none()
@@ -368,6 +541,7 @@ impl TaskView {
                 .border_color(cx.theme().border)
                 .child(svg().path("side-icons/message-circle-question-mark.svg").size(px(14.)).flex_none().text_color(cx.theme().muted_foreground))
                 .child(div().flex_1().min_w_0().truncate().text_color(cx.theme().muted_foreground).child(title))
+                .when(lost, |bar| bar.child(div().flex_none().text_color(cx.theme().warning).child("Its earlier conversation was not found: this one starts over")))
                 .child(
                     Button::new("question-to-task")
                         .xsmall()
@@ -811,8 +985,16 @@ impl TaskView {
         let thread = &chat.read(cx).thread;
         let Some(profile) = self.agent_of(who).map(|a| a.launch.as_ref().map(|l| l.profile.id.clone())) else { return };
         if let Some(usage) = &thread.usage {
-            if usage.size > 0 && who == Who::Main {
-                self.context_fill = (usage.used as f32 / usage.size as f32).min(1.);
+            if usage.size > 0 {
+                let fill = (usage.used as f32 / usage.size as f32).min(1.);
+                match who {
+                    Who::Main => self.context_fill = fill,
+                    Who::Question(n) => {
+                        if let Some(q) = self.questions.iter_mut().find(|q| q.id == n) {
+                            q.context_fill = fill;
+                        }
+                    }
+                }
             }
             // What it cost, counted for its profile's day.
             if let (Some(cost), Some(session), Some(profile)) = (usage.cost.as_deref().and_then(crate::acp::spend::usd), &thread.session, &profile) {

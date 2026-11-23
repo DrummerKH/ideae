@@ -82,7 +82,12 @@ impl Adapter for OpenCode {
             Start::Resume(id) => format!("{line} --session {id}"),
             Start::Last => format!("{line} --continue"),
             Start::New(_) => line,
+            Start::Fork { from, .. } => format!("{line} --session {from} --fork"),
         }
+    }
+
+    fn forks(&self) -> bool {
+        true
     }
 
     fn env(&self, profile: &Profile, hooks: Option<&Hooks>) -> Vec<(String, String)> {

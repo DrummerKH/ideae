@@ -325,6 +325,7 @@ impl TaskView {
         let marks = self.tree_marks.clone();
         let ignored = if self.tree_hides_ignored { Rc::default() } else { self.tree_ignored.clone() };
         let touched = self.agent_touched.clone();
+        let asked = self.question_touched.clone();
         let editing = self.agent_editing.clone();
         let (menu_view, menu_root) = (view.clone(), root.clone());
         div().flex_1().min_h_0().child(
@@ -353,6 +354,8 @@ impl TaskView {
                     Some("editing")
                 } else if on_the_way || touched.contains(&item.id) {
                     Some("●")
+                } else if asked.contains_key(&item.id) {
+                    Some("?")
                 } else {
                     None
                 };

@@ -302,6 +302,9 @@ pub enum Start {
     /// The latest one in the folder, else a new one: a task of before
     /// session ids were kept.
     Last,
+    /// A new one that starts from what another has said so far, which goes
+    /// on untouched; with the id ideae chose, when the agent takes one.
+    Fork { from: String, id: Option<String> },
 }
 
 /// How an agent tells what it does.
@@ -447,6 +450,11 @@ pub trait Adapter: Sync {
 
     /// It goes on with a session of before, by its id.
     fn resumes(&self) -> bool {
+        false
+    }
+
+    /// It can start a conversation from another's (`Start::Fork`).
+    fn forks(&self) -> bool {
         false
     }
 
@@ -643,15 +651,15 @@ impl Launch {
     /// The same session once more (Restart): what was new is resumed.
     pub fn again(&self) -> Launch {
         let start = match &self.start {
-            Start::New(Some(id)) | Start::Resume(id) => Start::Resume(id.clone()),
-            Start::New(None) | Start::Last => Start::Last,
+            Start::New(Some(id)) | Start::Resume(id) | Start::Fork { id: Some(id), .. } => Start::Resume(id.clone()),
+            Start::New(None) | Start::Last | Start::Fork { id: None, .. } => Start::Last,
         };
         Launch { start, ..self.clone() }
     }
 
     pub fn session_id(&self) -> Option<String> {
         match &self.start {
-            Start::New(id) => id.clone(),
+            Start::New(id) | Start::Fork { id, .. } => id.clone(),
             Start::Resume(id) => Some(id.clone()),
             Start::Last => None,
         }
@@ -675,15 +683,23 @@ impl SessionRef {
         self.profile.adapter().transcript(&self.profile, root, self.id.as_deref())
     }
 
+    /// Its own file: with an id, never the latest in the folder in its
+    /// place, which there may be another agent's conversation.
+    pub fn own_transcript(&self, root: &Path) -> Option<PathBuf> {
+        let file = self.transcript(root)?;
+        let ours = self.id.as_deref().is_none_or(|id| file.file_stem().is_some_and(|stem| stem.to_string_lossy().contains(id)));
+        ours.then_some(file)
+    }
+
     /// Its file and what it used. Not for the UI thread.
     pub fn usage(&self, root: &Path) -> Option<(PathBuf, crate::usage::Usage)> {
-        let file = self.transcript(root)?;
+        let file = self.own_transcript(root)?;
         let usage = self.profile.adapter().usage(&file)?;
         Some((file, usage))
     }
 
     pub fn last_answer(&self, root: &Path) -> Option<String> {
-        self.profile.adapter().last_answer(&self.transcript(root)?)
+        self.profile.adapter().last_answer(&self.own_transcript(root)?)
     }
 }
 

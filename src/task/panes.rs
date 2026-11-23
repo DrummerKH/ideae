@@ -45,6 +45,9 @@ pub(super) fn settle(panes: &mut [Pane]) {
     }
 }
 
+/// The height of a pane's row of tabs.
+const TAB_ROW: Pixels = px(33.);
+
 impl TaskView {
     pub(super) fn has(&self, pane: Pane) -> bool {
         self.tabs.iter().any(|t| t.pane == pane)
@@ -187,10 +190,14 @@ impl TaskView {
         }
     }
 
-    pub(super) fn tab_content(&self, ix: Option<usize>) -> AnyElement {
+    pub(super) fn tab_content(&self, ix: Option<usize>, cx: &mut Context<Self>) -> AnyElement {
         match ix.and_then(|ix| self.tabs.get(ix)).map(|t| &t.kind) {
             Some(TabKind::Terminal(view)) => view.clone().into_any_element(),
             Some(TabKind::Chat(chat)) => chat.clone().into_any_element(),
+            Some(TabKind::Asleep) => match ix {
+                Some(ix) => self.render_asleep(ix, cx),
+                None => div().into_any_element(),
+            },
             Some(TabKind::Changes) => self.changes.clone().into_any_element(),
             Some(TabKind::History) => self.history.clone().into_any_element(),
             Some(TabKind::File(file)) => file.clone().into_any_element(),
@@ -202,6 +209,28 @@ impl TaskView {
     }
 
     /// A tab dropped on a pane moves there (or just shows, if already there).
+    /// A tab dragged onto another takes its place, in that one's pane. The
+    /// task's agent stays first.
+    pub(crate) fn reorder_tab(&mut self, tab_id: usize, onto: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if tab_id == onto {
+            return;
+        }
+        let (Some(from), Some(to)) = (self.ix_of(tab_id), self.ix_of(onto)) else { return };
+        if self.tabs[from].agent == Some(Who::Main) {
+            return;
+        }
+        let pane = self.tabs[to].pane;
+        if self.tabs[from].pane != pane {
+            self.move_to(from, pane, window, cx);
+        }
+        let (Some(from), Some(to)) = (self.ix_of(tab_id), self.ix_of(onto)) else { return };
+        let to = if self.tabs[to].agent == Some(Who::Main) && to < from { to + 1 } else { to };
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        cx.emit(TaskEvent::Changed);
+        cx.notify();
+    }
+
     fn drop_tab(&mut self, tab_id: usize, pane: Pane, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.ix_of(tab_id) else { return };
         if self.tabs[ix].pane == pane {
@@ -308,13 +337,14 @@ impl TaskView {
                     }),
             )
             .children(shown.and_then(|id| self.ix_of(id)).and_then(|ix| self.render_question_bar(ix, cx)))
-            .child(div().flex_1().min_h_0().child(self.tab_content(shown.and_then(|id| self.ix_of(id)))))
+            .child(div().flex_1().min_h_0().child(self.tab_content(shown.and_then(|id| self.ix_of(id)), cx)))
             .when(layer, |el| {
                 el.child(
                     div()
                         .id("drop-layer")
                         .absolute()
-                        .top_0()
+                        // Below the tabs: a tab dropped on another takes its place.
+                        .top(TAB_ROW)
                         .left_0()
                         .h(if down_zone { relative(0.7) } else { relative(1.) })
                         .w(if right_zone { relative(0.7) } else { relative(1.) })
@@ -326,7 +356,7 @@ impl TaskView {
             })
             .when(right_zone, |el| {
                 let label = if drag == Drag::Files { "Drop to open beside" } else { "Drop to split" };
-                el.child(zone("split-zone", Pane { right: true, below: false }, label, cx).top_0().right_0().h_full().w(relative(0.3)).border_l_2())
+                el.child(zone("split-zone", Pane { right: true, below: false }, label, cx).top(TAB_ROW).right_0().h_full().w(relative(0.3)).border_l_2())
             })
             .when(down_zone, |el| {
                 el.child(

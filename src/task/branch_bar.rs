@@ -229,7 +229,7 @@ impl TaskView {
                 .on_click(cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
                     let (off, head) = (off.clone(), head.clone());
-                    this.run_action("Switch", move |root| git::switch_to_default(&root, &off, &head), false, window, cx)
+                    this.mind_questions(move |this, window, cx| this.run_action("Switch", move |root| git::switch_to_default(&root, &off, &head), false, window, cx), window, cx)
                 }))
         };
         let to_task = (!off.contained || dirty).then(|| {
@@ -245,7 +245,7 @@ impl TaskView {
                     cx.stop_propagation();
                     let (off, head) = (off.clone(), head.clone());
                     let copy_env = crate::state::settings().copy_env;
-                    this.run_action("Move", move |root| git::move_to_task(&root, &off, &head, copy_env).map(|dir| format!("{head} is a task in {}", dir.display())), false, window, cx)
+                    this.mind_questions(move |this, window, cx| this.run_action("Move", move |root| git::move_to_task(&root, &off, &head, copy_env).map(|dir| format!("{head} is a task in {}", dir.display())), false, window, cx), window, cx)
                 }))
         });
         let keep = Button::new("off-default-keep").xsmall().ghost().label(format!("Keep {head} here")).tooltip("Not told again while the main thread is on this branch").on_click(cx.listener(move |this, _, _, cx| {
@@ -304,7 +304,7 @@ impl TaskView {
                 .on_click(cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
                     let own = own.clone();
-                    this.run_action("Switch", move |root| git::back_on_branch(&root, &own), false, window, cx)
+                    this.mind_questions(move |this, window, cx| this.run_action("Switch", move |root| git::back_on_branch(&root, &own), false, window, cx), window, cx)
                 }))
         });
         Some(
