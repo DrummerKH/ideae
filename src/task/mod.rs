@@ -2543,7 +2543,8 @@ mod open_file_scenario {
             f.save_now(cx);
         });
         cx.run_until_parked();
-        assert_eq!((shown(cx), on_disk()), ("agent\nmine ".to_string(), "theirs\n".to_string()));
+        // The cursor was on a line the agent replaced: it stays in what replaced it.
+        assert_eq!((shown(cx), on_disk()), ("mine agent\n".to_string(), "theirs\n".to_string()));
 
         // Quitting right after a save, with more typed since: all of it is on disk at once.
         file.update(cx, |f, cx| {

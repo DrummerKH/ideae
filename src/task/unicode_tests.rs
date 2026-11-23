@@ -123,3 +123,25 @@ fn names_and_what_is_shown_short() {
     let long = "ё".repeat(100);
     assert!(naming::branch_name(&long).is_ascii());
 }
+
+#[test]
+fn matches_in_any_case_are_of_the_text_itself() {
+    use gpui_kit::component::label::folded_matches;
+    // Lowercased, these change their length in bytes.
+    assert_eq!(folded_matches("İi", "i", false), [2..3]);
+    assert_eq!(folded_matches("\u{212a}elvin", "k", true), [0..3]);
+    assert_eq!(folded_matches("ПРИВЕТ привет", "привет", false), [0..12, 13..25]);
+    for query in ["и", "Е", "世", "🎉", "é", "e\u{301}", "ß", "İ"] {
+        for prefix in [false, true] {
+            for range in folded_matches(TEXT, query, prefix) {
+                whole(TEXT, &range);
+            }
+        }
+    }
+    for at in places(TEXT) {
+        let (head, tail) = TEXT.split_at(at);
+        for range in folded_matches(tail, "о", false).into_iter().chain(folded_matches(head, "е", false)) {
+            assert!(range.end <= tail.len().max(head.len()));
+        }
+    }
+}

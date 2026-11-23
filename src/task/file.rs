@@ -470,18 +470,38 @@ impl FileView {
         self.conflict = false;
         let content_for_lsp = content.clone();
         self.editor.update(cx, |state, cx| {
-            let cursor = state.cursor_position();
-            let bookmarks = state.bookmark_rows();
+            // What you were looking at stays where it went in the new text.
+            let old = state.text().to_string();
+            let shift = crate::edit::LineShift::of(&old, &content);
+            let moved = |at: Position| Position::new(shift.row(at.line as usize) as u32, at.character);
+            let cursor = moved(state.cursor_position());
+            let selected = state.selected_range();
+            let selection = (!selected.is_empty()).then(|| (moved(state.text().offset_to_position(selected.start)), moved(state.text().offset_to_position(selected.end))));
+            let folded = !state.fold_starts().is_empty();
+            let mut scroll = state.scroll_offset();
+            if let Some(height) = state.line_height().filter(|h| *h > px(0.) && !folded) {
+                let top = ((-scroll.y) / height).max(0.).floor() as usize;
+                scroll.y -= height * (shift.row(top) as f32 - top as f32);
+            }
             state.forget_folds_to_restore();
-            state.set_value(content, window, cx);
-            state.set_bookmarks(&bookmarks, super::bookmarks::bookmark_color(), cx);
+            // It was about a place of the text that went.
+            state.clear_hover_state(cx);
+            let (from, to) = crate::edit::changed_part(&old, &content);
+            state.replace_from_outside(from, content.get(to).unwrap_or_default(), window, cx);
             // Not `set_cursor_position`, which takes the keyboard: the file may
             // be reloading in a task out of view, as its agent writes it.
             state.place_cursor(cursor, cx);
+            if let Some((start, end)) = selection {
+                let range = state.text().position_to_offset(&start)..state.text().position_to_offset(&end);
+                state.set_selected_range(range, cx);
+            }
+            state.set_scroll_offset(scroll, cx);
         });
         self.dirty = false;
         self.load_blame(cx);
         self.read_scopes(Duration::ZERO, cx);
+        // A change from outside tells no Change, and an agent writes in bursts.
+        self.refresh_preview(true, cx);
         if let Some(client) = self.lsp_client.clone() {
             self.lsp_version += 1;
             let (path, version) = (self.path.clone(), self.lsp_version);
@@ -1385,11 +1405,12 @@ impl CompletionProvider for LspBridge {
         let inserted = after.len() + range.len() - before.len();
         let (client, path, file, item) = (self.client.clone(), self.path.clone(), self.file.clone(), item.clone());
         let (before, after) = (before.clone(), after.clone());
+        let uri = lsp::path_to_uri(&path);
         window
             .spawn(cx, async move |cx| {
                 let item = if resolve {
                     let (client, asked) = (client.clone(), item.clone());
-                    let resolved = cx.background_spawn(crate::procs::on_thread(move || client.resolve_completion(&asked))).await;
+                    let resolved = cx.background_spawn(crate::procs::on_thread(move || client.resolve_completion(&uri, &asked))).await;
                     // Some servers answer with the item alone, without what it had.
                     resolved.map(|r| lsp_types::CompletionItem { command: r.command.clone().or(item.command.clone()), ..r }).unwrap_or(item)
                 } else {
@@ -1515,11 +1536,11 @@ impl CodeActionProvider for LspBridge {
         window: &mut Window,
         cx: &mut App,
     ) -> Task<anyhow::Result<()>> {
-        let (client, file) = (self.client.clone(), self.file.clone());
+        let (client, file, uri) = (self.client.clone(), self.file.clone(), lsp::path_to_uri(&self.path));
         window.spawn(cx, async move |cx| {
             let action = match action.edit {
                 Some(_) => action,
-                None => cx.background_spawn(crate::procs::on_thread(move || client.resolve_code_action(&action))).await?,
+                None => cx.background_spawn(crate::procs::on_thread(move || client.resolve_code_action(&uri, &action))).await?,
             };
             let Some(edit) = action.edit else { return Ok(()) };
             file.update_in(cx, |file, window, cx| {

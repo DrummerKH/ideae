@@ -87,6 +87,7 @@ src/crash.rs       what a panic leaves: crashes.log next to the state, told at t
 src/stalls.rs      debug aid: tells when the UI thread was held (debug builds, `IDEAE_DEBUG`): stderr and stalls.log
 src/git.rs         git CLI wrappers, worktrees
 src/lsp.rs         language server client
+src/lsp_columns.rs the editor's columns (characters) and those of a server that counts UTF-16, translated at the client's edge
 src/lsp_install.rs language servers installed on request, ~/.local/share/ideae/lsp
 src/lsp_share.rs   one server for the tasks of a project: a worktree is a folder of it, held by a Lease; a task's servers (TaskServers), found and started off the UI thread
 src/trash.rs       files to the system's trash and back (Undo of Delete in the Files panel)

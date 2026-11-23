@@ -58,6 +58,33 @@ pub struct Label {
     highlights_text: Option<HighlightsMatch>,
 }
 
+/// Where `query` is in `text`, whatever the case, in `text`'s own offsets and
+/// from whole characters to whole characters. `prefix`: only at its start.
+pub fn folded_matches(text: &str, query: &str, prefix: bool) -> Vec<Range<usize>> {
+    let needle: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let length_at = |rest: &str| {
+        let mut wanted = needle.iter();
+        let mut length = 0;
+        for c in rest.chars() {
+            for lower in c.to_lowercase() {
+                if wanted.next() != Some(&lower) {
+                    return None;
+                }
+            }
+            length += c.len_utf8();
+            if wanted.len() == 0 {
+                return Some(length);
+            }
+        }
+        None
+    };
+    let starts = text.char_indices().map(|(at, _)| at).take(if prefix { 1 } else { usize::MAX });
+    starts.filter_map(|at| Some(at..at + length_at(text.get(at..)?)?)).collect()
+}
+
 impl Label {
     /// Create a new label with the main label.
     pub fn new(label: impl Into<SharedString>) -> Self {
@@ -109,37 +136,9 @@ impl Label {
         if let Some(matched) = &self.highlights_text {
             let matched_str = matched.as_str();
             if !matched_str.is_empty() {
-                let search_lower = matched_str.to_lowercase();
-                let full_text_lower = full_text.to_lowercase();
-
-                if matched.is_prefix() {
-                    // For prefix matching, only check if the text starts with the search term
-                    if full_text_lower.starts_with(&search_lower) {
-                        ranges.push(0..matched_str.len());
-                    }
-                } else {
-                    // For full matching, find all occurrences
-                    let mut search_start = 0;
-                    while let Some(pos) = full_text_lower[search_start..].find(&search_lower) {
-                        let match_start = search_start + pos;
-                        let match_end = match_start + matched_str.len();
-
-                        if match_end <= full_text.len() {
-                            ranges.push(match_start..match_end);
-                        }
-
-                        search_start = match_start + 1;
-                        while !full_text.is_char_boundary(search_start)
-                            && search_start < full_text.len()
-                        {
-                            search_start += 1;
-                        }
-
-                        if search_start >= full_text.len() {
-                            break;
-                        }
-                    }
-                }
+                // ideae patch: lowercasing changes byte lengths, so the
+                // text itself is walked and its own offsets are kept.
+                ranges.extend(folded_matches(&full_text, matched_str, matched.is_prefix()));
             }
         }
 

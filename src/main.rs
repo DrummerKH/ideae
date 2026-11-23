@@ -30,6 +30,7 @@ mod keymap;
 mod keys;
 mod local_time;
 mod lsp;
+mod lsp_columns;
 #[cfg(target_os = "macos")]
 mod mac_notify;
 mod lsp_install;

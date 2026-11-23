@@ -1157,13 +1157,13 @@ impl MarkdownSource {
                 continue;
             }
             if cursor < lo {
-                self.push_str(&text[cursor..lo]);
+                self.push_str(text.get(cursor..lo).unwrap_or_default());
             }
-            self.push_marked(&text[lo..hi], mark);
+            self.push_marked(text.get(lo..hi).unwrap_or_default(), mark);
             cursor = hi;
         }
         if cursor < end {
-            self.push_str(&text[cursor..end]);
+            self.push_str(text.get(cursor..end).unwrap_or_default());
         }
     }
 
@@ -1681,7 +1681,8 @@ impl Paragraph {
                 continue;
             };
             if let Some(selection) = &state.selection {
-                text.push_str(&state.text[selection.start..selection.end]);
+                // ideae patch: a streamed text may have changed since the paint that selected it.
+                text.push_str(state.text.get(selection.start..selection.end).unwrap_or_default());
             }
             if let Some(custom) = &c.custom
                 && c.custom_selection.lock().is_ok_and(|selected| *selected)
@@ -1693,7 +1694,8 @@ impl Paragraph {
         if let Ok(state) = self.state.lock()
             && let Some(selection) = &state.selection
         {
-            text.push_str(&state.text[selection.start..selection.end]);
+            // ideae patch: a streamed text may have changed since the paint that selected it.
+                text.push_str(state.text.get(selection.start..selection.end).unwrap_or_default());
         }
 
         text
@@ -2480,7 +2482,8 @@ impl CodeBlock {
         if let Ok(state) = self.state.lock()
             && let Some(selection) = &state.selection
         {
-            text.push_str(&state.text[selection.start..selection.end]);
+            // ideae patch: a streamed text may have changed since the paint that selected it.
+                text.push_str(state.text.get(selection.start..selection.end).unwrap_or_default());
         }
         text
     }

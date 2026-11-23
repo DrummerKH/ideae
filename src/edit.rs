@@ -58,6 +58,50 @@ impl ChangeRun {
     }
 }
 
+/// Where a text's lines went when it was replaced: those before and after
+/// the part that differs are the same lines. Cheap, for a whole file reloaded.
+pub struct LineShift {
+    before: usize,
+    old_end: usize,
+    new_end: usize,
+}
+
+impl LineShift {
+    pub fn of(old: &str, new: &str) -> Self {
+        let (old, new): (Vec<&str>, Vec<&str>) = (old.split('\n').collect(), new.split('\n').collect());
+        let before = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+        let after = old[before..].iter().rev().zip(new[before..].iter().rev()).take_while(|(a, b)| a == b).count();
+        LineShift { before, old_end: old.len() - after, new_end: new.len() - after }
+    }
+
+    /// The line's row now; of a line that changed, as far into what replaced it.
+    pub fn row(&self, row: usize) -> usize {
+        if row < self.before {
+            row
+        } else if row >= self.old_end {
+            row - self.old_end + self.new_end
+        } else {
+            row.min(self.new_end.saturating_sub(1).max(self.before))
+        }
+    }
+}
+
+/// The part of `old` that differs from `new`, and what is there in `new`,
+/// each from and to a whole character.
+pub fn changed_part(old: &str, new: &str) -> (Range<usize>, Range<usize>) {
+    let (a, b) = (old.as_bytes(), new.as_bytes());
+    let mut start = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    while !old.is_char_boundary(start) {
+        start -= 1;
+    }
+    let most = a.len().min(b.len()) - start;
+    let mut same = a.iter().rev().zip(b.iter().rev()).take(most).take_while(|(x, y)| x == y).count();
+    while !old.is_char_boundary(a.len() - same) {
+        same -= 1;
+    }
+    (start..a.len() - same, start..b.len() - same)
+}
+
 pub fn change_runs(committed: &str, now: &str) -> Vec<ChangeRun> {
     use similar::DiffOp;
     // A whole rewrite of a long file takes the full search over a second, and
@@ -237,6 +281,43 @@ pub fn next_occurrence(text: &str, needle: &str, from: usize, first: usize) -> O
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn what_changed_is_cut_at_whole_characters() {
+        use super::changed_part;
+        let part = |old: &str, new: &str| {
+            let (from, to) = changed_part(old, new);
+            let mut made = old.to_string();
+            made.replace_range(from.clone(), new.get(to.clone()).unwrap());
+            assert_eq!(made, new);
+            (from, to)
+        };
+        assert_eq!(part("same", "same"), (4..4, 4..4));
+        assert_eq!(part("ab", "aXb"), (1..1, 1..2));
+        assert_eq!(part("aa", "aaa"), (2..2, 2..3));
+        // Letters that share their first or last byte.
+        part("é", "è");
+        part("日本", "日木");
+        part("😀", "😁");
+        part("x😀y", "xy");
+        part("Жя", "Ця");
+        part("", "新");
+        part("新", "");
+    }
+
+    #[test]
+    fn lines_keep_their_place_around_what_an_agent_wrote() {
+        use super::LineShift;
+        let shift = LineShift::of("a\nb\nc\nd\n", "a\nnew\nnewer\nb\nc\nd\n");
+        assert_eq!((shift.row(0), shift.row(1), shift.row(3)), (0, 3, 5));
+        let shift = LineShift::of("a\nb\nc\nd\n", "a\nX\nd\n");
+        assert_eq!((shift.row(0), shift.row(3)), (0, 2));
+        assert_eq!((shift.row(1), shift.row(2)), (1, 1), "a changed line stays inside what replaced it");
+        let shift = LineShift::of("a\nb\nc\n", "a\nc\n");
+        assert_eq!((shift.row(1), shift.row(2)), (1, 1));
+        let same = LineShift::of("😀\nb", "😀\nb");
+        assert_eq!(same.row(1), 1);
+    }
+
     use super::*;
 
     /// The text after the edit, with `|` at the ends of the selection.

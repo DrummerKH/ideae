@@ -30,7 +30,15 @@ impl<M: InputModeKind> InputBaseState<M> {
         let last_layout = self.last_layout.as_ref()?;
         let point = self.text.offset_to_point(offset);
         let line = last_layout.line(point.row)?;
-        let pos = line.position_for_index(point.column, last_layout, line_end_affinity)?;
+        // ideae patch: a masked input is laid out in its mask's bytes.
+        let index = if self.masked {
+            let start = self.text.line_start_offset(point.row);
+            super::element::masked_display_offset(&self.text, offset)
+                - super::element::masked_display_offset(&self.text, start)
+        } else {
+            point.column
+        };
+        let pos = line.position_for_index(index, last_layout, line_end_affinity)?;
         Some((pos.x, point.column))
     }
 

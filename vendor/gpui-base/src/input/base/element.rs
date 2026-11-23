@@ -364,7 +364,7 @@ use super::MASK_CHAR;
 /// The masked string consists of `MASK_CHAR` repeated once per character in the original text.
 /// Since `MASK_CHAR` may be multi-byte in UTF-8, the byte offset in the masked string is
 /// `char_index * MASK_CHAR.len_utf8()`.
-fn masked_display_offset(text: &Rope, original_offset: usize) -> usize {
+pub(super) fn masked_display_offset(text: &Rope, original_offset: usize) -> usize {
     text.offset_to_char_index(original_offset) * MASK_CHAR.len_utf8()
 }
 
@@ -2294,7 +2294,10 @@ impl<M: InputModeKind> TextElement<M> {
                 if at < end {
                     runs.push(style.clone().to_run(end - at));
                 }
-                let shaped = window.text_system().shape_line(shown.into(), text_size, &runs, None);
+                // ideae patch: as every other line, for a tree a step behind the text.
+                let aligned = align_runs_to_char_boundaries(&shown, &runs);
+                let runs = aligned.as_deref().unwrap_or(&runs);
+                let shaped = window.text_system().shape_line(shown.into(), text_size, runs, None);
                 let number = state.mode.line_number().then(|| {
                     let number: SharedString = format!("{:>width$}", displayed_line_number(line + 1), width = line_number_len).into();
                     let run = TextRun { len: number.len(), font: style.font(), color: state.editor_style.muted_foreground, background_color: None, underline: None, strikethrough: None };

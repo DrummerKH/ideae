@@ -574,22 +574,14 @@ impl CompletionProvider for LspProvider {
         _: &mut Window,
         cx: &mut App,
     ) -> Task<Result<CompletionResponse>> {
-        let mut left_offset = 0;
-        while left_offset < 100 {
-            match rope.char_at(offset.saturating_sub(left_offset)) {
-                Some('.') => {
-                    break;
-                }
-                None => break,
-                _ => {}
-            }
-            left_offset += 1;
-        }
-        let start = offset.saturating_sub(left_offset);
-        let trigger_character = rope.slice(start..offset).to_string();
-        if !trigger_character.starts_with('.') {
+        // ideae patch: from a whole character, the last dot before the cursor.
+        let near = rope.ceil_char_boundary(offset.saturating_sub(100)).min(offset);
+        let before = rope.slice(near..offset).to_string();
+        let Some(dot) = before.rfind('.') else {
             return Task::ready(Ok(CompletionResponse::Array(vec![])));
-        }
+        };
+        let start = near + dot;
+        let trigger_character = before[dot..].to_string();
 
         let start_pos = rope.offset_to_position(start);
         let end_pos = rope.offset_to_position(offset);

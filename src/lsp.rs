@@ -150,6 +150,8 @@ pub struct LspClient {
     borrowed: Mutex<HashSet<String>>,
     /// Its output closed: the server has ended.
     gone: Arc<AtomicBool>,
+    /// The editor's columns and the server's, when they are not the same.
+    columns: Arc<crate::lsp_columns::Columns>,
 }
 
 /// Folders whose reading has not ended, and since when.
@@ -681,10 +683,12 @@ impl LspClient {
         let reader_warming = warming.clone();
         let gone = Arc::new(AtomicBool::new(false));
         let reader_gone = gone.clone();
+        let columns: Arc<crate::lsp_columns::Columns> = Arc::default();
+        let reader_columns = columns.clone();
         thread::Builder::new()
             .name(format!("lsp-read-{program}"))
             .spawn(move || {
-                read_loop(stdout, reader_out, reader_pending, reader_progress, reader_import, reader_problems, reader_opened, reader_commanded, reader_settings, reader_warming);
+                read_loop(stdout, reader_out, reader_pending, reader_progress, reader_import, reader_problems, reader_opened, reader_commanded, reader_settings, reader_warming, reader_columns);
                 reader_gone.store(true, Ordering::Relaxed);
             })?;
 
@@ -707,6 +711,7 @@ impl LspClient {
             removed: AtomicUsize::new(0),
             borrowed: Mutex::new(HashSet::new()),
             gone,
+            columns,
         });
 
         let init = client.clone();
@@ -789,6 +794,7 @@ impl LspClient {
                 },
             }),
         )?;
+        self.columns.agree(&answer["capabilities"]);
         *self.capabilities.lock().unwrap() = answer["capabilities"].clone();
         self.send(Out::Now(json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} })))?;
         // For the servers that wait to be told rather than ask.
@@ -948,6 +954,7 @@ impl LspClient {
             }
             return Ok(());
         }
+        self.columns.sent(&uri, text);
         self.notify(
             "textDocument/didOpen",
             json!({ "textDocument": { "uri": uri, "languageId": language_id, "version": 1, "text": text } }),
@@ -983,6 +990,7 @@ impl LspClient {
         if !self.opened.lock().unwrap().remove(&uri) {
             return Ok(());
         }
+        self.columns.closed(&uri);
         self.notify("textDocument/didClose", json!({ "textDocument": { "uri": uri } }))
     }
 
@@ -995,6 +1003,7 @@ impl LspClient {
         if !self.opened.lock().unwrap().contains(&uri) {
             return Ok(());
         }
+        self.columns.sent(&uri, text);
         // Its version is given where it is written, in the order written.
         let message = json!({
             "jsonrpc": "2.0",
@@ -1095,8 +1104,8 @@ impl LspClient {
     }
 
     /// completionItem/resolve: the item with what the server left out of the list.
-    pub fn resolve_completion(&self, item: &lsp_types::CompletionItem) -> Result<lsp_types::CompletionItem> {
-        let value = self.raw_request("completionItem/resolve", serde_json::to_value(item)?)?;
+    pub fn resolve_completion(&self, uri: &str, item: &lsp_types::CompletionItem) -> Result<lsp_types::CompletionItem> {
+        let value = self.request_about(uri, "completionItem/resolve", serde_json::to_value(item)?)?;
         Ok(serde_json::from_value(value)?)
     }
 
@@ -1110,7 +1119,8 @@ impl LspClient {
         let asked = self.commanded.lock().unwrap().take().unwrap_or_default();
         answer?;
         let mut done = CommandDone::default();
-        for (method, params) in asked {
+        for (method, mut params) in asked {
+            self.columns.from_server("", &method, &mut params);
             if method == "workspace/applyEdit" {
                 done.edits.extend(serde_json::from_value::<lsp_types::WorkspaceEdit>(params["edit"].clone()).ok());
             } else if let (Some(uri), Ok(selection)) = (params["uri"].as_str(), serde_json::from_value::<lsp_types::Range>(params["selection"].clone())) {
@@ -1164,9 +1174,9 @@ impl LspClient {
     }
 
     /// codeAction/resolve: the edit of an action the server listed without one.
-    pub fn resolve_code_action(&self, action: &lsp_types::CodeAction) -> Result<lsp_types::CodeAction> {
+    pub fn resolve_code_action(&self, uri: &str, action: &lsp_types::CodeAction) -> Result<lsp_types::CodeAction> {
         self.wait_ready()?;
-        Ok(serde_json::from_value(self.raw_request("codeAction/resolve", serde_json::to_value(action)?)?)?)
+        Ok(serde_json::from_value(self.request_about(uri, "codeAction/resolve", serde_json::to_value(action)?)?)?)
     }
 
     /// workspace/symbol: what the project declares under a name like `query`.
@@ -1272,7 +1282,16 @@ impl LspClient {
     }
 
     fn raw_request(&self, method: &str, params: Value) -> Result<Value> {
-        self.request(false, method, params)
+        let uri = params["textDocument"]["uri"].as_str().unwrap_or_default().to_string();
+        self.request_about(&uri, method, params)
+    }
+
+    /// `uri`: the file whose columns its positions are in, where they do not say.
+    fn request_about(&self, uri: &str, method: &str, mut params: Value) -> Result<Value> {
+        self.columns.to_server(uri, &mut params);
+        let mut answer = self.request(false, method, params)?;
+        self.columns.from_server(uri, method, &mut answer);
+        Ok(answer)
     }
 
     /// `early`: part of the handshake, sent before the server is ready.
@@ -1575,8 +1594,9 @@ fn read_loop(
     commanded: Commanded,
     settings: Value,
     warming: Warming,
+    columns: Arc<crate::lsp_columns::Columns>,
 ) {
-    read_messages(stdout, out, &pending, progress, import, problems, opened, &commanded, &settings, &warming);
+    read_messages(stdout, out, &pending, progress, import, problems, opened, &commanded, &settings, &warming, &columns);
     // The server is gone: what waits for its answer need not wait out its time.
     pending.lock().unwrap().clear();
 }
@@ -1593,6 +1613,7 @@ fn read_messages(
     commanded: &Commanded,
     settings: &Value,
     warming: &Warming,
+    columns: &crate::lsp_columns::Columns,
 ) {
     let mut reader = BufReader::new(stdout);
     loop {
@@ -1657,9 +1678,10 @@ fn read_messages(
             }
             (None, Some(method)) if method == "textDocument/publishDiagnostics" => {
                 let params = &message["params"];
-                let (Some(uri), Ok(found)) = (params["uri"].as_str(), serde_json::from_value::<Vec<lsp_types::Diagnostic>>(params["diagnostics"].clone())) else {
-                    continue;
-                };
+                let Some(uri) = params["uri"].as_str() else { continue };
+                let mut told = params["diagnostics"].clone();
+                columns.problems_from_server(uri, &mut told);
+                let Ok(found) = serde_json::from_value::<Vec<lsp_types::Diagnostic>>(told) else { continue };
                 let mut problems = problems.lock().unwrap();
                 // A server tells of every file it looked at, most with
                 // nothing: kept only for an open one, whose editor clears
@@ -2222,7 +2244,7 @@ mod tests {
         assert!(!actions.is_empty(), "something is offered on a `let`");
         let action = match actions[0].edit {
             Some(_) => actions[0].clone(),
-            None => client.resolve_code_action(&actions[0]).unwrap(),
+            None => client.resolve_code_action(&uri, &actions[0]).unwrap(),
         };
         assert!(action.edit.is_some(), "{action:?}");
 
@@ -2554,6 +2576,38 @@ mod server_tests {
         Answers { hover, definition, hints }
     }
 
+    /// Needs pyright, which counts in UTF-16 whatever it is offered.
+    #[test]
+    #[ignore]
+    fn a_utf16_server_renames_and_finds_a_name_after_an_emoji() {
+        let base = std::env::temp_dir().join(format!("ideae-utf16-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("a.py");
+        let text = "note = '😀😀'; value = 1\nprint('😀', value)\n";
+        std::fs::write(&file, text).unwrap();
+        let program = locate("pyright-langserver").expect("pyright is not installed");
+        let client = LspClient::spawn("pyright-langserver", &program, &["--stdio"], &base, Value::Null).unwrap();
+        client.did_open(&file, "python", text).unwrap();
+        let uri = path_to_uri(&file);
+        let used = position_of(text, text.rfind("value").unwrap());
+        let declared = position_of(text, text.find("value").unwrap());
+        let started = std::time::Instant::now();
+        let found = loop {
+            let links = client.definition(&uri, used).unwrap_or_default();
+            if !links.is_empty() || started.elapsed() > Duration::from_secs(30) {
+                break links;
+            }
+            thread::sleep(Duration::from_millis(200));
+        };
+        assert_eq!(found.first().map(|l| l.target_selection_range.start), Some(declared));
+        let edit = client.rename(&uri, used, "total").unwrap().expect("an edit");
+        let (_, edits) = edits_by_file(&edit).into_iter().next().expect("the file");
+        drop(client);
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(apply_edits(text, &edits), "note = '😀😀'; total = 1\nprint('😀', total)\n");
+    }
+
     fn position_of(text: &str, offset: usize) -> lsp_types::Position {
         let line_start = text[..offset].rfind('\n').map_or(0, |i| i + 1);
         let line = text[..line_start].matches('\n').count() as u32;
@@ -2618,7 +2672,7 @@ mod server_tests {
         let mut after = format!("{}{new_text}{}", &text[..range.start], &text[range.end..]);
         let mut at = range.start + caret.start;
         let item = if item.additional_text_edits.is_none() && client.resolves_completions() {
-            let resolved = client.resolve_completion(&item).unwrap();
+            let resolved = client.resolve_completion(&uri, &item).unwrap();
             lsp_types::CompletionItem { command: resolved.command.clone().or(item.command), ..resolved }
         } else {
             item

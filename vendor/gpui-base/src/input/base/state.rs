@@ -1386,6 +1386,36 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx.notify();
     }
 
+    /// ideae patch: a part of the text changed from outside (an agent wrote
+    /// the file). No Change is told; it is one step of undo holding only that
+    /// part, and folds and bookmarks move with the edit. One too large to keep
+    /// several of ends the history instead.
+    pub fn replace_from_outside(
+        &mut self,
+        range: Range<usize>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        const MAX_KEPT_BYTES: usize = 2 * 1024 * 1024;
+        let too_large = range.len() + text.len() > MAX_KEPT_BYTES;
+        if too_large {
+            self.undo_manager.clear();
+            self.undo_manager.set_ignoring(true);
+        }
+        self.undo_manager.break_transaction_coalescing();
+        let emit_events = std::mem::replace(&mut self.emit_events, false);
+        self.with_edits_allowed(|this| {
+            this.undo_manager.set_pending_intent(EditIntent::Atomic);
+            this.replace_text_in_ranges(&[(range, text.to_string())], window, cx);
+        });
+        self.emit_events = emit_events;
+        self.undo_manager.break_transaction_coalescing();
+        if too_large {
+            self.undo_manager.set_ignoring(false);
+        }
+    }
+
     /// Perform `f` with the user-facing edit restrictions lifted.
     ///
     /// The `disabled` and `readonly` modes only reject the changes made by the
@@ -5070,6 +5100,13 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         let mut end_origin = None;
         let line_number_origin = point(line_number_width, px(0.));
         let mut y_offset = last_layout.visible_top;
+        // ideae patch: a masked input is laid out in its mask's bytes.
+        let range = if self.masked {
+            super::element::masked_display_offset(&self.text, range.start)
+                ..super::element::masked_display_offset(&self.text, range.end)
+        } else {
+            range
+        };
 
         for (vi, line) in last_layout.lines.iter().enumerate() {
             if start_origin.is_some() && end_origin.is_some() {

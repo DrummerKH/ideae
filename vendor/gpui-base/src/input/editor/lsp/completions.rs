@@ -795,7 +795,8 @@ impl InputBaseState<EditorMode> {
         }
         if let Some(replaced) = item.range.as_mut() {
             if replaced.end.line == replaced.start.line {
-                replaced.end.character += new_text.encode_utf16().count() as u32;
+                // ideae patch: a column here counts characters.
+                replaced.end.character += new_text.chars().count() as u32;
             }
             replaced.start = self.text.offset_to_position(self.cursor());
         }
