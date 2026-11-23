@@ -176,6 +176,11 @@ impl TaskView {
         self.agent.status == crate::agent::AgentStatus::Working
     }
 
+    /// One of its questions' agents is.
+    pub fn question_busy(&self) -> bool {
+        self.questions.iter().any(|q| q.agent.status == crate::agent::AgentStatus::Working)
+    }
+
     /// Something of the task works that the machine should stay up for:
     /// one of its agents in a turn, its setup or its check.
     pub fn at_work(&self) -> bool {

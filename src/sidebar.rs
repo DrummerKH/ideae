@@ -1067,12 +1067,16 @@ impl Workspace {
     /// In Needs you (`waiting`), only those that ask something.
     fn render_questions(&self, mut list: Stateful<Div>, pi: usize, ti: usize, waiting: bool, cx: &mut Context<Self>) -> Stateful<Div> {
         let t = &self.projects[pi].tasks[ti];
-        let Some(view) = t.view.as_ref() else { return list };
+        // A paused task's are listed too: each goes on when it is opened.
+        let view = t.view.as_ref();
+        if waiting && view.is_none() {
+            return list;
+        }
         let muted = cx.theme().muted_foreground;
         for q in t.questions.iter().filter(|q| q.closed == 0) {
             let (n, path) = (q.id, t.path.clone());
-            let v = view.read(cx);
-            let agent = v.agent_of(crate::task::Who::Question(n));
+            let v = view.map(|view| view.read(cx));
+            let agent = v.and_then(|v| v.agent_of(crate::task::Who::Question(n)));
             if waiting && !agent.is_some_and(|a| matches!(a.status, AgentStatus::NeedsInput(_))) {
                 continue;
             }
@@ -1082,7 +1086,7 @@ impl Workspace {
                 AgentStatus::NeedsInput(message) => Some(message.clone()),
                 _ => None,
             });
-            let doing = if v.question_asleep(n) { Some("asleep".to_string()) } else { doing };
+            let doing = if v.is_none_or(|v| v.question_asleep(n)) { Some("asleep".to_string()) } else { doing };
             let group = SharedString::from(format!("{}question-{}-{n}", if waiting { "waiting-" } else { "" }, t.path.display()));
             let (open, close) = (path.clone(), path);
             list = list.child(

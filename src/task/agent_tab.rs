@@ -197,6 +197,13 @@ impl TaskView {
         self.questions.push(Question { id, title, agent: AgentState::new(Some(launch)), parked: None, quiet_since: Some(std::time::Instant::now()), asleep: false });
     }
 
+    /// Its agent is not running, and not to be looked for in the daemon.
+    pub fn question_sleeps(&mut self, id: u32) {
+        if let Some(q) = self.questions.iter_mut().find(|q| q.id == id) {
+            q.asleep = true;
+        }
+    }
+
     /// The question's tab in front: back from hiding, or made, which starts
     /// its agent (in the daemon, a restart attaches to it again).
     pub fn show_question(&mut self, id: u32, window: &mut Window, cx: &mut Context<Self>) {

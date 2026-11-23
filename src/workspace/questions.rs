@@ -229,6 +229,9 @@ impl Workspace {
         for q in entry.questions.iter().filter(|q| q.closed == 0) {
             if let Some(launch) = question_launch(q) {
                 view.add_question(q.id, q.title.clone().into(), launch);
+                if q.asleep {
+                    view.question_sleeps(q.id);
+                }
             }
         }
     }
@@ -285,6 +288,9 @@ impl Workspace {
 
     /// A question's row clicked: its task in view, its tab in front.
     pub fn show_question(&mut self, path: &Path, n: u32, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(q) = self.entry_mut(path).and_then(|e| e.questions.iter_mut().find(|q| q.id == n)) {
+            q.asleep = false;
+        }
         self.switch_quietly(path, window, cx);
         if let Some(view) = self.entry_mut(path).and_then(|e| e.view.clone()) {
             view.update(cx, |t, cx| t.show_question(n, window, cx));
@@ -358,6 +364,7 @@ impl Workspace {
         let Some(entry) = self.entry_mut(path) else { return };
         let Some(q) = entry.questions.iter_mut().find(|q| q.id == n) else { return };
         q.closed = 0;
+        q.asleep = false;
         let (title, launch) = (q.title.clone(), question_launch(q));
         self.switch_quietly(path, window, cx);
         if let (Some(view), Some(launch)) = (self.entry_mut(path).and_then(|e| e.view.clone()), launch) {
@@ -811,6 +818,34 @@ mod tests {
         step(cx, &mut |w, window, cx| w.show_question(&repo, 1, window, cx));
         wait(cx, "the question woken", &mut |_| !args("q-1").is_empty());
         assert!(args("q-1").contains(&format!("--resume {id}")), "{}", args("q-1"));
+        // The main thread paused: a question at work is told of, and stays
+        // listed; opened, it goes on and the main thread's agent stays stopped.
+        step(cx, &mut |w, window, cx| {
+            w.on_hook(hook("UserPromptSubmit", Some("q-1")), window, cx);
+            w.close_task(&repo, window, cx);
+            assert!(main_entry(w).view.is_some(), "asked first");
+            {
+                use gpui_kit::component::WindowExt as _;
+                window.close_dialog(cx);
+            }
+            w.stop(&repo, window, cx);
+            let t = main_entry(w);
+            assert!(t.view.is_none() && t.questions[0].asleep);
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            use gpui_kit::test::TestWindowExt as _;
+            window.render_frame(cx);
+            assert!(window.try_find(SharedString::from(format!("question-{}-1", repo.display()))).is_some(), "its row, the task paused");
+        })
+        .unwrap();
+        let _ = std::fs::remove_file(repo.join(".args-q-1"));
+        let _ = std::fs::remove_file(repo.join(".args-"));
+        step(cx, &mut |w, window, cx| w.show_question(&repo, 1, window, cx));
+        wait(cx, "the question to go on", &mut |_| !args("q-1").is_empty());
+        assert!(args("q-1").contains(&format!("--resume {id}")), "{}", args("q-1"));
+        assert!(args("").is_empty(), "the main thread's agent still paused");
+        workspace.update(cx, |w, _| assert!(!main_entry(w).questions[0].asleep));
+
         // Left for days, it is closed by itself.
         step(cx, &mut |w, window, cx| {
             let entry = w.entry_mut(&repo).unwrap();

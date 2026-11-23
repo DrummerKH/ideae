@@ -148,7 +148,9 @@ task of its own: a worktree and a branch named after it, its conversation
 resumed there, and its agent told the files it wrote in the main thread, to
 move them over. Asked while the main thread is not running,
 only the question's agent starts; the main thread's starts when you open its
-tab (Ctrl+1). Questions come back after a restart, their agents running on
+tab (Ctrl+1). Pausing the main thread stops its questions' agents too (it says
+so if one is at work), their rows stay, marked asleep, and opening one starts
+only that agent, its conversation going on. Questions come back after a restart, their agents running on
 in the background. A question's agent with nothing to do for a while, its
 tab not in front, stops (Settings → Tasks, 15 minutes): the row says asleep,
 and the agent resumes the conversation when the question is opened. An open

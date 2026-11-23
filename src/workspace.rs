@@ -1490,7 +1490,13 @@ impl Workspace {
         if self.ask_losing_sql(files, window, cx, move |w, window, cx| w.stop(&again, window, cx)) {
             return;
         }
-        if view.read(cx).agent_busy() {
+        let (own, asked) = (view.read(cx).agent_busy(), view.read(cx).question_busy());
+        if own || asked {
+            let told = match (own, asked) {
+                (true, false) => "It is in the middle of a turn. The task's terminals are stopped too.",
+                (true, true) => "It and a question's agent are in the middle of a turn. The task's terminals are stopped too; the question stays, and goes on when you open it.",
+                _ => "A question's agent is in the middle of a turn. The task's terminals are stopped too; the question stays, and goes on when you open it.",
+            };
             let this = cx.weak_entity();
             let path = path.to_path_buf();
             window.open_alert_dialog(cx, move |dialog, _, _| {
@@ -1498,7 +1504,7 @@ impl Workspace {
                 dialog
                     .confirm()
                     .title("Stop the agent?")
-                    .description("It is in the middle of a turn. The task's terminals are stopped too.")
+                    .description(told)
                     .ok_text("Stop")
                     .on_ok(move |_, window, cx| {
                         let _ = this.update(cx, |this, cx| this.stop(&path, window, cx));
@@ -1522,6 +1528,10 @@ impl Workspace {
         }
         let entry = &mut self.projects[pi].tasks[ti];
         view.update(cx, |t, cx| t.shut_down(cx));
+        // Their agents end with it; each goes on when its question is opened.
+        for q in entry.questions.iter_mut().filter(|q| q.closed == 0) {
+            q.asleep = true;
+        }
         // Paused as any task is, the main thread too: the branch work starts
         // from is one click away, with its tabs.
         if !entry.main {
@@ -1542,6 +1552,7 @@ impl Workspace {
                 self.switch(&next, window, cx);
             }
         }
+        self.save_later(cx);
         cx.notify();
     }
 

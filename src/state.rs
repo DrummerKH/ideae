@@ -561,6 +561,10 @@ pub struct QuestionState {
     /// when it becomes a task of its own.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub wrote: Vec<String>,
+    /// Its agent ended with a pause of its task: it starts again when the
+    /// question is opened, not with the task.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub asleep: bool,
 }
 
 /// A session of an agent in a task.
