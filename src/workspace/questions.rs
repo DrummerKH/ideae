@@ -35,11 +35,16 @@ impl Workspace {
                 let _ = this.update(cx, |this, cx| this.ask(pi, text, profile, window, cx));
             }
         };
+        // Runs inside this entity's update, so it cannot go through `submit`.
         let on_enter = {
-            let submit = submit.clone();
-            move |_: &mut Self, _: &Entity<TextareaState>, event: &InputEvent, window: &mut Window, cx: &mut Context<Self>| {
-                if let InputEvent::PressEnter { secondary: true, .. } = event {
-                    submit(window, cx);
+            let agent = agent.clone();
+            move |this: &mut Self, prompt: &Entity<TextareaState>, event: &InputEvent, window: &mut Window, cx: &mut Context<Self>| {
+                let InputEvent::PressEnter { secondary: true, .. } = event else { return };
+                let text = prompt.read(cx).value().trim().to_string();
+                if !text.is_empty() {
+                    window.close_dialog(cx);
+                    let profile = agent.borrow().clone();
+                    this.ask(pi, text, profile, window, cx);
                 }
             }
         };
@@ -711,7 +716,18 @@ mod tests {
         }
         let args = |who: &str| std::fs::read_to_string(repo.join(format!(".args-{who}"))).unwrap_or_default();
 
-        step(cx, &mut |w, window, cx| w.ask(0, "Why does f.txt say one?\nAnd where is it read?".into(), String::new(), window, cx));
+        // As it is asked: typed into its dialog and sent from the keyboard.
+        step(cx, &mut |w, window, cx| w.ask_question_dialog(0, window, cx));
+        cx.update_window(handle.into(), |_, window, cx| {
+            use gpui_kit::test::TestWindowExt as _;
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.simulate_input(handle.into(), "Why does f.txt say one?");
+        cx.simulate_keystrokes(handle.into(), "enter");
+        cx.simulate_input(handle.into(), "And where is it read?");
+        cx.simulate_keystrokes(handle.into(), "secondary-enter");
         wait(cx, "the question's agent to start", &mut |_| !args("q-1").is_empty());
         let asked = args("q-1");
         let id = workspace.update(cx, |w, _| {
