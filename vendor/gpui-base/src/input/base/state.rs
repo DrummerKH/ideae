@@ -582,6 +582,8 @@ pub struct InputBaseState<M: InputModeKind> {
     /// line: those the top of the view is inside of keep their first line
     /// over it.
     pub(super) sticky_scopes: std::rc::Rc<Vec<std::ops::Range<usize>>>,
+    /// ideae patch: lines to fold once the highlighter has said what folds.
+    folds_to_restore: Vec<usize>,
     /// Where the sticky lines were drawn last, and the line each stands for.
     pub(super) sticky_hits: Vec<(Bounds<Pixels>, usize)>,
     pub(super) clean_on_escape: bool,
@@ -1082,6 +1084,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             hovered_inlay: None,
             gutter: Default::default(),
             sticky_scopes: Default::default(),
+            folds_to_restore: Vec::new(),
             sticky_hits: Vec::new(),
             clean_on_escape: false,
             submit_on_enter: false,
@@ -1267,6 +1270,9 @@ impl<M: InputModeKind> InputBaseState<M> {
     ) {
         if self.mode.is_folding() {
             self.display_map.set_fold_candidates(candidates);
+            for start in std::mem::take(&mut self.folds_to_restore) {
+                self.display_map.set_folded(start, true);
+            }
         }
         cx.notify();
     }
@@ -12554,6 +12560,26 @@ impl InputBaseState<crate::input::EditorMode> {
     /// range; otherwise the innermost one around the cursor that is still
     /// open is folded, or the outermost folded one there is opened. Whether
     /// anything changed.
+    /// ideae patch: folds these lines as soon as they are known to fold; a
+    /// tab out of view is not read until it is shown.
+    pub fn restore_folds(&mut self, starts: Vec<usize>) {
+        self.folds_to_restore = starts;
+    }
+
+    /// ideae patch: the text changed under folds still to be restored.
+    pub fn forget_folds_to_restore(&mut self) {
+        self.folds_to_restore.clear();
+    }
+
+    /// ideae patch: the first lines of what is folded or is to be.
+    pub fn fold_starts(&self) -> Vec<usize> {
+        let mut starts: Vec<usize> = self.display_map.folded_ranges().iter().map(|f| f.start_line).collect();
+        starts.extend(&self.folds_to_restore);
+        starts.sort_unstable();
+        starts.dedup();
+        starts
+    }
+
     pub fn fold(&mut self, fold: bool, all: bool, cx: &mut Context<Self>) -> bool {
         let line = self.text.offset_to_point(self.cursor()).row;
         let around = |range: &crate::input::FoldRange| line >= range.start_line && line <= range.end_line;

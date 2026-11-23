@@ -39,7 +39,9 @@ pub const DETAIL: char = '\u{1f}';
 #[derive(Clone)]
 pub struct OutlineItem {
     pub depth: usize,
-    pub label: String,
+    /// What it is: `function`, `region`, `heading`…
+    pub kind: String,
+    pub name: String,
     pub line: u32,
     /// The declaration's last line.
     pub end: u32,
@@ -162,8 +164,7 @@ impl Finder {
         let hits = items
             .into_iter()
             .map(|i| {
-                let (kind, name) = i.label.rsplit_once(' ').unwrap_or(("", i.label.as_str()));
-                let text = format!("{}{name}{DETAIL}{kind}", "  ".repeat(i.depth));
+                let text = format!("{}{}{DETAIL}{}", "  ".repeat(i.depth), i.name, i.kind);
                 Hit { path: path.clone(), line: i.line + 1, col: 0, text, ranges: Vec::new() }
             })
             .collect();
@@ -756,17 +757,29 @@ fn item(hit: &Hit, kind: FinderKind) -> CommandItem {
 /// Structure panel's and Go to declaration's rows.
 pub fn kind_mark(kind: &str) -> (&'static str, Hsla) {
     let has = |words: &[&str]| words.iter().any(|w| kind.contains(w));
-    let (mark, hue) = if has(&["method", "constructor"]) {
+    let (mark, hue) = if kind == "region" {
+        ("R", 0.0)
+    } else if kind == "heading" {
+        ("#", 0.62)
+    } else if kind == "statement" {
+        ("q", 0.52)
+    } else if has(&["selector", "at rule"]) {
+        ("s", 0.32)
+    } else if has(&["section", "stage", "target"]) {
+        ("S", 0.12)
+    } else if has(&["table", "view"]) {
+        ("C", 0.08)
+    } else if has(&["method", "constructor"]) {
         ("m", 0.58)
-    } else if has(&["function", "fn"]) {
+    } else if has(&["function", "fn", "macro"]) {
         ("f", 0.58)
-    } else if has(&["interface", "trait", "protocol"]) {
+    } else if has(&["interface", "trait", "protocol", "service"]) {
         ("I", 0.38)
     } else if has(&["enum"]) {
         ("E", 0.78)
     } else if has(&["impl"]) {
         ("i", 0.78)
-    } else if has(&["class", "struct", "object", "record"]) {
+    } else if has(&["class", "struct", "object", "record", "message", "model"]) {
         ("C", 0.08)
     } else if has(&["type"]) {
         ("T", 0.48)

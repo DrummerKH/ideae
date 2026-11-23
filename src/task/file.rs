@@ -472,6 +472,7 @@ impl FileView {
         self.editor.update(cx, |state, cx| {
             let cursor = state.cursor_position();
             let bookmarks = state.bookmark_rows();
+            state.forget_folds_to_restore();
             state.set_value(content, window, cx);
             state.set_bookmarks(&bookmarks, super::bookmarks::bookmark_color(), cx);
             // Not `set_cursor_position`, which takes the keyboard: the file may
@@ -694,6 +695,20 @@ impl FileView {
             )
             .into_any_element(),
         )
+    }
+
+    /// What is folded, to fold again after a restart.
+    pub(super) fn saved_folds(&self, cx: &App) -> Vec<crate::state::SavedFold> {
+        let state = self.editor.read(cx);
+        let text = state.text();
+        state.fold_starts().into_iter().map(|line| crate::state::SavedFold { line: line as u32, text: fold_words(text, line) }).collect()
+    }
+
+    pub(super) fn restore_folds(&mut self, saved: &[crate::state::SavedFold], cx: &mut Context<Self>) {
+        self.editor.update(cx, |state, _| {
+            let starts = saved.iter().filter_map(|fold| place_fold(state.text(), fold)).collect();
+            state.restore_folds(starts);
+        });
     }
 
     pub(super) fn fold(&mut self, fold: bool, all: bool, cx: &mut Context<Self>) {
@@ -1567,9 +1582,33 @@ fn problem_rank(severity: gpui_kit::component::input::DiagnosticSeverity) -> u8 
     }
 }
 
-/// Line ranges of the declarations that span lines, by first line.
+/// A line's words, enough of them to know it again.
+fn fold_words(text: &Rope, line: usize) -> String {
+    if line >= text.lines_len() {
+        return String::new();
+    }
+    text.slice_line(line).to_string().trim().chars().take(120).collect()
+}
+
+/// The line a saved fold is on now: where it was, or the nearest with its
+/// words; none when they are gone, not to fold something else.
+fn place_fold(text: &Rope, fold: &crate::state::SavedFold) -> Option<usize> {
+    const NEAR: usize = 200;
+    let line = fold.line as usize;
+    let here = |row: usize| fold_words(text, row) == fold.text && !fold.text.is_empty();
+    (0..=NEAR).find_map(|away| {
+        if here(line + away) {
+            Some(line + away)
+        } else {
+            line.checked_sub(away).filter(|row| here(*row))
+        }
+    })
+}
+
+/// Line ranges of what spans lines and is worth keeping in sight, by first
+/// line: every tag or key would take the few sticky rows from what matters.
 fn sticky_scopes(path: &std::path::Path, text: &str) -> Vec<std::ops::Range<usize>> {
-    let mut scopes: Vec<_> = super::outline(path, text).into_iter().filter(|i| i.end > i.line).map(|i| i.line as usize..i.end as usize).collect();
+    let mut scopes: Vec<_> = super::outline(path, text).into_iter().filter(|i| i.end > i.line && !matches!(i.kind.as_str(), "tag" | "key")).map(|i| i.line as usize..i.end as usize).collect();
     scopes.sort_by_key(|s| (s.start, std::cmp::Reverse(s.end)));
     scopes
 }
@@ -1593,6 +1632,26 @@ mod sticky_tests {
     fn declarations_that_span_lines_are_the_sticky_scopes() {
         let text = "impl A {\n    fn one() {\n        x();\n    }\n    fn two() {}\n}\nconst N: u8 = 1;\n";
         assert_eq!(super::sticky_scopes(std::path::Path::new("a.rs"), text), [0..5, 1..3]);
+    }
+
+    #[test]
+    fn regions_stick_and_tags_and_keys_do_not() {
+        let sql = "#region A\nselect 1;\n#endregion\n";
+        assert_eq!(super::sticky_scopes(std::path::Path::new("a.sql"), sql), [0..2]);
+        let html = "<div>\n<p>\nx\n</p>\n</div>\n";
+        assert!(super::sticky_scopes(std::path::Path::new("a.html"), html).is_empty());
+        assert!(super::sticky_scopes(std::path::Path::new("a.yaml"), "a:\n  b: 1\n").is_empty());
+    }
+
+    #[test]
+    fn a_saved_fold_follows_its_line_or_is_dropped() {
+        use crate::state::SavedFold;
+        let text = super::Rope::from("new\nnew\n  #region A\nx\n#endregion\n");
+        let fold = |line, text: &str| SavedFold { line, text: text.into() };
+        assert_eq!(super::place_fold(&text, &fold(2, "#region A")), Some(2));
+        assert_eq!(super::place_fold(&text, &fold(0, "#region A")), Some(2));
+        assert_eq!(super::place_fold(&text, &fold(9, "#region A")), Some(2));
+        assert_eq!(super::place_fold(&text, &fold(2, "#region B")), None);
     }
 }
 

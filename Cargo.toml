@@ -109,6 +109,8 @@ opt-level = 2
 # diff/mod.rs patched: the header of the file under the top edge sticks there.
 # highlighter/languages.rs + registry.rs patched: Swift, C#, CMake, Proto, GraphQL get highlights;
 # capture names of older queries (@conditional, @field…) take the colors themes define.
+# highlighter/text_folds.rs + input_adapter.rs: folds of region markers and runs of comments in any
+# language, of the indentation where no grammar reads the file; the markers named for the structure.
 # root.rs + lib.rs patched: dialogs_watch, whether a dialog is up, told while the window
 # dispatches an action and cannot be entered (the menu bar's keys go on to its fields).
 # menu/app_menu_bar.rs patched: menus asked of a source as each opens, behind a ☰ while

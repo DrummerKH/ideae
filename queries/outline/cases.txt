@@ -1,0 +1,1006 @@
+=== a.md
+# Title
+text
+## Section one
+### Deep
+## Section two
+Setext
+======
+@@@
+heading Title :1
+  heading Section one :3
+    heading Deep :4
+  heading Section two :5
+    heading Setext :6
+=== a.rs
+pub struct User { pub name: String, age: u32 }
+enum Kind { A, B }
+trait Run { fn go(&self); }
+impl Run for User { fn go(&self) { let x = helper(self.age); println!("{}", x); } }
+impl User { pub fn new() -> Self { todo!() } }
+const MAX: u32 = 1;
+static COUNT: u32 = 2;
+type Id = u32;
+union U { a: u32 }
+macro_rules! m { () => {} }
+mod inner { pub fn f() {} }
+fn helper(v: u32) -> u32 { v + 1 }
+@@@
+struct User :1
+  field name :1
+  field age :1
+enum Kind :2
+  enum variant A :2
+  enum variant B :2
+trait Run :3
+  function signature go :3
+impl Run for User :4
+  function go :4
+impl User :5
+  function new :5
+const MAX :6
+static COUNT :7
+type Id :8
+union U :9
+  field a :9
+macro m :10
+module inner :11
+  function f :11
+function helper :12
+=== a.go
+package main
+const Max = 1
+const (
+	A = 1
+)
+var Global = 2
+type User struct { Name string; age int }
+type Runner interface { Run() }
+type Id = int
+func (u User) Run() { x := helper(u.age); println(x, u.Name) }
+func helper(v int) int { return v + 1 }
+@@@
+const Max :2
+const A :4
+var Global :6
+type User :7
+  field Name :7
+  field age :7
+type Runner :8
+  method elem Run :8
+type alias Id :9
+method Run :10
+function helper :11
+=== a.py
+import os
+MAX = 1
+class User:
+    limit = 3
+    def __init__(self, name):
+        self.name = name
+    @staticmethod
+    def run():
+        x = helper(1)
+        return x.value
+def helper(v):
+    return os.path.join(v)
+@@@
+variable MAX :2
+class User :3
+  field limit :4
+  function __init__ :5
+  function run :8
+function helper :11
+=== a.js
+const MAX = 1;
+let counter = 2;
+class User { name = 1; #secret = 2; run() { return helper(this.name); } static make() {} get age() { return 1; } }
+function helper(v) { const inner = 1; return { a: v, b() {} }; }
+const arrow = (v) => v.x;
+const fn2 = function () {};
+export default function main() { arrow(1); }
+export const named = 1;
+function* gen() {}
+module.exports = { helper };
+@@@
+variable MAX :1
+variable counter :2
+class User :3
+  field name :3
+  field #secret :3
+  method run :3
+  method make :3
+  method age :3
+function helper :4
+function arrow :5
+function fn2 :6
+function main :7
+variable named :8
+function gen :9
+=== a.ts
+export const MAX = 1;
+interface Shape { area(): number; name: string }
+type Id = number;
+enum Kind { A, B }
+namespace NS { export function f() {} }
+declare module "m" { function g(): void; }
+abstract class Base { abstract run(): void; }
+export class User implements Shape { private age = 1; name = ""; area() { return helper(this.age); } }
+function helper(v: number): number { return v + 1 }
+const arrow = (v: number) => v;
+@@@
+variable MAX :1
+interface Shape :2
+  method area :2
+  property name :2
+type alias Id :3
+enum Kind :4
+  enum member A :4
+  enum member B :4
+namespace NS :5
+  function f :5
+module m :6
+  function g :6
+class Base :7
+  method run :7
+class User :8
+  field age :8
+  field name :8
+  method area :8
+function helper :9
+function arrow :10
+=== a.tsx
+type Props = { title: string };
+export function App({ title }: Props) { const [a, b] = useState(1); return <div className="x" onClick={() => b(a)}>{title}</div>; }
+const Other = () => <span/>;
+@@@
+type alias Props :1
+  property title :1
+function App :2
+function Other :3
+=== a.java
+package a;
+import java.util.List;
+public class User implements Runnable {
+  private int age;
+  public static final int MAX = 1;
+  public User() {}
+  public void run() { int x = helper(age); System.out.println(x); }
+  private int helper(int v) { return v; }
+  enum Kind { A, B }
+  interface Inner { void f(); }
+  record P(int x) {}
+}
+@interface Marker { int value(); }
+@@@
+class User :3
+  field age :4
+  field MAX :5
+  constructor User :6
+  method run :7
+  method helper :8
+  enum Kind :9
+    enum constant A :9
+    enum constant B :9
+  interface Inner :10
+    method f :10
+  record P :11
+interface Marker :13
+  method value :13
+=== a.kt
+package a
+const val MAX = 1
+data class User(val name: String) {
+    val age = 1
+    fun run() { val x = helper(age); println(x) }
+    companion object { fun make() = User("a") }
+}
+interface Shape { fun area(): Int }
+enum class Kind { A, B }
+object Single { fun f() {} }
+typealias Id = Int
+fun helper(v: Int) = v + 1
+@@@
+property MAX :2
+class User :3
+  property age :4
+  function run :5
+  companion object Companion :6
+    function make :6
+interface Shape :8
+  function area :8
+enum Kind :9
+  enum entry A :9
+  enum entry B :9
+object Single :10
+  function f :10
+type alias Id :11
+function helper :12
+=== a.scala
+package a
+trait Shape { def area: Int }
+case class User(name: String) extends Shape { val age = 1; def area = helper(age); def helper(v: Int) = v + 1 }
+class Plain { var x = 1 }
+object Single { def f() = 1 }
+enum Kind { case A, B }
+type Id = Int
+@@@
+trait Shape :2
+  function area :2
+class User :3
+  field age :3
+  function area :3
+  function helper :3
+class Plain :4
+  field x :4
+object Single :5
+  function f :5
+enum Kind :6
+  enum case A :6
+  enum case B :6
+type Id :7
+=== a.swift
+let max = 1
+protocol Shape { func area() -> Int }
+struct User: Shape { var name: String; func area() -> Int { return helper(1) } }
+class Box {
+    var v = 1
+    init() {}
+    func run() { let y = 2; print(v + y) }
+}
+enum Kind { case a, b }
+extension User { func more() {} }
+typealias Id = Int
+func helper(_ v: Int) -> Int { return v + 1 }
+@@@
+property max :1
+protocol Shape :2
+  function area :2
+struct User :3
+  property name :3
+  function area :3
+class Box :4
+  property v :5
+  constructor init :6
+  function run :7
+enum Kind :9
+  enum case a :9
+  enum case b :9
+extension User :10
+  function more :10
+type alias Id :11
+function helper :12
+=== a.c
+#include <stdio.h>
+#define MAX 1
+#define SQR(x) ((x) * (x))
+typedef int id_t2;
+typedef struct { int a; } anon_t;
+struct user { int age; char *name; };
+enum kind { A, B };
+union u { int a; };
+int global = 1;
+int declared(int v);
+static int helper(int v) { return v + 1; }
+int main(void) { struct user u; printf("%d", helper(u.age)); return 0; }
+@@@
+macro MAX :2
+macro SQR :3
+type id_t2 :4
+type anon_t :5
+  field a :5
+struct user :6
+  field age :6
+  field name :6
+enum kind :7
+  enumerator A :7
+  enumerator B :7
+union u :8
+  field a :8
+variable global :9
+function declared :10
+function helper :11
+function main :12
+=== a.cpp
+#include <vector>
+#define MAX 1
+namespace app {
+class User { public: User(); void run(); int age; private: int helper(int v) { return v; } };
+void User::run() { helper(age); }
+struct P { int x; };
+enum class Kind { A, B };
+using Id = int;
+template <typename T> T twice(T v) { return v + v; }
+template <typename T> class Box { T v; };
+}
+int main() { app::User u; u.run(); }
+@@@
+macro MAX :2
+namespace app :3
+  class User :4
+    constructor User :4
+    method run :4
+    field age :4
+    function helper :4
+  function User::run :5
+  struct P :6
+    field x :6
+  enum Kind :7
+    enumerator A :7
+    enumerator B :7
+  type alias Id :8
+  function twice :9
+  class Box :10
+    field v :10
+function main :12
+=== a.cs
+namespace App;
+public interface IShape { int Area(); }
+public class User : IShape { private int age; public string Name { get; set; } public User() {} public int Area() { return Helper(age); } private int Helper(int v) => v; }
+public enum Kind { A, B }
+public struct P { public int X; }
+public record R(int A);
+public delegate void D(int x);
+@@@
+namespace App :1
+interface IShape :2
+  method Area :2
+class User :3
+  field age :3
+  property Name :3
+  constructor User :3
+  method Area :3
+  method Helper :3
+enum Kind :4
+  enum member A :4
+  enum member B :4
+struct P :5
+  field X :5
+record R :6
+delegate D :7
+=== a.php
+<?php
+namespace App;
+const MAX = 1;
+interface Shape { public function area(); }
+trait T { public function t() {} }
+enum Kind { case A; case B; }
+class User implements Shape { private $age = 1; const LIMIT = 2; public function __construct() {} public function area() { return helper($this->age); } }
+function helper($v) { return $v + 1; }
+@@@
+namespace App :2
+const MAX :3
+interface Shape :4
+  method area :4
+trait T :5
+  method t :5
+enum Kind :6
+  enum case A :6
+  enum case B :6
+class User :7
+  property $age :7
+  const LIMIT :7
+  method __construct :7
+  method area :7
+function helper :8
+=== a.rb
+module App
+  MAX = 1
+  class User
+    attr_reader :name
+    def initialize(name); @name = name; end
+    def run; helper(@name); end
+    def self.make; new("a"); end
+  end
+end
+def helper(v) = v
+@@@
+module App :1
+  const MAX :2
+  class User :3
+    method initialize :5
+    method run :6
+    singleton method make :7
+method helper :10
+=== a.lua
+local M = {}
+local max = 1
+function M.run(a) return helper(a) end
+function M:method() end
+local function helper(v) return v + 1 end
+function global_fn() end
+M.other = function() end
+local assigned = function() end
+return M
+@@@
+function M.run :3
+function M:method :4
+function helper :5
+function global_fn :6
+function M.other :7
+function assigned :8
+=== a.sh
+#!/bin/bash
+MAX=1
+export OTHER=2
+helper() { echo "$1"; }
+function run { helper "$MAX"; }
+run
+@@@
+variable MAX :2
+variable OTHER :3
+function helper :4
+function run :5
+=== a.fish
+set -g MAX 1
+function helper
+    echo $argv
+end
+@@@
+function helper :2
+=== a.ps1
+$max = 1
+function Get-Thing { param($a) return $a }
+class User { [string]$Name; [int] Run() { return 1 } }
+enum Kind { A; B }
+@@@
+function Get-Thing :2
+class User :3
+  property $Name :3
+  method Run :3
+enum Kind :4
+=== a.bat
+@echo off
+set MAX=1
+call :helper
+goto :eof
+:helper
+echo hi
+@@@
+variable MAX :2
+label :helper :5
+=== a.ex
+defmodule App.User do
+  @max 1
+  defstruct [:name]
+  def run(a), do: helper(a)
+  defp helper(v), do: v + 1
+  defmacro m(x), do: x
+  defprotocol Show do
+    def show(x)
+  end
+end
+@@@
+module App.User :1
+  function run :4
+  function helper :5
+  function m :6
+  module Show :7
+    function show :8
+=== a.zig
+const std = @import("std");
+const MAX = 1;
+const User = struct { age: u32, pub fn run(self: User) u32 { return helper(self.age); } };
+const Kind = enum { a, b };
+const U = union { a: u32 };
+fn helper(v: u32) u32 { return v + 1; }
+pub fn main() void { std.debug.print("x", .{}); }
+test "one" {}
+@@@
+const std :1
+const MAX :2
+struct User :3
+  field age :3
+  function run :3
+enum Kind :4
+  field a :4
+  field b :4
+union U :5
+  field a :5
+function helper :6
+function main :7
+test one :8
+=== a.proto
+syntax = "proto3";
+package app;
+message User { string name = 1; message Inner { int32 a = 1; } oneof pick { int32 x = 2; } }
+enum Kind { A = 0; B = 1; }
+service Api { rpc Get (User) returns (User); }
+@@@
+message User :3
+  field name :3
+  message Inner :3
+    field a :3
+  oneof pick :3
+    field x :3
+enum Kind :4
+  enum member A :4
+  enum member B :4
+service Api :5
+  method Get :5
+=== a.graphql
+type User { name: String age: Int }
+interface Shape { area: Int }
+enum Kind { A B }
+input New { name: String }
+union Pick = User | Shape
+scalar Date
+query GetUser($id: ID) { user(id: $id) { name } }
+mutation Save { save { id } }
+fragment F on User { name }
+@@@
+type User :1
+  field name :1
+  field age :1
+interface Shape :2
+  field area :2
+enum Kind :3
+  enum value A :3
+  enum value B :3
+input New :4
+  field name :4
+union Pick :5
+scalar Date :6
+operation query GetUser :7
+operation mutation Save :8
+fragment F :9
+=== a.css
+.btn { color: red; }
+#main .x, .y > a { margin: 0; }
+@media (max-width: 1px) { .y { color: blue; } }
+@keyframes spin { from { top: 0; } to { top: 1px; } }
+@@@
+selector .btn :1
+selector #main .x, .y > a :2
+at rule @media (max-width: 1px) :3
+  selector .y :3
+at rule @keyframes spin :4
+=== a.less
+@color: red;
+.btn { color: @color; .inner { top: 0; } }
+.mixin() { left: 0; }
+@@@
+selector .btn :2
+  selector .inner :2
+function mixin :3
+=== a.html
+<!doctype html>
+<html>
+<head><title>x</title></head>
+<body>
+<div id="main"><h1>Hello</h1><script>function f() {}</script></div>
+<br/>
+</body>
+</html>
+@@@
+tag html :2
+  tag head :3
+    tag title :3
+  tag body :4
+    tag div main :5
+      tag h1 :5
+      tag script :5
+    tag br :6
+=== a.vue
+<template>
+  <div id="app"/>
+</template>
+<script>
+export function f() {}
+</script>
+@@@
+tag template :1
+  tag div app :2
+tag script :4
+=== a.svelte
+<script>
+function f() {}
+let x = 1;
+</script>
+<h1>hi</h1>
+<div><p>a</p></div>
+@@@
+tag script :1
+tag h1 :5
+tag div :6
+  tag p :6
+=== a.astro
+---
+const a = 1;
+---
+<div><p>a</p></div>
+@@@
+tag div :4
+  tag p :4
+=== a.twig
+{% block main %}
+<div>{{ x }}</div>
+{% endblock %}
+{% macro m(a) %}x{% endmacro %}
+@@@
+section main :1
+macro m :4
+=== a.erb
+<div><% if a %>x<% end %></div>
+@@@
+=== a.ejs
+<div><%= a %></div>
+@@@
+=== a.json
+{"name": "x", "nested": {"a": 1, "list": [{"b": 2}]}}
+@@@
+key name :1
+key nested :1
+  key a :1
+  key list :1
+    key b :1
+=== a.yaml
+name: x
+nested:
+  a: 1
+  list:
+    - b: 2
+@@@
+key name :1
+key nested :2
+  key a :3
+  key list :4
+    key b :5
+=== a.toml
+title = "x"
+[server]
+port = 1
+[server.tls]
+on = true
+[[item]]
+name = "a"
+@@@
+key title :1
+section server :2
+  key port :3
+section server.tls :4
+  key on :5
+section item :6
+  key name :7
+=== a.xml
+<?xml version="1.0"?>
+<root><item id="1"><name>x</name></item><empty/></root>
+@@@
+tag root :2
+  tag item :2
+    tag name :2
+  tag empty :2
+=== a.ini
+top = 1
+[section]
+key = 1
+[other]
+b = 2
+@@@
+key top :1
+section section :2
+  key key :3
+section other :4
+  key b :5
+=== a.properties
+a.b = 1
+c = 2
+@@@
+key a.b :1
+key c :2
+=== a.env
+A=1
+export B=2
+@@@
+key A :1
+=== nginx.conf
+user www;
+http {
+    upstream api { server 127.0.0.1; }
+    server {
+        listen 80;
+        location / { return 200; }
+    }
+}
+@@@
+section http :2
+  section server :4
+    section location / :6
+=== a.tf
+variable "name" { default = "x" }
+resource "aws_instance" "web" { ami = "a" }
+output "ip" { value = 1 }
+locals { a = 1 }
+@@@
+section variable name :1
+section resource aws_instance web :2
+section output ip :3
+section locals :4
+=== Dockerfile
+FROM alpine AS build
+RUN x
+FROM scratch
+COPY . .
+@@@
+stage alpine build :1
+stage scratch :3
+=== Makefile
+VAR = 1
+all: build
+
+build:
+	cc a.c
+define helper
+x
+endef
+@@@
+variable VAR :1
+target all :2
+target build :4
+macro helper :6
+=== CMakeLists.txt
+project(a)
+set(X 1)
+function(f)
+endfunction()
+macro(m)
+endmacro()
+add_executable(app a.c)
+add_library(lib a.c)
+@@@
+target a :1
+function f :3
+macro m :5
+target app :7
+target lib :8
+=== a.groovy
+class User { String name; def run() { helper(1) } }
+interface Shape { int area() }
+enum Kind { A, B }
+def helper(v) { v + 1 }
+@@@
+class User :1
+  field name :1
+  method run :1
+interface Shape :2
+  method area :2
+enum Kind :3
+  enum constant A :3
+  enum constant B :3
+function helper :4
+=== a.dart
+const max = 1;
+class User { int age = 1; User(); void run() { helper(age); } }
+mixin M { void m() {} }
+enum Kind { a, b }
+extension E on User { void more() {} }
+typedef Id = int;
+int helper(int v) => v + 1;
+@@@
+const max :1
+class User :2
+  field age :2
+  constructor User :2
+  method run :2
+mixin M :3
+  method m :3
+enum Kind :4
+  enum entry a :4
+  enum entry b :4
+extension E :5
+  method more :5
+type alias Id :6
+function helper :7
+=== a.nix
+{ pkgs }:
+let
+  a = 1;
+  f = x: x;
+in {
+  name = "x";
+  nested = { b = 2; };
+}
+@@@
+key a :3
+key f :4
+key name :6
+key nested :7
+  key b :7
+=== a.hs
+module App where
+data User = User { name :: String }
+class Shape a where
+  area :: a -> Int
+type Id = Int
+newtype W = W Int
+instance Shape User where
+  area _ = 1
+helper :: Int -> Int
+helper v = v + 1
+@@@
+module App :1
+type User :2
+class Shape :3
+  function area :4
+type alias Id :5
+type W :6
+impl Shape :7
+  function area :8
+function helper :10
+=== a.r
+max <- 1
+helper <- function(v) { v + 1 }
+other = function(a) a
+@@@
+variable max :1
+function helper :2
+function other :3
+=== a.ml
+module M = struct let f x = x end
+type user = { name : string }
+exception Oops
+let max = 1
+let helper v = v + 1
+@@@
+module M :1
+  function f :1
+type user :2
+exception Oops :3
+let max :4
+function helper :5
+=== a.erl
+-module(app).
+-record(user, {name}).
+-define(MAX, 1).
+-type id() :: integer().
+helper(V) -> V + 1.
+main() -> helper(1).
+@@@
+module app :1
+record user :2
+macro MAX :3
+type id :4
+function helper :5
+function main :6
+=== a.glsl
+#define MAX 1
+uniform vec2 size;
+struct P { float x; };
+float helper(float v) { return v + 1.0; }
+void main() { gl_FragColor = vec4(1.0); }
+@@@
+macro MAX :1
+variable size :2
+struct P :3
+  field x :3
+function helper :4
+function main :5
+=== a.sol
+pragma solidity ^0.8.0;
+interface IShape { function area() external; }
+library L { function f() internal {} }
+contract User is IShape { uint age; event Saved(uint a); error Bad(); modifier only() { _; } struct P { uint x; } enum Kind { A, B } constructor() {} function area() external {} }
+@@@
+interface IShape :2
+  function area :2
+module L :3
+  function f :3
+class User :4
+  field age :4
+  event Saved :4
+  error Bad :4
+  modifier only :4
+  struct P :4
+    field x :4
+  enum Kind :4
+    enum member A :4
+    enum member B :4
+  constructor constructor :4
+  function area :4
+=== a.jl
+module App
+const MAX = 1
+struct User
+    name
+end
+abstract type Shape end
+function helper(v)
+    v + 1
+end
+short(x) = x + 1
+macro m(x) end
+end
+@@@
+module App :1
+  const MAX :2
+  struct User :3
+  type Shape :6
+  function helper :7
+  function short :10
+  macro m :11
+=== a.elm
+module App exposing (..)
+type Kind = A | B
+type alias User = { name : String }
+helper : Int -> Int
+helper v = v + 1
+@@@
+module App :1
+type Kind :2
+  enum member A :2
+  enum member B :2
+type alias User :3
+function helper :5
+=== a.gleam
+pub type Kind { A B }
+pub type Id = Int
+pub const max = 1
+pub fn helper(v) { v + 1 }
+fn other() { 1 }
+@@@
+type Kind :1
+  enum member A :1
+  enum member B :1
+type alias Id :2
+const max :3
+function helper :4
+function other :5
+=== a.prisma
+datasource db { provider = "postgresql" url = "x" }
+generator client { provider = "prisma-client-js" }
+model User { id Int @id name String }
+enum Kind { A B }
+@@@
+section db :1
+section client :2
+model User :3
+  field id :3
+  field name :3
+enum Kind :4
+  enum member A :4
+  enum member B :4
+=== a.diff
+diff --git a/x.rs b/x.rs
+--- a/x.rs
++++ b/x.rs
+@@ -1 +1 @@ fn main
+-a
++b
+diff --git a/y.rs b/y.rs
+@@ -2 +2 @@
+-c
++d
+@@@
+section a/x.rs b/x.rs :1
+  hunk @@ -1 +1 @@ fn main :4
+section a/y.rs b/y.rs :7
+=== a.sql
+#region Config
+select settings from config where id='core';
+#--region By path
+set @entry = '$.a';
+select JSON_EXTRACT(settings, @entry), d from config where id='core';
+#--endregion
+#endregion
+create table if not exists `users` (id int);
+create or replace view v as select 1;
+create index idx on users (id);
+insert into users values (1);
+update users set a = 1;
+delete from users where id = 1;
+drop table users;
+alter table users add b int;
+@@@
+region Config :1
+  statement select config :2
+  region By path :3
+    statement set @entry :4
+    statement select config :5
+table users :8
+view v :9
+index idx :10
+statement insert users :11
+statement update users :12
+statement delete users :13
+statement drop users :14
+statement alter users :15

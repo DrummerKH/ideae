@@ -220,8 +220,15 @@ all: what is removed stays under `refs/ideae/variants` for two weeks.
   struck through and green, that Tab makes; one further away is reached
   with a first Tab.
 - The declarations you are inside of stay at the top as you scroll.
-- File structure (Ctrl+F12), syntax-aware selection, folding, CamelHumps
-  words (Settings → Editor).
+- File structure (Ctrl+F12) in every language with a grammar: declarations,
+  Markdown's headings, keys and sections of config files, tags, CSS selectors,
+  a `.sql` file's statements. Syntax-aware selection, CamelHumps words
+  (Settings → Editor).
+- Folding by syntax, and in any language by `region`/`endregion` comments
+  (`//region`, `#region`, `-- region`, `<editor-fold>`), which the structure
+  shows as sections, and by runs of line comments such as a license. A file no
+  grammar reads folds by its indentation. What is folded stays so after a
+  restart.
 - The gutter marks what differs from the last commit. A right click on the
   line numbers annotates the file with git blame. Bookmarks (F11) follow
   their text and are listed for the whole task (Shift+F11).

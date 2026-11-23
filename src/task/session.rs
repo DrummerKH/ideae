@@ -40,6 +40,7 @@ impl TaskView {
                         s.path = Some(rel(&f.path));
                         s.line = f.cursor_line;
                         s.look = f.preview.look.name().map(String::from);
+                        s.folds = f.saved_folds(cx);
                     }
                     TabKind::Binary(view) => {
                         s.kind = "file".into();
@@ -121,6 +122,9 @@ impl TaskView {
             let new = self.tabs.iter_mut().find(|t| !before.contains(&t.id));
             if let (Some(look), Some(TabKind::File(file))) = (saved.look.as_deref().and_then(super::preview::Look::named), new.as_ref().map(|t| &t.kind)) {
                 file.update(cx, |f, cx| f.set_look(look, cx));
+            }
+            if let (false, Some(TabKind::File(file))) = (saved.folds.is_empty(), new.as_ref().map(|t| &t.kind)) {
+                file.update(cx, |f, cx| f.restore_folds(&saved.folds, cx));
             }
             ids.push(new.map(|tab| {
                 tab.pane = Pane { right: saved.right, below: saved.below };

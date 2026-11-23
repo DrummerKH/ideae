@@ -51,7 +51,8 @@ src/task/          one task, a module: what is private to it is seen by all of i
   bookmarks.rs     bookmarked lines: toggle, next/previous, the task's list
   change_tree.rs   the changed files as a tree
   file_tree.rs     the Files panel: names colored by git status, ignored folders read when opened
-  helpers.rs       patches parsed for the panels, outline, symbol search, definition providers
+  helpers.rs       patches parsed for the panels, symbol search, definition providers
+  outline.rs       a file's structure: a query per language (`queries/outline/`, each with its case in `cases.txt`), regions, a `.sql` file's statements
 src/menu.rs        the macOS menu bar, kept short: tasks, git and the window, not the editor's commands
 src/commands.rs    the commands on a task, its project, its variants, its git: names and what allows them, for the menu bar, the sidebar and the palette
 src/file_icons.rs  file and folder icons (assets/file-icons, JetBrains' new UI), by name

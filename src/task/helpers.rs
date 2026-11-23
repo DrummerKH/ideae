@@ -573,28 +573,6 @@ mod editing_tests {
     }
 }
 
-/// Declarations in a file, by its tree-sitter grammar: classes, functions,
-/// methods, types… nested as in the source. Calls and expressions are left
-/// out even when the grammar gives them a name.
-pub(super) fn outline(path: &std::path::Path, text: &str) -> Vec<crate::finder::OutlineItem> {
-    let name = lsp::language_for(path);
-    let Some(language) = gpui_kit::component::highlighter::LanguageRegistry::singleton()
-        .language(name)
-        .and_then(|c| c.language)
-    else {
-        return Vec::new();
-    };
-    let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(&language).is_err() {
-        return Vec::new();
-    }
-    let Some(tree) = parser.parse(text, None) else { return Vec::new() };
-    let mut items = Vec::new();
-    let data = matches!(name, "json" | "yaml" | "xml");
-    collect_declarations(tree.root_node(), text, (!data).then_some(name), 0, &mut items);
-    items
-}
-
 /// Declarations by a part of their name: from the task's language servers,
 /// which know the project; from the grammars' reading of its files where
 /// no server answers.
@@ -628,9 +606,8 @@ pub(super) fn symbol_source(root: PathBuf, clients: Vec<Arc<lsp::LspClient>>, fi
                         continue;
                     }
                     let Ok(text) = std::fs::read_to_string(&path) else { continue };
-                    all.extend(outline(&path, &text).into_iter().filter_map(|item| {
-                        let (kind, name) = item.label.rsplit_once(' ')?;
-                        Some(Hit { path: file.clone(), line: item.line + 1, col: 0, text: format!("{name}{DETAIL}{kind}"), ranges: Vec::new() })
+                    all.extend(outline(&path, &text).into_iter().filter(|item| super::outline::is_declaration(&item.kind)).map(|item| {
+                        Hit { path: file.clone(), line: item.line + 1, col: 0, text: format!("{}{DETAIL}{}", item.name, item.kind), ranges: Vec::new() }
                     }));
                 }
                 all
@@ -640,167 +617,6 @@ pub(super) fn symbol_source(root: PathBuf, clients: Vec<Arc<lsp::LspClient>>, fi
         hits.truncate(LIMIT);
         hits
     })
-}
-
-/// The first identifier within `depth` levels, breadth first: a Kotlin or
-/// Java field names itself a level or two down (declarator, variable).
-pub(super) fn first_identifier(node: tree_sitter::Node, depth: usize) -> Option<tree_sitter::Node> {
-    let mut level = vec![node];
-    for _ in 0..depth {
-        let mut next = Vec::new();
-        for n in level {
-            let mut c = n.walk();
-            for child in n.named_children(&mut c) {
-                if child.kind().ends_with("identifier") && child.kind() != "type_identifier" {
-                    return Some(child);
-                }
-                next.push(child);
-            }
-        }
-        level = next;
-    }
-    None
-}
-
-/// The line a declaration is read by: past the annotations above it
-/// (`@Obfuscate` on a line of its own before a Kotlin class).
-fn head_line(node: tree_sitter::Node) -> usize {
-    fn first_token(node: tree_sitter::Node) -> Option<usize> {
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            let kind = child.kind();
-            if ["annotation", "decorator", "attribute", "comment"].iter().any(|k| kind.contains(k)) {
-                continue;
-            }
-            if kind == "modifiers" {
-                match first_token(child) {
-                    Some(row) => return Some(row),
-                    None => continue,
-                }
-            }
-            return Some(child.start_position().row);
-        }
-        None
-    }
-    first_token(node).unwrap_or(node.start_position().row)
-}
-
-/// A YAML block ends past its last line break, at the start of the next.
-fn last_line(node: tree_sitter::Node) -> usize {
-    let end = node.end_position();
-    if end.column == 0 && end.row > node.start_position().row { end.row - 1 } else { end.row }
-}
-
-/// Keys of YAML and JSON mappings and XML elements: what their files are
-/// made of, where code has declarations.
-fn data_name(node: tree_sitter::Node, text: &str) -> Option<(String, String)> {
-    let first_line = |n: tree_sitter::Node| text.get(n.byte_range()).map(|t| t.lines().next().unwrap_or(t).trim().to_string());
-    match node.kind() {
-        "block_mapping_pair" | "flow_pair" | "pair" => {
-            let key = first_line(node.child_by_field_name("key")?)?;
-            let key = key.trim_matches(|c| c == '"' || c == '\'').to_string();
-            (!key.is_empty()).then(|| ("key".to_string(), key))
-        }
-        "element" => {
-            let mut cursor = node.walk();
-            let tag = node.named_children(&mut cursor).find(|c| c.kind() == "STag" || c.kind() == "EmptyElemTag")?;
-            let mut cursor = tag.walk();
-            let name = tag.named_children(&mut cursor).find(|c| c.kind() == "Name")?;
-            Some(("tag".to_string(), first_line(name)?))
-        }
-        _ => None,
-    }
-}
-
-/// The declarations under `node`; in a `data` file (YAML, JSON, XML) its
-/// keys and tags instead.
-fn collect_declarations(node: tree_sitter::Node, text: &str, language: Option<&str>, depth: usize, items: &mut Vec<crate::finder::OutlineItem>) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        let named = if language.is_none() { data_name(child, text) } else { declaration_name(child, text) };
-        match named {
-            Some((short, name)) => {
-                items.push(crate::finder::OutlineItem {
-                    depth,
-                    label: format!("{short} {name}"),
-                    line: head_line(child) as u32,
-                    end: last_line(child) as u32,
-                    private: language.is_some_and(|language| is_private(language, child, &name, text)),
-                });
-                collect_declarations(child, text, language, depth + 1, items);
-            }
-            None => collect_declarations(child, text, language, depth, items),
-        }
-    }
-}
-
-/// Whether a declaration is private, read from the syntax tree: the
-/// modifier the grammar has on it (`private`, Rust's missing `pub`), not
-/// the text of its line. Two languages have no such word and say it by the
-/// name: Go's lower case, Python's underscore.
-fn is_private(language: &str, node: tree_sitter::Node, name: &str, text: &str) -> bool {
-    // The modifiers a grammar hangs on a declaration, whatever it calls them: `visibility_modifier`, `modifiers`, `accessibility_modifier`.
-    let mut cursor = node.walk();
-    let modifiers: Vec<&str> = node
-        .children(&mut cursor)
-        .filter(|child| {
-            let kind = child.kind();
-            kind.contains("visibility") || kind.contains("accessibility") || kind.contains("modifier")
-        })
-        .filter_map(|child| text.get(child.byte_range()))
-        .collect();
-    let says = |word: &str| modifiers.iter().any(|modifier| modifier.split(|c: char| !c.is_alphanumeric()).any(|w| w == word));
-    match language {
-        "rust" => {
-            // What a trait asks for, and what an impl gives it, is as public as the trait; so are an enum's variants. An impl itself is of its type.
-            let kind = node.kind();
-            let of_a_trait = std::iter::successors(node.parent(), |up| up.parent())
-                .any(|up| up.kind() == "trait_item" || (up.kind() == "impl_item" && up.child_by_field_name("trait").is_some()) || up.kind() == "enum_variant_list");
-            !says("pub") && !of_a_trait && kind != "impl_item"
-        }
-        "go" => name.chars().next().is_some_and(|c| c.is_lowercase() || c == '_'),
-        "python" => name.starts_with('_') && !name.starts_with("__init__"),
-        _ => says("private") || name.starts_with('#'),
-    }
-}
-
-/// What `node` declares, its kind and its name, if it is a declaration:
-/// not a call, a pattern (`Some(x)` in a match), a bound or a parameter,
-/// whatever word the grammar's name for it has in it.
-fn declaration_name(node: tree_sitter::Node, text: &str) -> Option<(String, String)> {
-    let kind = node.kind();
-    let has = |words: &[&str]| words.iter().any(|w| kind.contains(w));
-    // A function made where it is used is a declaration only when it is given a name.
-    let anonymous = matches!(kind, "arrow_function" | "function" | "function_expression" | "lambda" | "lambda_expression" | "closure_expression");
-    let declaration = has(&["function", "method", "class", "interface", "struct", "enum", "trait", "impl", "object", "type_spec", "type_alias", "type_item", "module", "namespace", "property", "field", "const_spec", "const_item", "static_item"])
-        && !has(&["call", "invocation", "reference", "expression", "parameter", "argument", "literal", "access", "body", "list", "initializer", "pattern", "heritage", "clause", "superclass", "super_interfaces", "bound", "generic_function", "primary_constructor"])
-        && !kind.ends_with("identifier")
-        // A field's type or a class's body is not a declaration of its own.
-        && !kind.ends_with("_type")
-        // JavaScript's `{ a: 1 }`; Kotlin's and Scala's are `object_declaration`.
-        && kind != "object";
-    let name = if anonymous {
-        node.parent().filter(|p| p.kind() == "variable_declarator").and_then(|p| p.child_by_field_name("name"))?
-    } else if declaration {
-        let by_type = has(&["impl"]).then(|| node.child_by_field_name("type")).flatten();
-        // Kotlin names a class by a type identifier, after which its constructor's parameters come.
-        let mut cursor = node.walk();
-        let type_name = node.named_children(&mut cursor).find(|c| c.kind() == "type_identifier");
-        if kind == "companion_object" && type_name.is_none() {
-            // Kotlin's unnamed companion is called Companion; a name deeper down is one of its members'.
-            return Some(("companion object".into(), "Companion".into()));
-        }
-        node.child_by_field_name("name").or(by_type).or(type_name).or_else(|| first_identifier(node, 3))?
-    } else {
-        return None;
-    };
-    let name = text.get(name.byte_range())?;
-    let short = if anonymous {
-        "function".to_string()
-    } else {
-        kind.trim_end_matches("_declaration").trim_end_matches("_definition").trim_end_matches("_item").trim_end_matches("_spec").replace('_', " ")
-    };
-    Some((short, name.lines().next().unwrap_or(name).to_string()))
 }
 
 #[cfg(test)]
@@ -870,95 +686,6 @@ mod places_tests {
         assert_eq!(places.implementations.iter().map(|h| h.line).collect::<Vec<_>>(), [5]);
         assert_eq!(places.usages.iter().map(|h| (h.line, h.text.as_str())).collect::<Vec<_>>(), [(9, "func main() { var s Shape = Sq{}; _ = s.Area() }")]);
         let _ = std::fs::remove_dir_all(&root);
-    }
-}
-
-#[cfg(test)]
-mod outline_tests {
-    use super::outline;
-    use std::path::Path;
-
-    #[test]
-    fn what_is_private_is_told_by_its_words() {
-        let private = |path: &str, text: &str| -> Vec<String> {
-            outline(Path::new(path), text).into_iter().filter(|i| i.private).map(|i| i.label.rsplit(' ').next().unwrap_or_default().to_string()).collect()
-        };
-        let rust = "pub struct Open {}\nstruct Kept {}\nimpl Open {\n    pub fn seen(&self) {}\n    fn hidden(&self) {}\n}\npub(crate) fn near() {}\n\
-            pub trait Says {\n    fn say(&self);\n}\nimpl Says for Open {\n    fn say(&self) {}\n}\n";
-        assert_eq!(private("a.rs", rust), ["Kept", "hidden"], "a trait's own, and what an impl gives it, are as public as the trait");
-        let ts = "class A {\n  open() {}\n  private kept() {}\n  #hash() {}\n}\n";
-        assert_eq!(private("a.ts", ts), ["kept", "#hash"]);
-        let kt = "class A {\n    fun open() {}\n    private fun kept() {}\n}\n";
-        assert_eq!(private("a.kt", kt), ["kept"]);
-        assert_eq!(private("m.go", "package m\n\nfunc Open() {}\n\nfunc kept() {}\n"), ["kept"]);
-        assert_eq!(private("a.py", "def open():\n    pass\n\ndef _kept():\n    pass\n"), ["_kept"]);
-        let java = "class A {\n    public void open() {}\n    private void kept() {}\n}\n";
-        assert_eq!(private("A.java", java), ["kept"]);
-    }
-
-    #[test]
-    fn go_declarations() {
-        let src = "package main\n\ntype Server struct{}\n\nfunc (s *Server) Run() { go s.loop() }\n\nfunc main() {}\n";
-        let labels: Vec<String> = outline(Path::new("m.go"), src).into_iter().map(|i| i.label).collect();
-        assert!(labels.iter().any(|l| l.ends_with("Server")), "{labels:?}");
-        assert!(labels.iter().any(|l| l.ends_with("Run")), "{labels:?}");
-        assert!(labels.iter().any(|l| l.ends_with("main")), "{labels:?}");
-        assert!(!labels.iter().any(|l| l.contains("loop")), "{labels:?}");
-    }
-
-    #[test]
-    fn fields_are_listed() {
-        let ts = "class A {\n  count: number = 1;\n  name = 'x';\n  run() {}\n}\n";
-        let labels: Vec<String> = outline(Path::new("a.ts"), ts).into_iter().map(|i| i.label).collect();
-        assert!(labels.iter().any(|l| l.ends_with("count")), "{labels:?}");
-        assert!(labels.iter().any(|l| l.ends_with("run")), "{labels:?}");
-        let kt = "class A {\n    val count: Int = 1\n    fun run() {}\n}\n";
-        let labels: Vec<String> = outline(Path::new("a.kt"), kt).into_iter().map(|i| i.label).collect();
-        assert!(labels.iter().any(|l| l.ends_with("count")), "{labels:?}");
-    }
-
-    fn lines(path: &str, text: &str) -> Vec<(String, u32, u32)> {
-        crate::grammars::register();
-        outline(Path::new(path), text).into_iter().map(|i| (format!("{}{}", "  ".repeat(i.depth), i.label), i.line, i.end)).collect()
-    }
-
-    #[test]
-    fn patterns_calls_and_clauses_are_not_declarations() {
-        let rust = "struct P { x: u32 }\nfn f(o: Option<P>) {\n    match o { Some(P { x }) => {}, None => {} }\n    if let Ok(v) = parse::<u32>(\"1\") {}\n}\nimpl<T: 'static> Tr for P {}\n";
-        assert_eq!(
-            lines("a.rs", rust).into_iter().map(|(l, _, _)| l).collect::<Vec<_>>(),
-            ["struct P", "  field x", "function f", "impl P"]
-        );
-        let ts = "export const run = async (req) => { list.map((item) => item.id); return { ok: true }; };\nclass A extends B implements C {}\n";
-        assert_eq!(lines("a.ts", ts).into_iter().map(|(l, _, _)| l).collect::<Vec<_>>(), ["function run", "class A"]);
-        let kt = "class A(val p: Int) : B() {\n    fun run() {}\n}\n";
-        assert_eq!(lines("a.kt", kt).into_iter().map(|(l, _, _)| l).collect::<Vec<_>>(), ["class A", "  function run"]);
-    }
-
-    #[test]
-    fn kotlin_objects_are_declarations() {
-        let kt = "object Registry {\n    fun get() {}\n}\nclass A {\n    companion object {\n        const val X = 1\n    }\n    companion object Factory\n}\n";
-        assert_eq!(
-            lines("a.kt", kt).into_iter().map(|(l, _, _)| l).collect::<Vec<_>>(),
-            ["object Registry", "  function get", "class A", "  companion object Companion", "    property X", "  companion object Factory"]
-        );
-    }
-
-    #[test]
-    fn an_annotated_class_starts_at_its_name() {
-        let text = "@Obfuscate\nabstract class App : Base() {\n    @Suppress(\"x\")\n    fun run() {\n    }\n}\n";
-        assert_eq!(lines("a.kt", text)[0].1, 1);
-        assert!(lines("a.kt", text).iter().any(|(l, line, _)| l.ends_with("function run") && *line == 3), "{:?}", lines("a.kt", text));
-    }
-
-    #[test]
-    fn yaml_json_and_xml_have_their_keys_and_tags() {
-        let yaml = lines("a.yml", "services:\n  web:\n    image: x\n");
-        assert_eq!(yaml, [("key services".into(), 0, 2), ("  key web".into(), 1, 2), ("    key image".into(), 2, 2)]);
-        let json = lines("a.json", "{\n  \"a\": {\n    \"b\": 1\n  }\n}\n");
-        assert_eq!(json, [("key a".into(), 1, 3), ("  key b".into(), 2, 2)]);
-        let xml = lines("a.xml", "<?xml version=\"1.0\"?>\n<project>\n  <dependency/>\n</project>\n");
-        assert_eq!(xml, [("tag project".into(), 1, 3), ("  tag dependency".into(), 2, 2)]);
     }
 }
 
@@ -1042,7 +769,7 @@ pub fn find_symbol(root: &std::path::Path, files: &[String], symbol: &str) -> Ve
     let Some((path, mut line, code)) = found else { return Vec::new() };
     if let Some(member) = member {
         if let Ok(text) = std::fs::read_to_string(&path) {
-            if let Some(item) = outline(&path, &text).into_iter().find(|i| i.label.rsplit(' ').next() == Some(member)) {
+            if let Some(item) = outline(&path, &text).into_iter().find(|i| i.name == member) {
                 line = item.line;
             }
         }

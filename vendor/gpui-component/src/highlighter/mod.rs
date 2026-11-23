@@ -11,6 +11,10 @@ pub(crate) use diagnostic_styles::*;
 #[cfg(feature = "tree-sitter")]
 mod input_adapter;
 #[cfg(feature = "tree-sitter")]
+mod text_folds;
+#[cfg(feature = "tree-sitter")]
+pub use text_folds::{TextRegion, text_regions};
+#[cfg(feature = "tree-sitter")]
 pub(crate) use input_adapter::input_highlighter_factory;
 
 // The lighter highlighter, used when tree-sitter is not enabled.

@@ -298,9 +298,9 @@ impl TaskView {
                                         let (file, line) = (file.clone(), item.line);
                                         // "function open" read slowly down a list: a colored
                                         // letter for the kind, the word in the tooltip.
-                                        let (kind, name) = item.label.rsplit_once(' ').unwrap_or(("", item.label.as_str()));
-                                        let (mark, color) = crate::finder::kind_mark(kind);
-                                        let kind = SharedString::from(kind.to_string());
+                                        let name = item.name.as_str();
+                                        let (mark, color) = crate::finder::kind_mark(&item.kind);
+                                        let kind = SharedString::from(item.kind.clone());
                                         div()
                                             .id(("decl", ix))
                                             .w_full()

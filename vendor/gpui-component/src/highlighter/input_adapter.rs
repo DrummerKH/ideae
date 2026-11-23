@@ -17,12 +17,15 @@ use gpui_base::input::{
 use ropey::Rope;
 use tree_sitter::{InputEdit, ParseOptions, Point};
 
-use super::{LanguageRegistry, SyntaxHighlighter, highlighter::parse_input_bytes};
+use super::{LanguageRegistry, SyntaxHighlighter, highlighter::parse_input_bytes, text_folds};
 
 pub(crate) fn input_highlighter_factory() -> InputHighlighterFactory {
     Rc::new(|language| {
-        LanguageRegistry::singleton().has_parser(language).then(|| {
+        // ideae patch: a text no grammar reads still folds, by its indentation.
+        Some(if LanguageRegistry::singleton().has_parser(language) {
             Box::new(TreeSitterInputHighlighter::new(language)) as Box<dyn InputHighlighter>
+        } else {
+            Box::new(PlainInputHighlighter::new(language))
         })
     })
 }
@@ -34,6 +37,8 @@ const PARSE_DEBOUNCE: Duration = Duration::from_millis(150);
 struct TreeSitterInputHighlighter {
     inner: Rc<RefCell<SyntaxHighlighter>>,
     parse_task: Rc<RefCell<Option<Task<()>>>>,
+    /// ideae patch: the last folds of the tree and the text together.
+    folds: Rc<RefCell<Vec<FoldRange>>>,
 }
 
 impl TreeSitterInputHighlighter {
@@ -41,7 +46,40 @@ impl TreeSitterInputHighlighter {
         Self {
             inner: Rc::new(RefCell::new(SyntaxHighlighter::new(language))),
             parse_task: Rc::new(RefCell::new(None)),
+            folds: Rc::default(),
         }
+    }
+
+    /// ideae patch: a marker folds lines far from the edit that wrote it, so
+    /// after a pause in typing the folds are read again from the whole text.
+    fn refresh_folds(
+        &mut self,
+        text: &Rope,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<EditorState>,
+    ) {
+        let (language, tree) = {
+            let highlighter = self.inner.borrow();
+            (highlighter.language().clone(), highlighter.tree().cloned())
+        };
+        let Some(tree) = tree else {
+            self.parse_task.borrow_mut().take();
+            return;
+        };
+        let text = text.clone();
+        let known = self.folds.clone();
+        let task = cx.spawn_in(window, async move |entity, cx| {
+            cx.background_executor().timer(PARSE_DEBOUNCE).await;
+            let folds = cx
+                .background_executor()
+                .spawn(async move { text_folds::merge(&language, extract_fold_ranges(&tree), &text) })
+                .await;
+            *known.borrow_mut() = folds.clone();
+            let _ = entity.update(cx, |state, cx| {
+                state.apply_highlighter_fold_candidates(folds, cx);
+            });
+        });
+        self.parse_task.borrow_mut().replace(task);
     }
 
     /// Settle after the edits reached the tree: drop a pending background
@@ -55,12 +93,17 @@ impl TreeSitterInputHighlighter {
         cx: &mut gpui::Context<EditorState>,
     ) {
         if completed {
-            self.parse_task.borrow_mut().take();
+            if folding {
+                self.refresh_folds(text, window, cx);
+            } else {
+                self.parse_task.borrow_mut().take();
+            }
             return;
         }
 
         let highlighter = self.inner.clone();
         let parse_task = self.parse_task.clone();
+        let known = self.folds.clone();
         let language = highlighter.borrow().language().clone();
         let old_tree = highlighter.borrow().tree().cloned();
         let injection_data = highlighter.borrow().injection_parse_data();
@@ -105,7 +148,7 @@ impl TreeSitterInputHighlighter {
                         SyntaxHighlighter::compute_injection_layers(data, &tree, &text)
                     });
                     let folds = if folding {
-                        extract_fold_ranges(&tree)
+                        text_folds::merge(&language, extract_fold_ranges(&tree), &text)
                     } else {
                         Vec::new()
                     };
@@ -117,6 +160,7 @@ impl TreeSitterInputHighlighter {
                 highlighter
                     .borrow_mut()
                     .apply_background_tree(tree, &text_for_apply, injections);
+                *known.borrow_mut() = folds.clone();
                 let _ = entity.update(cx, |state, cx| {
                     state.apply_highlighter_fold_candidates(folds, cx);
                 });
@@ -198,12 +242,21 @@ impl InputHighlighter for TreeSitterInputHighlighter {
     ) -> Vec<(Range<usize>, HighlightStyle)> {
         self.inner.borrow().styles(range, resolver)
     }
-    fn fold_ranges(&self, _: &Rope) -> Vec<FoldRange> {
-        self.inner
-            .borrow()
+    fn fold_ranges(&self, text: &Rope) -> Vec<FoldRange> {
+        // ideae patch: this runs on the UI thread, so a large text keeps what
+        // the background read of it last found.
+        if text.len() > SYNC_PARSE_MAX_BYTES && !self.folds.borrow().is_empty() {
+            return self.folds.borrow().clone();
+        }
+        let highlighter = self.inner.borrow();
+        let tree = highlighter
             .tree()
             .map(extract_fold_ranges)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if text.len() > SYNC_PARSE_MAX_BYTES {
+            return tree;
+        }
+        text_folds::merge(highlighter.language(), tree, text)
     }
 
     fn fold_ranges_for_edit(&self, range: Range<usize>, _: &Rope) -> Vec<FoldRange> {
@@ -212,6 +265,67 @@ impl InputHighlighter for TreeSitterInputHighlighter {
             .tree()
             .map(|tree| extract_fold_ranges_in_range(tree, range))
             .unwrap_or_default()
+    }
+}
+
+/// ideae patch: no colors, the folds of the indentation.
+struct PlainInputHighlighter {
+    language: SharedString,
+    folds: Rc<RefCell<Vec<FoldRange>>>,
+    task: Option<Task<()>>,
+}
+
+impl PlainInputHighlighter {
+    fn new(language: &str) -> Self {
+        Self {
+            language: language.to_owned().into(),
+            folds: Rc::default(),
+            task: None,
+        }
+    }
+}
+
+impl InputHighlighter for PlainInputHighlighter {
+    fn language(&self) -> SharedString {
+        self.language.clone()
+    }
+
+    fn update(
+        &mut self,
+        _: Option<BaseInputEdit>,
+        text: &Rope,
+        folding: bool,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<EditorState>,
+    ) {
+        if !folding {
+            return;
+        }
+        let text = text.clone();
+        let known = self.folds.clone();
+        self.task = Some(cx.spawn_in(window, async move |entity, cx| {
+            cx.background_executor().timer(PARSE_DEBOUNCE).await;
+            let folds = cx
+                .background_executor()
+                .spawn(async move { text_folds::indent_folds(&text) })
+                .await;
+            *known.borrow_mut() = folds.clone();
+            let _ = entity.update(cx, |state, cx| {
+                state.apply_highlighter_fold_candidates(folds, cx);
+            });
+        }));
+    }
+
+    fn styles(
+        &self,
+        range: &Range<usize>,
+        _: &dyn HighlightStyleResolver,
+    ) -> Vec<(Range<usize>, HighlightStyle)> {
+        vec![(range.clone(), HighlightStyle::default())]
+    }
+
+    fn fold_ranges(&self, _: &Rope) -> Vec<FoldRange> {
+        self.folds.borrow().clone()
     }
 }
 

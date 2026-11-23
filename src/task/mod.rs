@@ -42,6 +42,7 @@ mod panes;
 use panes::Pane;
 mod git_ui;
 mod helpers;
+mod outline;
 mod term;
 mod chat;
 mod file;
@@ -68,7 +69,7 @@ use file_tree::*;
 use git_ui::*;
 pub use helpers::*;
 // Named, to come before the one of the same name in gpui's own glob.
-use helpers::outline;
+use outline::outline;
 pub use term::*;
 pub use chat::{ChatEvent, ChatView};
 pub use file::*;
@@ -1981,8 +1982,7 @@ impl TaskView {
             if under.is_some_and(|depth| item.depth > depth) {
                 continue;
             }
-            let kind = item.label.rsplit_once(' ').map_or("", |(kind, _)| kind);
-            let field = crate::finder::kind_mark(kind).0 == "v";
+            let field = crate::finder::kind_mark(&item.kind).0 == "v";
             under = ((public && item.private) || (!fields && field)).then_some(item.depth);
             if under.is_none() {
                 shown.push(item.clone());
@@ -2125,7 +2125,7 @@ fn sorted_by_name(items: Vec<crate::finder::OutlineItem>) -> Vec<crate::finder::
         // Each of this depth with all that follows it deeper.
         let starts: Vec<usize> = (0..items.len()).filter(|&ix| items[ix].depth == depth).collect();
         let mut groups: Vec<&[crate::finder::OutlineItem]> = starts.iter().enumerate().map(|(n, &at)| &items[at..starts.get(n + 1).copied().unwrap_or(items.len())]).collect();
-        let name = |item: &crate::finder::OutlineItem| item.label.rsplit(' ').next().unwrap_or_default().to_lowercase();
+        let name = |item: &crate::finder::OutlineItem| item.name.to_lowercase();
         groups.sort_by_cached_key(|group| name(&group[0]));
         // What comes before the first of this depth is deeper and has no one above it: it stays first.
         sort_rest(&items[..starts.first().copied().unwrap_or(0)], out);
@@ -2242,10 +2242,10 @@ mod structure_tests {
 
     #[test]
     fn an_outline_by_name_keeps_what_is_declared_in_each() {
-        let item = |depth: usize, name: &str, line: u32| OutlineItem { depth, label: format!("fn {name}"), line, end: line, private: false };
+        let item = |depth: usize, name: &str, line: u32| OutlineItem { depth, kind: "fn".into(), name: name.into(), line, end: line, private: false };
         let file = vec![item(0, "Zeta", 0), item(1, "run", 1), item(1, "Add", 2), item(0, "alpha", 3), item(0, "Beta", 4), item(1, "x", 5)];
         let shown = sorted_by_name(file);
-        let names: Vec<(usize, &str)> = shown.iter().map(|i| (i.depth, i.label.rsplit(' ').next().unwrap())).collect();
+        let names: Vec<(usize, &str)> = shown.iter().map(|i| (i.depth, i.name.as_str())).collect();
         assert_eq!(names, [(0, "alpha"), (0, "Beta"), (1, "x"), (0, "Zeta"), (1, "Add"), (1, "run")]);
         // The cursor on line 2 is in Add, wherever that is in the list.
         assert_eq!(at_cursor(&shown, 2).map(|ix| shown[ix].line), Some(2));

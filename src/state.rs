@@ -645,6 +645,17 @@ pub struct TabSession {
     /// A file shown drawn, beside its text or instead of it: "split", "preview".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub look: Option<String>,
+    /// What is folded in a file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub folds: Vec<SavedFold>,
+}
+
+/// A fold by its first line, and that line's words: the file may have
+/// changed by the time it opens again.
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq, Debug)]
+pub struct SavedFold {
+    pub line: u32,
+    pub text: String,
 }
 
 /// A Web tab's screen, colors and DevTools, kept with the session.
