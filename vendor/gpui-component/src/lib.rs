@@ -100,6 +100,8 @@ pub use element_ext::*;
 pub use global_state::GlobalState;
 pub use gpui_base::Root;
 pub use gpui_base::animation;
+/// ideae patch: plain text the window's selection reaches.
+pub use gpui_base::{SelectableText, TextSelection};
 pub use gpui_base::{
     AxisExt, Edges, FocusTrapElement, InteractiveElementExt, LengthExt, Measure, OngoingScrollExt,
     Placement, Side, measure, measure_if,

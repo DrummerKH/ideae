@@ -110,14 +110,8 @@ impl TaskView {
                     h_flex()
                         .gap_1()
                         .items_start()
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .text_xs()
-                                .text_color(if ok { gpui_kit::green() } else { gpui_kit::red() })
-                                .child(message.lines().find(|l| !l.trim().is_empty()).unwrap_or_default().to_string()),
-                        )
+                        // All of it: what git says first is seldom why.
+                        .child(div().flex_1().min_w_0().child(crate::copying::message("git-action-message", message.trim().to_string(), if ok { gpui_kit::green() } else { gpui_kit::red() }, cx)))
                         .when(self.discard_undo.is_some(), |row| {
                             row.child(
                                 Button::new("undo-discard")
@@ -335,6 +329,7 @@ impl TaskView {
                     }))
                 };
                 let name = stash.name.clone();
+                let what = stash.what.to_string();
                 (
                     h_flex()
                         .id(group.clone())
@@ -363,6 +358,7 @@ impl TaskView {
                                 .child(act("stash-drop", "Drop", "Throw it away", stash.clone(), cx)),
                         )
                         .on_click(cx.listener(move |this, _, window, cx| this.show_stash(name.clone(), window, cx)))
+                        .context_menu(move |menu, _, _| menu.item(crate::copying::item("Copy message", what.clone())))
                 )
                 .into_any_element()
         }
@@ -1097,7 +1093,7 @@ impl TaskView {
     /// commits its opposite, 2 starts a task from it. A conflict changes
     /// nothing and goes to the agent as a request.
     pub fn commit_action(&mut self, what: u8, hash: String, window: &mut Window, cx: &mut Context<Self>) {
-        let short = hash[..hash.len().min(8)].to_string();
+        let short = hash.get(..8).unwrap_or(&hash).to_string();
         match what {
             2 => {
                 let copy_env = crate::state::settings().copy_env;

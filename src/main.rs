@@ -4,6 +4,7 @@
 mod acp;
 mod agent;
 mod battery;
+mod copying;
 mod agents;
 mod awake;
 mod archive;

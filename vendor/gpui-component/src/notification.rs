@@ -417,6 +417,11 @@ impl Render for Notification {
             Some(type_) => Some(type_.icon(cx)),
         };
         let has_icon = icon.is_some();
+        let copied = match (&self.title, &self.message) {
+            (Some(title), Some(message)) => Some(format!("{title}\n{message}")),
+            (Some(text), None) | (None, Some(text)) => Some(text.to_string()),
+            (None, None) => None,
+        };
         let placement = self.placement.unwrap_or(cx.theme().notification.placement);
 
         BaseToast::new("notification")
@@ -443,11 +448,12 @@ impl Render for Notification {
                     .flex_1()
                     .overflow_hidden()
                     .when(has_icon, |this| this.pl_6())
+                    // ideae patch: what a notice says can be selected and copied.
                     .when_some(self.title.clone(), |this, title| {
-                        this.child(div().text_sm().font_semibold().child(title))
+                        this.child(div().text_sm().font_semibold().child(gpui_base::SelectableText::new("notification-title", title)))
                     })
                     .when_some(self.message.clone(), |this, message| {
-                        this.child(div().text_sm().child(message))
+                        this.child(div().text_sm().child(gpui_base::SelectableText::new("notification-message", message)))
                     })
                     .when_some(content, |this, content| this.child(content)),
             )
@@ -459,6 +465,20 @@ impl Render for Notification {
                     .right_1()
                     .invisible()
                     .group_hover("", |this| this.visible())
+                    .flex()
+                    .gap_0p5()
+                    .when_some(copied, |this, text| {
+                        this.child(
+                            Button::new("copy")
+                                .icon(IconName::Copy)
+                                .ghost()
+                                .xsmall()
+                                .on_click(move |_, _, cx| {
+                                    cx.stop_propagation();
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
+                                }),
+                        )
+                    })
                     .child(
                         Button::new("close")
                             .icon(IconName::Close)
@@ -472,6 +492,10 @@ impl Render for Notification {
             )
             .when_some(self.on_click.clone(), |this, on_click| {
                 this.on_click(cx.listener(move |view, event, window, cx| {
+                    // ideae patch: the end of selecting its text is no click on it.
+                    if gpui_base::TextSelection::has_selection(window, cx) {
+                        return;
+                    }
                     view.dismiss(window, cx);
                     on_click(event, window, cx);
                 }))

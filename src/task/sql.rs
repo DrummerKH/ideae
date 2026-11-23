@@ -2091,7 +2091,7 @@ impl FileView {
                 .gap_3()
                 .items_start()
                 .child(div().flex_none().text_color(muted).child(line.at.clone()))
-                .child(div().flex_1().min_w_0().text_color(color).child(line.text.clone()))
+                .child(div().flex_1().min_w_0().text_color(color).child(crate::copying::text(("sql-log-text", ix), line.text.clone())))
                 .when_some(place, |row, place| {
                     row.child(Button::new(("sql-log-go", ix)).xsmall().ghost().label("Go to").on_click(cx.listener(move |this, _, window, cx| this.go_to_statement(place.clone(), window, cx))))
                 })

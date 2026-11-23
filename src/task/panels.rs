@@ -231,6 +231,14 @@ impl TaskView {
             let to_right = !t.closed_together(pane, |ix, _| ix > from, cx).is_empty();
             let all = !t.closed_together(pane, |_, _| true, cx).is_empty();
             let close = tab.is_some_and(closable);
+            let paths = tab.and_then(|tab| match &tab.kind {
+                TabKind::File(file) => {
+                    let path = file.read(cx).path.clone();
+                    let relative = path.strip_prefix(&t.root).unwrap_or(&path).display().to_string();
+                    Some((path.display().to_string(), relative))
+                }
+                _ => None,
+            });
             let act = |label: &'static str, f: fn(&mut TaskView, Option<usize>, Pane, &mut Window, &mut Context<TaskView>)| {
                 let view = view.downgrade();
                 PopupMenuItem::new(label).on_click(move |_, window, cx| {
@@ -255,6 +263,9 @@ impl TaskView {
                     })
                     .when(all, |menu| menu.item(act("Close all", |t, _, pane, window, cx| t.close_many(pane, |_, _| true, window, cx))))
                     .when(close || others || to_right || all, |menu| menu.separator())
+                    .when_some(paths, |menu, (path, relative)| {
+                        menu.item(crate::copying::item("Copy path", path)).item(crate::copying::item("Copy relative path", relative)).separator()
+                    })
                     .item(act(if pinned { "Unpin" } else { "Pin" }, |t, id, _, _, cx| {
                         if let Some(id) = id {
                             t.toggle_pin(id, cx)
@@ -358,6 +369,10 @@ impl TaskView {
                                                 }
                                                 file.update(cx, |f, cx| f.go_to_line(line, 0, window, cx));
                                             }))
+                                            .context_menu({
+                                                let name = name.to_string();
+                                                move |menu, _, _| menu.item(crate::copying::item("Copy name", name.clone()))
+                                            })
                                     })
                                     .collect::<Vec<_>>()
                             }),

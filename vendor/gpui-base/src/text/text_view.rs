@@ -113,6 +113,13 @@ pub(crate) type LinkClickHandlerFn =
 /// may hold a `ScrollHandle`.
 pub(crate) type RevealHandlerFn = dyn Fn(Bounds<Pixels>, &mut Window, &mut App);
 
+/// ideae patch: the buttons that follow a link. A link answers the release,
+/// and the mouse's Back goes to a page while it is held: let go, it would
+/// follow whatever link of that page is now under the pointer.
+pub(crate) fn follows_links(button: MouseButton) -> bool {
+    matches!(button, MouseButton::Left | MouseButton::Middle)
+}
+
 pub(crate) fn handle_link_click(
     handler: &Option<Arc<LinkClickHandlerFn>>,
     url: SharedString,
@@ -120,15 +127,16 @@ pub(crate) fn handle_link_click(
     window: &mut Window,
     cx: &mut App,
 ) {
-    if let Some(handler) = handler {
-        handler(&url, &event, window, cx);
-    } else if match &event {
-        ClickEvent::Mouse(click) => {
-            matches!(click.up.button, MouseButton::Left | MouseButton::Middle)
-        }
+    let follows = match &event {
+        ClickEvent::Mouse(click) => follows_links(click.up.button),
         ClickEvent::Keyboard(_) => true,
         ClickEvent::Touch(click) => !click.long_press,
-    } {
+    };
+    if let Some(handler) = handler {
+        if follows || !matches!(event, ClickEvent::Mouse(_)) {
+            handler(&url, &event, window, cx);
+        }
+    } else if follows {
         cx.open_url(&url);
     }
 }

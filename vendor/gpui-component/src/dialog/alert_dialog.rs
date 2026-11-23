@@ -174,9 +174,9 @@ impl AlertDialog {
 
     /// Sets the description of the alert dialog.
     #[track_caller]
-    pub fn description(mut self, description: impl IntoElement) -> Self {
+    pub fn description(mut self, description: impl super::DialogText) -> Self {
         self.debug_assert_no_trigger();
-        self.description = Some(description.into_any_element());
+        self.description = Some(description.into_description());
         self
     }
 

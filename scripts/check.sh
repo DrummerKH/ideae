@@ -18,6 +18,7 @@ done
 [ -n "$chrome" ] || echo "no Chrome or Chromium here: the browser's tests are skipped (name one in IDEAE_CHROME)" >&2
 
 cargo build
+scripts/string-slices.sh
 cargo test
 cargo test -- --ignored \
   an_acp_agent \

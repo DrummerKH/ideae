@@ -18,6 +18,7 @@ pub enum TaskCommand {
     Star,
     Rename,
     CopyBranchName,
+    CopyTitle,
     AnotherVariant,
     KeepVariant,
     Pause,
@@ -41,6 +42,7 @@ impl TaskCommand {
             Star => "Star Task",
             Rename => "Rename Task…",
             CopyBranchName => "Copy Branch Name",
+            CopyTitle => "Copy Title",
             AnotherVariant => "Another Variant…",
             KeepVariant => "Keep Only This Variant…",
             Pause => "Pause Task",
@@ -233,7 +235,7 @@ impl InHand {
     pub fn allows(&self, what: TaskCommand) -> bool {
         use TaskCommand::*;
         match what {
-            Star | CopyBranchName => true,
+            Star | CopyBranchName | CopyTitle => true,
             Rename => !self.main,
             Archive | Defer | AnotherVariant => !self.main && !self.side && self.ready,
             RemoveSide => self.side && self.ready,
@@ -308,6 +310,11 @@ impl Workspace {
             CompareWithBranch => in_view(|t, window, cx| t.compare_with_dialog(None, window, cx), window, cx),
             CompareThisFile => in_view(crate::task::TaskView::compare_open_file, window, cx),
             Star => self.toggle_star(&path, cx),
+            CopyTitle => {
+                if let Some((pi, ti)) = self.find(&path) {
+                    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(self.task_title(pi, ti, cx)));
+                }
+            }
             CopyBranchName => {
                 if let Some((pi, ti)) = self.find(&path) {
                     cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(self.projects[pi].tasks[ti].branch.clone()));

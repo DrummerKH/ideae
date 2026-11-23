@@ -526,7 +526,7 @@ impl FileView {
         let text = if info.uncommitted() {
             "not committed yet".to_string()
         } else {
-            format!("{}, {} · {} · {}", info.author, git::ago(info.time), info.summary, &info.hash[..8])
+            format!("{}, {} · {} · {}", info.author, git::ago(info.time), info.summary, info.hash.get(..8).unwrap_or(&info.hash))
         };
         let task = self.task.clone();
         let hash = info.hash.clone();
@@ -1101,11 +1101,11 @@ impl Render for FileView {
                             .flex_none()
                             .max_w(relative(0.45))
                             .truncate()
-                            .child(if crate::db::scratch::is_scratch(&self.path) {
+                            .child(crate::copying::text("file-path", if crate::db::scratch::is_scratch(&self.path) {
                                 format!("Scratch: {}", self.path.file_name().unwrap_or_default().to_string_lossy())
                             } else {
                                 self.path.strip_prefix(&self.root).unwrap_or(&self.path).display().to_string()
-                            }),
+                            })),
                     )
                     .children(self.render_blame(cx))
                     .children(self.render_look_switch(cx))
@@ -1212,7 +1212,7 @@ impl Render for FileView {
                 )
             })
             .when_some(self.error.clone(), |this, error| {
-                this.child(div().px_3().py_1().text_xs().text_color(gpui_kit::red()).child(error))
+                this.child(div().px_3().py_1().child(crate::copying::message("file-error", error, gpui_kit::red(), cx)))
             })
             .when(veil, |this| {
                 this.child(

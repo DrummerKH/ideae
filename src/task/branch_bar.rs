@@ -115,12 +115,20 @@ impl TaskView {
             })
             .child(
                 div()
+                    .id("branch-last-commit")
                     .flex_1()
                     .min_w_0()
                     .truncate()
                     .text_color(cx.theme().muted_foreground)
                     .cursor_pointer()
-                    .when(!b.last_hash.is_empty(), |line| line.child(format!("· {} {}", b.last_hash, b.last_subject))),
+                    .when(!b.last_hash.is_empty(), |line| line.child(format!("· {} {}", b.last_hash, b.last_subject)))
+                    .context_menu({
+                        let (head, hash, subject) = (b.head.clone(), b.last_hash.clone(), b.last_subject.clone());
+                        move |menu, _, _| {
+                            menu.when(!hash.is_empty(), |menu| menu.item(crate::copying::item("Copy hash", hash.clone())).item(crate::copying::item("Copy subject", subject.clone())))
+                                .item(crate::copying::item("Copy branch name", head.clone()))
+                        }
+                    }),
             )
             .when(!b.last_hash.is_empty(), |bar| {
                 bar.child(

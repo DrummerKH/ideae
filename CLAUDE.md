@@ -51,8 +51,10 @@ src/task/          one task, a module: what is private to it is seen by all of i
   bookmarks.rs     bookmarked lines: toggle, next/previous, the task's list
   change_tree.rs   the changed files as a tree
   file_tree.rs     the Files panel: names colored by git status, ignored folders read when opened
+  unicode_tests.rs  everything that cuts text, run at every position of text in many scripts
   helpers.rs       patches parsed for the panels, symbol search, definition providers
   outline.rs       a file's structure: a query per language (`queries/outline/`, each with its case in `cases.txt`), regions, a `.sql` file's statements
+src/copying.rs     text taken out of the app: selectable text, Copy items of menus, an error shown whole
 src/menu.rs        the macOS menu bar, kept short: tasks, git and the window, not the editor's commands
 src/commands.rs    the commands on a task, its project, its variants, its git: names and what allows them, for the menu bar, the sidebar and the palette
 src/file_icons.rs  file and folder icons (assets/file-icons, JetBrains' new UI), by name
@@ -163,6 +165,7 @@ IDEAE_STATE=/tmp/x/state.json scripts/drive.sh /tmp/x/run.log 7 \
 - The repository is public: no personal paths, hostnames, emails or private project names in code, tests or commits.
 - Agents and terminals belong to tasks; whatever a task starts must end on Pause, Archive and quit.
 - No comments unless the why is non-obvious.
+- Text is Unicode, in any language. A byte offset is valid only if it came from that same text (a `find`, `char_indices`, a match). Never cut `str`, `String` or `Rope` at a computed one (`n`, `len - n`, `start - 64`): use `chars().take(n)`, `str::get`, or step to `is_char_boundary`. An editor column counts characters, not bytes. Whatever cuts or measures text gets a case in `task/unicode_tests.rs`. `scripts/string-slices.sh` (in `check.sh`) fails on a new raw slice of a string; one whose offset came from that same text is recorded with `--update`.
 
 ## Speed and memory
 

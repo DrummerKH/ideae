@@ -548,7 +548,11 @@ impl Workspace {
                         let path = t.path.clone();
                         row.on_hover(cx.listener(move |this, on: &bool, _, cx| this.hover_answer(&path, n, *on, cx)))
                     })
-                    .on_click(cx.listener(move |this, _, window, cx| this.show_question(&path, n, window, cx))),
+                    .on_click(cx.listener(move |this, _, window, cx| this.show_question(&path, n, window, cx)))
+                    .context_menu({
+                        let (title, answer) = (q.title.clone(), q.answer.clone());
+                        move |menu, _, _| menu.item(crate::copying::item("Copy title", title.clone())).when(!answer.is_empty(), |menu| menu.item(crate::copying::item("Copy answer", answer.clone())))
+                    }),
             );
         }
         rail
@@ -927,6 +931,7 @@ impl Workspace {
 
     /// What a right click on a task offers: the same from its row in the list and from the rail.
     fn task_menu(&self, pi: usize, ti: usize, cx: &mut Context<Self>) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        let task_title = self.task_title(pi, ti, cx);
         let t = &self.projects[pi].tasks[ti];
         let path = t.path.clone();
         let several = crate::state::with_settings(|s| s.several_agents());
@@ -956,6 +961,7 @@ impl Workspace {
             .item(PopupMenuItem::new(named(T::Star)).on_click(move |_, _, cx| {
                 let _ = a.update(cx, |w, cx| w.toggle_star(&pa, cx));
             }))
+            .item(crate::copying::item(named(T::CopyTitle), task_title.clone()))
             .item(PopupMenuItem::new(named(T::CopyBranchName)).on_click(move |_, _, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(branch.clone()));
             }))
@@ -1233,7 +1239,11 @@ impl Workspace {
                         } else {
                             this.show_question(&open, n, window, cx)
                         }
-                    })),
+                    }))
+                    .context_menu({
+                        let (title, answer) = (q.title.clone(), q.answer.clone());
+                        move |menu, _, _| menu.item(crate::copying::item("Copy title", title.clone())).when(!answer.is_empty(), |menu| menu.item(crate::copying::item("Copy answer", answer.clone())))
+                    }),
             );
         }
         list

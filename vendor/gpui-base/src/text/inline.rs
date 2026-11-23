@@ -1423,7 +1423,10 @@ impl Element for Inline {
                 let link_click_handler = self.link_click_handler.clone();
 
                 move |event: &MouseUpEvent, phase, window, cx| {
-                    if !phase.bubble() || !hitbox.is_hovered(window) {
+                    if !phase.bubble()
+                        || !hitbox.is_hovered(window)
+                        || !crate::text::text_view::follows_links(event.button)
+                    {
                         return;
                     }
                     if text_view_state

@@ -371,6 +371,7 @@ impl Element for InlineObject {
             window.on_mouse_event(move |event: &gpui::MouseUpEvent, phase, window, cx| {
                 if !phase.bubble()
                     || !link_hitbox.is_hovered(window)
+                    || !super::text_view::follows_links(event.button)
                     || link_view
                         .as_ref()
                         .is_some_and(|view| view.read(cx).has_selection(cx))

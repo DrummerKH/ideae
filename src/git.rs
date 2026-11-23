@@ -2059,7 +2059,7 @@ pub fn replay_commit(root: &Path, hash: &str, revert: bool) -> Result<String, Re
     let mut all = args.to_vec();
     all.push(hash);
     match run(root, "git", &all) {
-        Ok(_) => Ok(if revert { format!("Reverted {}", &hash[..hash.len().min(8)]) } else { format!("Picked {}", &hash[..hash.len().min(8)]) }),
+        Ok(_) => Ok(if revert { format!("Reverted {}", hash.get(..8).unwrap_or(hash)) } else { format!("Picked {}", hash.get(..8).unwrap_or(hash)) }),
         Err(e) => {
             let conflicts: Vec<String> = git(root, &["diff", "--name-only", "--diff-filter=U"]).unwrap_or_default().lines().map(str::to_string).collect();
             let _ = run(root, "git", &[verb, "--abort"]);
@@ -2075,7 +2075,7 @@ pub fn replay_commit(root: &Path, hash: &str, revert: bool) -> Result<String, Re
 /// the app then shows it as a task.
 pub fn commit_worktree(root: &Path, hash: &str, copy_env: bool) -> Result<PathBuf, String> {
     let repo = main_worktree(root).ok_or("not a git repository")?;
-    worktree_at(&repo, &format!("from-{}", &hash[..hash.len().min(8)]), hash, copy_env)
+    worktree_at(&repo, &format!("from-{}", hash.get(..8).unwrap_or(hash)), hash, copy_env)
 }
 
 /// Fetches the base and rebases the branch onto it, uncommitted changes

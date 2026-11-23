@@ -759,6 +759,23 @@ mod tests {
     }
 
     #[test]
+    fn every_place_of_a_text_in_many_scripts() {
+        let text = "Привет, мир — «слово» 你好 🎉👍🏽 é\n\tfn main() { let ñ = \"строка\"; }\n\n// комментарий 🎉\nконец";
+        let rope = Rope::from(text);
+        let before = seen(&text.replace("слово", "дело"), Vec::new());
+        for cursor in text.char_indices().map(|(at, _)| at).chain([text.len()]) {
+            for format in [Format::Sweep, Format::Zeta] {
+                let prompt = build(&Ask { format, path: "a.rs", root: "r", text: &rope, cursor, seen: &before, with_context: true });
+                let reply = text.replace("мир", "мир 🎉").replace("строка", "текст");
+                if let Some(answer) = parse(&prompt, &rope, &reply) {
+                    assert!(text.is_char_boundary(answer.range.start) && text.is_char_boundary(answer.range.end));
+                    let _ = prediction(&rope, cursor, answer);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn edits_a_second_apart_are_separate_changes() {
         let path: Arc<str> = "src/a.rs".into();
         let mut tracker = Tracker::default();

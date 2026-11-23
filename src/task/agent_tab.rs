@@ -540,7 +540,7 @@ impl TaskView {
                 .border_b_1()
                 .border_color(cx.theme().border)
                 .child(svg().path("side-icons/message-circle-question-mark.svg").size(px(14.)).flex_none().text_color(cx.theme().muted_foreground))
-                .child(div().flex_1().min_w_0().truncate().text_color(cx.theme().muted_foreground).child(title))
+                .child(div().flex_1().min_w_0().truncate().text_color(cx.theme().muted_foreground).child(crate::copying::text("question-title", title)))
                 .when(lost, |bar| bar.child(div().flex_none().text_color(cx.theme().warning).child("Its earlier conversation was not found: this one starts over")))
                 .child(
                     Button::new("question-to-task")

@@ -304,7 +304,7 @@ impl Workspace {
                 .detail(crate::commands::git_hint(what))
             };
             use T::*;
-            of_task.extend([NewTerminal, NewBrowserTab, RestartAgent, CompareThisFile, Star, CopyBranchName, Rename, AnotherVariant, KeepVariant, StartServices, StopServices, Pause, Archive, Defer, RemoveSide].into_iter().filter(|what| hand.is_some_and(|t| t.allows(*what))).map(task));
+            of_task.extend([NewTerminal, NewBrowserTab, RestartAgent, CompareThisFile, Star, CopyTitle, CopyBranchName, Rename, AnotherVariant, KeepVariant, StartServices, StopServices, Pause, Archive, Defer, RemoveSide].into_iter().filter(|what| hand.is_some_and(|t| t.allows(*what))).map(task));
             of_git = G::ALL.into_iter().filter(|what| hand.is_some_and(|t| t.git(*what))).map(git).collect();
         }
         let mut entries = vec![

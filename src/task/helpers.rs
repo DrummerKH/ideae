@@ -459,7 +459,8 @@ pub(super) fn plain_parent(text: &str, range: std::ops::Range<usize>) -> std::op
     let line_end = text[range.end..].find('\n').map_or(text.len(), |i| range.end + i);
     if range.is_empty() {
         let is_word = |c: char| c.is_alphanumeric() || c == '_';
-        let start = text[..range.start].rfind(|c: char| !is_word(c)).map_or(0, |i| i + 1);
+        // Past the character before the word, which may be of several bytes (`«`, `—`).
+        let start = text[..range.start].char_indices().rev().find(|(_, c)| !is_word(*c)).map_or(0, |(i, c)| i + c.len_utf8());
         let end = text[range.end..].find(|c: char| !is_word(c)).map_or(text.len(), |i| range.end + i);
         if start < end {
             return start..end;
@@ -617,6 +618,24 @@ pub(super) fn symbol_source(root: PathBuf, clients: Vec<Arc<lsp::LspClient>>, fi
         hits.truncate(LIMIT);
         hits
     })
+}
+
+#[cfg(test)]
+mod markdown_link_tests {
+    use super::markdown_link_at;
+
+    #[test]
+    fn a_link_is_found_under_the_pointer() {
+        let line = "Весь план готов, см. [PLAN.md](docs/PLAN.md#top \"t\"). Задачи";
+        let inside = line.find("PLAN").unwrap();
+        let (bytes, target) = markdown_link_at(line, inside).unwrap();
+        assert_eq!((&line[bytes], target), ("[PLAN.md](docs/PLAN.md#top \"t\")", "docs/PLAN.md"));
+        assert!(markdown_link_at(line, 0).is_none());
+        assert!(markdown_link_at("[a](https://example.com)", 1).is_none());
+        assert!(markdown_link_at("[a](#here)", 1).is_none());
+        let two = "[a](a.md) and [b](b.md)";
+        assert_eq!(markdown_link_at(two, two.find("[b").unwrap()).unwrap().1, "b.md");
+    }
 }
 
 #[cfg(test)]
@@ -984,6 +1003,52 @@ pub(super) fn is_at(target: lsp_types::Range, pos: Position) -> bool {
     key(target.start) <= key(pos) && key(pos) <= key(target.end)
 }
 
+/// The link of Markdown around `at` in `line`: `[label](target)`, the bytes
+/// of all of it and where it leads. A web address or a place in this file is
+/// not a file to open.
+pub(super) fn markdown_link_at(line: &str, at: usize) -> Option<(std::ops::Range<usize>, &str)> {
+    let mut from = 0;
+    while let Some(found) = line.get(from..)?.find("](") {
+        let middle = from + found;
+        let close = middle + 2 + line[middle + 2..].find(')')?;
+        let open = line[..middle].rfind('[');
+        if let Some(open) = open.filter(|&open| open <= at && at <= close) {
+            let target = line[middle + 2..close].split_whitespace().next()?.trim_matches(['<', '>']);
+            let target = target.split('#').next()?;
+            return (!target.is_empty() && !target.contains("://")).then_some((open..close + 1, target));
+        }
+        from = close + 1;
+    }
+    None
+}
+
+impl UsagesAtDeclaration {
+    /// In a Markdown file, Ctrl+click on a link goes to the file it names.
+    fn markdown_link(&self, text: &Rope, offset: usize, cx: &mut App) -> Option<Task<anyhow::Result<Vec<lsp_types::LocationLink>>>> {
+        if lsp::language_for(&self.path) != "markdown" {
+            return None;
+        }
+        let row = text.offset_to_point(offset).row;
+        let start = text.line_start_offset(row);
+        let line = text.slice_line(row).to_string();
+        let (bytes, target) = markdown_link_at(&line, offset.checked_sub(start)?)?;
+        let file = self.path.parent()?.join(target);
+        let origin = lsp_types::Range { start: text.offset_to_position(start + bytes.start), end: text.offset_to_position(start + bytes.end) };
+        Some(cx.background_spawn(async move {
+            if !file.is_file() {
+                return Ok(Vec::new());
+            }
+            let at = lsp_types::Range::default();
+            Ok(vec![lsp_types::LocationLink {
+                origin_selection_range: Some(origin),
+                target_uri: lsp::path_to_uri(&file).parse()?,
+                target_range: at,
+                target_selection_range: at,
+            }])
+        }))
+    }
+}
+
 impl DefinitionProvider for UsagesAtDeclaration {
     fn definitions(
         &self,
@@ -992,6 +1057,9 @@ impl DefinitionProvider for UsagesAtDeclaration {
         window: &mut Window,
         cx: &mut App,
     ) -> Task<anyhow::Result<Vec<lsp_types::LocationLink>>> {
+        if let Some(link) = self.markdown_link(text, offset, cx) {
+            return link;
+        }
         let pos = text.offset_to_position(offset);
         let found = self.inner.definitions(text, offset, window, cx);
         let path = self.path.clone();
@@ -1021,6 +1089,12 @@ pub(super) struct SearchDefinitionProvider {
     pub(super) files: Arc<std::sync::RwLock<Arc<Vec<String>>>>,
 }
 
+/// Up to `bytes` of `text` before `at`, from a whole character.
+pub(super) fn text_before(text: &Rope, at: usize, bytes: usize) -> String {
+    let from = (at.saturating_sub(bytes)..=at).find(|&from| text.is_char_boundary(from)).unwrap_or(at);
+    text.slice(from..at).to_string()
+}
+
 impl DefinitionProvider for SearchDefinitionProvider {
     fn definitions(
         &self,
@@ -1032,7 +1106,7 @@ impl DefinitionProvider for SearchDefinitionProvider {
         let Some(range) = text.word_range(offset) else { return Task::ready(Ok(Vec::new())) };
         let word = text.slice(range.clone()).to_string();
         // `Model.silentFail`: the member of that class, not any silentFail.
-        let before = text.slice(range.start.saturating_sub(64)..range.start).to_string();
+        let before = text_before(text, range.start, 64);
         let symbol = match before.strip_suffix('.') {
             Some(prefix) => {
                 let class: String = prefix.chars().rev().take_while(|c| c.is_alphanumeric() || *c == '_').collect::<Vec<_>>().into_iter().rev().collect();

@@ -70,7 +70,7 @@ fn parse(v: &Value) -> Option<Release> {
 
 /// "15.11 11:32" from a tag.
 pub fn when(tag: &str) -> String {
-    if tag.len() == 14 {
+    if tag.len() == 14 && tag.is_ascii() {
         format!("{}.{} {}:{}", &tag[6..8], &tag[4..6], &tag[8..10], &tag[10..12])
     } else {
         tag.to_string()

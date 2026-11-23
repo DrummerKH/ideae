@@ -189,7 +189,7 @@ impl TaskView {
         let shown = if rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_hexdigit()) { rev[..10].to_string() } else { rev.clone() };
         let named = shown.clone();
         let source: DiffSource = std::sync::Arc::new(move || match git::work_of(&root, &rev, file.as_deref()) {
-            Some((patch, base)) => (format!("what {named} did since {}, with what is not committed there yet", &base[..base.len().min(10)]), patch),
+            Some((patch, base)) => (format!("what {named} did since {}, with what is not committed there yet", base.get(..10).unwrap_or(&base)), patch),
             None => (
                 match &file {
                     Some(file) => format!("{file}: {named} on the left, as it is now on the right"),

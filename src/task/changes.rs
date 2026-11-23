@@ -658,7 +658,9 @@ impl Render for ChangesView {
                 .on_action(cx.listener(|this, _: &SendDiffToAgent, window, cx| this.send_selection(window, cx)))
                 .on_action(cx.listener(|this, _: &CommentOnDiff, window, cx| this.comment_selection(window, cx)))
                 .context_menu(|menu, _, _| {
-                    menu.menu("Comment on selected lines…", Box::new(CommentOnDiff))
+                    menu.menu("Copy", Box::new(gpui_kit::component::input::Copy))
+                        .separator()
+                        .menu("Comment on selected lines…", Box::new(CommentOnDiff))
                         .menu("Send selected lines to Agent", Box::new(SendDiffToAgent))
                 })
                 .map(|this| {

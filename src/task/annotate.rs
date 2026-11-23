@@ -178,7 +178,7 @@ impl FileView {
                         .shadow_md()
                         .child(div().font_weight(FontWeight::SEMIBOLD).child(line.summary.clone()))
                         .child(format!("{} · {} ({})", line.author, day(line.time), git::ago(line.time)))
-                        .child(div().text_color(cx.theme().muted_foreground).child(format!("{} · click to open", &line.hash[..line.hash.len().min(10)]))),
+                        .child(div().text_color(cx.theme().muted_foreground).child(format!("{} · click to open", line.hash.get(..10).unwrap_or(&line.hash)))),
                 ),
             )
             .into_any_element(),

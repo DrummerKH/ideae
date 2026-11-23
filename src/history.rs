@@ -657,9 +657,9 @@ impl HistoryView {
                                             Some((to + offset, SharedString::from(format!("Goes on {rows_away} rows {way}, to {} {}. Click to go there.", target.short, target.subject))))
                                         });
                                         let dim = found.as_ref().is_some_and(|f| f.binary_search(&ix).is_err());
-                                        return graph_row(ix, commit, row, *lanes, palette, selected == Some(ix), dim, jump, owner, cx);
+                                        return commit_menu(ix, commit, graph_row(ix, commit, row, *lanes, palette, selected == Some(ix), dim, jump, owner, cx));
                                     }
-                                    ListItem::new(ix)
+                                    let item = ListItem::new(ix)
                                         .selected(selected == Some(ix))
                                         .h_12()
                                         .px_3()
@@ -695,7 +695,8 @@ impl HistoryView {
                                         .on_click(move |_, _, cx| {
                                             let _ = owner.update(cx, |this, cx| this.select(ix, cx));
                                         })
-                                        .into_any_element()
+                                        .into_any_element();
+                                    commit_menu(ix, commit, item)
                                 })
                                 .collect()
                         })
@@ -769,7 +770,7 @@ impl HistoryView {
                         cx.notify();
                     }))
                 })
-                .child(if branches.len() > FEW && !open { format!("{told} ▾") } else { told })
+                .child(crate::copying::text("commit-branches-text", if branches.len() > FEW && !open { format!("{told} ▾") } else { told }))
                 .into_any_element(),
         )
     }
@@ -792,7 +793,7 @@ impl HistoryView {
                         .when(open, |d| d.max_h(window.viewport_size().height * 0.4).overflow_y_scroll())
                         .text_sm()
                         .text_color(cx.theme().foreground.opacity(0.85))
-                        .children(shown.iter().map(|line| if line.trim().is_empty() { div().h_2().into_any_element() } else { div().child(line.clone()).into_any_element() })),
+                        .child(crate::copying::text("commit-body-text", shown.join("\n"))),
                 )
                 .when(long, |this| {
                     this.child(
@@ -848,10 +849,10 @@ impl Render for HistoryView {
                                 .gap_0p5()
                                 .border_b_1()
                                 .border_color(cx.theme().border)
-                                .child(div().font_semibold().child(c.subject.clone()))
+                                .child(div().font_semibold().child(crate::copying::text("commit-subject", c.subject.clone())))
                                 .children(self.render_body(&c.hash, window, cx))
                                 .children(self.render_containing(&c.hash, cx))
-                                .child(div().min_w_0().truncate().text_xs().text_color(cx.theme().muted_foreground).child(format!("{} · {} · {}", c.short, c.author, c.date)))
+                                .child(div().min_w_0().truncate().text_xs().text_color(cx.theme().muted_foreground).child(crate::copying::text("commit-meta", format!("{} · {} · {}", c.short, c.author, c.date))))
                                 // A narrow pane puts the buttons on more lines rather than cut their labels.
                                 .child(
                                     h_flex()
@@ -1024,6 +1025,23 @@ fn graph_row(
         )
         .on_click(move |_, _, cx| {
             let _ = owner.update(cx, |this, cx| this.select(ix, cx));
+        })
+        .into_any_element()
+}
+
+/// A commit's row, its right-click menu around it.
+fn commit_menu(ix: usize, commit: &git::Commit, row: AnyElement) -> AnyElement {
+    use gpui_kit::component::menu::ContextMenuExt as _;
+    let commit = commit.clone();
+    div()
+        .id(("commit-row", ix))
+        .w_full()
+        .child(row)
+        .context_menu(move |menu, _, _| {
+            menu.item(crate::copying::item("Copy hash", commit.hash.clone()))
+                .item(crate::copying::item("Copy short hash", commit.short.clone()))
+                .item(crate::copying::item("Copy subject", commit.subject.clone()))
+                .item(crate::copying::item("Copy author", commit.author.clone()))
         })
         .into_any_element()
 }

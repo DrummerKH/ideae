@@ -42,6 +42,8 @@ mod panes;
 use panes::Pane;
 mod git_ui;
 mod helpers;
+#[cfg(test)]
+mod unicode_tests;
 mod outline;
 mod term;
 mod chat;

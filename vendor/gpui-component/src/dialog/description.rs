@@ -5,6 +5,34 @@ use gpui_base::DialogDescription as BaseDialogDescription;
 
 use crate::{ActiveTheme as _, StyledExt as _};
 
+/// ideae patch: what a dialog says, selectable when it is text.
+pub trait DialogText {
+    fn into_description(self) -> AnyElement;
+}
+
+macro_rules! selectable_description {
+    ($($text:ty),*) => {$(
+        impl DialogText for $text {
+            fn into_description(self) -> AnyElement {
+                gpui_base::SelectableText::new("dialog-description", gpui::SharedString::from(self)).into_any_element()
+            }
+        }
+    )*};
+}
+selectable_description!(&'static str, String, gpui::SharedString);
+
+impl DialogText for AnyElement {
+    fn into_description(self) -> AnyElement {
+        self
+    }
+}
+
+impl DialogText for gpui::Div {
+    fn into_description(self) -> AnyElement {
+        self.into_any_element()
+    }
+}
+
 /// Description element for a dialog header.
 ///
 /// Typically used inside a DialogHeader component to provide additional context.

@@ -378,7 +378,7 @@ impl TaskView {
         let mut panel = v_flex().id("run-panel").size_full().overflow_y_scroll().track_scroll(&self.run_scroll).text_sm();
         panel = self.render_auto(panel, cx);
         if let Some(error) = &self.services_error {
-            panel = panel.child(div().px_3().py_2().text_xs().text_color(gpui_kit::red()).child(error.clone()));
+            panel = panel.child(div().px_3().py_2().child(crate::copying::message("services-error", error.clone(), gpui_kit::red(), cx)));
         }
         if self.services.is_empty() {
             panel = panel.child(
