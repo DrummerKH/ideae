@@ -12,7 +12,12 @@ impl TaskView {
     }
 
     pub fn open_file_as(&mut self, path: PathBuf, line: u32, col: u32, how: OpenAs, window: &mut Window, cx: &mut Context<Self>) {
-        self.record_nav(cx);
+        // A remote file read in the background, back here: taken whatever comes of it, so
+        // none is kept to be used later in place of a fresh read; recorded the first time.
+        let fetched = self.remote_texts.remove(&path);
+        if fetched.is_none() {
+            self.record_nav(cx);
+        }
         if let Some(ix) = self.tabs.iter().position(|t| match &t.kind {
             TabKind::File(f) => f.read(cx).path == path,
             TabKind::Binary(b) => b.read(cx).path == path,
@@ -35,7 +40,25 @@ impl TaskView {
             self.place_tab(TabItem::new(title, TabKind::Binary(view)), how, window, cx);
             return;
         }
-        let content = match read_text(&path) {
+        // A remote task's file comes from its host off the UI thread: opened once it is here.
+        let (read, disk_mtime) = match fetched {
+            Some((read, mtime)) => (read, Some(mtime)),
+            None if crate::hosts::is_remote(&path) => {
+                let at = path.clone();
+                cx.spawn_in(window, async move |this, cx| {
+                    let file = at.clone();
+                    let read = cx.background_spawn(async move { (read_text(&file), super::file::mtime(&file)) }).await;
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.remote_texts.insert(at.clone(), read);
+                        this.open_file_as(at, line, col, how, window, cx);
+                    });
+                })
+                .detach();
+                return;
+            }
+            None => (read_text(&path), None),
+        };
+        let content = match read {
             Ok(content) => content,
             Err(reason) => {
                 let title = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -113,7 +136,8 @@ impl TaskView {
             editor: editor.clone(),
             indent,
             saved,
-            disk_mtime: mtime(&path),
+            // A remote file's, read with it off the UI thread.
+            disk_mtime: disk_mtime.unwrap_or_else(|| mtime(&path)),
             dirty: false,
             conflict: false,
             error: None,
@@ -453,6 +477,17 @@ const MAX_TEXT: u64 = 16 << 20;
 
 /// A file's text, or why it is not opened as text.
 fn read_text(path: &std::path::Path) -> Result<String, String> {
+    if crate::hosts::is_remote(path) {
+        let size = crate::hostfs::stat(path).map_err(|e| format!("Cannot read: {e}"))?.len;
+        if size > MAX_TEXT {
+            return Err(format!("{} file: too large to open here", human_size(size)));
+        }
+        return match crate::hostfs::read(path).map(String::from_utf8) {
+            Ok(Ok(content)) => Ok(content),
+            Ok(Err(_)) => Err(format!("Binary file, {}: not shown as text", human_size(size))),
+            Err(e) => Err(format!("Cannot read: {e}")),
+        };
+    }
     let size = std::fs::metadata(path).map_err(|e| format!("Cannot read: {e}"))?.len();
     if size > MAX_TEXT {
         return Err(format!("{} file: too large to open here", human_size(size)));

@@ -342,6 +342,19 @@ pub fn hooks() -> Option<Hooks> {
     HOOKS.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// The hooks of agents on other machines, by host: files and an
+/// ideae-server there ([`crate::daemon::install`]).
+static HOST_HOOKS: std::sync::RwLock<std::collections::BTreeMap<String, Hooks>> = std::sync::RwLock::new(std::collections::BTreeMap::new());
+
+#[cfg_attr(not(unix), allow(dead_code))]
+pub fn set_host_hooks(host: &str, hooks: Hooks) {
+    HOST_HOOKS.write().unwrap_or_else(|e| e.into_inner()).insert(host.to_string(), hooks);
+}
+
+pub fn host_hooks(host: &str) -> Option<Hooks> {
+    HOST_HOOKS.read().unwrap_or_else(|e| e.into_inner()).get(host).cloned()
+}
+
 /// One question, answered once, for the app.
 #[derive(Clone, Debug)]
 pub enum Ask {
@@ -608,6 +621,9 @@ pub struct Launch {
     /// A chat agent's choices for this task alone (a variant's model), over
     /// those the profile remembers.
     pub options: Vec<(String, String)>,
+    /// The machine it runs on, when another ([`crate::hosts`]): its hooks
+    /// are files there, and this machine's MCP server is not there.
+    pub host: Option<String>,
 }
 
 impl Launch {
@@ -615,9 +631,10 @@ impl Launch {
     /// are set before it, so that shell runs the command.
     pub fn command(&self) -> String {
         let adapter = self.profile.adapter();
+        let hooks = self.hooks();
         let command = match self.aside {
-            true => adapter.command(&Profile { command: adapter.aside(&self.profile.command), ..self.profile.clone() }, &self.start, false, hooks().as_ref()),
-            false => adapter.command(&self.profile, &self.start, self.unasked, hooks().as_ref()),
+            true => adapter.command(&Profile { command: adapter.aside(&self.profile.command), ..self.profile.clone() }, &self.start, false, hooks.as_ref()),
+            false => adapter.command(&self.profile, &self.start, self.unasked, hooks.as_ref()),
         };
         let made: Vec<String> = self
             .profile
@@ -635,7 +652,7 @@ impl Launch {
     /// token is in them, not on the command line, which other users of the
     /// machine see.
     pub fn env(&self, root: &Path) -> Vec<(String, String)> {
-        let hooks = hooks();
+        let hooks = self.hooks();
         let adapter = self.profile.adapter();
         let mut env = match self.aside {
             true => adapter.aside_env(&self.profile, hooks.as_ref()),
@@ -646,6 +663,14 @@ impl Launch {
         }
         env.extend(self.profile.env_vars().into_iter().filter(|(_, v)| crate::secrets::command_value(v).is_none()));
         env
+    }
+
+    /// The hooks it reports through: none for one on another machine.
+    pub fn hooks(&self) -> Option<Hooks> {
+        match &self.host {
+            Some(host) => host_hooks(host),
+            None => hooks(),
+        }
     }
 
     /// The same session once more (Restart): what was new is resumed.
@@ -800,7 +825,7 @@ mod tests {
 
     #[test]
     fn restart_resumes() {
-        let launch = Launch { profile: Profile::claude_code(), start: Start::New(Some("abc".into())), unasked: false, aside: false, options: Vec::new() };
+        let launch = Launch { profile: Profile::claude_code(), start: Start::New(Some("abc".into())), unasked: false, aside: false, options: Vec::new(), host: None };
         assert_eq!(launch.again().start, Start::Resume("abc".into()));
         let legacy = Launch { start: Start::Last, ..launch.clone() };
         assert_eq!(legacy.again().start, Start::Last);

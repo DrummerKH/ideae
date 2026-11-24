@@ -7,7 +7,7 @@
 //! Ghostty's terminfo, needs the `ghostty` feature.
 //!
 //! ```
-//! use gpui_cn::shell;
+//! use cn_pty::shell;
 //!
 //! // The user's shell, such as /bin/zsh.
 //! println!("{}", shell::default_shell().display());
@@ -250,23 +250,22 @@ fn quote(value: &str) -> String {
 /// `GHOSTTY_RESOURCES_DIR` for the shell integration scripts.
 ///
 /// The database and the scripts are written to a cache directory on first
-/// use; see `ghostty_vt::terminfo::dir`. A remote program needs only
+/// use; see [`crate::resources::terminfo`]. A remote program needs only
 /// `TERM`, `COLORTERM` and `TERM_PROGRAM`, plus the terminfo entry on the
 /// remote machine.
-#[cfg(feature = "ghostty")]
 pub fn terminal_env() -> std::io::Result<Vec<(&'static str, OsString)>> {
     Ok(vec![
-        ("TERM", ghostty_vt::terminfo::TERM.into()),
-        ("TERMINFO", ghostty_vt::terminfo::dir()?.into_os_string()),
+        ("TERM", crate::resources::TERM.into()),
+        ("TERMINFO", crate::resources::terminfo()?.into_os_string()),
         ("COLORTERM", "truecolor".into()),
         ("TERM_PROGRAM", "ghostty".into()),
         (
             "TERM_PROGRAM_VERSION",
-            ghostty_vt::build_info::pinned_version().into(),
+            crate::resources::GHOSTTY_VERSION.into(),
         ),
         (
             "GHOSTTY_RESOURCES_DIR",
-            ghostty_vt::shell_integration::resources_dir()?.into_os_string(),
+            crate::resources::shell_integration()?.into_os_string(),
         ),
     ])
 }
@@ -454,8 +453,7 @@ mod tests {
         assert_eq!(status.ok().and_then(|s| s.code()), Some(7));
     }
 
-    #[cfg(feature = "ghostty")]
-    #[test]
+        #[test]
     fn the_terminal_environment_names_ghostty() {
         let env = terminal_env().unwrap();
         let get = |name: &str| {

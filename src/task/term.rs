@@ -209,8 +209,10 @@ impl TermView {
         };
         state.update(cx, |s, cx| s.close(cx));
         #[cfg(unix)]
-        if let (Some(session), Some(daemon)) = (session, crate::daemon::client::get()) {
-            daemon.kill(&session);
+        if let Some(session) = session {
+            if let Some(daemon) = crate::daemon::client::for_session(&session) {
+                daemon.kill(&session);
+            }
         }
         #[cfg(not(unix))]
         let _ = session;

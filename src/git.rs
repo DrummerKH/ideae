@@ -45,6 +45,16 @@ fn process_alive(pid: u32, start: Option<u64>) -> bool {
 }
 
 fn git(root: &Path, args: &[&str]) -> Option<String> {
+    // On another machine: run there, the same way.
+    if crate::hosts::is_remote(root) {
+        let mut all = vec!["-c", "core.quotePath=false"];
+        all.extend_from_slice(args);
+        let out = crate::hostfs::run(root, "git", &all, &[("GIT_OPTIONAL_LOCKS", "0")], None).ok()?;
+        if !out.success() && out.code != Some(1) {
+            return None;
+        }
+        return Some(String::from_utf8(out.stdout).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()));
+    }
     // No optional locks: status and diff must not rewrite the index, or the
     // file watcher would see our own refresh and refresh again forever.
     let output = crate::procs::command("git")
@@ -89,7 +99,8 @@ pub fn worktrees(path: &Path) -> Vec<Worktree> {
         let mut locked = None;
         for line in block.lines() {
             if let Some(p) = line.strip_prefix("worktree ") {
-                wt_path = Some(PathBuf::from(p));
+                // On another machine: keyed as the window knows it.
+                wt_path = Some(crate::hostfs::rekey(path, PathBuf::from(p)));
             } else if let Some(b) = line.strip_prefix("branch ") {
                 branch = b.trim_start_matches("refs/heads/").to_string();
             } else if line == "locked" {
@@ -135,19 +146,20 @@ impl Head {
 /// The git folder of a worktree: its `.git`, or where its `.git` file points.
 fn git_dir_of(worktree: &Path) -> Option<PathBuf> {
     let dot = worktree.join(".git");
-    if dot.is_dir() {
+    // Where the worktree's machine is (crate::hostfs).
+    if crate::hostfs::stat(&dot).is_ok_and(|s| s.dir) {
         return Some(dot);
     }
-    let text = std::fs::read_to_string(&dot).ok()?;
+    let text = crate::hostfs::read_to_string(&dot).ok()?;
     let dir = PathBuf::from(text.trim().strip_prefix("gitdir:")?.trim());
-    Some(if dir.is_absolute() { dir } else { worktree.join(dir) })
+    Some(if dir.is_absolute() { crate::hostfs::rekey(worktree, dir) } else { worktree.join(dir) })
 }
 
 /// What a worktree's HEAD is on, `listed` being its branch as `git worktree
 /// list` gave it ("(detached)" for none).
 pub fn head_of(worktree: &Path, listed: &str) -> Head {
     let dir = git_dir_of(worktree);
-    let has = |name: &str| dir.as_ref().is_some_and(|d| d.join(name).exists());
+    let has = |name: &str| dir.as_ref().is_some_and(|d| crate::hostfs::stat(&d.join(name)).is_ok());
     let rebasing = ["rebase-merge", "rebase-apply"].into_iter().find(|d| has(d));
     let doing = if rebasing.is_some() {
         Some("rebasing")
@@ -164,7 +176,7 @@ pub fn head_of(worktree: &Path, listed: &str) -> Head {
     };
     let mut branch = if listed.starts_with('(') { String::new() } else { listed.to_string() };
     if let (Some(rebase), Some(dir)) = (rebasing, dir.as_ref()) {
-        if let Ok(name) = std::fs::read_to_string(dir.join(rebase).join("head-name")) {
+        if let Ok(name) = crate::hostfs::read_to_string(&dir.join(rebase).join("head-name")) {
             branch = name.trim().trim_start_matches("refs/heads/").to_string();
         }
     }
@@ -299,19 +311,17 @@ fn new_files_patch(root: &Path, untracked: &[&str]) -> String {
 fn new_file_patch(root: &Path, file: &str, in_full: bool, patch: &mut String) {
     use std::fmt::Write as _;
     let path = root.join(file);
-    let Ok(meta) = std::fs::symlink_metadata(&path) else { return };
-    #[cfg(unix)]
-    let executable = std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o111 != 0;
-    #[cfg(not(unix))]
-    let executable = false;
-    let (mode, text) = if meta.file_type().is_symlink() {
+    // Where the task's machine is (crate::hostfs).
+    let Ok(meta) = crate::hostfs::stat(&path) else { return };
+    let executable = meta.executable;
+    let (mode, text) = if meta.link {
         ("120000", std::fs::read_link(&path).ok().map(|to| to.to_string_lossy().into_owned()))
-    } else if !meta.is_file() {
+    } else if !meta.file {
         return;
     } else {
         // Too large, or not text (as git tells: a NUL early on): named, not shown.
-        let text = (in_full && meta.len() <= NEW_FILE_BYTES)
-            .then(|| std::fs::read(&path).ok())
+        let text = (in_full && meta.len <= NEW_FILE_BYTES)
+            .then(|| crate::hostfs::read(&path).ok())
             .flatten()
             .filter(|bytes| !bytes[..bytes.len().min(8000)].contains(&0))
             .and_then(|bytes| String::from_utf8(bytes).ok());
@@ -890,8 +900,10 @@ struct History {
 impl Known {
     fn fresh(&mut self, root: &Path) {
         if self.age % 30 == 0 {
-            self.git_dir = git(root, &["rev-parse", "--absolute-git-dir"]).map(|dir| PathBuf::from(dir.trim()));
-            let common = git(root, &["rev-parse", "--path-format=absolute", "--git-common-dir"]).map(|common| PathBuf::from(common.trim()));
+            // Paths on the task's machine: keyed as the window knows it (a
+            // remote one's are not looked at here).
+            self.git_dir = git(root, &["rev-parse", "--absolute-git-dir"]).map(|dir| crate::hostfs::rekey(root, PathBuf::from(dir.trim())));
+            let common = git(root, &["rev-parse", "--path-format=absolute", "--git-common-dir"]).map(|common| crate::hostfs::rekey(root, PathBuf::from(common.trim())));
             self.main_worktree = self.git_dir.is_some() && self.git_dir == common;
             self.refs = common.map(|common| common.join("refs")).filter(|refs| refs.is_dir());
             self.has_origin = git(root, &["remote", "get-url", "origin"]).is_some();
@@ -1580,6 +1592,13 @@ pub enum Change {
 /// Runs a command in `root` for a user action: stdout on success, stderr (or
 /// stdout) as the error.
 pub fn run(root: &Path, program: &str, args: &[&str]) -> Result<String, String> {
+    if crate::hosts::is_remote(root) {
+        let env: &[(&str, &str)] = if program == "git" { &[("GIT_TERMINAL_PROMPT", "0")] } else { &[] };
+        let out = crate::hostfs::run(root, program, args, env, None).map_err(|e| format!("{program}: {e}"))?;
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let stderr = out.stderr.trim().to_string();
+        return if out.success() { Ok(if stdout.is_empty() { stderr } else { stdout }) } else { Err(if stderr.is_empty() { stdout } else { stderr }) };
+    }
     let mut command = crate::procs::command(program);
     command.current_dir(root).args(args).stdin(std::process::Stdio::null());
     if program == "git" {
@@ -1923,9 +1942,11 @@ pub fn blame(root: &Path, file: &Path) -> Vec<Option<std::sync::Arc<BlameLine>>>
     // Whitespace and line endings are no change of who wrote a line.
     let mut args = vec!["blame", "--porcelain", "-w"];
     // Commits that only reformatted, as GitHub's blame leaves them out.
-    if root.join(".git-blame-ignore-revs").is_file() {
+    if crate::hostfs::stat(&root.join(".git-blame-ignore-revs")).is_ok_and(|s| s.file) {
         args.extend(["--ignore-revs-file", ".git-blame-ignore-revs"]);
     }
+    // A remote task's file by its place in the worktree: its key is no path there.
+    let file = if crate::hosts::is_remote(root) { file.strip_prefix(root).unwrap_or(file) } else { file };
     let file = file.to_string_lossy();
     args.extend(["--", &file]);
     let Some(out) = git(root, &args) else {
@@ -2970,6 +2991,11 @@ pub fn branches(root: &Path) -> Vec<String> {
 }
 
 pub(crate) fn git_status(root: &Path, args: &[&str]) -> Result<String, String> {
+    // On another machine: run there, the same way.
+    if crate::hosts::is_remote(root) {
+        let out = crate::hostfs::run(root, "git", args, &[("GIT_TERMINAL_PROMPT", "0")], None).map_err(|e| format!("git: {e}"))?;
+        return if out.success() { Ok(String::from_utf8_lossy(&out.stdout).into_owned()) } else { Err(out.stderr.trim().to_string()) };
+    }
     let output = crate::procs::command("git")
         .env("GIT_TERMINAL_PROMPT", "0")
         .arg("-C")

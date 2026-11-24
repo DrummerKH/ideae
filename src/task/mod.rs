@@ -42,6 +42,47 @@ mod panes;
 use panes::Pane;
 mod git_ui;
 mod helpers;
+/// What a test outside the task looks at and does.
+#[cfg(test)]
+impl TaskView {
+    /// The changed files shown, by name.
+    pub(crate) fn changed_names(&self) -> Vec<String> {
+        self.files.iter().map(|f| f.path.to_string()).collect()
+    }
+
+    pub(crate) fn refresh_now(&self) {
+        let _ = self.refresh_tx.try_send(());
+    }
+
+    /// The text of the open file at `path`.
+    pub(crate) fn open_text(&self, path: &std::path::Path, cx: &App) -> Option<String> {
+        self.tabs.iter().find_map(|tab| match &tab.kind {
+            TabKind::File(f) if f.read(cx).path == path => Some(f.read(cx).editor.read(cx).value().to_string()),
+            _ => None,
+        })
+    }
+
+    /// Commits what changed with `message`, as the commit box does.
+    pub(crate) fn commit_for_test(&mut self, message: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_input.update(cx, |input, cx| input.set_value(message.to_string(), window, cx));
+        self.commit(window, cx);
+    }
+
+    /// Types `text` at the cursor of the open file at `path`, and saves it.
+    pub(crate) fn type_and_save(&self, path: &std::path::Path, text: &str, window: &mut Window, cx: &mut App) {
+        let Some(file) = self.tabs.iter().find_map(|tab| match &tab.kind {
+            TabKind::File(f) if f.read(cx).path == path => Some(f.clone()),
+            _ => None,
+        }) else {
+            return;
+        };
+        file.update(cx, |f, cx| {
+            f.editor.update(cx, |e, cx| e.insert(text, window, cx));
+            f.save(cx);
+        });
+    }
+}
+
 #[cfg(test)]
 mod unicode_tests;
 mod outline;
@@ -442,6 +483,8 @@ impl EventEmitter<TaskEvent> for TaskView {}
 pub struct TaskView {
     /// The project's own checkout, not a worktree of a task.
     pub main_thread: bool,
+    /// A remote task's files, read in the background before they open.
+    remote_texts: HashMap<PathBuf, (Result<String, String>, Option<std::time::SystemTime>)>,
     /// The branches the main thread was asked to stay on, not the default.
     pub kept_branches: Vec<String>,
     pub root: PathBuf,
@@ -656,9 +699,14 @@ impl TaskView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let services = crate::services::load(&root).unwrap_or_default();
+        // On another machine: its agent and terminals run there; what reads
+        // its files here (the watcher, the refresh, .ideae.toml) is off.
+        let remote = crate::hosts::is_remote(&root);
+        let services = if remote { Default::default() } else { crate::services::load(&root).unwrap_or_default() };
         let mut task_env = crate::services::task_env(&services, port_slot);
-        task_env.push(crate::browser::task_env(&root));
+        if !remote {
+            task_env.push(crate::browser::task_env(&root));
+        }
         let weak = cx.weak_entity();
         let changes = cx.new(|cx| ChangesView::new(root.clone(), weak.clone(), cx));
         let history = cx.new(|cx| HistoryView::new(root.clone(), weak, cx));
@@ -686,7 +734,7 @@ impl TaskView {
         let watch_tx = refresh_tx.clone();
         let filter: Arc<std::sync::RwLock<WatchFilter>> = Arc::default();
         let event_filter = filter.clone();
-        let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        let watcher = (!remote).then(|| notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
             if let Ok(event) = event {
                 let wanted = !whole_trees() || event.paths.is_empty() || {
                     let filter = event_filter.read().unwrap();
@@ -698,7 +746,7 @@ impl TaskView {
             }
         })
         .inspect_err(|e| eprintln!("file watcher off, polling only: {e}"))
-        .ok();
+        .ok()).flatten();
         let watching = Arc::new(std::sync::Mutex::new(Watching::new(watcher, filter)));
         let poll_watching = watching.clone();
         // Fallback for anything the watcher misses (new directories, remotes).
@@ -828,6 +876,7 @@ impl TaskView {
         });
 
         let mut this = Self {
+            remote_texts: HashMap::new(),
             main_thread: false,
             kept_branches: Vec::new(),
             root,
@@ -959,6 +1008,18 @@ impl TaskView {
         cx: &mut Context<Self>,
     ) -> TabItem {
         let mut env: Vec<(String, String)> = extra_env;
+        // A remote task's terminals run in its host's daemon, which takes
+        // its reports there.
+        let remote = crate::hosts::is_remote(root);
+        #[cfg(unix)]
+        let daemon = crate::daemon::client::for_path(root);
+        #[cfg(not(unix))]
+        let daemon: Option<()> = None;
+        #[cfg(unix)]
+        let remote_socket = daemon.as_ref().filter(|_| remote).and_then(|d| d.hook_socket());
+        #[cfg(not(unix))]
+        let remote_socket: Option<String> = None;
+        let hook_socket = if remote { remote_socket.as_ref() } else { hook_socket };
         // Every terminal of the task can reach the hook socket, so a claude
         // started by hand reports too once given the settings file.
         if let Some(socket) = hook_socket {
@@ -978,6 +1039,8 @@ impl TaskView {
             Term::Service { cwd, .. } => cwd.clone(),
             _ => cwd.unwrap_or_else(|| root.clone()),
         };
+        // The path on its machine.
+        let cwd = crate::hosts::there(&cwd);
         env.push((crate::agent::ROLE_ENV.into(), role.into()));
         // Enter is a carriage return; PowerShell's line editor takes a bare
         // newline for a line break inside the command and waits for more.
@@ -998,10 +1061,6 @@ impl TaskView {
                 Term::Shell { seq, .. } => format!("shell-{seq}"),
             }
         );
-        #[cfg(unix)]
-        let daemon = crate::daemon::client::get();
-        #[cfg(not(unix))]
-        let daemon: Option<()> = None;
         #[cfg(not(unix))]
         let _ = &session;
         let (state, session) = match daemon {
@@ -1010,6 +1069,12 @@ impl TaskView {
                 let spec = crate::daemon::proto::Spec { cwd: cwd.clone(), env, input, program: Vec::new() };
                 let id = session.clone();
                 (cx.new(|cx| daemon.terminal(id, spec, config, window, cx)), Some(session))
+            }
+            // Its host is not connected: nothing of it runs here instead.
+            _ if remote => {
+                let told = "echo 'ideae: not connected to this task'\''s host'";
+                let options = LocalTerminalOptions::default().with_program("/bin/sh", ["-c", told]);
+                (cx.new(|cx| TerminalState::local(options, config, window, cx)), None)
             }
             _ => {
                 let mut options = LocalTerminalOptions::default().with_cwd(WorkingDirectory::Path(cwd.clone()));

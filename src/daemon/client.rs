@@ -52,7 +52,7 @@ const SIZE_SETTLES: Duration = Duration::from_millis(300);
 pub struct Daemon {
     /// The daemon process, as the socket's peer: changes with a handover.
     pid: std::sync::atomic::AtomicI32,
-    writer: Mutex<UnixStream>,
+    writer: Mutex<Box<dyn Write + Send>>,
     peers: Mutex<HashMap<String, Peer>>,
     /// The app told it to end: it is not looked for again, nor started anew.
     quitting: std::sync::atomic::AtomicBool,
@@ -61,6 +61,11 @@ pub struct Daemon {
     /// The sessions it had when this window came: attached once their
     /// terminal's size holds.
     running: Mutex<std::collections::HashSet<String>>,
+    /// A daemon on another machine, over ssh: dialled again whenever the
+    /// link drops, for as long as the window wants it.
+    wire: Option<super::remote::Wire>,
+    /// Calls waiting for their reply, by id.
+    calls: Mutex<HashMap<String, std::sync::mpsc::Sender<(proto::Reply, Vec<u8>)>>>,
 }
 
 static DAEMON: OnceLock<Option<Arc<Daemon>>> = OnceLock::new();
@@ -70,6 +75,31 @@ pub fn get() -> Option<Arc<Daemon>> {
     DAEMON.get().cloned().flatten().filter(|daemon| !daemon.lost.load(std::sync::atomic::Ordering::Relaxed))
 }
 
+/// The daemons of other machines, by host ([`crate::hosts`]).
+static REMOTES: Mutex<std::collections::BTreeMap<String, Arc<Daemon>>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// The daemon that runs `path`'s terminals: its host's for a remote task,
+/// this machine's for the rest.
+pub fn for_path(path: &std::path::Path) -> Option<Arc<Daemon>> {
+    match crate::hosts::split(path) {
+        Some((host, _)) => REMOTES.lock().unwrap().get(&host).cloned(),
+        None => get(),
+    }
+}
+
+/// The daemon of session `id` (`<task>#<name>`).
+pub fn for_session(id: &str) -> Option<Arc<Daemon>> {
+    for_path(std::path::Path::new(id.rsplit_once('#').map_or(id, |(task, _)| task)))
+}
+
+pub fn add_remote(host: String, daemon: Arc<Daemon>) {
+    REMOTES.lock().unwrap().insert(host, daemon);
+}
+
+pub fn remotes() -> Vec<Arc<Daemon>> {
+    REMOTES.lock().unwrap().values().cloned().collect()
+}
+
 /// Connects, starting the daemon when none runs, and moving its sessions
 /// to a daemon of this build when it runs another. Hook reports and the
 /// latest ones the daemon kept go to `on_hook`.
@@ -77,11 +107,13 @@ pub fn connect(on_hook: impl Fn(Hook) + Send + Sync + 'static) -> Option<(Arc<Da
     let (writer, reader, hooks, sessions) = dial(true)?;
     let daemon = Arc::new(Daemon {
         pid: peer_pid(&writer).into(),
-        writer: Mutex::new(writer),
+        writer: Mutex::new(Box::new(writer)),
         peers: Mutex::default(),
         quitting: Default::default(),
         lost: Default::default(),
         running: Mutex::new(sessions.into_iter().collect()),
+        wire: None,
+        calls: Mutex::default(),
     });
     let reading = daemon.clone();
     std::thread::Builder::new()
@@ -102,7 +134,7 @@ pub fn connect(on_hook: impl Fn(Hook) + Send + Sync + 'static) -> Option<(Arc<Da
                 match dial(false) {
                     Some((writer, next, kept, _)) => {
                         reading.pid.store(peer_pid(&writer), std::sync::atomic::Ordering::Relaxed);
-                        *reading.writer.lock().unwrap() = writer;
+                        *reading.writer.lock().unwrap() = Box::new(writer);
                         reader = next;
                         reading.reopen();
                         // What was reported while nobody listened: a turn's
@@ -152,7 +184,7 @@ fn dial(upgrade: bool) -> Option<(UnixStream, UnixStream, Vec<Hook>, Vec<String>
                 }
                 if !started {
                     started = true;
-                    start_daemon().ok()?;
+                    ideae_core::daemon::start().ok()?;
                 }
                 std::thread::sleep(Duration::from_millis(50));
                 continue;
@@ -165,7 +197,7 @@ fn dial(upgrade: bool) -> Option<(UnixStream, UnixStream, Vec<Hook>, Vec<String>
         let welcome = proto::read_frame(&mut reader);
         let _ = reader.set_read_timeout(None);
         match welcome {
-            Ok(Frame::Msg(Msg::Welcome { protocol, version, hooks, sessions })) => {
+            Ok(Frame::Msg(Msg::Welcome { protocol, version, hooks, sessions, .. })) => {
                 if protocol == proto::PROTOCOL && (version == crate::build_watch::build_id() || upgraded) {
                     return Some((writer, reader, hooks, sessions));
                 }
@@ -203,23 +235,6 @@ fn dial(upgrade: bool) -> Option<(UnixStream, UnixStream, Vec<Hook>, Vec<String>
     }
 }
 
-/// Starts `ideae --daemon` in a session of its own, so it stays when the
-/// window goes.
-fn start_daemon() -> std::io::Result<()> {
-    use std::os::unix::process::CommandExt as _;
-    let exe = crate::desktop::exe()?;
-    let mut command = std::process::Command::new(exe);
-    command.arg("--daemon").stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-    // SAFETY: setsid only changes the child's session.
-    unsafe {
-        command.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-    command.spawn().map(|_| ())
-}
-
 fn size_of(viewport: Viewport) -> Size {
     Size { cols: viewport.columns(), rows: viewport.rows(), cell_w: viewport.cell_width(), cell_h: viewport.cell_height() }
 }
@@ -254,13 +269,13 @@ impl Daemon {
         Some(self.pid.load(std::sync::atomic::Ordering::Relaxed)).filter(|&p| p > 0)
     }
 
-    fn send(&self, frame: Vec<u8>) {
+    pub(super) fn send(&self, frame: Vec<u8>) {
         let _ = self.writer.lock().unwrap().write_all(&frame);
     }
 
     /// After a reconnect: every terminal attaches again, its screen cleared
     /// for the replay that follows.
-    fn reopen(&self) {
+    pub(super) fn reopen(&self) {
         let peers = self.peers.lock().unwrap();
         for (id, p) in peers.iter() {
             let Some(size) = p.size.filter(|_| p.opened) else { continue };
@@ -274,8 +289,13 @@ impl Daemon {
         }
     }
 
-    fn on_frame(&self, frame: Frame, on_hook: &impl Fn(Hook)) {
+    pub(super) fn on_frame(&self, frame: Frame, on_hook: &impl Fn(Hook)) {
         match frame {
+            Frame::Bytes { kind: proto::KIND_REPLY, id, bytes } => {
+                if let (Some(tx), Some((reply, body))) = (self.calls.lock().unwrap().remove(&id), proto::unpack::<proto::Reply>(&bytes)) {
+                    let _ = tx.send((reply, body.to_vec()));
+                }
+            }
             Frame::Bytes { kind, id, bytes } => {
                 let peer = {
                     let mut peers = self.peers.lock().unwrap();
@@ -327,6 +347,11 @@ impl Daemon {
                 }
             }
             Frame::Msg(Msg::Hook(hook)) => on_hook(hook),
+            Frame::Msg(Msg::Pong) => {
+                if let Some(wire) = &self.wire {
+                    wire.heard();
+                }
+            }
             Frame::Msg(_) => {}
         }
     }
@@ -436,17 +461,89 @@ impl Daemon {
         self.send(proto::encode_msg(&Msg::Prune { keep }));
     }
 
+    /// Builds one for a daemon on another machine; [`super::remote`] keeps
+    /// its link.
+    pub(super) fn remote(wire: super::remote::Wire, writer: Box<dyn Write + Send>, sessions: Vec<String>) -> Self {
+        Daemon {
+            pid: 0.into(),
+            writer: Mutex::new(writer),
+            peers: Mutex::default(),
+            quitting: Default::default(),
+            lost: Default::default(),
+            running: Mutex::new(sessions.into_iter().collect()),
+            wire: Some(wire),
+            calls: Mutex::default(),
+        }
+    }
+
+    pub fn wire(&self) -> Option<&super::remote::Wire> {
+        self.wire.as_ref()
+    }
+
+    pub(super) fn set_writer(&self, writer: Box<dyn Write + Send>) {
+        *self.writer.lock().unwrap() = writer;
+    }
+
+    pub(super) fn quitting(&self) -> bool {
+        self.quitting.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Asks the daemon's machine to run a program or read, write or look
+    /// at a file ([`proto::Call`]), and waits for the answer: off the UI
+    /// thread. A link that drops meanwhile fails it.
+    pub fn call(&self, call: &proto::Call, body: &[u8]) -> std::io::Result<(proto::Reply, Vec<u8>)> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = format!("call-{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Waiting first, then asked whether the link is up: one that drops
+        // after this is told by `drop_calls`, which runs after it is down.
+        self.calls.lock().unwrap().insert(id.clone(), tx);
+        if self.wire.as_ref().is_some_and(|wire| !wire.is_up()) {
+            self.calls.lock().unwrap().remove(&id);
+            return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "the host is not connected now"));
+        }
+        self.send(proto::encode_bytes(proto::KIND_CALL, &id, &proto::pack(call, body)));
+        let answer = rx.recv_timeout(Duration::from_secs(120));
+        self.calls.lock().unwrap().remove(&id);
+        answer.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "no answer from the host"))
+    }
+
+    /// The link dropped: what waits for a reply is told now.
+    pub(super) fn drop_calls(&self) {
+        self.calls.lock().unwrap().clear();
+    }
+
+    /// Where `ideae --hook` reports to this daemon, on its machine.
+    pub fn hook_socket(&self) -> Option<String> {
+        match &self.wire {
+            Some(wire) => wire.socket(),
+            None => Some(super::proto::socket_path().display().to_string()),
+        }
+    }
+
+    /// Lets go of a daemon on another machine: its sessions run on there,
+    /// for this window or another to attach to later.
+    pub fn disconnect(&self) {
+        self.quitting.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(wire) = &self.wire {
+            wire.drop_link();
+        }
+    }
+
+    /// Says on every terminal that the link is down, once per drop.
+    pub(super) fn tell_terminals(&self, line: &str) {
+        for p in self.peers.lock().unwrap().values() {
+            if let Link::Term { peer, .. } = &p.link {
+                peer.output(line.as_bytes());
+            }
+        }
+    }
+
     /// Ends every session and the daemon: the app quits for good.
     pub fn shutdown(&self) {
         self.quitting.store(true, std::sync::atomic::Ordering::Relaxed);
         self.send(proto::encode_msg(&Msg::Shutdown));
+        let _ = self.writer.lock().unwrap().flush();
     }
 }
 
-/// `ideae --hook` in a terminal of the daemon: reports there.
-pub fn send_hook(socket: &str, hook: Hook) {
-    if let Ok(mut stream) = UnixStream::connect(socket) {
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
-        let _ = proto::write_msg(&mut stream, &Msg::Hook(hook));
-    }
-}

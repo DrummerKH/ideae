@@ -167,7 +167,7 @@ impl Workspace {
 actions!(
     ideae,
     [
-        FindAndReplace, AddProject, PresentationMode, PowerSaving, Restart, CheckForUpdates, KeyboardShortcuts, About, BringAllToFront, CloseWindow, Documentation, Hide, HideOthers, ShowAll,
+        FindAndReplace, AddProject, AddRemoteProject, PresentationMode, PowerSaving, Restart, CheckForUpdates, KeyboardShortcuts, About, BringAllToFront, CloseWindow, Documentation, Hide, HideOthers, ShowAll,
         Minimize, ZoomWindow, FullScreen, ResetTextSize, PinToDash, ListApp, OpenMenuBar
     ]
 );
@@ -249,6 +249,7 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &crate::NewTask, cx| opens(cx, |w, window, cx| w.new_task(window, cx)));
     cx.on_action(|_: &crate::AskQuestion, cx| opens(cx, |w, window, cx| w.ask_question(window, cx)));
     cx.on_action(|_: &AddProject, cx| opens(cx, |w, window, cx| w.ask_for_project(window, cx)));
+    cx.on_action(|_: &AddRemoteProject, cx| opens(cx, |w, window, cx| w.ask_for_remote_project(window, cx)));
     cx.on_action(|_: &crate::OpenSettings, cx| opens(cx, |w, window, cx| w.open_settings(window, cx)));
     cx.on_action(|_: &KeyboardShortcuts, cx| opens(cx, |w, window, cx| w.open_settings_at(crate::settings_ui::KEYS_PAGE, window, cx)));
     cx.on_action(|_: &crate::SwitchTheme, cx| opens(cx, |w, window, cx| w.theme_picker(window, cx)));
@@ -754,6 +755,7 @@ fn menus(shown: Shown) -> Vec<Menu> {
         when(projects, key("Ask a Question…", "ask_question")),
         sep(),
         when(!presenting, act("Add Project…", AddProject)),
+        when(!presenting, act("Add Project on Another Machine…", AddRemoteProject)),
         project_item(ProjectCommand::Remove),
         project_item(ProjectCommand::ArchiveMerged),
         sep(),
@@ -985,7 +987,7 @@ mod tests {
     /// Every item has an action, and no menu says the same thing twice.
     #[test]
     fn the_menus_are_made() {
-        let menus = super::menus(Shown { projects: true, project: true, task: Some(InHand { main: false, side: false, ready: true, grouped: true, starred: false, open: true, agent: true, agent_ended: true, closable: true, file: true, back: true, forward: true, reopen: true, services: true, services_running: true, services_waiting: true, git: [true; 9], front: Some(FrontTab::Agent), panels: [false; 5] }), spaces: vec!["Work".into()], ..Default::default() });
+        let menus = super::menus(Shown { projects: true, project: true, task: Some(InHand { main: false, remote: false, side: false, ready: true, grouped: true, starred: false, open: true, agent: true, agent_ended: true, closable: true, file: true, back: true, forward: true, reopen: true, services: true, services_running: true, services_waiting: true, git: [true; 9], front: Some(FrontTab::Agent), panels: [false; 5] }), spaces: vec!["Work".into()], ..Default::default() });
         let titles: Vec<_> = menus.iter().map(|m| m.name.as_ref()).collect();
         // Linux and Windows have no menu named after the app: its items are in File and Help.
         assert_eq!(titles[usize::from(cfg!(target_os = "macos"))..], ["File", "Edit", "View", "Navigate", "Task", "Git", "Window", "Help"]);
@@ -1033,7 +1035,7 @@ mod tests {
         assert!(!live(&none, "Task", "Rename Task…") && !live(&none, "Git", "Commit…") && !live(&none, "Task", "Star Task"));
         assert!(!live(&none, "File", "Archive Merged Tasks…") && !live(&none, "File", "New Task…") && !live(&none, "View", "Agent Tab"));
 
-        let task = InHand { main: false, side: false, ready: true, grouped: false, starred: true, open: true, agent: true, agent_ended: false, closable: true, file: false, back: false, forward: false, reopen: false, services: true, services_running: false, services_waiting: true, git: [true; 9], front: Some(FrontTab::Agent), panels: [false; 5] };
+        let task = InHand { main: false, remote: false, side: false, ready: true, grouped: false, starred: true, open: true, agent: true, agent_ended: false, closable: true, file: false, back: false, forward: false, reopen: false, services: true, services_running: false, services_waiting: true, git: [true; 9], front: Some(FrontTab::Agent), panels: [false; 5] };
         let one = super::menus(Shown { task: Some(task), projects: true, project: true, ..Default::default() });
         assert!(live(&one, "File", "New Task…") && live(&one, "View", "Agent Tab") && live(&one, "Task", "Unstar Task") && live(&one, "Task", "Archive Task") && live(&one, "Git", "Pull"));
         assert!(!live(&one, "Task", "Stop All in Run Panel"));
@@ -1126,7 +1128,7 @@ mod bar {
     }
 
     fn task() -> InHand {
-        InHand { main: true, side: false, ready: true, grouped: false, starred: false, open: true, agent: true, agent_ended: false, closable: true, file: false, back: false, forward: false, reopen: false, services: false, services_running: false, services_waiting: false, git: [true; 9], front: None, panels: [false; 5] }
+        InHand { main: true, remote: false, side: false, ready: true, grouped: false, starred: false, open: true, agent: true, agent_ended: false, closable: true, file: false, back: false, forward: false, reopen: false, services: false, services_running: false, services_waiting: false, git: [true; 9], front: None, panels: [false; 5] }
     }
 
     fn click_label(window: &mut Window, label: &str, cx: &mut gpui_kit::App) {

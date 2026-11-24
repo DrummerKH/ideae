@@ -15,7 +15,7 @@
 
 use std::io;
 
-use crate::terminal::engine::ByteSink;
+use crate::Output;
 
 /// How much output one read takes.
 const READ_BUFFER: usize = 64 * 1024;
@@ -33,7 +33,7 @@ mod unix {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::{READ_BUFFER, read_into};
-    use crate::terminal::engine::ByteSink;
+    use crate::Output;
 
     /// The pty master in non-blocking mode, with the thread that reads it.
     pub(crate) struct PollIo {
@@ -61,7 +61,7 @@ mod unix {
     impl PollIo {
         /// Puts `master` in non-blocking mode and starts the thread that
         /// reads it into `sink`.
-        pub(crate) fn start(master: RawFd, sink: ByteSink) -> io::Result<Self> {
+        pub(crate) fn start(master: RawFd, sink: impl Output) -> io::Result<Self> {
             set_nonblocking(master)?;
             // The thread's own descriptor, so it never reads a closed or
             // reused one. It shares the non-blocking mode with `master`.
@@ -78,13 +78,13 @@ mod unix {
             });
             let thread = shared.clone();
             std::thread::Builder::new()
-                .name("gpui-cn-pty".to_owned())
+                .name("cn-pty".to_owned())
                 .spawn(move || run(&reader, &wake_rx, &sink, &thread))?;
             Ok(Self { master, shared })
         }
 
         /// Writes what the pty takes now. A short write has the thread
-        /// watch for room and call [`ByteSink::writable`].
+        /// watch for room and call [`Output::writable`].
         pub(crate) fn write(&self, bytes: &[u8]) -> io::Result<usize> {
             if bytes.is_empty() {
                 return Ok(0);
@@ -129,7 +129,7 @@ mod unix {
         }
     }
 
-    fn run(reader: &OwnedFd, wake: &OwnedFd, sink: &ByteSink, shared: &Shared) {
+    fn run(reader: &OwnedFd, wake: &OwnedFd, sink: &impl Output, shared: &Shared) {
         let mut buf = vec![0u8; READ_BUFFER];
         while !shared.closed.load(Ordering::SeqCst) {
             let want = shared.want_writable.load(Ordering::SeqCst);
@@ -250,9 +250,9 @@ fn read_into(fd: std::os::fd::RawFd, buf: &mut [u8]) -> io::Result<usize> {
 /// Reads a blocking pty into `sink` on a thread of its own, holding back
 /// while the engine's read queue is full.
 #[cfg_attr(unix, allow(dead_code))]
-pub(crate) fn spawn_reader(mut reader: Box<dyn io::Read + Send>, sink: ByteSink) -> io::Result<()> {
+pub(crate) fn spawn_reader(mut reader: Box<dyn io::Read + Send>, sink: impl Output) -> io::Result<()> {
     std::thread::Builder::new()
-        .name("gpui-cn-pty".to_owned())
+        .name("cn-pty".to_owned())
         .spawn(move || {
             let mut buf = vec![0u8; READ_BUFFER];
             while sink.wait_for_room() {
@@ -322,7 +322,7 @@ mod writer {
             });
             let thread = shared.clone();
             std::thread::Builder::new()
-                .name("gpui-cn-pty-writer".to_owned())
+                .name("cn-pty-writer".to_owned())
                 .spawn(move || {
                     let mut chunk = Vec::with_capacity(CHUNK);
                     loop {

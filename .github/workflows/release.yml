@@ -127,6 +127,13 @@ jobs:
         with:
           key: release-${{ matrix.arch }}
       - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Server
+        run: |
+          cargo build -p ideae-core --bin ideae-server --release --locked --target ${{ matrix.target }}
+          arch=${{ matrix.arch }}
+          [ "$arch" = arm64 ] && arch=aarch64
+          cp "target/${{ matrix.target }}/release/ideae-server" "ideae-server-$IDEAE_VERSION-$arch-macos"
+          codesign --force --sign - "ideae-server-$IDEAE_VERSION-$arch-macos"
       - name: Package
         run: |
           bin="ideae-$IDEAE_VERSION-macos-${{ matrix.arch }}"
@@ -137,12 +144,50 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: macos-${{ matrix.arch }}
-          path: ideae-*-macos-${{ matrix.arch }}*
+          path: |
+            ideae-*-macos-${{ matrix.arch }}*
+            ideae-server-*
+
+  # What a server runs for a window on another machine (src/daemon/install.rs):
+  # static, so any Linux takes it, with no library of a desktop. Named
+  # arch-os (x86_64-linux): releases before these take the file that ends
+  # as their system's app (-linux-x86_64), and must never take a server's.
+  server:
+    needs: version
+    runs-on: ubuntu-24.04
+    env:
+      IDEAE_VERSION: ${{ needs.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SHA }}
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-server
+      - name: Build
+        run: |
+          for arch in x86_64 aarch64; do
+            cargo zigbuild -p ideae-core --bin ideae-server --release --locked --target $arch-unknown-linux-musl
+            cp target/$arch-unknown-linux-musl/release/ideae-server "ideae-server-$IDEAE_VERSION-$arch-linux"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server
+          path: ideae-server-*
 
   # A macOS build that fails leaves the others to be released.
   release:
-    needs: [version, linux, windows, macos]
-    if: ${{ !cancelled() && needs.linux.result == 'success' && needs.windows.result == 'success' }}
+    needs: [version, linux, windows, macos, server]
+    if: ${{ !cancelled() && needs.linux.result == 'success' && needs.windows.result == 'success' && needs.server.result == 'success' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write

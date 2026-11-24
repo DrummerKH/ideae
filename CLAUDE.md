@@ -94,8 +94,14 @@ src/lsp_share.rs   one server for the tasks of a project: a worktree is a folder
 src/trash.rs       files to the system's trash and back (Undo of Delete in the Files panel)
 src/browser.rs     Web tabs: a headless Chrome per task (its profile kept, IDEAE_BROWSER_CDP), CDP screencast, pages it opens as tabs
 src/procs.rs       starting helper programs (no console on Windows), ending child sessions on quit
-src/daemon/        terminals and agents' hosts (pipe.rs) in a daemon (`ideae --daemon`, unix): they outlive the window (×, Restart); Exit/Ctrl+Q ends them;
-                   a window of another build makes the daemon hand its ptys to a new one (SCM_RIGHTS), agents keep running
+src/daemon/        the window's side of daemons (`ideae --daemon`, unix): this machine's (client.rs) and other machines' over ssh (remote.rs: link, pings,
+                   dialled again; install.rs: ideae-server put there, its hooks' files); Exit/Ctrl+Q ends them, the window's × leaves them
+core/              ideae-core, no gpui: the daemon itself (daemon/: server, pipes, bridge for `--daemon --stdio`, calls: a program run, a file read or written
+                   for a window elsewhere), hook reports (`--hook`), what an agent said, paths. `ideae-server` is built from it alone for servers
+                   (scripts/server.sh: static Linux x86_64/aarch64, macOS); a window of another build makes the daemon hand its ptys to a new one (SCM_RIGHTS)
+src/hosts.rs       projects on another machine: their key `ssh:/<host>/<path there>`, never a path here; ssh_for (IDEAE_SSH)
+src/hostfs.rs      a task's programs and files there or here by its path: git, reads and writes of a remote task go through it
+src/workspace/hosts_ui.rs  a remote project: added (checked there), its host connected before its tasks open, a task's worktree made there
 src/desktop.rs     launcher entry, dash pin, restart, `--install` / `--uninstall` (run by scripts/install.sh, install.ps1)
 src/predict/       edit prediction: llama-server and a model downloaded on consent, run for the app, ghost text at the cursor;
                    tests and UI checks use local files: IDEAE_PREDICT_SERVER, IDEAE_PREDICT_MODEL (IDEAE_DEBUG_PREDICT logs misses; IDEAE_PREDICT_GHOST="text" shows that as the suggestion, for screenshots)
@@ -103,7 +109,8 @@ src/naming.rs      branch names from task titles
 src/digest.rs      what of a long output (a check's, a CI log) an agent reads: the errors, each once, and the end
 src/services.rs    `.ideae.toml` services (Run ▾): per-task port slots, IDEAE_PORT_<NAME>
 src/project_config.rs  `.ideae.toml` [task] (setup, teardown, check, copy), your own over the file, suggestions, runs
-vendor/            patched gpui-component, gpui-base, gpui-cn, gpui-fast-linux, gpui-fast-macos; changes marked `ideae patch`
+vendor/            patched gpui-component, gpui-base, gpui-cn, gpui-fast-linux, gpui-fast-macos; changes marked `ideae patch`;
+                   cn-pty: gpui-cn's pty, shell setup and process table without a window (gpui-cn re-exports it), for the daemon
 assets/side-icons/ the marks of the side's strip (Lucide's drawings, served by `task::Assets` over the kit's)
 assets/icon/       the app icon: ideae.svg, and the .icns and .ico made from it by scripts/icons.py
 scripts/           Xvfb driver for UI checks, wayland.sh (the same in a headless GNOME Shell), check.sh (the tests to run before a push), icons.py, macos-app.sh (a .app around a binary)
@@ -123,6 +130,7 @@ scripts/           Xvfb driver for UI checks, wayland.sh (the same in a headless
 - So has archiving and restoring: `cargo test -- --ignored an_archived_task` after changing either.
 - And chat agents (ACP): `cargo build && cargo test -- --ignored an_acp_agent` after changing the host, the chat's link or the daemon's pipes (a stand-in agent, the real daemon, an upgrade of it).
 - And the daemon's terminals: `cargo test -- --ignored a_window_that_does_not_read` after changing how output goes from a session to a window (it floods one that reads nothing).
+- And projects on another machine: `cargo build && cargo test -- --ignored a_remote_daemon a_remote_project` after changing the bridge, the remote link, calls, hostfs or hosts_ui (a stand-in ssh to this machine, ideae-server from target/debug). Against a real host: `scripts/server.sh && IDEAE_LIVE_REMOTE="ssh -i key -p 2222 me@host" cargo test -- --ignored a_real_server`.
 - And a project's setup, check and teardown: `cargo test -- --ignored a_task_is_set_up_checked_and_torn_down` after changing them.
 - And Web tabs (needs Chrome): `cargo test -- --ignored a_page_tells_the_tab a_task_s_browser_wakes_when_called` after changing browser.rs: a page's dialog, select, pickers, cursor, errors, title, user agent, DevTools and the pages it opens; a task's Chrome started again by a call at its port.
 - And tasks sharing a language server: `cargo test -- --ignored two_tasks_share_one_rust_analyzer` after changing lsp_share.rs or how a task holds its servers; `an_agent_asks_the_language_server` after changing the MCP server's code questions (tell.rs). Both need rust-analyzer.

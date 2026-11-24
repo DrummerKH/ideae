@@ -31,6 +31,8 @@ cargo test -- --ignored \
   a_ticket_task_is_named \
   the_tasks_of_the_last_run \
   a_window_that_does_not_read \
+  a_remote_daemon \
+  a_remote_project \
   a_task_is_set_up_checked_and_torn_down \
   an_archived_task \
   a_page_tells_the_tab \

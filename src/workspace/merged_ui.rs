@@ -40,7 +40,7 @@ impl Workspace {
         }
         let mut due: Vec<(PathBuf, HashSet<String>)> = Vec::new();
         for pi in 0..self.projects.len() {
-            if self.projects[pi].merged_checked.is_some_and(|at| at.elapsed() < EVERY) {
+            if crate::hosts::is_remote(&self.projects[pi].path) || self.projects[pi].merged_checked.is_some_and(|at| at.elapsed() < EVERY) {
                 continue;
             }
             self.projects[pi].merged_checked = Some(std::time::Instant::now());

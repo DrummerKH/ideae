@@ -1,0 +1,30 @@
+# ideae patch: the part of gpui-cn's terminal that needs no window (a pty,
+# its program's shell set up as Ghostty does, the process table), split out
+# so that a daemon on a server builds without gpui or libghostty-vt.
+[package]
+name = "cn-pty"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "A local program in a pty, set up as Ghostty sets it up; from gpui-cn."
+
+[dependencies]
+anyhow = "1"
+dirs = "6"
+
+[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
+portable-pty = "0.9"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.61"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+]

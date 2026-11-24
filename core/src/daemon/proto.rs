@@ -16,6 +16,72 @@ pub const KIND_MSG: u8 = 0;
 pub const KIND_BYTES: u8 = 1;
 /// Daemon: earlier output of a session, replayed on attach.
 pub const KIND_REPLAY: u8 = 2;
+/// Window: a [`Call`] (its id in place of a session's), its JSON and then
+/// its body: `[u32 length][JSON][body]`. A daemon that does not know it
+/// leaves it, as it leaves any bytes it does not know.
+pub const KIND_CALL: u8 = 4;
+/// Daemon: the [`Reply`] to a call, framed the same.
+pub const KIND_REPLY: u8 = 3;
+
+/// What a window asks of the machine a daemon runs on: a program run to
+/// its end (the body its input), a file read, written (the body), looked at.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "op")]
+pub enum Call {
+    Exec {
+        cwd: PathBuf,
+        program: String,
+        args: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        env: Vec<(String, String)>,
+    },
+    Read { path: PathBuf },
+    Write { path: PathBuf },
+    Stat { path: PathBuf },
+}
+
+/// A file as [`Call::Stat`] finds it, its links not followed.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stat {
+    pub dir: bool,
+    pub file: bool,
+    pub link: bool,
+    pub len: u64,
+    /// Changed at, in nanoseconds since 1970.
+    pub modified: u128,
+    pub mode: u32,
+}
+
+/// What a call came to; its body is the program's output, or the file.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct Reply {
+    /// Why it could not be done: no such file, no such program.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// A program's exit code (none: ended by a signal) and its error output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<i32>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stderr: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stat: Option<Stat>,
+}
+
+/// `[u32 length][JSON][body]`, as calls and replies travel.
+pub fn pack(head: &impl Serialize, body: &[u8]) -> Vec<u8> {
+    let json = serde_json::to_vec(head).unwrap_or_default();
+    let mut out = Vec::with_capacity(4 + json.len() + body.len());
+    out.extend_from_slice(&(json.len() as u32).to_be_bytes());
+    out.extend_from_slice(&json);
+    out.extend_from_slice(body);
+    out
+}
+
+pub fn unpack<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Option<(T, &[u8])> {
+    let len = u32::from_be_bytes(bytes.get(..4)?.try_into().ok()?) as usize;
+    let head = serde_json::from_slice(bytes.get(4..4 + len)?).ok()?;
+    Some((head, &bytes[4 + len..]))
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Spec {
@@ -86,6 +152,26 @@ impl Hook {
     }
 }
 
+impl Hook {
+    /// The report as the window reads it.
+    pub fn event(&self) -> crate::status::HookEvent {
+        crate::status::HookEvent {
+            task: self.task.clone().into(),
+            event: self.event.clone(),
+            message: self.message.clone(),
+            kind: self.kind.clone(),
+            file: self.file.clone(),
+            said: self.said.clone(),
+            session: self.session.clone(),
+            guessed: false,
+            worktree: self.worktree.clone(),
+            call: self.call.clone(),
+            agent: self.agent.clone(),
+            replayed: None,
+        }
+    }
+}
+
 fn is_zero(n: &u64) -> bool {
     *n == 0
 }
@@ -109,12 +195,34 @@ pub enum Msg {
     // `ideae --hook` → daemon → windows
     Hook(Hook),
     // daemon → window
-    Welcome { protocol: u32, version: String, sessions: Vec<String>, hooks: Vec<Hook> },
+    Welcome {
+        protocol: u32,
+        version: String,
+        sessions: Vec<String>,
+        hooks: Vec<Hook>,
+        /// It answers `Ping`: one that does not drops a window that sends it.
+        #[serde(default)]
+        ping: bool,
+        /// Its socket, where `ideae --hook` reports on its machine.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        socket: Option<String>,
+        /// It answers [`Call`]s.
+        #[serde(default)]
+        calls: bool,
+    },
     /// The answer to an `Upgrade` that did not happen: this daemon goes on
     /// serving its sessions.
     Stays,
     Exited { id: String, code: Option<i32>, signal: Option<String> },
     Foreground { id: String, fg: Option<Fg> },
+    /// Over a link that can go quiet (ssh): the window asks, the daemon
+    /// answers; a window that hears nothing for a while dials again.
+    Ping,
+    Pong,
+    /// What a newer side sends that this one does not know: left alone,
+    /// not a reason to drop the connection.
+    #[serde(other)]
+    Unknown,
 }
 
 pub fn write_msg(w: &mut impl Write, msg: &Msg) -> io::Result<()> {
@@ -205,7 +313,7 @@ pub struct Handovers {
 }
 
 pub fn socket_path() -> PathBuf {
-    let dir = crate::state::runtime_dir();
+    let dir = crate::paths::runtime_dir();
     match std::env::var_os("IDEAE_STATE") {
         Some(state) => {
             use std::hash::{Hash as _, Hasher as _};

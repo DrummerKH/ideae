@@ -215,7 +215,7 @@ impl Workspace {
                     }
                 };
                 entry.sessions.push(state::AgentSession { profile: profile.id.clone(), id: session.clone(), started: state::now() });
-                let launch = agents::Launch { profile: profile.clone(), start, unasked, aside: false, options: Vec::new() };
+                let launch = agents::Launch { profile: profile.clone(), start, unasked, aside: false, options: Vec::new(), host: crate::hosts::split(&root).map(|(host, _)| host) };
                 let view = match entry.view.clone() {
                     Some(view) => view,
                     None => {

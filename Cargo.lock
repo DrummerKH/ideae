@@ -982,6 +982,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
+name = "cn-pty"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs 6.0.0",
+ "libc",
+ "portable-pty",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "cocoa"
 version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2638,6 +2649,7 @@ name = "gpui-cn"
 version = "0.9.0"
 dependencies = [
  "anyhow",
+ "cn-pty",
  "damascene-fonts-jetbrains-mono",
  "ghostty-vt",
  "gpui-kit",
@@ -4090,6 +4102,7 @@ dependencies = [
  "base64 0.22.1",
  "block2 0.6.2",
  "cc",
+ "cn-pty",
  "embed-resource",
  "flate2",
  "gpui-cn",
@@ -4098,6 +4111,7 @@ dependencies = [
  "grep-matcher",
  "grep-regex",
  "grep-searcher",
+ "ideae-core",
  "ignore",
  "image",
  "libc",
@@ -4156,6 +4170,16 @@ dependencies = [
  "tungstenite",
  "webpki-roots",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "ideae-core"
+version = "0.1.0"
+dependencies = [
+ "cn-pty",
+ "libc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -308,7 +308,7 @@ mod tests {
         assert!(p.env_vars().contains(&("ANTHROPIC_API_KEY".into(), "sk-test-2".into())), "a new value replaces it");
         p.set_env_text("CLAUDE_CONFIG_DIR=/c");
         assert!(p.secrets.is_empty() && super::get("cc/ANTHROPIC_API_KEY").is_none(), "taken out, forgotten");
-        let launch = crate::agents::Launch { profile: crate::agents::Profile { env: [("GH_TOKEN".into(), "$(echo t)".into())].into(), ..p }, start: crate::agents::Start::New(None), unasked: false, aside: false, options: Vec::new() };
+        let launch = crate::agents::Launch { profile: crate::agents::Profile { env: [("GH_TOKEN".into(), "$(echo t)".into())].into(), ..p }, start: crate::agents::Start::New(None), unasked: false, aside: false, options: Vec::new(), host: None };
         // In a shell the command makes the value itself; Windows has no such line, and the app runs it.
         if cfg!(unix) {
             assert!(launch.command().starts_with("GH_TOKEN=\"$(echo t)\" "), "{}", launch.command());

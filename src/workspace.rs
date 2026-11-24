@@ -99,6 +99,7 @@ pub struct TaskEntry {
 
 pub mod agents_ui;
 pub mod archive_ui;
+mod hosts_ui;
 mod merged_ui;
 pub mod automation;
 pub mod present;
@@ -351,6 +352,13 @@ pub struct Workspace {
     /// Deferred tasks coming back now, and those that could not: told once.
     waking: std::collections::HashSet<PathBuf>,
     wake_failed: std::collections::HashSet<PathBuf>,
+    /// Tasks of hosts being connected, by host ([`hosts_ui`]), and the one
+    /// to show when its host is.
+    host_waiting: std::collections::BTreeMap<String, Vec<PathBuf>>,
+    host_shown: Option<PathBuf>,
+    /// Where agents' reports go, from this machine's daemon and others'.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    hook_tx: async_channel::Sender<agent::HookEvent>,
 }
 
 impl Workspace {
@@ -531,6 +539,11 @@ impl Workspace {
                     this.teardown_at_quit();
                     #[cfg(unix)]
                     if let Some(daemon) = crate::daemon::client::get() {
+                        daemon.shutdown();
+                    }
+                    // Exit ends the agents of other machines too; the window's × leaves them.
+                    #[cfg(unix)]
+                    for daemon in crate::daemon::client::remotes() {
                         daemon.shutdown();
                     }
                     // Here, not on the tasks' threads: the app exits next.
@@ -779,6 +792,9 @@ impl Workspace {
             archive_dir: crate::archive::root(),
             waking: Default::default(),
             wake_failed: Default::default(),
+            host_waiting: Default::default(),
+            host_shown: None,
+            hook_tx: hook_tx.clone(),
         };
         this.restore(&saved, window, cx);
         this.tell_what_is_hidden();
@@ -796,7 +812,11 @@ impl Workspace {
             repos
         };
         for repo in repos {
-            if let Some(ix) = this.add_project(&repo) {
+            let added = match repo.to_str().filter(|r| r.starts_with("ssh://")) {
+                Some(url) => this.add_remote_project(url),
+                None => this.add_project(&repo),
+            };
+            if let Some(ix) = added {
                 first_cli.get_or_insert(ix);
             }
         }
@@ -984,7 +1004,8 @@ impl Workspace {
             .projects
             .iter()
             .flat_map(|p| &p.tasks)
-            .filter(|t| t.open && t.path.exists())
+            // A remote task's path is on its host, not here.
+            .filter(|t| t.open && (crate::hosts::is_remote(&t.path) || t.path.exists()))
             .map(|t| t.path.clone())
             .collect();
         // The one in view now; the rest after the window is up (`restoring`).
@@ -1140,6 +1161,9 @@ impl Workspace {
     /// Starts a task: its terminals, agent and watchers.
     fn load(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) -> Option<Entity<TaskView>> {
         self.restoring.retain(|p| p != path);
+        if self.entry_mut(path).is_some_and(|e| e.view.is_none()) && self.waits_for_host(path, false, window, cx) {
+            return None;
+        }
         let socket = self.hook_socket.clone();
         let entry = self.entry_mut(path)?;
         if let Some(view) = &entry.view {
@@ -1177,7 +1201,8 @@ impl Workspace {
             t.pr = pr;
             t.main_thread = main;
             t.kept_branches = kept;
-            t.lsp_off = lsp_off;
+            // Its language servers would read its files here: off for a remote one for now.
+            t.lsp_off = lsp_off || crate::hosts::is_remote(path);
             t
         });
         cx.subscribe_in(&view, window, |this, view, event: &TaskEvent, window, cx| this.on_task_event(view, event, window, cx)).detach();
@@ -1246,6 +1271,11 @@ impl Workspace {
     }
 
     pub fn switch(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        // Another shown meanwhile: the one whose host is connecting stays out of view.
+        self.host_shown = None;
+        if self.entry_mut(path).is_some_and(|e| e.view.is_none()) && self.waits_for_host(path, true, window, cx) {
+            return;
+        }
         self.active_group = None;
         if self.active.as_deref() != Some(path) {
             if let Some(old) = self.active_view() {
@@ -1295,7 +1325,8 @@ impl Workspace {
         }
         use std::time::Duration;
         let mut due = Vec::new();
-        for p in self.projects.iter_mut().filter(|p| !p.pr_off) {
+        // gh reads a remote project's repository here: not yet.
+        for p in self.projects.iter_mut().filter(|p| !p.pr_off && !crate::hosts::is_remote(&p.path)) {
             for t in &mut p.tasks {
                 if t.main || t.busy.is_some() {
                     continue;
@@ -1381,6 +1412,7 @@ impl Workspace {
             .projects
             .iter()
             .map(|p| p.path.clone())
+            .filter(|path| !crate::hosts::is_remote(path))
             .filter(|path| self.fetched.get(path).is_none_or(|at| now.duration_since(*at) >= every))
             .collect();
         if due.is_empty() {
@@ -1408,7 +1440,7 @@ impl Workspace {
         let due: Vec<PathBuf> = self
             .projects
             .iter()
-            .filter(|p| p.tasks.iter().filter(|t| !t.main).count() > 1)
+            .filter(|p| !crate::hosts::is_remote(&p.path) && p.tasks.iter().filter(|t| !t.main).count() > 1)
             .flat_map(|p| p.tasks.iter().filter(|t| !t.main && t.busy.is_none()).map(|t| t.path.clone()))
             .collect();
         // A loaded task has read its changes already: git is asked for the others.
@@ -2015,6 +2047,9 @@ impl Workspace {
         // Taken now, for this task alone, whatever way it is made.
         let given = std::mem::take(&mut self.send_next_prompt);
         let Some(repo) = self.projects.get(project).map(|p| p.path.clone()) else { return };
+        if crate::hosts::is_remote(&repo) {
+            return self.create_remote_task(project, title, prompt, agents, given, window, cx);
+        }
         cx.spawn_in(window, async move |this, cx| {
             let folder = repo.clone();
             let has_commit = cx.background_spawn(async move { git::adopt(&folder) }).await;
@@ -2258,7 +2293,13 @@ impl Workspace {
     /// Brings the task list in line with `git worktree list`: worktrees made
     /// outside the app appear, removed ones go.
     pub fn sync_worktrees(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let repos: Vec<(PathBuf, std::collections::BTreeMap<PathBuf, PathBuf>)> = self.projects.iter().map(|p| (p.path.clone(), p.made_by_agents.clone())).collect();
+        // A remote project's worktrees are listed on its host, once it is connected.
+        let repos: Vec<(PathBuf, std::collections::BTreeMap<PathBuf, PathBuf>)> = self
+            .projects
+            .iter()
+            .filter(|p| !crate::hosts::is_remote(&p.path) || crate::hostfs::reachable(&p.path))
+            .map(|p| (p.path.clone(), p.made_by_agents.clone()))
+            .collect();
         // The branch each task owns, and since when.
         let owned: std::collections::HashMap<PathBuf, (String, u64)> =
             self.projects.iter().flat_map(|p| &p.tasks).filter(|t| t.owns_branch()).map(|t| (t.path.clone(), (t.branch.clone(), t.created))).collect();
@@ -2295,13 +2336,14 @@ impl Workspace {
                                     let from = parent.as_ref().unwrap_or(&all[0]);
                                     let base = worktrees.iter().find(|o| &o.path == from).map(|o| o.branch.clone()).unwrap_or_default();
                                     let (ahead, dirty) = git::work_beyond(&w.path, &base);
-                                    let about = side::about(&w.path, from);
+                                    // Claude Code's notes of it are on its machine.
+                                    let about = if crate::hosts::is_remote(&w.path) { None } else { side::about(&w.path, from) };
                                     Some((w.path.clone(), side::Side { parent, ahead, dirty, about }))
                                 })
                                 .collect();
                             // Removed since: forgotten. One not made yet (its hook comes
                             // before the command runs) is not on disk either way.
-                            let gone: Vec<PathBuf> = made.keys().filter(|path| !all.contains(path) && !path.exists()).cloned().collect();
+                            let gone: Vec<PathBuf> = made.keys().filter(|path| !all.contains(path) && crate::hostfs::stat(path).is_err()).cloned().collect();
                             (worktrees, sides, r, gone, heads)
                         })
                         .collect::<Vec<_>>()
@@ -2618,7 +2660,7 @@ impl Workspace {
             .projects
             .iter()
             .flat_map(|p| &p.tasks)
-            .filter(|t| t.view.is_some())
+            .filter(|t| t.view.is_some() && !crate::hosts::is_remote(&t.path))
             .filter_map(|t| Some((t.path.clone(), t.session_ref()?, self.usage.get(&t.path).and_then(|(written, _)| *written))))
             .collect();
         // Questions by their own sessions: how full each is, for its tab.
@@ -2839,7 +2881,7 @@ impl Workspace {
             Start::New(id)
         };
         t.fresh = false;
-        Some(Launch { profile, start, unasked, aside: false, options: t.choices.clone() })
+        Some(Launch { profile, start, unasked, aside: false, options: t.choices.clone(), host: crate::hosts::split(path).map(|(host, _)| host) })
     }
 
     /// New settings: they go to the state, and what they change now
@@ -2951,6 +2993,11 @@ impl Workspace {
         #[cfg(unix)]
         if crate::daemon::client::get().is_some() {
             self.keep_terminals = true;
+        }
+        // Other machines' agents go on there; the links go.
+        #[cfg(unix)]
+        for daemon in crate::daemon::client::remotes() {
+            daemon.disconnect();
         }
         self.save(cx);
         cx.quit();

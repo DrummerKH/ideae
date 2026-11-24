@@ -1,0 +1,22 @@
+# What runs where there is no window: the daemon that keeps terminals and
+# agents, the bridge ssh runs to reach it, and what both need to know. The
+# app links it; `ideae-server`, built from it alone, is what a server runs.
+[package]
+name = "ideae-core"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+publish = false
+
+[[bin]]
+name = "ideae-server"
+path = "src/bin/ideae-server.rs"
+
+[dependencies]
+serde_json = "1"
+
+# The daemon: unix only.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+cn-pty = { path = "../vendor/cn-pty" }
+serde = { version = "1", features = ["derive"] }

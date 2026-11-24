@@ -317,6 +317,7 @@ impl Workspace {
                 if e.is_empty() { e } else { format!("{e} {e}") }
             }),
             own("Add project…", "task", |w, window, cx| w.add_project_dialog(window, cx)),
+            own("Add project on another machine…", "task", |w, window, cx| w.add_remote_project_dialog(window, cx)),
             own("Archive merged tasks…", "task: of the project in hand", |w, window, cx| {
                 if let Some(project) = w.project_in_hand() {
                     w.archive_merged(project, window, cx);

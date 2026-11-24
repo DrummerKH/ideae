@@ -224,11 +224,23 @@ impl Workspace {
         if self.projects.is_empty() {
             list = list.child(
                 div().px_3().py_3().child(
-                    Button::new("add-first-project")
-                        .small()
-                        .outline()
-                        .label("Add project…")
-                        .on_click(cx.listener(|this, _, window, cx| this.add_project_dialog(window, cx))),
+                    v_flex()
+                        .gap_1()
+                        .items_start()
+                        .child(
+                            Button::new("add-first-project")
+                                .small()
+                                .outline()
+                                .label("Add project…")
+                                .on_click(cx.listener(|this, _, window, cx| this.add_project_dialog(window, cx))),
+                        )
+                        .child(
+                            Button::new("add-first-remote-project")
+                                .small()
+                                .ghost()
+                                .label("On another machine…")
+                                .on_click(cx.listener(|this, _, window, cx| this.add_remote_project_dialog(window, cx))),
+                        ),
                 ),
             );
         }
@@ -348,7 +360,18 @@ impl Workspace {
                                 .ghost()
                                 .child(svg().path("side-icons/folder-plus.svg").size(px(16.)).text_color(cx.theme().muted_foreground))
                                 .tooltip("Add a project")
-                                .on_click(cx.listener(|this, _, window, cx| this.add_project_dialog(window, cx))),
+                                .dropdown_menu({
+                                    let this = cx.weak_entity();
+                                    move |menu, _, _| {
+                                        let (here, there) = (this.clone(), this.clone());
+                                        menu.item(PopupMenuItem::new("A folder here…").icon(menu_icon("folder-plus")).on_click(move |_, window, cx| {
+                                            let _ = here.update(cx, |w, cx| w.add_project_dialog(window, cx));
+                                        }))
+                                        .item(PopupMenuItem::new("On another machine…").icon(menu_icon("server")).on_click(move |_, window, cx| {
+                                            let _ = there.update(cx, |w, cx| w.add_remote_project_dialog(window, cx));
+                                        }))
+                                    }
+                                }),
                         )
                     }),
             )
@@ -1072,6 +1095,21 @@ impl Workspace {
             .text_sm()
             .text_color(muted)
             .child(div().flex_1().min_w_0().truncate().child(name.clone()))
+            // On another machine: which, and how its link is.
+            .when_some(self.host_state(&p.path), |s, (host, state)| {
+                s.child(
+                    div()
+                        .flex_shrink_0()
+                        .max_w(px(120.))
+                        .truncate()
+                        .text_xs()
+                        .when(state == Some("no link"), |s| s.text_color(cx.theme().warning))
+                        .child(match state {
+                            Some(state) => format!("{host} · {state}"),
+                            None => host,
+                        }),
+                )
+            })
             .when(p.collapsed, |s| {
                 s.when(questions > 0, |s| s.child(div().text_xs().child(format!("? {questions}")))).child(div().text_xs().child(if running > 0 { format!("{running} running ▸") } else { "▸".into() }))
             })

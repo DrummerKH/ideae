@@ -154,6 +154,8 @@ pub fn sentence(name: &str) -> String {
 #[derive(Clone, Copy, PartialEq)]
 pub struct InHand {
     pub(crate) main: bool,
+    /// On another machine: what reads or writes its files here is not there yet.
+    pub(crate) remote: bool,
     /// A worktree an agent made for itself: no variants, removed rather than archived.
     pub(crate) side: bool,
     /// Not at work on something that a variant or a delete would get in the way of.
@@ -187,6 +189,7 @@ impl InHand {
     pub fn basic(t: &crate::workspace::TaskEntry) -> Self {
         InHand {
             main: t.main,
+            remote: crate::hosts::is_remote(&t.path),
             side: t.side.is_some(),
             ready: t.busy.is_none(),
             grouped: !t.group.is_empty(),
@@ -237,20 +240,23 @@ impl InHand {
         match what {
             Star | CopyBranchName | CopyTitle => true,
             Rename => !self.main,
-            Archive | Defer | AnotherVariant => !self.main && !self.side && self.ready,
-            RemoveSide => self.side && self.ready,
-            KeepVariant => !self.main && !self.side && self.ready && self.grouped,
+            Archive | Defer | AnotherVariant => !self.main && !self.side && self.ready && !self.remote,
+            RemoveSide => self.side && self.ready && !self.remote,
+            KeepVariant => !self.main && !self.side && self.ready && self.grouped && !self.remote,
             RestartAgent => self.open && self.agent_ended,
             // With nothing in .ideae.toml yet, the Run panel tells how to begin.
-            StartServices => self.open && (!self.services || self.services_waiting),
+            StartServices => self.open && !self.remote && (!self.services || self.services_waiting),
             StopServices => self.services_running,
             CompareThisFile => self.file,
-            NewTerminal | NewBrowserTab | Pause | CompareWithBranch => self.open,
+            NewBrowserTab | CompareWithBranch => self.open && !self.remote,
+            NewTerminal | Pause => self.open,
         }
     }
 
     pub(crate) fn git(&self, what: GitCommand) -> bool {
-        self.open && GitCommand::ALL.iter().position(|w| *w == what).is_some_and(|i| self.git[i])
+        // A remote task's git runs on its host; gh, with the user's sign-in, is here: not yet.
+        let here_only = self.remote && what == GitCommand::PullRequest;
+        self.open && !here_only && GitCommand::ALL.iter().position(|w| *w == what).is_some_and(|i| self.git[i])
     }
 }
 

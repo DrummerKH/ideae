@@ -8,7 +8,7 @@ use std::process::{Child, Stdio};
 use std::sync::{Mutex, mpsc};
 use std::time::Duration;
 
-use gpui_cn::terminal::{ByteHandle, ByteSink, ExitStatus, frame::Viewport};
+use cn_pty::{ByteHandle, ExitStatus, Output as _, Sink as ByteSink, Viewport};
 
 use super::proto::Spec;
 

@@ -221,8 +221,8 @@ impl TerminalState {
             crate::terminal::pty::LocalPty::new(options.clone()),
             options.engine.clone(),
         )
-        .with_abnormal_exit_runtime(options.abnormal_exit_runtime)
-        .with_input(options.input);
+        .with_abnormal_exit_runtime(options.abnormal_exit_runtime())
+        .with_input(options.input().to_vec());
         Self::new(engine, config, window, cx)
     }
 
@@ -1093,7 +1093,7 @@ impl TerminalState {
     pub(crate) fn status_message(&self) -> Option<SharedString> {
         match &self.status {
             TerminalStatus::Failed(error) => Some(error.clone().into()),
-            TerminalStatus::Exited(status) => Some(match (status.code, &status.signal) {
+            TerminalStatus::Exited(status) => Some(match (status.code(), status.signal()) {
                 (Some(0), None) => "Process exited".into(),
                 (Some(code), None) => format!("Process exited with code {code}").into(),
                 (_, Some(signal)) => format!("Process ended by {signal}").into(),

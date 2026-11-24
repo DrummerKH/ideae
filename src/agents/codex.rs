@@ -298,16 +298,8 @@ fn read_rollout(path: &Path) -> Option<crate::usage::Usage> {
 
 /// What `ideae --hook Codex <json>` hands on: a turn's end, as Claude
 /// Code's Stop would say it.
-pub fn notify_payload(json: &str) -> Option<serde_json::Value> {
-    let v: serde_json::Value = serde_json::from_str(json).ok()?;
-    (v["type"] == "agent-turn-complete").then(|| {
-        serde_json::json!({
-            "session_id": v["thread-id"],
-            "last_assistant_message": v["last-assistant-message"],
-            "cwd": v["cwd"],
-        })
-    })
-}
+#[cfg(test)]
+use ideae_core::hook::codex_payload as notify_payload;
 
 #[cfg(test)]
 mod tests {

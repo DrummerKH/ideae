@@ -10,10 +10,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use gpui_cn::terminal::{
-    ByteHandle, ByteSink, ByteSource as _, DetachedSink, LocalPty, LocalTerminalOptions, WorkingDirectory,
-    frame::Viewport,
-};
+use cn_pty::{ByteHandle, Detached as DetachedSink, LocalPty, LocalTerminalOptions, Sink as ByteSink, Viewport, WorkingDirectory};
 
 use super::proto::{self, Fg, Frame, Hook, KIND_BYTES, KIND_REPLAY, Msg, Size, Spec};
 
@@ -55,7 +52,10 @@ type Shared = Arc<Mutex<Server>>;
 /// A window: where its frames go, and how many bytes of them wait to be
 /// written to its socket.
 struct Client {
-    tx: mpsc::Sender<Vec<u8>>,
+    /// Frames, and whether they count as what waits for it: a reply to a
+    /// call does not, a large one over a slow link being no window that
+    /// stopped reading.
+    tx: mpsc::Sender<(Vec<u8>, bool)>,
     queued: Arc<std::sync::atomic::AtomicUsize>,
     /// Its socket, to let go of a window that takes nothing.
     stream: UnixStream,
@@ -71,6 +71,13 @@ const CLIENT_QUEUE_BYTES: usize = 4 << 20;
 const CLIENT_STALL: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 5 });
 
 impl Server {
+    /// A call's reply: as large as a file, and no sign of a window that is behind.
+    fn reply(&self, client: u64, frame: Vec<u8>) {
+        if let Some(client) = self.clients.get(&client) {
+            let _ = client.tx.send((frame, false));
+        }
+    }
+
     fn send(&self, client: u64, frame: Vec<u8>) {
         if let Some(client) = self.clients.get(&client) {
             client.queue(frame);
@@ -116,7 +123,7 @@ impl Client {
         #[cfg(test)]
         MOST_QUEUED.fetch_max(queued, std::sync::atomic::Ordering::Relaxed);
         let _ = queued;
-        if self.tx.send(frame).is_err() {
+        if self.tx.send((frame, true)).is_err() {
             self.queued.fetch_sub(len, std::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -143,8 +150,9 @@ fn fg_of(handle: &Mutex<Box<dyn ByteHandle>>) -> Option<Fg> {
 /// to hand over its sessions.
 pub fn run(adopt: bool) {
     let path = proto::socket_path();
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+    if let Err(e) = crate::paths::own_runtime_dir() {
+        eprintln!("ideae daemon: {e}");
+        return;
     }
     let shared: Shared = Arc::new(Mutex::new(Server { alone_since: Some(Instant::now()), ..Default::default() }));
     let mut handover = None;
@@ -209,7 +217,7 @@ fn housekeeping(shared: Shared) {
 
 fn serve(shared: Shared, stream: UnixStream) {
     let Ok(mut writer) = stream.try_clone() else { return };
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let (tx, rx) = mpsc::channel::<(Vec<u8>, bool)>();
     let client = {
         let mut s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         s.next_client += 1;
@@ -219,9 +227,11 @@ fn serve(shared: Shared, stream: UnixStream) {
     let queued: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
     let written = queued.clone();
     let writer_thread = std::thread::spawn(move || {
-        while let Ok(frame) = rx.recv() {
+        while let Ok((frame, counted)) = rx.recv() {
             let sent = writer.write_all(&frame);
-            written.fetch_sub(frame.len(), std::sync::atomic::Ordering::Relaxed);
+            if counted {
+                written.fetch_sub(frame.len(), std::sync::atomic::Ordering::Relaxed);
+            }
             if sent.is_err() {
                 break;
             }
@@ -232,6 +242,18 @@ fn serve(shared: Shared, stream: UnixStream) {
     while let Ok(frame) = proto::read_frame(&mut reader) {
         match frame {
             Frame::Bytes { kind: KIND_BYTES, id, bytes } => input(&shared, &id, &bytes),
+            Frame::Bytes { kind: proto::KIND_CALL, id, bytes } => {
+                let shared = shared.clone();
+                // Its own thread: a slow git holds up nothing else.
+                std::thread::spawn(move || {
+                    let reply = match proto::unpack::<proto::Call>(&bytes) {
+                        Some((call, body)) => super::calls::answer(call, body),
+                        None => (proto::Reply { error: Some("a call not understood".into()), ..Default::default() }, Vec::new()),
+                    };
+                    let frame = proto::encode_bytes(proto::KIND_REPLY, &id, &proto::pack(&reply.0, &reply.1));
+                    shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).reply(client, frame);
+                });
+            }
             Frame::Bytes { .. } => {}
             Frame::Msg(Msg::Hello { .. }) => {
                 let Ok(stream) = reader.try_clone() else { break };
@@ -241,9 +263,12 @@ fn serve(shared: Shared, stream: UnixStream) {
                 registered = true;
                 let welcome = Msg::Welcome {
                     protocol: proto::PROTOCOL,
-                    version: crate::build_watch::build_id(),
+                    version: crate::build::id(),
                     sessions: s.sessions.keys().cloned().collect(),
                     hooks: s.hooks.values().cloned().collect(),
+                    ping: true,
+                    socket: Some(proto::socket_path().display().to_string()),
+                    calls: true,
                 };
                 s.send(client, proto::encode_msg(&welcome));
             }
@@ -263,13 +288,14 @@ fn serve(shared: Shared, stream: UnixStream) {
                 }
             }
             Frame::Msg(Msg::Shutdown) => shutdown(&shared),
+            Frame::Msg(Msg::Ping) => shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).send(client, proto::encode_msg(&Msg::Pong)),
             Frame::Msg(Msg::Upgrade { exe }) => {
                 // It returns only when the sessions stayed here.
                 handover::give(&shared, &exe);
                 shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).send(client, proto::encode_msg(&Msg::Stays));
             }
             Frame::Msg(Msg::Hook(mut hook)) => {
-                hook.at = crate::state::now();
+                hook.at = crate::paths::now();
                 let mut s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 // A window that comes later hears only this one: the reminder
                 // after a turn, or the question after a tool call, keeps
@@ -277,7 +303,7 @@ fn serve(shared: Shared, stream: UnixStream) {
                 if hook.said.is_none() {
                     hook.said = s.hooks.get(&hook.key()).filter(|before| carries(before, &hook)).and_then(|before| before.said.clone());
                 }
-                let asked = s.hooks.get(&hook.key()).and_then(|before| event_of(before).status()).is_some_and(|was| crate::agent::asked_again(&was, &event_of(&hook)));
+                let asked = s.hooks.get(&hook.key()).and_then(|before| event_of(before).status()).is_some_and(|was| crate::status::asked_again(&was, &event_of(&hook)));
                 if s.clients.is_empty() && !asked {
                     notify(&hook);
                 }
@@ -352,7 +378,7 @@ fn open(shared: &Shared, client: u64, id: String, spec: Spec, size: Size) {
         for (name, value) in &spec.env {
             options = options.with_env(name.clone(), value.clone());
         }
-        Box::new(LocalPty::new(options)).start(sink, viewport(size))
+        LocalPty::new(options).start(sink, viewport(size))
     } else {
         super::pipe::Pipe::start(&spec, sink).map(|p| {
             let p = Arc::new(p);
@@ -503,28 +529,15 @@ fn shutdown(shared: &Shared) -> ! {
     std::process::exit(0);
 }
 
-fn event_of(hook: &Hook) -> crate::agent::HookEvent {
-    crate::agent::HookEvent {
-        task: hook.task.clone().into(),
-        event: hook.event.clone(),
-        message: hook.message.clone(),
-        kind: hook.kind.clone(),
-        file: hook.file.clone(),
-        said: hook.said.clone(),
-        session: hook.session.clone(),
-        guessed: false,
-        worktree: hook.worktree.clone(),
-        call: hook.call.clone(),
-        agent: hook.agent.clone(),
-        replayed: None,
-    }
+fn event_of(hook: &Hook) -> crate::status::HookEvent {
+    hook.event()
 }
 
 /// Whether what was said before still holds for a later report without
 /// words of its own: a turn's last words for the reminder after it, a tool
 /// call's for the question about it.
 fn carries(before: &Hook, now: &Hook) -> bool {
-    use crate::agent::AgentStatus::{Done, NeedsInput};
+    use crate::status::AgentStatus::{Done, NeedsInput};
     if now.event != "Notification" {
         return false;
     }
@@ -536,20 +549,14 @@ fn carries(before: &Hook, now: &Hook) -> bool {
     }
 }
 
-/// No window to show it: an agent that wants the user says so on the desktop.
+/// What tells the user of a report no window heard (the app's desktop
+/// notification); a daemon on a server has none.
+pub static NOTIFY: std::sync::OnceLock<fn(&Hook)> = std::sync::OnceLock::new();
+
 fn notify(hook: &Hook) {
-    // The window may have changed it since this daemon started.
-    let saved = crate::state::load();
-    if !saved.settings.notifications || !saved.tells_of(std::path::Path::new(&hook.task)) {
-        return;
+    if let Some(notify) = NOTIFY.get() {
+        notify(hook);
     }
-    let Some(status) = event_of(hook).status().filter(|s| s.is_attention()) else { return };
-    let words = saved.settings.notify_said && saved.settings.show_said && saved.presenting.is_none();
-    let said = hook.said.as_deref().filter(|_| words);
-    let body = crate::said::notice(&status, said, words);
-    let task = std::path::Path::new(&hook.task).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let path = std::path::PathBuf::from(&hook.task);
-    crate::desktop::notify_with(&task, &body, move || crate::desktop::open_window_on(&path));
 }
 
 /// Moving the sessions to a daemon of a newer build without stopping their
@@ -563,7 +570,7 @@ mod handover {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use gpui_cn::terminal::ByteSink;
+    use cn_pty::Sink as ByteSink;
 
     use super::{Session, Shared, pump};
     use crate::daemon::proto::{Handover, Handovers};
@@ -770,14 +777,14 @@ mod handover {
         }
         for session in state.sessions {
             let (sink, detached) = ByteSink::detached();
-            let (handle, pipe): (Box<dyn gpui_cn::terminal::ByteHandle>, _) = if session.pipe {
+            let (handle, pipe): (Box<dyn cn_pty::ByteHandle>, _) = if session.pipe {
                 let (Some(input), Some(output)) = (fds.next(), fds.next()) else { break };
                 let pipe = Arc::new(crate::daemon::pipe::Pipe::adopt(session.pid, input, output, sink));
                 (Box::new(crate::daemon::pipe::Handle(pipe.clone())), Some(pipe))
             } else {
                 let Some(fd) = fds.next() else { break };
                 let program = crate::procs::name(session.pid);
-                let Ok(handle) = gpui_cn::terminal::adopt(fd, session.pid, program, sink) else { continue };
+                let Ok(handle) = cn_pty::adopt(fd, session.pid, program, sink) else { continue };
                 (handle, None)
             };
             let handle = Arc::new(Mutex::new(handle));
@@ -842,7 +849,7 @@ mod tests {
     #[test]
     #[ignore]
     fn a_window_that_does_not_read_holds_the_program_back() {
-        let _one = crate::workspace::variants::tests::ONE_WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = crate::tests::ONE.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("ideae-daemon-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -856,7 +863,7 @@ mod tests {
                 UnixStream::connect(&path).ok()
             })
             .expect("the daemon listens");
-        proto::write_msg(&mut stream, &Msg::Hello { protocol: proto::PROTOCOL, version: crate::build_watch::build_id() }).unwrap();
+        proto::write_msg(&mut stream, &Msg::Hello { protocol: proto::PROTOCOL, version: crate::build::id() }).unwrap();
         assert!(matches!(proto::read_frame(&mut stream), Ok(Frame::Msg(Msg::Welcome { .. }))));
         let spec = Spec { cwd: dir.clone(), env: Vec::new(), input: Some("yes 0123456789012345678901234567890123456789\n".into()), program: Vec::new() };
         let size = Size { cols: 80, rows: 24, cell_w: 8, cell_h: 16 };
@@ -887,7 +894,7 @@ mod tests {
 
         // The program ran on; the window, back, finds it and what it printed last.
         let mut stream = UnixStream::connect(&path).unwrap();
-        proto::write_msg(&mut stream, &Msg::Hello { protocol: proto::PROTOCOL, version: crate::build_watch::build_id() }).unwrap();
+        proto::write_msg(&mut stream, &Msg::Hello { protocol: proto::PROTOCOL, version: crate::build::id() }).unwrap();
         let Ok(Frame::Msg(Msg::Welcome { sessions, .. })) = proto::read_frame(&mut stream) else { panic!("no welcome") };
         assert_eq!(sessions, ["flood".to_string()]);
         let spec = Spec { cwd: dir.clone(), env: Vec::new(), input: None, program: Vec::new() };
@@ -903,7 +910,7 @@ mod tests {
         // through its pipe, its window let go of, the program kept.
         MOST_QUEUED.store(0, std::sync::atomic::Ordering::Relaxed);
         let mut flooded = UnixStream::connect(&path).unwrap();
-        proto::write_msg(&mut flooded, &Msg::Hello { protocol: proto::PROTOCOL, version: crate::build_watch::build_id() }).unwrap();
+        proto::write_msg(&mut flooded, &Msg::Hello { protocol: proto::PROTOCOL, version: crate::build::id() }).unwrap();
         assert!(matches!(proto::read_frame(&mut flooded), Ok(Frame::Msg(Msg::Welcome { .. }))));
         let spec = Spec { cwd: dir.clone(), env: Vec::new(), input: None, program: vec!["yes".into(), "0123456789012345678901234567890123456789".into()] };
         proto::write_msg(&mut flooded, &Msg::Open { id: "pipe-flood".into(), spec, size }).unwrap();
@@ -926,7 +933,7 @@ mod tests {
         assert!(most > 100_000 && most < 3 * CLIENT_QUEUE_BYTES, "{most} bytes of a pipe waited for a window that read none");
         assert!(closed, "the window that took nothing from a pipe was let go of");
         let mut stream = UnixStream::connect(&path).unwrap();
-        proto::write_msg(&mut stream, &Msg::Hello { protocol: proto::PROTOCOL, version: crate::build_watch::build_id() }).unwrap();
+        proto::write_msg(&mut stream, &Msg::Hello { protocol: proto::PROTOCOL, version: crate::build::id() }).unwrap();
         let Ok(Frame::Msg(Msg::Welcome { sessions, .. })) = proto::read_frame(&mut stream) else { panic!("no welcome") };
         assert!(sessions.contains(&"pipe-flood".to_string()), "the program on pipes ran on: {sessions:?}");
         proto::write_msg(&mut stream, &Msg::Kill { id: "pipe-flood".into() }).unwrap();
@@ -951,7 +958,7 @@ mod tests {
         // Attached once the daemon has sent the replay: the open is done.
         let attach = |size: Size| {
             let mut again = UnixStream::connect(&path).unwrap();
-            proto::write_msg(&mut again, &Msg::Hello { protocol: proto::PROTOCOL, version: crate::build_watch::build_id() }).unwrap();
+            proto::write_msg(&mut again, &Msg::Hello { protocol: proto::PROTOCOL, version: crate::build::id() }).unwrap();
             proto::write_msg(&mut again, &Msg::Open { id: "sizes".into(), spec: spec.clone(), size }).unwrap();
             again.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
             let replayed = (0..50).any(|_| matches!(proto::read_frame(&mut again), Ok(Frame::Bytes { kind: KIND_REPLAY, .. })));

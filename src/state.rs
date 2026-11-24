@@ -795,7 +795,8 @@ pub struct WebLook {
 
 /// Debug builds are a separate app: their own data, sockets, window class
 /// and launcher, so a dev build never touches the release one's tasks.
-pub const APP_ID: &str = if cfg!(debug_assertions) { "ideae-dev" } else { "ideae" };
+pub use ideae_core::paths::APP_ID;
+pub use ideae_core::paths::{now, runtime_dir};
 
 /// Where apps keep their data: `~/.local/share`, `%LOCALAPPDATA%` on Windows.
 pub fn data_home() -> PathBuf {
@@ -812,9 +813,6 @@ pub fn data_home() -> PathBuf {
 }
 
 /// Sockets, hook files and browser profiles of running instances.
-pub fn runtime_dir() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join(APP_ID)
-}
 
 pub fn data_dir() -> PathBuf {
     data_home().join(APP_ID)
@@ -865,10 +863,6 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 fn is_zero<T: Default + PartialEq>(n: &T) -> bool {
     *n == T::default()
-}
-
-pub fn now() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 #[cfg(test)]

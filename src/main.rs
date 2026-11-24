@@ -13,6 +13,8 @@ mod crash;
 mod build_watch;
 #[cfg(unix)]
 mod daemon;
+mod hosts;
+mod hostfs;
 mod db;
 mod desktop;
 mod digest;
@@ -405,6 +407,13 @@ impl Workspace {
         }
     }
 
+    /// The same, of another machine.
+    pub fn ask_for_remote_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_presenting() {
+            self.add_remote_project_dialog(window, cx);
+        }
+    }
+
     pub fn toggle_presentation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_presenting() { self.end_presentation(window, cx) } else { self.presentation_dialog(window, cx) }
     }
@@ -544,6 +553,13 @@ impl Workspace {
                                 .label("Add project…")
                                 .on_click(cx.listener(|this, _, window, cx| this.add_project_dialog(window, cx))),
                         )
+                        .child(
+                            Button::new("empty-add-remote-project")
+                                .small()
+                                .ghost()
+                                .label("On another machine…")
+                                .on_click(cx.listener(|this, _, window, cx| this.add_remote_project_dialog(window, cx))),
+                        )
                     })
                     .when_some(project, |s, project| {
                         s.child(
@@ -591,7 +607,12 @@ fn main() {
     let _ = build_watch::build_id();
     #[cfg(unix)]
     if argv.get(1).map(String::as_str) == Some("--daemon") {
+        if argv.get(2).map(String::as_str) == Some("--stdio") {
+            daemon::bridge::run();
+            return;
+        }
         crash::install("daemon");
+        let _ = daemon::server::NOTIFY.set(daemon::notify);
         daemon::server::run(argv.get(2).map(String::as_str) == Some("--adopt"));
         return;
     }
@@ -645,7 +666,7 @@ fn main() {
                 return;
             }
             "--help" | "-h" => {
-                println!("usage: ideae [--agent CMD | --no-agent] [--theme auto|light|dark] [--task PATH] [--version] [REPO...]\n       ideae --install | --uninstall   (list the app with the system's apps, or remove it)\nRepos join the project list, kept in {}.", state::data_dir().join("state.json").display());
+                println!("usage: ideae [--agent CMD | --no-agent] [--theme auto|light|dark] [--task PATH] [--version] [REPO... | ssh://[user@]host[:port]/path...]\n       ideae --install | --uninstall   (list the app with the system's apps, or remove it)\nRepos join the project list, kept in {}.", state::data_dir().join("state.json").display());
                 return;
             }
             _ => repos.push(PathBuf::from(arg)),

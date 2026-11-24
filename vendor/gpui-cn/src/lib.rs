@@ -65,7 +65,8 @@ pub mod remote;
 mod root;
 mod scroll_area;
 mod select;
-pub mod shell;
+/// ideae patch: cn-pty's, which needs no window.
+pub use cn_pty::shell;
 mod sidebar;
 mod skeleton;
 mod slider;

@@ -417,19 +417,8 @@ pub fn runs_a_shell(_: u32) -> bool {
     true
 }
 
-/// A process's name, such as `bash`.
-#[cfg(target_os = "linux")]
-pub fn name(pid: u32) -> Option<String> {
-    std::fs::read_to_string(format!("/proc/{pid}/comm")).ok().map(|n| n.trim().to_string())
-}
-
-#[cfg(target_os = "macos")]
-pub fn name(pid: u32) -> Option<String> {
-    let mut buf = [0u8; 256];
-    // SAFETY: proc_name writes at most the buffer's size.
-    let n = unsafe { libc::proc_name(pid as i32, buf.as_mut_ptr().cast(), buf.len() as u32) };
-    (n > 0).then(|| String::from_utf8_lossy(&buf[..n as usize]).into_owned())
-}
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use ideae_core::procs::name;
 
 #[cfg(unix)]
 pub fn sid(pid: i32) -> i32 {

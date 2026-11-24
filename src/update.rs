@@ -73,7 +73,9 @@ fn newest(releases: &Value) -> Option<Release> {
 
 fn parse(v: &Value) -> Option<Release> {
     let tag = v["tag_name"].as_str()?.to_string();
-    let asset = v["assets"].as_array()?.iter().find(|a| a["name"].as_str().is_some_and(|n| n.ends_with(suffix())))?;
+    // The app's own, never a server's (`ideae-server-<tag>-x86_64-linux`).
+    let name = format!("ideae-{tag}{}", suffix());
+    let asset = v["assets"].as_array()?.iter().find(|a| a["name"].as_str() == Some(name.as_str()))?;
     Some(Release {
         tag,
         asset: asset["name"].as_str()?.to_string(),
@@ -89,6 +91,37 @@ pub fn when(tag: &str) -> String {
     } else {
         tag.to_string()
     }
+}
+
+/// This release's `ideae-server` for a server's system, downloaded once
+/// next to the state; `None` for a build that is no release.
+#[cfg(unix)]
+pub fn server_release(target: crate::daemon::install::Target) -> Option<Result<PathBuf, String>> {
+    let tag = current()?.to_string();
+    let name = format!("ideae-server-{tag}-{}", target.name());
+    let path = crate::state::data_dir().join("server").join(&name);
+    if path.is_file() {
+        return Some(Ok(path));
+    }
+    let download = || {
+        let dir = path.parent().ok_or("no directory")?;
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        let part = dir.join(format!(".{name}.download"));
+        let url = format!("https://github.com/{}/releases/download/{tag}/{name}", repo().ok_or("no repository")?);
+        let status = crate::procs::command("curl")
+            .args(["-fsSL", "--max-time", "300", "-o"])
+            .arg(&part)
+            .arg(&url)
+            .status()
+            .map_err(|e| format!("curl: {e}"))?;
+        if !status.success() {
+            let _ = std::fs::remove_file(&part);
+            return Err(format!("could not download {url}"));
+        }
+        std::fs::rename(&part, &path).map_err(|e| e.to_string())?;
+        Ok(path.clone())
+    };
+    Some(download())
 }
 
 /// Downloads `release` and puts it in place of the running binary.
@@ -246,7 +279,9 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&format!(
             r#"{{"tag_name":"20261115113213","assets":[
                 {{"name":"ideae-20261115113213-other","browser_download_url":"u0","size":1}},
+                {{"name":"ideae-server-20261115113213{}","browser_download_url":"u2","size":2}},
                 {{"name":"ideae-20261115113213{}","browser_download_url":"u1","size":7}}]}}"#,
+            suffix(),
             suffix()
         ))
         .unwrap();

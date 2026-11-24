@@ -105,6 +105,10 @@ pub struct FileView {
 pub(super) const HIDDEN_REFRESH_WAITS: usize = 20;
 
 pub(super) fn mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    if crate::hosts::is_remote(path) {
+        let stat = crate::hostfs::stat(path).ok()?;
+        return Some(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(u64::try_from(stat.modified).ok()?));
+    }
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
@@ -170,7 +174,7 @@ pub(super) fn write_in_order(
         if now.is_some() && now != known && now != latest.1 {
             return Ok(Err(ChangedOnDisk));
         }
-        std::fs::write(path, bytes)?;
+        crate::hostfs::write(path, bytes)?;
         *latest = (seq, mtime(path));
     }
     Ok(Ok(mtime(path)))
@@ -291,7 +295,7 @@ pub(super) fn changed_on_disk(known: Vec<(PathBuf, Option<std::time::SystemTime>
         .into_iter()
         .map(|(path, known)| {
             let now = mtime(&path).filter(|now| Some(*now) != known)?;
-            Some(DiskChange { known, now, content: std::fs::read_to_string(&path).ok()? })
+            Some(DiskChange { known, now, content: crate::hostfs::read_to_string(&path).ok()? })
         })
         .collect()
 }
@@ -515,6 +519,21 @@ impl FileView {
     }
 
     pub(super) fn reload_from_disk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A remote task's file comes from its host off the UI thread.
+        if crate::hosts::is_remote(&self.path) {
+            let path = self.path.clone();
+            cx.spawn_in(window, async move |this, cx| {
+                let read = cx.background_spawn(async move { (crate::hostfs::read_to_string(&path), mtime(&path)) }).await;
+                if let (Ok(content), mtime) = read {
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.disk_mtime = mtime;
+                        this.reload(content, window, cx);
+                    });
+                }
+            })
+            .detach();
+            return;
+        }
         if let Ok(content) = std::fs::read_to_string(&self.path) {
             self.disk_mtime = mtime(&self.path);
             self.reload(content, window, cx);

@@ -339,72 +339,8 @@ pub struct InputModes {
     pub alternate_scroll: bool,
 }
 
-/// The grid size and the cell size in device pixels.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Viewport {
-    columns: u16,
-    rows: u16,
-    cell_width: u32,
-    cell_height: u32,
-}
-
-impl Default for Viewport {
-    fn default() -> Self {
-        Self {
-            columns: 80,
-            rows: 24,
-            cell_width: 8,
-            cell_height: 16,
-        }
-    }
-}
-
-/// The largest grid the engine accepts on either axis.
-pub const MAX_GRID: u16 = 1000;
-
-impl Viewport {
-    /// A viewport, rejecting empty grids, grids over [`MAX_GRID`] and cells
-    /// over 4096 pixels.
-    pub fn new(columns: u16, rows: u16, cell_width: u32, cell_height: u32) -> Option<Self> {
-        if columns == 0
-            || rows == 0
-            || columns > MAX_GRID
-            || rows > MAX_GRID
-            || cell_width == 0
-            || cell_height == 0
-            || cell_width > 4096
-            || cell_height > 4096
-        {
-            return None;
-        }
-        Some(Self {
-            columns,
-            rows,
-            cell_width,
-            cell_height,
-        })
-    }
-    /// Columns.
-    #[must_use]
-    pub fn columns(self) -> u16 {
-        self.columns
-    }
-    /// Rows.
-    #[must_use]
-    pub fn rows(self) -> u16 {
-        self.rows
-    }
-    /// Cell width in device pixels.
-    #[must_use]
-    pub fn cell_width(self) -> u32 {
-        self.cell_width
-    }
-    /// Cell height in device pixels.
-    #[must_use]
-    pub fn cell_height(self) -> u32 {
-        self.cell_height
-    }
-}
+/// ideae patch: cn-pty's, which needs no window.
+pub use cn_pty::{MAX_GRID, Viewport};
 
 /// The pixels of one image a program sent, 8-bit RGBA with straight alpha,
 /// row by row.

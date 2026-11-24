@@ -24,14 +24,7 @@ fn desktop_file() -> Option<PathBuf> {
 
 /// The running binary; after it was replaced on disk Linux reports the old
 /// path with " (deleted)", and the new file is there under the plain name.
-pub fn exe() -> std::io::Result<PathBuf> {
-    let exe = std::env::current_exe()?;
-    let s = exe.to_string_lossy();
-    Ok(match s.strip_suffix(" (deleted)") {
-        Some(plain) => PathBuf::from(plain),
-        None => exe,
-    })
-}
+pub use ideae_core::paths::exe;
 
 fn entry(exe: &std::path::Path) -> String {
     format!(

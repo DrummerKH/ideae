@@ -42,6 +42,22 @@ how a project names its branches is for its agent (its CLAUDE.md) or you. A
 Linear link has the issue's title in it: the task and its branch are named
 from it at once (`ENG-123_fixTheLoginForm`).
 
+## Projects on another machine
+
+A repository on a server or another computer, reached by ssh as a terminal
+reaches it (keys, `~/.ssh/config`): **Add project → On another machine…**
+(`me@box:/home/me/project`, or `ssh://me@box:2222/home/me/project`), or
+`ideae ssh://me@box/home/me/project`. ideae puts a small `ideae-server` of
+its own version there (static, for Linux x86_64 and aarch64 and macOS; no
+network needed there) and its tasks run there: their worktrees, agents and
+terminals, git, the changes and the files you open and save. The agents
+report as local ones do and go on while the window is closed or the link is
+down; the window dials again on its own. Exit ends them there too.
+
+Not there yet: language servers, the file watcher (a task in view is read
+again every ten seconds), pull requests, archive, variants, the Run panel
+and Web tabs, chat agents, passwords (keys and the ssh agent only).
+
 ## Pause, archive, restore
 
 A task's menu ends with **Pause** and **Archive**. Pause stops its agent,
