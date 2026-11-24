@@ -1,6 +1,6 @@
-//! The themes of the UI and the terminals, each light/dark/auto; Fira Code for code.
+//! The themes of the UI and the terminals, each light/dark/auto; the font of code.
 
-use gpui_cn::terminal::TerminalColors;
+use gpui_cn::terminal::{TerminalAppearance, TerminalColors};
 use gpui_kit::component::{Theme, ThemeMode, ThemeRegistry};
 use gpui_kit::*;
 
@@ -28,11 +28,15 @@ impl Appearance {
     }
 }
 
-/// The code font of the editor, diffs and lists of code; terminals keep
-/// gpui-cn's JetBrains Mono, which they draw without ligatures anyway.
-/// Embedded (SIL OFL 1.1, `assets/fonts/OFL-FiraCode.txt`), so the machine
-/// need not have it. Ligatures are on: GPUI shapes with `calt` by default.
+/// The code font of the editor, diffs and lists of code until Settings
+/// names another; terminals keep gpui-cn's JetBrains Mono, which they draw
+/// without ligatures anyway. Embedded (SIL OFL 1.1,
+/// `assets/fonts/OFL-FiraCode.txt`), so the machine need not have it.
 pub const CODE_FONT: &str = "Fira Code";
+
+/// The code fonts that come with the app: Fira Code, and gpui-cn's
+/// JetBrains Mono, which the terminals draw with.
+pub const BUILT_IN_FONTS: [&str; 2] = [CODE_FONT, "JetBrains Mono"];
 
 fn register_code_font(cx: &mut App) {
     use std::borrow::Cow;
@@ -44,6 +48,82 @@ fn register_code_font(cx: &mut App) {
         Ok(()) => Theme::global_mut(cx).mono_font_family = CODE_FONT.into(),
         Err(error) => eprintln!("{CODE_FONT}: {error:#}"),
     }
+}
+
+/// Draws code in `family`: one built in, or one installed. Any other is
+/// Fira Code: GPUI panics at the first line laid out in a family it cannot
+/// find.
+pub fn set_code_font(family: &str, cx: &mut App) {
+    let family = if BUILT_IN_FONTS.contains(&family) || installed(family, cx) { family } else { CODE_FONT };
+    let theme = Theme::global_mut(cx);
+    if theme.mono_font_family.as_ref() != family {
+        theme.mono_font_family = SharedString::from(family.to_string());
+        cx.refresh_windows();
+    }
+}
+
+/// Whether the machine has `family`. The families are listed once: that
+/// takes about a tenth of a second, and only a font not built in asks.
+fn installed(family: &str, cx: &App) -> bool {
+    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| cx.text_system().all_font_names()).iter().any(|name| name == family)
+}
+
+/// The monospaced families installed, found once off the UI thread; None
+/// while they are looked for.
+struct Monospaced(Option<Vec<SharedString>>);
+impl Global for Monospaced {}
+
+/// The code fonts to choose from: those built in, then the monospaced ones
+/// installed once they are found, the windows drawn again then.
+pub fn code_fonts(cx: &mut App) -> Vec<SharedString> {
+    let mut fonts: Vec<SharedString> = BUILT_IN_FONTS.into_iter().map(SharedString::from).collect();
+    match cx.try_global::<Monospaced>() {
+        Some(Monospaced(Some(found))) => fonts.extend(found.iter().filter(|name| !BUILT_IN_FONTS.contains(&name.as_ref())).cloned()),
+        Some(Monospaced(None)) => {}
+        None => {
+            cx.set_global(Monospaced(None));
+            let text = cx.text_system().clone();
+            let found = cx.background_spawn(async move { monospaced(&text) });
+            cx.spawn(async move |cx| {
+                let found = found.await;
+                let _ = cx.update(|cx| {
+                    cx.set_global(Monospaced(Some(found)));
+                    cx.refresh_windows();
+                });
+            })
+            .detach();
+        }
+    }
+    fonts
+}
+
+/// The families whose letters are all as wide, the ones a family only
+/// stands in for left out.
+fn monospaced(text: &TextSystem) -> Vec<SharedString> {
+    let size = px(16.);
+    text.all_font_names()
+        .into_iter()
+        .filter(|name| !name.starts_with('.'))
+        .filter(|name| {
+            let id = text.resolve_font(&font(name.clone()));
+            if text.get_font_for_id(id).is_none_or(|found| found.family.as_ref() != name) {
+                return false;
+            }
+            let widths: Vec<f32> = ['i', 'M', 'W', '.'].into_iter().filter_map(|c| text.advance(id, size, c).ok()).map(|a| f32::from(a.width)).collect();
+            widths.len() == 4 && widths.iter().all(|w| (w - widths[0]).abs() < 0.01)
+        })
+        .map(SharedString::from)
+        .collect()
+}
+
+/// The cell of every terminal as Settings sizes it.
+pub fn terminal_appearance(settings: &crate::state::Settings) -> TerminalAppearance {
+    let (least, most) = crate::state::SPACING;
+    let fraction = |percent: u32| percent.clamp(least, most) as f32 / 100. - 1.;
+    TerminalAppearance::default()
+        .with_cell_width_adjust(fraction(settings.terminal_letter_spacing))
+        .with_cell_height_adjust(fraction(settings.terminal_line_height))
 }
 
 /// A theme to choose: a light and a dark one that go together, by the
@@ -224,7 +304,7 @@ selection-background = #d1e4f4
 
 #[cfg(test)]
 mod tests {
-    use super::{Appearance, FAMILIES, apply_everywhere, choose, family, hex, init, terminal_colors};
+    use super::{Appearance, BUILT_IN_FONTS, CODE_FONT, FAMILIES, apply_everywhere, choose, family, hex, init, set_code_font, terminal_appearance, terminal_colors};
     use gpui_cn::terminal::TerminalColors;
     use gpui_kit::TestAppContext;
     use gpui_kit::component::{Theme, ThemeRegistry};
@@ -261,5 +341,30 @@ mod tests {
             apply_everywhere(Appearance::Dark, cx);
             assert_eq!((family(cx), Theme::global(cx).theme_name().as_ref()), ("Gruvbox", "Gruvbox Dark"), "each side its own family");
         });
+    }
+
+    /// A code font built in is taken as it is; one the machine lacks would
+    /// panic at the first line laid out, so Fira Code stays.
+    #[gpui_kit::test]
+    fn a_code_font_the_machine_lacks_is_fira_code(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            init(cx);
+            set_code_font(BUILT_IN_FONTS[1], cx);
+            assert_eq!(Theme::global(cx).mono_font_family.as_ref(), BUILT_IN_FONTS[1]);
+            set_code_font("No Such Mono", cx);
+            assert_eq!(Theme::global(cx).mono_font_family.as_ref(), CODE_FONT);
+        });
+    }
+
+    /// Percent in Settings, a fraction of the font's cell for the terminal.
+    #[test]
+    fn a_terminal_s_cell_is_sized_by_percent() {
+        let settings = crate::state::Settings { terminal_letter_spacing: 95, terminal_line_height: 103, ..Default::default() };
+        let appearance = terminal_appearance(&settings);
+        assert!((appearance.cell_width_adjust() + 0.05).abs() < 1e-6);
+        assert!((appearance.cell_height_adjust() - 0.03).abs() < 1e-6);
+        let plain = terminal_appearance(&crate::state::Settings::default());
+        assert_eq!((plain.cell_width_adjust(), plain.cell_height_adjust()), (0., 0.));
     }
 }

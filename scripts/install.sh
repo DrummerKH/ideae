@@ -1,7 +1,7 @@
 #!/bin/sh
 # Installs the latest release of ideae:
 #   Linux x86_64             ~/.local/bin/ideae, listed with the applications
-#   macOS on Apple Silicon   ~/Applications/ideae.app
+#   macOS                    ~/Applications/ideae.app
 #
 #   curl -fsSL https://github.com/scillarium/ideae/releases/latest/download/install.sh | sh
 #
@@ -33,10 +33,15 @@ case "$(uname -s)-$(uname -m)" in
       *) echo "To run it from a terminal too, add $dir to PATH." ;;
     esac
     ;;
-  Darwin-arm64)
+  Darwin-arm64 | Darwin-x86_64)
+    arch=$(uname -m)
+    # A shell under Rosetta says x86_64 on Apple Silicon too.
+    if [ "$(sysctl -n sysctl.proc_translated 2>/dev/null)" = 1 ]; then
+      arch=arm64
+    fi
     apps="$HOME/Applications"
     mkdir -p "$apps"
-    curl -fL --progress-bar -o "$tmp/ideae.zip" "$from/ideae-$tag-macos-arm64.app.zip"
+    curl -fL --progress-bar -o "$tmp/ideae.zip" "$from/ideae-$tag-macos-$arch.app.zip"
     ditto -x -k "$tmp/ideae.zip" "$tmp/app"
     rm -rf "$apps/ideae.app"
     mv "$tmp/app/ideae.app" "$apps/ideae.app"

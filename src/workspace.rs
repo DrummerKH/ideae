@@ -371,6 +371,7 @@ impl Workspace {
             .or_else(|| saved.appearance.as_deref().and_then(Appearance::parse))
             .unwrap_or(Appearance::Auto);
         theme::choose(&saved.settings.theme, saved.settings.dark_theme(), cx);
+        theme::set_code_font(&saved.settings.code_font, cx);
         theme::apply(appearance, window, cx);
         crate::lsp::POWER_SAVING.store(saved.power_saving, std::sync::atomic::Ordering::Relaxed);
         // A global: tests running alongside would flip it under edit.rs's test of it.
@@ -1709,7 +1710,11 @@ impl Workspace {
         let prompt = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(4, 14)
-                .placeholder("For the agent, optional: put into its prompt for you to finish and send")
+                .placeholder(if state::settings().send_new_prompt {
+                    "For the agent, optional: sent once it is up"
+                } else {
+                    "For the agent, optional: put into its prompt for you to finish and send"
+                })
         });
         // How many variants of the task, and what each one's agent alone is told.
         let count = Rc::new(std::cell::Cell::new(1usize));
@@ -1951,7 +1956,7 @@ impl Workspace {
                 this.open_main(project, window, cx);
                 let view = this.entry_mut(&repo).and_then(|entry| entry.view.clone());
                 if let (false, Some(view)) = (prompt.is_empty(), view) {
-                    view.update(cx, |t, cx| t.queue_prompt(prompt, false, window, cx));
+                    view.update(cx, |t, cx| t.queue_prompt(prompt, state::settings().send_new_prompt, window, cx));
                 }
                 let told = "Tasks get a worktree of their own from a git commit. There is none here yet, so this one works right in the folder.";
                 window.push_notification(Notification::info(told).title("Working in the folder"), cx);
@@ -2007,7 +2012,7 @@ impl Workspace {
                         let view = this.entry_mut(&path).and_then(|entry| entry.view.clone());
                         if let (false, Some(view)) = (prompt.is_empty(), view) {
                             // A run of IDEAE_NEW_TASK has nobody to press Enter: its prompts are sent.
-                            let send = std::env::var_os("IDEAE_NEW_TASK").is_some();
+                            let send = state::settings().send_new_prompt || std::env::var_os("IDEAE_NEW_TASK").is_some();
                             view.update(cx, |t, cx| t.queue_prompt(prompt, send, window, cx));
                         }
                     }
@@ -2747,6 +2752,18 @@ impl Workspace {
         }
         if old.notices_at != new.notices_at {
             theme::place_notices(cx);
+        }
+        if old.code_font != new.code_font {
+            theme::set_code_font(&new.code_font, cx);
+        }
+        if old.ligatures != new.ligatures {
+            cx.refresh_windows();
+        }
+        if (old.terminal_letter_spacing, old.terminal_line_height) != (new.terminal_letter_spacing, new.terminal_line_height) {
+            let appearance = theme::terminal_appearance(&new);
+            for view in self.views() {
+                view.update(cx, |t, cx| t.set_terminal_appearance(&appearance, cx));
+            }
         }
         if old.gutter_since_base != new.gutter_since_base {
             for view in self.views() {

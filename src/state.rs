@@ -146,6 +146,16 @@ pub struct Settings {
     /// The one drawn while dark; empty for the same family as [`Self::theme`].
     #[serde(skip_serializing_if = "String::is_empty")]
     pub dark_theme: String,
+    /// A new task's prompt is sent once its agent is up, not left in the
+    /// agent's input to finish.
+    pub send_new_prompt: bool,
+    /// The family code is drawn in: one built in, or one installed.
+    pub code_font: String,
+    /// Pairs such as `->` and `!=` are drawn as one sign where the font has one.
+    pub ligatures: bool,
+    /// A terminal's cell, in percent of the font's own width and height.
+    pub terminal_letter_spacing: u32,
+    pub terminal_line_height: u32,
     /// The title bar shows the machine's load, and what the agents took.
     pub show_load: bool,
     pub show_tokens: bool,
@@ -244,6 +254,9 @@ fn yes() -> bool {
     true
 }
 
+/// The percent a terminal's letter spacing and line height may be.
+pub const SPACING: (u32, u32) = (50, 200);
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -280,6 +293,11 @@ impl Default for Settings {
             rail_open_ms: 750,
             theme: "Ayu".into(),
             dark_theme: String::new(),
+            send_new_prompt: false,
+            code_font: crate::theme::CODE_FONT.into(),
+            ligatures: true,
+            terminal_letter_spacing: 100,
+            terminal_line_height: 100,
             show_load: false,
             show_tokens: false,
             context_dial: true,
@@ -341,6 +359,8 @@ impl Settings {
             self.quick_agent.clear();
         }
         self.agent = self.default_profile().map(|p| p.command.clone()).unwrap_or_default();
+        self.terminal_letter_spacing = self.terminal_letter_spacing.clamp(SPACING.0, SPACING.1);
+        self.terminal_line_height = self.terminal_line_height.clamp(SPACING.0, SPACING.1);
     }
 
     pub fn dark_theme(&self) -> &str {

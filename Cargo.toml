@@ -118,6 +118,7 @@ opt-level = 2
 [patch.crates-io]
 gpui-component = { path = "vendor/gpui-component" }
 # terminal/core.rs + engine.rs patched: report light/dark (CSI ? 996 n, mode 2031).
+# terminal/appearance.rs patched: with_cell_width_adjust, a cell's width as a fraction of the font's.
 gpui-cn = { path = "vendor/gpui-cn" }
 # input/base/state.rs patched: hover/Ctrl+click hit-test ignored the scroll offset.
 # input/base/state.rs + element.rs + editor/lsp/definitions.rs patched: jump_to_position,

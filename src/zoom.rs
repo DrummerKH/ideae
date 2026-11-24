@@ -27,13 +27,13 @@ pub struct Zoom {
 
 impl Global for Zoom {}
 
-const MIN: f32 = 6.;
-const MAX: f32 = 48.;
+pub const MIN: f32 = 6.;
+pub const MAX: f32 = 48.;
 /// Touchpad scroll, in pixels, that makes one step of one point.
 const PIXELS_PER_STEP: f32 = 40.;
 
 impl Zoom {
-    fn slot(&mut self, kind: Kind) -> &mut Option<f32> {
+    pub fn slot(&mut self, kind: Kind) -> &mut Option<f32> {
         match kind {
             Kind::Editor => &mut self.editor,
             Kind::Changes => &mut self.changes,
