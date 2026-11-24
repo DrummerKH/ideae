@@ -1,5 +1,5 @@
-//! Updates for release builds: the latest GitHub release of the repository
-//! this binary came from, downloaded next to the running binary and put in
+//! Updates for release builds: the newest GitHub release of the repository
+//! this binary came from that has a build for this system, downloaded next to the running binary and put in
 //! its place. A build of a checkout: new commits of its remote's main branch,
 //! pulled and built over the running binary, which the new-build notice then
 //! offers to restart into.
@@ -49,14 +49,26 @@ pub fn newer() -> Option<Release> {
     let current = current()?;
     let out = crate::procs::command("curl")
         .args(["-fsSL", "--max-time", "20", "-H", "Accept: application/vnd.github+json"])
-        .arg(format!("https://api.github.com/repos/{}/releases/latest", repo()?))
+        .arg(format!("https://api.github.com/repos/{}/releases?per_page=20", repo()?))
         .output()
         .ok()?;
     if !out.status.success() {
         return None;
     }
-    let release = parse(&serde_json::from_slice(&out.stdout).ok()?)?;
+    let release = newest(&serde_json::from_slice(&out.stdout).ok()?)?;
     (release.tag.parse::<u64>().ok()? > current).then_some(release)
+}
+
+/// The newest of `releases` with this system's binary: a release whose
+/// macOS builds failed has only the others, and the one before it is
+/// still the newest for a Mac.
+fn newest(releases: &Value) -> Option<Release> {
+    releases
+        .as_array()?
+        .iter()
+        .filter(|r| !r["draft"].as_bool().unwrap_or(false) && !r["prerelease"].as_bool().unwrap_or(false))
+        .filter_map(parse)
+        .max_by_key(|r| r.tag.parse::<u64>().unwrap_or(0))
 }
 
 fn parse(v: &Value) -> Option<Release> {
@@ -226,7 +238,7 @@ pub fn rebuild(dir: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse, suffix, target_dir, when};
+    use super::{newest, parse, suffix, target_dir, when};
     use std::path::Path;
 
     #[test]
@@ -241,6 +253,27 @@ mod tests {
         let r = parse(&v).unwrap();
         assert_eq!((r.url.as_str(), r.size), ("u1", 7));
         assert_eq!(when("20261115113213"), "15.11 11:32");
+    }
+
+    /// A release without this system's binary (its build failed) is passed
+    /// over for the one before it; drafts and pre-releases too.
+    #[test]
+    fn the_newest_release_with_this_systems_binary() {
+        let release = |tag: &str, ours: bool, extra: &str| {
+            let name = if ours { format!("ideae-{tag}{}", suffix()) } else { format!("ideae-{tag}-other") };
+            format!(r#"{{"tag_name":"{tag}",{extra}"assets":[{{"name":"{name}","browser_download_url":"u{tag}","size":1}}]}}"#)
+        };
+        let list = format!(
+            "[{},{},{},{},{}]",
+            release("20261124161159", false, ""),
+            release("20261124150000", true, r#""draft":true,"#),
+            release("20261124140000", true, r#""prerelease":true,"#),
+            release("20261124093835", true, ""),
+            release("20261120000000", true, ""),
+        );
+        let found = newest(&serde_json::from_str(&list).unwrap()).unwrap();
+        assert_eq!(found.tag, "20261124093835");
+        assert!(newest(&serde_json::from_str(&format!("[{}]", release("20261124161159", false, ""))).unwrap()).is_none());
     }
 
     #[test]
