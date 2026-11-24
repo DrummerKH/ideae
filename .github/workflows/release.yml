@@ -98,12 +98,19 @@ jobs:
           name: windows
           path: ideae-*-windows-x86_64.exe
 
-  # Apple Silicon. The bare binary is what updates download; the .app in a
-  # zip is for a first install. Ad-hoc signed only (no Developer ID yet):
-  # the first start needs right click, Open.
+  # Apple Silicon and Intel, both built on Apple Silicon. The bare binary is
+  # what updates download; the .app in a zip is for a first install. Ad-hoc
+  # signed only (no Developer ID yet): the first start needs right click, Open.
   macos:
     needs: version
     runs-on: macos-latest
+    strategy:
+      # One that fails leaves the other to be released.
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, arch: arm64 }
+          - { target: x86_64-apple-darwin, arch: x86_64 }
     env:
       IDEAE_VERSION: ${{ needs.version.outputs.tag }}
     steps:
@@ -114,21 +121,23 @@ jobs:
         with:
           version: 0.17.1
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release
-      - run: cargo build --release --locked
+          key: release-${{ matrix.arch }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Package
         run: |
-          bin="ideae-$IDEAE_VERSION-macos-arm64"
-          cp target/release/ideae "$bin"
+          bin="ideae-$IDEAE_VERSION-macos-${{ matrix.arch }}"
+          cp "target/${{ matrix.target }}/release/ideae" "$bin"
           codesign --force --sign - "$bin"
           scripts/macos-app.sh "$bin" ideae.app "$IDEAE_VERSION"
-          ditto -c -k --keepParent ideae.app "ideae-$IDEAE_VERSION-macos-arm64.app.zip"
+          ditto -c -k --keepParent ideae.app "$bin.app.zip"
       - uses: actions/upload-artifact@v4
         with:
-          name: macos
-          path: ideae-*-macos-arm64*
+          name: macos-${{ matrix.arch }}
+          path: ideae-*-macos-${{ matrix.arch }}*
 
   # A macOS build that fails leaves the others to be released.
   release:

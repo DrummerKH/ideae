@@ -46,6 +46,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
   <key>CFBundleVersion</key><string>$version</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSMicrophoneUsageDescription</key><string>Programs in ideae's terminals, such as an agent's voice input, use the microphone.</string>
 </dict></plist>
 PLIST
 # A linked binary carries the linker's own ad-hoc signature, and a bundle

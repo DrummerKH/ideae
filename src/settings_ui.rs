@@ -18,6 +18,9 @@ use gpui_kit::{TestSupportExt as _, prelude::FluentBuilder as _, *};
 use crate::{lsp, state, theme::Appearance, workspace::Workspace};
 
 type Draft = Rc<RefCell<state::Settings>>;
+/// The text sizes, which Ctrl+wheel sets too: kept in the state apart
+/// from the settings, applied with them on Save.
+type Sizes = Rc<Cell<crate::zoom::Zoom>>;
 
 fn switch(
     draft: &Draft,
@@ -96,12 +99,87 @@ fn language_choice(
     items
 }
 
+/// The font of code, its sizes and a terminal's cell. `fonts` are those to
+/// choose from, `code_size` the theme's size of code.
+fn text_group(draft: &Draft, sizes: &Sizes, fonts: Vec<SharedString>, code_size: f32) -> SettingGroup {
+    use crate::zoom::Kind;
+    let font = {
+        let (read, write) = (draft.clone(), draft.clone());
+        // One chosen that is not listed yet, or no longer, is still the one shown.
+        let chosen = SharedString::from(read.borrow().code_font.clone());
+        let mut fonts = fonts;
+        if !fonts.contains(&chosen) {
+            fonts.push(chosen);
+        }
+        let options = fonts
+            .into_iter()
+            .map(|name| {
+                let label = if crate::theme::BUILT_IN_FONTS.contains(&name.as_ref()) { format!("{name} (built in)") } else { name.to_string() };
+                (name, SharedString::from(label))
+            })
+            .collect();
+        SettingField::scrollable_dropdown(options, move |_| read.borrow().code_font.clone().into(), move |value, _| {
+            write.borrow_mut().code_font = value.to_string()
+        })
+        .default_value(SharedString::from(crate::theme::CODE_FONT))
+    };
+    let size = |kind: Kind| {
+        let (read, write) = (sizes.clone(), sizes.clone());
+        SettingField::number_input(
+            NumberFieldOptions { min: f64::from(crate::zoom::MIN), max: f64::from(crate::zoom::MAX), step: 1. },
+            move |_| f64::from(read.get().get(kind).unwrap_or(code_size)),
+            move |value, _| {
+                let mut zoom = write.get();
+                *zoom.slot(kind) = Some(value as f32).filter(|size| *size != code_size);
+                write.set(zoom);
+            },
+        )
+        .default_value(f64::from(code_size))
+    };
+    let percent = |get: fn(&state::Settings) -> u32, set: fn(&mut state::Settings, u32)| {
+        let (read, write) = (draft.clone(), draft.clone());
+        SettingField::number_input(
+            NumberFieldOptions { min: f64::from(state::SPACING.0), max: f64::from(state::SPACING.1), step: 1. },
+            move |_| f64::from(get(&read.borrow())),
+            move |value, _| set(&mut write.borrow_mut(), value as u32),
+        )
+        .default_value(100.)
+    };
+    SettingGroup::new()
+        .title("Text")
+        .item(SettingItem::new("Code font", font).description(
+            "Files, diffs and the code in lists. Fira Code and JetBrains Mono come with ideae; the others are the fonts installed, monospaced ones meant. Terminals keep JetBrains Mono.",
+        ))
+        .item(switch(
+            draft,
+            "Ligatures",
+            "Pairs such as -> and != are drawn as one sign where the code font has one. Terminals draw every character apart.",
+            |s| s.ligatures,
+            |s, v| s.ligatures = v,
+        ))
+        .item(SettingItem::new("Text size in files", size(Kind::Editor)).description("In points. Ctrl+wheel over a view sets its size too."))
+        .item(SettingItem::new("Text size in Changes", size(Kind::Changes)))
+        .item(SettingItem::new("Text size in terminals", size(Kind::Terminal)))
+        .item(
+            SettingItem::new("Letter spacing in terminals", percent(|s| s.terminal_letter_spacing, |s, v| s.terminal_letter_spacing = v))
+                .description("The width of a terminal's cell, in percent of the font's. Below 100 the letters come closer."),
+        )
+        .item(
+            SettingItem::new("Line height in terminals", percent(|s| s.terminal_line_height, |s, v| s.terminal_line_height = v))
+                .description("The height of a terminal's cell, in percent of the font's."),
+        )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn pages(
     draft: &Draft,
     look: &Rc<Cell<Appearance>>,
     dark_now: bool,
     recording: &Rc<Cell<Option<&'static str>>>,
     catcher: &Rc<RefCell<Option<Subscription>>>,
+    sizes: &Sizes,
+    fonts: Vec<SharedString>,
+    code_size: f32,
 ) -> Vec<SettingPage> {
     let default = state::Settings::default();
     let idle = {
@@ -269,7 +347,7 @@ fn pages(
                 .item(SettingItem::new("Light or dark", appearance).description(format!(
                     "Auto follows the system's setting, which is {now} now. Light and Dark stay fixed.",
                 ))),
-        ).group(
+        ).group(text_group(draft, sizes, fonts, code_size)).group(
             SettingGroup::new().title("Notices")
                 .item(switch(
                     draft,
@@ -399,6 +477,13 @@ fn pages(
                     "New worktrees get copies of the main checkout's ignored .env* files, unless the project's settings list other files to copy.",
                     |s| s.copy_env,
                     |s, v| s.copy_env = v,
+                ))
+                .item(switch(
+                    draft,
+                    "Send the prompt at once",
+                    "The prompt written with a new task is sent once its agent is up. When off, it waits in the agent's input for you to finish and send.",
+                    |s| s.send_new_prompt,
+                    |s, v| s.send_new_prompt = v,
                 ))
                 .item({
                     let (read, write) = (draft.clone(), draft.clone());
@@ -1271,8 +1356,10 @@ fn open(
 ) {
     let draft: Draft = Rc::new(RefCell::new(current));
     let look = Rc::new(Cell::new(appearance));
+    let sizes: Sizes = Rc::new(Cell::new(crate::zoom::current(cx)));
     INSTALLED.with(|known| known.borrow_mut().clear());
     crate::workspace::welcome::forget_find();
+    crate::theme::forget_code_fonts(cx);
     // The shortcut waiting for keys, and what catches them before any
     // binding does.
     let recording: Rc<Cell<Option<&'static str>>> = Rc::default();
@@ -1281,13 +1368,16 @@ fn open(
     window.open_dialog(cx, move |dialog, window, _| {
         // Room for the longer titles of the pages' list, as the window allows.
         let wide = (window.viewport_size().width - px(64.)).clamp(px(640.), px(1000.));
-        let (draft, look, recording, catcher) = (draft.clone(), look.clone(), recording.clone(), catcher.clone());
+        let (draft, look, sizes, recording, catcher) = (draft.clone(), look.clone(), sizes.clone(), recording.clone(), catcher.clone());
         let save = {
-            let (draft, look, save) = (draft.clone(), look.clone(), save.clone());
+            let (draft, look, sizes, save) = (draft.clone(), look.clone(), sizes.clone(), save.clone());
             move |window: &mut Window, cx: &mut App| {
                 let mut settings = draft.borrow().clone();
                 settings.normalize();
                 settings.lsp_idle_minutes = settings.lsp_idle_minutes.max(1);
+                for kind in [crate::zoom::Kind::Editor, crate::zoom::Kind::Changes, crate::zoom::Kind::Terminal] {
+                    crate::zoom::set(kind, sizes.get().get(kind), cx);
+                }
                 save(settings, look.get(), window, cx);
                 window.close_dialog(cx);
             }
@@ -1297,6 +1387,7 @@ fn open(
             .w(wide)
             .content(move |content, window, cx| {
                 let dark_now = matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark);
+                let (fonts, code_size) = (crate::theme::code_fonts(cx), f32::from(cx.theme().mono_font_size));
                 // The dialog is as tall as the window lets it; the pages scroll inside.
                 let height = (window.viewport_size().height - px(220.)).clamp(px(200.), px(620.));
                 content.child(
@@ -1310,7 +1401,7 @@ fn open(
                             Settings::new("settings")
                                 .sidebar_width(px(240.))
                                 .default_selected_index(SelectIndex { page_ix: first, group_ix: None })
-                                .pages(pages(&draft, &look, dark_now, &recording, &catcher)),
+                                .pages(pages(&draft, &look, dark_now, &recording, &catcher, &sizes, fonts, code_size)),
                         ),
                 )
             })

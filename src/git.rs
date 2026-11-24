@@ -2162,18 +2162,37 @@ pub fn pull_conflicts(root: &Path) -> Option<Vec<String>> {
 fn merge_conflicts(root: &Path, base: Option<&str>, theirs: &str) -> Option<Vec<String>> {
     let written = worktree_commit(root)?;
     let mine = written.as_str();
-    let mut merge = crate::procs::command("git");
-    merge.current_dir(root).args(["-c", "core.quotePath=false", "merge-tree", "--write-tree", "--name-only", "--no-messages"]);
-    if let Some(base) = base {
-        merge.args(["--merge-base", base]);
-    }
-    let merged = merge.args([mine, theirs]).output().ok()?;
+    let merge_tree = |extra: &[&str], mine: &str, theirs: &str| {
+        let mut merge = crate::procs::command("git");
+        merge.current_dir(root).args(["-c", "core.quotePath=false", "merge-tree", "--write-tree", "--name-only", "--no-messages"]);
+        merge.args(extra).args([mine, theirs]).output().ok()
+    };
+    let merged = match base {
+        None => merge_tree(&[], mine, theirs)?,
+        Some(base) => match merge_tree(&["--merge-base", base], mine, theirs) {
+            // Git before 2.40 (macOS's own) has no --merge-base: the two sides
+            // made children of the base alone, which is then theirs in common.
+            Some(merged) if merged.status.code() != Some(129) => merged,
+            _ => merge_tree(&[], &on_base(root, mine, base)?, &on_base(root, theirs, base)?)?,
+        },
+    };
     match merged.status.code() {
         Some(0) => Some(Vec::new()),
         // The tree it made, then the files it could not merge.
         Some(1) => Some(String::from_utf8_lossy(&merged.stdout).lines().skip(1).filter(|line| !line.is_empty()).map(str::to_string).collect()),
         _ => None,
     }
+}
+
+/// `rev`'s files as a commit whose one parent is `base`, kept nowhere.
+fn on_base(root: &Path, rev: &str, base: &str) -> Option<String> {
+    let made = crate::procs::command("git")
+        .current_dir(root)
+        .envs([("GIT_AUTHOR_NAME", "ideae"), ("GIT_AUTHOR_EMAIL", "ideae@localhost"), ("GIT_COMMITTER_NAME", "ideae"), ("GIT_COMMITTER_EMAIL", "ideae@localhost")])
+        .args(["commit-tree", &format!("{rev}^{{tree}}"), "-p", base, "-m", "ideae"])
+        .output()
+        .ok()?;
+    made.status.success().then(|| String::from_utf8_lossy(&made.stdout).trim().to_string())
 }
 
 /// A commit of the worktree as it is, kept nowhere: HEAD when it is clean.

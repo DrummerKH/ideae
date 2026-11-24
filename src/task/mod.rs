@@ -967,7 +967,9 @@ impl TaskView {
         // newline for a line break inside the command and waits for more.
         let enter = if cfg!(windows) { "\r" } else { "\n" };
         let input = input.map(|input| format!("{input}{enter}"));
-        let config = TerminalConfig::default().with_colors(crate::theme::terminal_colors(cx));
+        let config = TerminalConfig::default()
+            .with_colors(crate::theme::terminal_colors(cx))
+            .with_appearance(crate::theme::terminal_appearance(&crate::state::settings()));
         // In the daemon the program outlives the window; a restart attaches
         // to it again under the same session name.
         let session = format!(
@@ -1414,11 +1416,21 @@ impl TaskView {
         }
     }
 
+    /// Every terminal of the task, those of questions put away too.
     pub fn set_terminal_colors(&mut self, colors: &gpui_cn::terminal::TerminalColors, cx: &mut Context<Self>) {
-        for tab in &self.tabs {
+        for tab in self.all_tabs() {
             if let TabKind::Terminal(view) = &tab.kind {
                 let state = view.read(cx).state.clone();
                 state.update(cx, |s, cx| s.set_colors(colors.clone(), cx));
+            }
+        }
+    }
+
+    pub fn set_terminal_appearance(&mut self, appearance: &gpui_cn::terminal::TerminalAppearance, cx: &mut Context<Self>) {
+        for tab in self.all_tabs() {
+            if let TabKind::Terminal(view) = &tab.kind {
+                let state = view.read(cx).state.clone();
+                state.update(cx, |s, cx| s.set_appearance(appearance.clone(), cx));
             }
         }
     }

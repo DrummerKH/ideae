@@ -23,6 +23,7 @@ pub struct TerminalAppearance {
     pub(crate) font_fallbacks: Vec<String>,
     pub(crate) font_size: Option<Pixels>,
     pub(crate) font_weight: FontWeight,
+    pub(crate) cell_width_adjust: f32,
     pub(crate) cell_height_adjust: f32,
     pub(crate) cell_height_offset: Pixels,
     pub(crate) padding: Option<Pixels>,
@@ -40,6 +41,7 @@ impl Default for TerminalAppearance {
             font_fallbacks: Vec::new(),
             font_size: None,
             font_weight: FontWeight::NORMAL,
+            cell_width_adjust: 0.0,
             cell_height_adjust: 0.0,
             cell_height_offset: px(0.),
             padding: None,
@@ -81,6 +83,14 @@ impl TerminalAppearance {
     #[must_use]
     pub fn with_font_weight(mut self, weight: impl Into<FontWeight>) -> Self {
         self.font_weight = weight.into();
+        self
+    }
+
+    /// ideae patch: set the extra cell width as a fraction of the natural
+    /// width, as Ghostty's `adjust-cell-width`; -0.05 takes a twentieth off.
+    #[must_use]
+    pub fn with_cell_width_adjust(mut self, fraction: f32) -> Self {
+        self.cell_width_adjust = fraction;
         self
     }
 
@@ -162,6 +172,11 @@ impl TerminalAppearance {
     /// The font weight.
     pub fn font_weight(&self) -> FontWeight {
         self.font_weight
+    }
+
+    /// The extra cell width as a fraction of the natural width.
+    pub fn cell_width_adjust(&self) -> f32 {
+        self.cell_width_adjust
     }
 
     /// The extra cell height as a fraction of the natural height.
@@ -250,6 +265,11 @@ impl TerminalAppearance {
         font
     }
 
+    /// Cell width after the adjustment, whole pixels as before it.
+    pub(crate) fn cell_width(&self, natural: Pixels) -> Pixels {
+        px((f32::from(natural) * (1.0 + self.cell_width_adjust)).ceil().max(1.0))
+    }
+
     /// Cell height after the adjustment, snapped to a physical pixel so rows
     /// tile without seams.
     pub(crate) fn cell_height(&self, natural: Pixels, scale: f32) -> Pixels {
@@ -276,7 +296,7 @@ impl TerminalAppearance {
             None,
         );
         size(
-            sample.width.ceil().max(px(1.0)),
+            self.cell_width(sample.width),
             self.cell_height(sample.ascent + sample.descent, window.scale_factor()),
         )
     }

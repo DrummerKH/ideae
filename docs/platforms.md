@@ -9,15 +9,18 @@ be pinned to the dock.
 
 ## macOS
 
-Apple Silicon. The build is signed ad hoc, without an Apple Developer ID:
-installed with the script it opens as it is, but an `.app` downloaded with a
-browser needs right click → Open the first time (or
+Apple Silicon and Intel. The build is signed ad hoc, without an Apple
+Developer ID: installed with the script it opens as it is, but an `.app`
+downloaded with a browser needs right click → Open the first time (or
 `xattr -d com.apple.quarantine ideae.app`). Shortcuts use Cmd where Linux uses
 Ctrl.
 
-macOS gives permissions (Screen Recording, Accessibility) to a signature, and
-an ad-hoc one changes with every build, so they are asked for again after an
-update.
+macOS gives permissions (Screen Recording, Accessibility, the microphone an
+agent's voice input uses) to a signature, and an ad-hoc one changes with
+every build, so they are asked for again after an update. The microphone is
+asked for only by an app whose `Info.plist` says what it is for: one
+installed before that was added gets it from `install.sh` run again, since an
+update from inside the app replaces the program, not the bundle around it.
 
 Not there yet: clicks on notifications, the Kotlin language server install.
 

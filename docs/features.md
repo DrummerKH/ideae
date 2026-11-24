@@ -10,6 +10,10 @@ branched from the remote's default branch, with the main checkout's ignored
 what it needs there, check the agent's work after each turn and clean up
 when the task goes.
 
+A prompt written with the title waits in the agent's input for you to finish
+and send; Settings → Tasks → "Send the prompt at once" sends it once the agent
+is up.
+
 Worktrees made outside the app show up as tasks too. Those an agent made for
 itself (Claude Code's subagents in `.claude/worktrees/`, a try in a temporary
 folder, or one its Claude Code made anywhere with `git worktree add`, which
@@ -352,6 +356,10 @@ take the whole page; say what to do with them and send them all in one prompt.
   Rosé Pine, Tokyo Night and JetBrains' Islands, each light and dark. Settings has
   the light one and the dark one apart, and whether the window is light, dark or
   follows the system.
+- Text (Settings → General): the code font (Fira Code or JetBrains Mono, which
+  come with ideae, or one installed), ligatures on or off, the size
+  of code in files, Changes and terminals (Ctrl+wheel over a view sets it too),
+  and a terminal's letter spacing and line height.
 - Spaces sort projects into sets (work, personal, a client); the window shows
   one at a time, and the agents of the others keep working unseen.
 - Presentation mode (View → Presentation Mode…) leaves only the tasks you pick in the window, draws code
