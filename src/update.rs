@@ -1,6 +1,8 @@
 //! Updates for release builds: the latest GitHub release of the repository
 //! this binary came from, downloaded next to the running binary and put in
-//! its place. Local builds have the new-build notice instead.
+//! its place. A build of a checkout: new commits of its remote's main branch,
+//! pulled and built over the running binary, which the new-build notice then
+//! offers to restart into.
 
 use std::path::{Path, PathBuf};
 
@@ -117,9 +119,115 @@ fn replace(exe: &Path, new: &Path) -> Result<(), String> {
     })
 }
 
+/// A build of a checkout: new commits on its remote's main branch, which a
+/// click pulls and builds over the running binary.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Behind {
+    pub commits: usize,
+    /// `origin/main`.
+    pub base: String,
+}
+
+/// The checkout this binary was built from, while it is there. Release and
+/// debug builds have none.
+pub fn source() -> Option<PathBuf> {
+    if enabled() || cfg!(debug_assertions) {
+        return None;
+    }
+    let dir = PathBuf::from(std::env::var("IDEAE_UPDATE_SOURCE").unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_string()));
+    dir.join(".git").exists().then_some(dir)
+}
+
+fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let out = crate::procs::command("git").arg("-C").arg(dir).args(args).output().map_err(|e| format!("git: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(format!("git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim()))
+    }
+}
+
+/// `origin/main` or `origin/master`, fetched without asking for a password.
+fn fetch_base(dir: &Path) -> Result<String, String> {
+    crate::git::fetch_base(dir)?;
+    crate::git::remote_default(dir).map(|b| format!("origin/{b}")).ok_or_else(|| "no origin/main or origin/master".into())
+}
+
+/// Fetches and counts the base's commits the checkout lacks, off the UI thread.
+pub fn behind(dir: &Path) -> Result<Option<Behind>, String> {
+    let base = fetch_base(dir)?;
+    let commits = git(dir, &["rev-list", "--count", &format!("HEAD..{base}")])?.parse().unwrap_or(0);
+    Ok((commits > 0).then_some(Behind { commits, base }))
+}
+
+/// Why the checkout cannot be pulled as it is: not on the base's branch, or changed.
+fn blocked(dir: &Path, base: &str) -> Option<String> {
+    let branch = base.split_once('/').map_or(base, |(_, b)| b);
+    let on = git(dir, &["branch", "--show-current"]).unwrap_or_default();
+    if on != branch {
+        return Some(format!("{} is on {}, not {branch}: switch it to {branch} to update.", dir.display(), if on.is_empty() { "no branch" } else { &on }));
+    }
+    let changed = git(dir, &["status", "--porcelain", "--untracked-files=no"]).unwrap_or_default();
+    (!changed.is_empty()).then(|| format!("{} has uncommitted changes: commit or stash them to update.", dir.display()))
+}
+
+/// Where cargo puts the running binary: `…/target` of `…/target/release/ideae`.
+fn target_dir(exe: &Path) -> Option<&Path> {
+    let release = exe.parent()?;
+    (release.file_name()? == "release").then(|| release.parent()).flatten()
+}
+
+/// Runs a step of the update as a session of its own, tied to the app: a
+/// build left by a quit or a restart ends with it (`end_child_sessions`).
+fn run(cmd: &mut std::process::Command, what: &str) -> Result<(), String> {
+    cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        // SAFETY: setsid only changes the child's own session.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    let out = crate::procs::spawn_tied(cmd).and_then(|c| c.wait_with_output()).map_err(|e| format!("{what}: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let said = String::from_utf8_lossy(&out.stderr);
+    let lines: Vec<&str> = said.lines().filter(|l| !l.trim().is_empty()).collect();
+    Err(format!("{what} failed:\n{}", lines[lines.len().saturating_sub(12)..].join("\n")))
+}
+
+/// Brings the base into the checkout (fast-forward only) and builds it over the running binary;
+/// the title bar's new-build notice then offers the restart.
+pub fn rebuild(dir: &Path) -> Result<(), String> {
+    let base = fetch_base(dir)?;
+    if let Some(why) = blocked(dir, &base) {
+        return Err(why);
+    }
+    // The base that was counted, not whatever the branch tracks.
+    git(dir, &["merge", "--ff-only", "--quiet", &base])?;
+    let exe = crate::desktop::exe().map_err(|e| e.to_string())?;
+    let mut cargo = crate::procs::command("cargo");
+    cargo.current_dir(dir).args(["build", "--release"]);
+    if let Some(target) = target_dir(&exe) {
+        cargo.env("CARGO_TARGET_DIR", target);
+    }
+    run(&mut cargo, "cargo build --release")?;
+    let sign = dir.join("scripts/macos-sign.sh");
+    if cfg!(target_os = "macos") && sign.exists() {
+        run(crate::procs::command(&sign).arg(&exe), "macos-sign.sh")?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse, suffix, when};
+    use super::{parse, suffix, target_dir, when};
+    use std::path::Path;
 
     #[test]
     fn picks_this_systems_asset() {
@@ -133,5 +241,38 @@ mod tests {
         let r = parse(&v).unwrap();
         assert_eq!((r.url.as_str(), r.size), ("u1", 7));
         assert_eq!(when("20261115113213"), "15.11 11:32");
+    }
+
+    #[test]
+    fn builds_where_the_running_binary_is() {
+        assert_eq!(target_dir(Path::new("/w/ideae/target/release/ideae")), Some(Path::new("/w/ideae/target")));
+        assert_eq!(target_dir(Path::new("/usr/local/bin/ideae")), None);
+    }
+
+    #[test]
+    fn a_checkout_off_its_main_branch_or_changed_is_not_pulled() {
+        let dir = std::env::temp_dir().join(format!("ideae-update-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.as_path();
+        let git = |args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(d).args(args).output().unwrap().status.success(), "{args:?}");
+        git(&["init", "-q", "-b", "main"]);
+        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "one"]);
+        std::fs::write(d.join("a"), "1").unwrap();
+        git(&["add", "a"]);
+        assert!(super::blocked(d, "origin/main").unwrap().contains("uncommitted"));
+        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "two"]);
+        assert_eq!(super::blocked(d, "origin/main"), None);
+        git(&["switch", "-q", "-c", "feature"]);
+        assert!(super::blocked(d, "origin/main").unwrap().contains("is on feature, not main"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_step_tells_its_last_lines() {
+        assert_eq!(super::run(std::process::Command::new("sh").args(["-c", "true"]), "ok"), Ok(()));
+        let e = super::run(std::process::Command::new("sh").args(["-c", "echo one >&2; echo two >&2; exit 3"]), "step").unwrap_err();
+        assert_eq!(e, "step failed:\none\ntwo");
     }
 }
