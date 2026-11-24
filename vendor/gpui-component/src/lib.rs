@@ -124,6 +124,11 @@ pub use virtual_list::{VirtualList, VirtualListScrollHandle, h_virtual_list, v_v
 pub use window_border::{WindowBorder, window_border, window_paddings};
 pub use window_ext::WindowExt;
 
+/// ideae patch: font features for all of every window, the dialogs,
+/// sheets and notifications drawn beside its view too.
+pub struct WindowFontFeatures(pub gpui::FontFeatures);
+impl gpui::Global for WindowFontFeatures {}
+
 /// ideae patch: see `WindowState::dialogs`.
 pub fn dialogs_watch(window: &gpui::Window, cx: &gpui::App) -> Option<Box<dyn Fn(&gpui::App) -> bool>> {
     root::WindowState::dialogs(window, cx)

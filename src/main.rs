@@ -101,8 +101,6 @@ impl Render for Workspace {
         v_flex()
             .relative()
             .size_full()
-            // Inherited by every text below, the code's with it.
-            .when(!shown.ligatures, |root| root.font_features(FontFeatures::disable_ligatures()))
             .bg(cx.theme().background)
             .child(
                 TitleBar::new()

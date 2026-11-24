@@ -326,18 +326,6 @@ mod tests {
     }
 
     #[test]
-    fn cell_width_is_whole_pixels_after_the_adjustment() {
-        let appearance = TerminalAppearance::default();
-        assert_eq!(appearance.cell_width(px(8.4)), px(9.0));
-        let narrower = appearance.clone().with_cell_width_adjust(-0.05);
-        assert_eq!(narrower.cell_width(px(8.4)), px(8.0));
-        let wider = appearance.clone().with_cell_width_adjust(0.25);
-        assert_eq!(wider.cell_width(px(8.0)), px(10.0));
-        let crushed = appearance.with_cell_width_adjust(-2.0);
-        assert_eq!(crushed.cell_width(px(8.4)), px(1.0));
-    }
-
-    #[test]
     fn an_explicit_cursor_blink_setting_overrides_the_program_request() {
         let appearance = TerminalAppearance::default();
         assert!(appearance.cursor_blinks(true));

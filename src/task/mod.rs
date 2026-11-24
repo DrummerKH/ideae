@@ -1416,8 +1416,9 @@ impl TaskView {
         }
     }
 
+    /// Every terminal of the task, those of questions put away too.
     pub fn set_terminal_colors(&mut self, colors: &gpui_cn::terminal::TerminalColors, cx: &mut Context<Self>) {
-        for tab in &self.tabs {
+        for tab in self.all_tabs() {
             if let TabKind::Terminal(view) = &tab.kind {
                 let state = view.read(cx).state.clone();
                 state.update(cx, |s, cx| s.set_colors(colors.clone(), cx));
@@ -1426,7 +1427,7 @@ impl TaskView {
     }
 
     pub fn set_terminal_appearance(&mut self, appearance: &gpui_cn::terminal::TerminalAppearance, cx: &mut Context<Self>) {
-        for tab in &self.tabs {
+        for tab in self.all_tabs() {
             if let TabKind::Terminal(view) = &tab.kind {
                 let state = view.read(cx).state.clone();
                 state.update(cx, |s, cx| s.set_appearance(appearance.clone(), cx));

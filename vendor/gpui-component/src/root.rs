@@ -726,12 +726,15 @@ impl gpui_base::RootPlugin for WindowState {
 
     fn style(&self, surface: &mut gpui::Stateful<gpui::Div>, _window: &mut Window, cx: &mut App) {
         use gpui::Refineable as _;
-        surface.style().refine(
-            &gpui::StyleRefinement::default()
-                .font_family(cx.theme().font_family.clone())
-                .bg(cx.theme().tokens.background)
-                .text_color(cx.theme().foreground),
-        );
+        let mut base = gpui::StyleRefinement::default()
+            .font_family(cx.theme().font_family.clone())
+            .bg(cx.theme().tokens.background)
+            .text_color(cx.theme().foreground);
+        // ideae patch: the window's font features, for its layers as for its view.
+        if let Some(features) = cx.try_global::<crate::WindowFontFeatures>() {
+            base = base.font_features(features.0.clone());
+        }
+        surface.style().refine(&base);
     }
 
     fn decorate(

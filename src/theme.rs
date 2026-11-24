@@ -35,7 +35,8 @@ impl Appearance {
 pub const CODE_FONT: &str = "Fira Code";
 
 /// The code fonts that come with the app: Fira Code, and gpui-cn's
-/// JetBrains Mono, which the terminals draw with.
+/// JetBrains Mono, which the terminals draw with (SIL OFL 1.1,
+/// `assets/fonts/OFL-JetBrainsMono.txt`).
 pub const BUILT_IN_FONTS: [&str; 2] = [CODE_FONT, "JetBrains Mono"];
 
 fn register_code_font(cx: &mut App) {
@@ -50,45 +51,89 @@ fn register_code_font(cx: &mut App) {
     }
 }
 
-/// Draws code in `family`: one built in, or one installed. Any other is
-/// Fira Code: GPUI panics at the first line laid out in a family it cannot
-/// find.
+/// The code font Settings names, for a look at the machine's families to
+/// tell whether it is still the one wanted when it ends.
+struct WantedFont(SharedString);
+impl Global for WantedFont {}
+
+/// Draws code in `family`: one built in, or one installed. GPUI draws a
+/// family it cannot find in a stand-in, a proportional one most likely, so
+/// another is drawn once the machine is found to have it, looked for and
+/// loaded off the UI thread (listing the families takes about a tenth of a
+/// second); until then, and if it has not, Fira Code.
 pub fn set_code_font(family: &str, cx: &mut App) {
-    let family = if BUILT_IN_FONTS.contains(&family) || installed(family, cx) { family } else { CODE_FONT };
-    let theme = Theme::global_mut(cx);
-    if theme.mono_font_family.as_ref() != family {
-        theme.mono_font_family = SharedString::from(family.to_string());
-        cx.refresh_windows();
+    let family = SharedString::from(family.to_string());
+    cx.set_global(WantedFont(family.clone()));
+    // Already drawn in: it was found before.
+    if BUILT_IN_FONTS.contains(&family.as_ref()) || Theme::global(cx).mono_font_family == family {
+        draw_code_in(family, cx);
+        return;
+    }
+    draw_code_in(CODE_FONT.into(), cx);
+    let text = cx.text_system().clone();
+    let name = family.clone();
+    // Loaded here too: the family's files are read off the UI thread, and
+    // one listed that does not load as itself is not taken.
+    let found = cx.background_spawn(async move {
+        text.all_font_names().iter().any(|installed| *installed == name.as_ref())
+            && text.get_font_for_id(text.resolve_font(&font(name.clone()))).is_some_and(|loaded| loaded.family == name)
+    });
+    cx.spawn(async move |cx| {
+        if found.await {
+            let _ = cx.update(|cx| {
+                if cx.try_global::<WantedFont>().is_some_and(|wanted| wanted.0 == family) {
+                    draw_code_in(family, cx);
+                }
+            });
+        }
+    })
+    .detach();
+}
+
+/// Through the theme's edit: Markdown and chats read the code font from
+/// what it brings up to date, the editor and the diffs from the theme.
+fn draw_code_in(family: SharedString, cx: &mut App) {
+    if Theme::global(cx).mono_font_family != family {
+        Theme::update(cx, |theme| theme.mono_font_family = family);
     }
 }
 
-/// Whether the machine has `family`. The families are listed once: that
-/// takes about a tenth of a second, and only a font not built in asks.
-fn installed(family: &str, cx: &App) -> bool {
-    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    NAMES.get_or_init(|| cx.text_system().all_font_names()).iter().any(|name| name == family)
+/// Ligatures on or off in every window, its dialogs and notifications too.
+pub fn set_ligatures(on: bool, cx: &mut App) {
+    let features = if on { FontFeatures::default() } else { FontFeatures::disable_ligatures() };
+    cx.set_global(gpui_kit::component::WindowFontFeatures(features));
+    cx.refresh_windows();
 }
 
-/// The monospaced families installed, found once off the UI thread; None
-/// while they are looked for.
-struct Monospaced(Option<Vec<SharedString>>);
-impl Global for Monospaced {}
+/// The families installed, listed off the UI thread; None while they are.
+struct Installed(Option<Vec<SharedString>>);
+impl Global for Installed {}
 
-/// The code fonts to choose from: those built in, then the monospaced ones
-/// installed once they are found, the windows drawn again then.
+/// The installed families are listed again at the next `code_fonts`:
+/// Settings, opened, lists those installed since.
+pub fn forget_code_fonts(cx: &mut App) {
+    if cx.has_global::<Installed>() {
+        cx.remove_global::<Installed>();
+    }
+}
+
+/// The code fonts to choose from: those built in, then the families
+/// installed once they are listed, the windows drawn again then. Only their
+/// names: telling which are monospaced would load every one of them into
+/// the app's text system, for good.
 pub fn code_fonts(cx: &mut App) -> Vec<SharedString> {
     let mut fonts: Vec<SharedString> = BUILT_IN_FONTS.into_iter().map(SharedString::from).collect();
-    match cx.try_global::<Monospaced>() {
-        Some(Monospaced(Some(found))) => fonts.extend(found.iter().filter(|name| !BUILT_IN_FONTS.contains(&name.as_ref())).cloned()),
-        Some(Monospaced(None)) => {}
+    match cx.try_global::<Installed>() {
+        Some(Installed(Some(found))) => fonts.extend(found.iter().filter(|name| !BUILT_IN_FONTS.contains(&name.as_ref())).cloned()),
+        Some(Installed(None)) => {}
         None => {
-            cx.set_global(Monospaced(None));
+            cx.set_global(Installed(None));
             let text = cx.text_system().clone();
-            let found = cx.background_spawn(async move { monospaced(&text) });
+            let found = cx.background_spawn(async move { installed_families(&text) });
             cx.spawn(async move |cx| {
                 let found = found.await;
                 let _ = cx.update(|cx| {
-                    cx.set_global(Monospaced(Some(found)));
+                    cx.set_global(Installed(Some(found)));
                     cx.refresh_windows();
                 });
             })
@@ -98,23 +143,12 @@ pub fn code_fonts(cx: &mut App) -> Vec<SharedString> {
     fonts
 }
 
-/// The families whose letters are all as wide, the ones a family only
-/// stands in for left out.
-fn monospaced(text: &TextSystem) -> Vec<SharedString> {
-    let size = px(16.);
-    text.all_font_names()
-        .into_iter()
-        .filter(|name| !name.starts_with('.'))
-        .filter(|name| {
-            let id = text.resolve_font(&font(name.clone()));
-            if text.get_font_for_id(id).is_none_or(|found| found.family.as_ref() != name) {
-                return false;
-            }
-            let widths: Vec<f32> = ['i', 'M', 'W', '.'].into_iter().filter_map(|c| text.advance(id, size, c).ok()).map(|a| f32::from(a.width)).collect();
-            widths.len() == 4 && widths.iter().all(|w| (w - widths[0]).abs() < 0.01)
-        })
-        .map(SharedString::from)
-        .collect()
+/// The families installed, by name, the system's own hidden ones left out.
+fn installed_families(text: &TextSystem) -> Vec<SharedString> {
+    let mut names: Vec<String> = text.all_font_names().into_iter().filter(|name| !name.starts_with('.')).collect();
+    names.sort_by_key(|name| name.to_lowercase());
+    names.dedup();
+    names.into_iter().map(SharedString::from).collect()
 }
 
 /// The cell of every terminal as Settings sizes it.
@@ -344,17 +378,27 @@ mod tests {
     }
 
     /// A code font built in is taken as it is; one the machine lacks would
-    /// panic at the first line laid out, so Fira Code stays.
+    /// be drawn in a stand-in, so Fira Code stays. The look for one ends
+    /// after another was chosen: that one stays.
     #[gpui_kit::test]
     fn a_code_font_the_machine_lacks_is_fira_code(cx: &mut TestAppContext) {
+        let code_font = |cx: &mut TestAppContext| cx.update(|cx| Theme::global(cx).mono_font_family.to_string());
         cx.update(|cx| {
             gpui_kit::init(cx);
             init(cx);
             set_code_font(BUILT_IN_FONTS[1], cx);
-            assert_eq!(Theme::global(cx).mono_font_family.as_ref(), BUILT_IN_FONTS[1]);
-            set_code_font("No Such Mono", cx);
-            assert_eq!(Theme::global(cx).mono_font_family.as_ref(), CODE_FONT);
         });
+        assert_eq!(code_font(cx), BUILT_IN_FONTS[1]);
+        cx.update(|cx| set_code_font("No Such Mono", cx));
+        assert_eq!(code_font(cx), CODE_FONT, "Fira Code while it is looked for");
+        cx.run_until_parked();
+        assert_eq!(code_font(cx), CODE_FONT, "and when it is not found");
+        cx.update(|cx| {
+            set_code_font("No Such Mono", cx);
+            set_code_font(BUILT_IN_FONTS[1], cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(code_font(cx), BUILT_IN_FONTS[1], "the one chosen last");
     }
 
     /// Percent in Settings, a fraction of the font's cell for the terminal.

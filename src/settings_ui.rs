@@ -148,7 +148,7 @@ fn text_group(draft: &Draft, sizes: &Sizes, fonts: Vec<SharedString>, code_size:
     SettingGroup::new()
         .title("Text")
         .item(SettingItem::new("Code font", font).description(
-            "Files, diffs and the code in lists. Fira Code and JetBrains Mono come with ideae; the others are the monospaced fonts installed. Terminals keep JetBrains Mono.",
+            "Files, diffs and the code in lists. Fira Code and JetBrains Mono come with ideae; the others are the fonts installed, monospaced ones meant. Terminals keep JetBrains Mono.",
         ))
         .item(switch(
             draft,
@@ -1359,6 +1359,7 @@ fn open(
     let sizes: Sizes = Rc::new(Cell::new(crate::zoom::current(cx)));
     INSTALLED.with(|known| known.borrow_mut().clear());
     crate::workspace::welcome::forget_find();
+    crate::theme::forget_code_fonts(cx);
     // The shortcut waiting for keys, and what catches them before any
     // binding does.
     let recording: Rc<Cell<Option<&'static str>>> = Rc::default();

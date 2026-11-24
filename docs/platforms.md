@@ -17,7 +17,10 @@ Ctrl.
 
 macOS gives permissions (Screen Recording, Accessibility, the microphone an
 agent's voice input uses) to a signature, and an ad-hoc one changes with
-every build, so they are asked for again after an update.
+every build, so they are asked for again after an update. The microphone is
+asked for only by an app whose `Info.plist` says what it is for: one
+installed before that was added gets it from `install.sh` run again, since an
+update from inside the app replaces the program, not the bundle around it.
 
 Not there yet: clicks on notifications, the Kotlin language server install.
 

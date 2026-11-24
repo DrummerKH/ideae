@@ -357,7 +357,7 @@ take the whole page; say what to do with them and send them all in one prompt.
   the light one and the dark one apart, and whether the window is light, dark or
   follows the system.
 - Text (Settings → General): the code font (Fira Code or JetBrains Mono, which
-  come with ideae, or a monospaced one installed), ligatures on or off, the size
+  come with ideae, or one installed), ligatures on or off, the size
   of code in files, Changes and terminals (Ctrl+wheel over a view sets it too),
   and a terminal's letter spacing and line height.
 - Spaces sort projects into sets (work, personal, a client); the window shows

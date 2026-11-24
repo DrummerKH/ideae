@@ -372,6 +372,7 @@ impl Workspace {
             .unwrap_or(Appearance::Auto);
         theme::choose(&saved.settings.theme, saved.settings.dark_theme(), cx);
         theme::set_code_font(&saved.settings.code_font, cx);
+        theme::set_ligatures(saved.settings.ligatures, cx);
         theme::apply(appearance, window, cx);
         crate::lsp::POWER_SAVING.store(saved.power_saving, std::sync::atomic::Ordering::Relaxed);
         // A global: tests running alongside would flip it under edit.rs's test of it.
@@ -2757,7 +2758,7 @@ impl Workspace {
             theme::set_code_font(&new.code_font, cx);
         }
         if old.ligatures != new.ligatures {
-            cx.refresh_windows();
+            theme::set_ligatures(new.ligatures, cx);
         }
         if (old.terminal_letter_spacing, old.terminal_line_height) != (new.terminal_letter_spacing, new.terminal_line_height) {
             let appearance = theme::terminal_appearance(&new);

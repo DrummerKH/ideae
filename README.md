@@ -9,7 +9,7 @@ without leaving the window.
 ![Five tasks in three projects: one agent done, one working, one asking](docs/images/tasks.png)
 
 Native (Rust and [GPUI](https://www.gpui.rs)), for Linux, macOS (Apple
-Silicon) and Windows. Early, and moving fast.
+Silicon and Intel) and Windows. Early, and moving fast.
 
 ## Why
 
