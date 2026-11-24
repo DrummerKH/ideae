@@ -954,20 +954,20 @@ impl Workspace {
             let branch = branch.clone();
             // What it is called and how it is found; its variants; its end.
             menu.when(can(T::Rename), |m| {
-                m.item(PopupMenuItem::new(named(T::Rename)).on_click(move |_, window, cx| {
+                m.item(PopupMenuItem::new(named(T::Rename)).icon(menu_icon("pencil")).on_click(move |_, window, cx| {
                     let _ = d.update(cx, |w, cx| w.rename_task_dialog(&pd, window, cx));
                 }))
             })
-            .item(PopupMenuItem::new(named(T::Star)).on_click(move |_, _, cx| {
+            .item(PopupMenuItem::new(named(T::Star)).icon(menu_icon(if starred { "star-off" } else { "star" })).on_click(move |_, _, cx| {
                 let _ = a.update(cx, |w, cx| w.toggle_star(&pa, cx));
             }))
-            .item(crate::copying::item(named(T::CopyTitle), task_title.clone()))
+            .item(crate::copying::item(named(T::CopyTitle), task_title.clone()).icon(menu_icon("copy")))
             .item(PopupMenuItem::new(named(T::CopyBranchName)).on_click(move |_, _, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(branch.clone()));
             }))
             .when(can(T::AnotherVariant), |m| {
                 m.separator()
-                    .item(PopupMenuItem::new(named(T::AnotherVariant)).on_click(move |_, window, cx| {
+                    .item(PopupMenuItem::new(named(T::AnotherVariant)).icon(menu_icon("git-fork")).on_click(move |_, window, cx| {
                         let _ = e.update(cx, |w, cx| w.another_variant_dialog(&pe, window, cx));
                     }))
                     .when(can(T::KeepVariant), |m| {
@@ -977,7 +977,7 @@ impl Workspace {
                     })
             })
             .when(can_continue, |m| {
-                m.when(main, |m| m.separator()).item(PopupMenuItem::new("Continue with another agent…").on_click(move |_, window, cx| {
+                m.when(main, |m| m.separator()).item(PopupMenuItem::new("Continue with another agent…").icon(menu_icon("bot")).on_click(move |_, window, cx| {
                     let _ = g.update(cx, |w, cx| w.continue_with_dialog(&pg, window, cx));
                 }))
             })
@@ -985,20 +985,20 @@ impl Workspace {
             // Pause stops what runs and keeps the task; Archive is the end
             // of one, which a restore takes up again.
             .when(can(T::Pause), |m| {
-                m.item(PopupMenuItem::new("Pause").on_click(move |_, window, cx| {
+                m.item(PopupMenuItem::new("Pause").icon(menu_icon("pause")).on_click(move |_, window, cx| {
                     let _ = b.update(cx, |w, cx| w.close_task(&pb, window, cx));
-                }))
-            })
-            .when(can(T::Archive) || can(T::RemoveSide), |m| {
-                // In a row of its own the task needs no naming: "Pause", not "Pause task".
-                m.item(PopupMenuItem::new(if side { "Remove" } else { "Archive" }).on_click(move |_, window, cx| {
-                    let _ = c.update(cx, |w, cx| if side { w.remove_side(&pc, window, cx) } else { w.archive_task(&pc, window, cx) });
                 }))
             })
             // Archived and kept, back on a day: a task to come back to.
             .when(can(T::Defer), |m| {
-                m.item(PopupMenuItem::new("Defer…").on_click(move |_, window, cx| {
+                m.item(PopupMenuItem::new("Defer…").icon(menu_icon("clock")).on_click(move |_, window, cx| {
                     let _ = h.update(cx, |w, cx| w.defer_task(&ph, window, cx));
+                }))
+            })
+            .when(can(T::Archive) || can(T::RemoveSide), |m| {
+                // In a row of its own the task needs no naming: "Pause", not "Pause task".
+                m.item(PopupMenuItem::new(if side { "Remove" } else { "Archive" }).icon(menu_icon(if side { "trash" } else { "archive" })).on_click(move |_, window, cx| {
+                    let _ = c.update(cx, |w, cx| if side { w.remove_side(&pc, window, cx) } else { w.archive_task(&pc, window, cx) });
                 }))
             })
         };

@@ -1189,7 +1189,9 @@ impl PopupMenu {
             Icon::empty()
         };
 
-        Some(icon.xsmall())
+        // ideae patch: a drawing fills some 20/24 of its box; at 12 px it was
+        // smaller than the text beside it. The row keeps its height.
+        Some(icon.with_size(px(16.)))
     }
 
     #[inline]

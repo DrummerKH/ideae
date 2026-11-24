@@ -109,6 +109,7 @@ pub static SHORTCUTS: &[Shortcut] = &[
     shortcut!("review_stage", "Stage the change", "s", Review, task::StageChange),
     shortcut!("review_revert", "Revert the change", "r", Review, task::RevertChange),
     shortcut!("review_comment", "Comment on the change", "c", Review, task::CommentOnChange),
+    shortcut!("copy_reference", "Copy reference (path:line)", "ctrl-alt-shift-c", Editor, task::CopyReference),
     shortcut!("bookmark", "Toggle bookmark", "f11", Editor, task::ToggleBookmark),
     shortcut!("bookmarks", "Bookmarks", "shift-f11", NotInTerminal, task::ShowBookmarks),
     shortcut!("next_bookmark", "Next bookmark", "alt-pagedown", Editor, task::NextBookmark),

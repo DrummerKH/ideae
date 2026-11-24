@@ -384,12 +384,12 @@ impl TaskView {
                     let _ = view.update(cx, |t, cx| t.open_file_as(path, 0, 0, how, window, cx));
                 })
             })
-            .context_menu(move |_, entry, menu, _, _| {
+            .context_menu(move |_, entry, menu, window, cx| {
                 let id = entry.item().id.clone();
                 if id.ends_with('\0') {
                     return menu;
                 }
-                TaskView::tree_menu(menu_view.clone(), menu_root.clone(), id, menu)
+                TaskView::tree_menu(menu_view.clone(), menu_root.clone(), id, menu, window, cx)
             })
             .size_full(),
         )
@@ -468,8 +468,9 @@ pub(super) fn reveal(path: PathBuf, folder: bool, cx: &mut App) {
 
 impl TaskView {
     /// The Files panel's menu of a row: `id` as the tree has it.
-    pub(super) fn tree_menu(view: WeakEntity<Self>, root: PathBuf, id: SharedString, menu: PopupMenu) -> PopupMenu {
+    pub(super) fn tree_menu(view: WeakEntity<Self>, root: PathBuf, id: SharedString, menu: PopupMenu, window: &mut Window, cx: &mut Context<PopupMenu>) -> PopupMenu {
         use gpui_kit::component::menu::PopupMenuItem;
+        let icon = crate::sidebar::menu_icon;
         let folder = id.ends_with('/');
         let relative = id.trim_end_matches('/').to_string();
         let absolute = root.join(&relative);
@@ -479,37 +480,27 @@ impl TaskView {
                 let _ = view.update(cx, |task, cx| run(task, id.clone(), window, cx));
             }
         };
-        let (shown, copied, copied_relative) = (absolute.clone(), absolute.to_string_lossy().into_owned(), relative.clone());
+        let shown = absolute.clone();
         let here = if folder { absolute.clone() } else { absolute.parent().map_or(root.clone(), PathBuf::from) };
         let terminal_view = view.clone();
-        menu.item(PopupMenuItem::new("New file…").on_click(at(|task, id, window, cx| task.new_entry_dialog(folder_of(&id).to_string(), false, window, cx))))
-            .item(PopupMenuItem::new("New folder…").on_click(at(|task, id, window, cx| task.new_entry_dialog(folder_of(&id).to_string(), true, window, cx))))
+        menu.item(PopupMenuItem::new("New file…").icon(icon("file-plus")).on_click(at(|task, id, window, cx| task.new_entry_dialog(folder_of(&id).to_string(), false, window, cx))))
+            .item(PopupMenuItem::new("New folder…").icon(icon("folder-plus")).on_click(at(|task, id, window, cx| task.new_entry_dialog(folder_of(&id).to_string(), true, window, cx))))
             .separator()
-            .item(PopupMenuItem::new("Rename…").on_click(at(|task, id, window, cx| task.rename_entry_dialog(id, window, cx))))
-            .item(PopupMenuItem::new("Delete").on_click(at(|task, id, window, cx| task.delete_entry(id, window, cx))))
-            .separator()
-            .item(PopupMenuItem::new("Copy path").on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()))))
-            .item(PopupMenuItem::new("Copy relative path").on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copied_relative.clone()))))
-            // The tree's menu takes no submenu: the ways into .gitignore are listed here.
-            .separator()
-            .map(|menu| {
-                git::ignore_patterns(&relative, folder).into_iter().fold(menu, |menu, (label, pattern, _)| {
-                    let view = view.clone();
-                    menu.item(PopupMenuItem::new(format!("Add to .gitignore: {label}")).on_click(move |_, window, cx| {
-                        let pattern = pattern.clone();
-                        let _ = view.update(cx, |t, cx| t.run_action("Ignore", move |root| git::ignore(&root, &pattern, git::IgnoreIn::Shared), false, window, cx));
-                    }))
-                })
-            })
-            .separator()
-            .item(PopupMenuItem::new("Reveal in file manager").on_click(move |_, _, cx| reveal(shown.clone(), folder, cx)))
-            .item(PopupMenuItem::new("Open terminal here").on_click(move |_, window, cx| {
+            .item(crate::copying::item("Copy path", absolute.to_string_lossy()).icon(icon("copy")))
+            .item(crate::copying::item("Copy relative path", relative.clone()))
+            .item(PopupMenuItem::new("Reveal in file manager").icon(icon("folder-open")).on_click(move |_, _, cx| reveal(shown.clone(), folder, cx)))
+            .item(PopupMenuItem::new("Open terminal here").icon(icon("square-terminal")).on_click(move |_, window, cx| {
                 let here = here.clone();
                 let _ = terminal_view.update(cx, |task, cx| task.new_terminal_in(here, window, cx));
             }))
+            .separator()
             .when(!folder, |menu| {
-                menu.item(PopupMenuItem::new("Compare with…").on_click(at(|task, id, window, cx| task.compare_with_dialog(Some(id.to_string()), window, cx))))
+                menu.item(PopupMenuItem::new("Compare with…").icon(icon("git-compare")).on_click(at(|task, id, window, cx| task.compare_with_dialog(Some(id.to_string()), window, cx))))
             })
+            .submenu("Add to .gitignore", window, cx, super::git_ui::ignore_submenu(view.clone(), relative, folder))
+            .separator()
+            .item(PopupMenuItem::new("Rename…").icon(icon("pencil")).on_click(at(|task, id, window, cx| task.rename_entry_dialog(id, window, cx))))
+            .item(PopupMenuItem::new("Delete").icon(icon("trash")).on_click(at(|task, id, window, cx| task.delete_entry(id, window, cx))))
     }
 
     /// F2 in the tree: the row it is on.

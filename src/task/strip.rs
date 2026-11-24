@@ -22,40 +22,23 @@ pub struct Assets;
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> gpui_kit::Result<Option<std::borrow::Cow<'static, [u8]>>> {
-        let ours: &[u8] = match path {
-            "side-icons/diff.svg" => include_bytes!("../../assets/side-icons/diff.svg"),
-            "side-icons/folder.svg" => include_bytes!("../../assets/side-icons/folder.svg"),
-            "side-icons/list-tree.svg" => include_bytes!("../../assets/side-icons/list-tree.svg"),
-            "side-icons/play.svg" => include_bytes!("../../assets/side-icons/play.svg"),
-            "side-icons/locate-fixed.svg" => include_bytes!("../../assets/side-icons/locate-fixed.svg"),
-            "side-icons/chevrons-down-up.svg" => include_bytes!("../../assets/side-icons/chevrons-down-up.svg"),
-            "side-icons/folder-tree.svg" => include_bytes!("../../assets/side-icons/folder-tree.svg"),
-            "side-icons/folder-plus.svg" => include_bytes!("../../assets/side-icons/folder-plus.svg"),
-            "side-icons/plus.svg" => include_bytes!("../../assets/side-icons/plus.svg"),
-            "side-icons/globe.svg" => include_bytes!("../../assets/side-icons/globe.svg"),
-            "side-icons/history.svg" => include_bytes!("../../assets/side-icons/history.svg"),
-            "side-icons/undo-2.svg" => include_bytes!("../../assets/side-icons/undo-2.svg"),
-            "side-icons/arrow-left.svg" => include_bytes!("../../assets/side-icons/arrow-left.svg"),
-            "side-icons/arrow-right.svg" => include_bytes!("../../assets/side-icons/arrow-right.svg"),
-            "side-icons/rotate-cw.svg" => include_bytes!("../../assets/side-icons/rotate-cw.svg"),
-            "side-icons/x.svg" => include_bytes!("../../assets/side-icons/x.svg"),
-            "side-icons/square-dashed-mouse-pointer.svg" => include_bytes!("../../assets/side-icons/square-dashed-mouse-pointer.svg"),
-            "side-icons/code-xml.svg" => include_bytes!("../../assets/side-icons/code-xml.svg"),
-            "side-icons/monitor-smartphone.svg" => include_bytes!("../../assets/side-icons/monitor-smartphone.svg"),
-            "side-icons/triangle-alert.svg" => include_bytes!("../../assets/side-icons/triangle-alert.svg"),
-            "side-icons/arrow-right-left.svg" => include_bytes!("../../assets/side-icons/arrow-right-left.svg"),
-            "side-icons/lock-open.svg" => include_bytes!("../../assets/side-icons/lock-open.svg"),
-            "side-icons/variable.svg" => include_bytes!("../../assets/side-icons/variable.svg"),
-            "side-icons/arrow-down-a-z.svg" => include_bytes!("../../assets/side-icons/arrow-down-a-z.svg"),
-            "side-icons/house.svg" => include_bytes!("../../assets/side-icons/house.svg"),
-            "side-icons/square-plus.svg" => include_bytes!("../../assets/side-icons/square-plus.svg"),
-            "side-icons/archive-restore.svg" => include_bytes!("../../assets/side-icons/archive-restore.svg"),
-            "side-icons/archive.svg" => include_bytes!("../../assets/side-icons/archive.svg"),
-            "side-icons/git-branch-minus.svg" => include_bytes!("../../assets/side-icons/git-branch-minus.svg"),
-            "side-icons/settings.svg" => include_bytes!("../../assets/side-icons/settings.svg"),
-            "side-icons/message-circle-question-mark.svg" => include_bytes!("../../assets/side-icons/message-circle-question-mark.svg"),
-            _ => return gpui_kit::assets::Assets.load(path),
-        };
+        macro_rules! ours {
+            ($($name:literal),* $(,)?) => {
+                match path {
+                    $(concat!("side-icons/", $name, ".svg") => include_bytes!(concat!("../../assets/side-icons/", $name, ".svg")).as_slice(),)*
+                    _ => return gpui_kit::assets::Assets.load(path),
+                }
+            };
+        }
+        let ours: &[u8] = ours!(
+            "diff", "folder", "list-tree", "play", "locate-fixed", "chevrons-down-up", "folder-tree", "folder-plus",
+            "plus", "globe", "history", "undo-2", "arrow-left", "arrow-right", "rotate-cw", "x",
+            "square-dashed-mouse-pointer", "code-xml", "monitor-smartphone", "triangle-alert", "arrow-right-left",
+            "lock-open", "variable", "arrow-down-a-z", "house", "square-plus", "archive-restore", "archive",
+            "git-branch-minus", "settings", "message-circle-question-mark", "copy", "folder-open", "square-terminal",
+            "pencil", "trash", "file-plus", "pin", "pin-off", "columns-2", "rows-2", "pause", "star", "star-off",
+            "external-link", "rotate-ccw", "git-compare", "eye", "clock", "bot", "git-fork", "minus", "scissors", "clipboard-paste", "lightbulb", "send", "bookmark", "wand-sparkles",
+        );
         Ok(Some(ours.into()))
     }
 
@@ -414,7 +397,19 @@ impl TaskView {
     /// and has it chosen and in view.
     pub(super) fn locate_in_tree(&mut self, cx: &mut Context<Self>) {
         let Some((_, file)) = self.structure_target() else { return };
-        let Ok(relative) = file.read(cx).path.strip_prefix(&self.root).map(|path| path.to_string_lossy().replace('\\', "/")) else { return };
+        let path = file.read(cx).path.clone();
+        self.locate_path(&path, cx);
+    }
+
+    /// Show in Files: the panel comes, with the file or folder chosen in it.
+    pub(super) fn show_in_files(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        self.side_over = true;
+        self.open_panel(RightPane::Files, cx);
+        self.locate_path(path, cx);
+    }
+
+    fn locate_path(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        let Ok(relative) = path.strip_prefix(&self.root).map(|path| path.to_string_lossy().replace('\\', "/")) else { return };
         for (slash, _) in relative.match_indices('/') {
             self.expanded.insert(format!("{}/", &relative[..slash]).into());
         }

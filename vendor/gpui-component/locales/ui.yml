@@ -377,19 +377,19 @@ Input:
     zh-HK: 貼上
     zh-TW: 貼上
   Select All:
-    en: Select All
+    en: Select all
     pt-BR: "Selecionar tudo"
     zh-CN: 全选
     zh-HK: 全選
     zh-TW: 全選
   Go to Definition:
-    en: Go to Definition
+    en: Go to definition
     pt-BR: "Ir para a definição"
     zh-CN: 跳转到定义
     zh-HK: 跳轉到定義
     zh-TW: 前往定義
   Show Code Actions:
-    en: Show Code Actions
+    en: Show code actions
     pt-BR: "Mostrar ações de código"
     zh-CN: 显示代码操作
     zh-HK: 顯示代碼操作

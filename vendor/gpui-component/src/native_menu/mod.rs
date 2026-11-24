@@ -22,8 +22,6 @@
 //!     .show(position, window, cx);
 //! ```
 
-#[cfg(target_os = "windows")]
-use crate::ActiveTheme as _;
 use crate::Icon;
 #[cfg(any(target_os = "macos", target_os = "windows", test))]
 use crate::icon::IconSource;
@@ -37,8 +35,10 @@ use gpui::{Image, ImageFormat};
 use std::{path::Path, sync::Arc};
 
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 mod macos;
 #[cfg(target_os = "windows")]
+#[allow(dead_code)]
 mod windows;
 
 // Drawn-menu fallback (used on platforms without an OS-native popup, e.g. Linux).
@@ -203,22 +203,8 @@ impl NativeMenu {
             return;
         }
 
-        #[cfg(target_os = "macos")]
-        {
-            macos::show(self.items, cx.asset_source().clone(), position, window, cx);
-        }
-        #[cfg(target_os = "windows")]
-        {
-            windows::show(
-                self.items,
-                cx.asset_source().clone(),
-                position,
-                cx.theme().is_dark(),
-                window,
-                cx,
-            );
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        // ideae patch: drawn on every system, as all the app's other menus
+        // are: one look, the same icons and keys, a submenu where it helps.
         fallback::show(self.items, position, window, cx);
     }
 }

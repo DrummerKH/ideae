@@ -641,20 +641,20 @@ impl TaskView {
             }))
             .context_menu(move |menu, window, cx| {
                 use gpui_kit::component::menu::PopupMenuItem;
-                let menu = if untracked { menu.submenu("Add to .gitignore", window, cx, ignore_submenu(view.clone(), menu_path.clone(), false)).separator() } else { menu };
+                let icon = crate::sidebar::menu_icon;
                 let (open_view, open_path) = (view.clone(), open_path.clone());
                 let (stage_view, stage_path) = (view.clone(), menu_path.clone());
                 let (viewed_view, viewed_path) = (view.clone(), menu_path.clone());
                 let (discard_view, discard_path) = (view.clone(), menu_path.clone());
                 let (absolute, relative) = (open_path.to_string_lossy().to_string(), menu_path.clone());
-                let (system_path, reveal_path) = (open_path.clone(), open_path.clone());
+                let (system_path, reveal_path, shown_path, shown_view) = (open_path.clone(), open_path.clone(), open_path.clone(), view.clone());
                 let (terminal_view, here) = (view.clone(), open_path.parent().map(PathBuf::from).unwrap_or_default());
                 let (compare_view, compare_path) = (view.clone(), menu_path.clone());
-                menu.item(PopupMenuItem::new(if in_staged { "Unstage" } else { "Stage" }).on_click(move |_, window, cx| {
+                menu.item(PopupMenuItem::new(if in_staged { "Unstage" } else { "Stage" }).icon(icon(if in_staged { "minus" } else { "plus" })).on_click(move |_, window, cx| {
                     let path = stage_path.clone();
                     stage_view.update(cx, |this, cx| this.stage_paths(vec![path], !in_staged, window, cx)).ok();
                 }))
-                .item(PopupMenuItem::new(if viewed { "Mark not viewed" } else { "Mark viewed" }).on_click(move |_, _, cx| {
+                .item(PopupMenuItem::new(if viewed { "Mark not viewed" } else { "Mark viewed" }).icon(icon("eye")).on_click(move |_, _, cx| {
                     viewed_view.update(cx, |this, cx| this.toggle_viewed(&viewed_path, cx)).ok();
                 }))
                 .when(!deleted, |menu| {
@@ -662,23 +662,31 @@ impl TaskView {
                         let path = open_path.clone();
                         open_view.update(cx, |this, cx| this.open_file(path, open_line, window, cx)).ok();
                     }))
-                    .item(PopupMenuItem::new("Open in the system app").on_click(move |_, _, cx| cx.open_with_system(&system_path)))
-                    .separator()
-                    .item(PopupMenuItem::new("Reveal in file manager").on_click(move |_, _, cx| super::file_tree::reveal(reveal_path.clone(), false, cx)))
-                    .item(PopupMenuItem::new("Open terminal here").on_click(move |_, window, cx| {
+                    .item(PopupMenuItem::new("Open in the system app").icon(icon("external-link")).on_click(move |_, _, cx| cx.open_with_system(&system_path)))
+                })
+                .separator()
+                .item(crate::copying::item("Copy path", absolute).icon(icon("copy")))
+                .item(crate::copying::item("Copy relative path", relative))
+                .when(!deleted, |menu| {
+                    menu.item(PopupMenuItem::new("Show in Files").icon(icon("locate-fixed")).on_click(move |_, _, cx| {
+                        let _ = shown_view.update(cx, |task, cx| task.show_in_files(&shown_path, cx));
+                    }))
+                    .item(PopupMenuItem::new("Reveal in file manager").icon(icon("folder-open")).on_click(move |_, _, cx| super::file_tree::reveal(reveal_path.clone(), false, cx)))
+                    .item(PopupMenuItem::new("Open terminal here").icon(icon("square-terminal")).on_click(move |_, window, cx| {
                         let here = here.clone();
                         let _ = terminal_view.update(cx, |task, cx| task.new_terminal_in(here, window, cx));
                     }))
-                    .item(PopupMenuItem::new("Compare with…").on_click(move |_, window, cx| {
+                })
+                .when(!deleted || untracked, |menu| menu.separator())
+                .when(!deleted, |menu| {
+                    menu.item(PopupMenuItem::new("Compare with…").icon(icon("git-compare")).on_click(move |_, window, cx| {
                         let path = compare_path.clone();
                         let _ = compare_view.update(cx, |task, cx| task.compare_with_dialog(Some(path), window, cx));
                     }))
                 })
-                .separator()
-                .item(PopupMenuItem::new("Copy path").on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(absolute.clone()))))
-                .item(PopupMenuItem::new("Copy relative path").on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(relative.clone()))))
+                .when(untracked, |menu| menu.submenu("Add to .gitignore", window, cx, ignore_submenu(view.clone(), menu_path.clone(), false)))
                 .when(!in_staged, |menu| {
-                    menu.separator().item(PopupMenuItem::new("Discard changes").on_click(move |_, window, cx| {
+                    menu.separator().item(PopupMenuItem::new("Discard changes").icon(icon("trash")).on_click(move |_, window, cx| {
                         let path = discard_path.clone();
                         discard_view.update(cx, |this, cx| this.confirm_discard(path, window, cx)).ok();
                     }))

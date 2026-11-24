@@ -235,7 +235,7 @@ impl TaskView {
                 TabKind::File(file) => {
                     let path = file.read(cx).path.clone();
                     let relative = path.strip_prefix(&t.root).unwrap_or(&path).display().to_string();
-                    Some((path.display().to_string(), relative))
+                    Some((path, relative))
                 }
                 _ => None,
             });
@@ -245,6 +245,7 @@ impl TaskView {
                     let _ = view.update(cx, |t, cx| f(t, id, pane, window, cx));
                 })
             };
+            let icon = crate::sidebar::menu_icon;
             let menu = match id {
                 Some(_) => menu
                     .when(close, |menu| {
@@ -252,7 +253,7 @@ impl TaskView {
                             if let Some(ix) = id.and_then(|id| t.ix_of(id)) {
                                 t.close_tab(ix, window, cx)
                             }
-                        }))
+                        }).icon(icon("x")))
                     })
                     .when(others, |menu| menu.item(act("Close others", |t, id, pane, window, cx| t.close_many(pane, |_, tab| Some(tab.id) != id, window, cx))))
                     .when(to_right, |menu| {
@@ -264,17 +265,32 @@ impl TaskView {
                     .when(all, |menu| menu.item(act("Close all", |t, _, pane, window, cx| t.close_many(pane, |_, _| true, window, cx))))
                     .when(close || others || to_right || all, |menu| menu.separator())
                     .when_some(paths, |menu, (path, relative)| {
-                        menu.item(crate::copying::item("Copy path", path)).item(crate::copying::item("Copy relative path", relative)).separator()
+                        let (shown, revealed) = (path.clone(), path.clone());
+                        let view = view.downgrade();
+                        menu.item(crate::copying::item("Copy path", path.display().to_string()).icon(icon("copy")))
+                            .item(crate::copying::item("Copy relative path", relative))
+                            .item(PopupMenuItem::new("Show in Files").icon(icon("locate-fixed")).on_click(move |_, _, cx| {
+                                let _ = view.update(cx, |t, cx| t.show_in_files(&shown, cx));
+                            }))
+                            .item(PopupMenuItem::new("Reveal in file manager").icon(icon("folder-open")).on_click(move |_, _, cx| {
+                                super::file_tree::reveal(revealed.clone(), false, cx)
+                            }))
+                            .separator()
                     })
                     .item(act(if pinned { "Unpin" } else { "Pin" }, |t, id, _, _, cx| {
                         if let Some(id) = id {
                             t.toggle_pin(id, cx)
                         }
-                    }))
+                    }).icon(icon(if pinned { "pin-off" } else { "pin" })))
                     .map(|mut menu| {
                         for (label, to) in moves {
                             let view = view.downgrade();
-                            menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                            let mark = match label.as_ref() {
+                                "Split down" => Some(icon("rows-2")),
+                                "Split right" => Some(icon("columns-2")),
+                                _ => None,
+                            };
+                            menu = menu.item(PopupMenuItem::new(label).when_some(mark, |item, mark| item.icon(mark)).on_click(move |_, window, cx| {
                                 let _ = view.update(cx, |t, cx| {
                                     if let Some(ix) = id.and_then(|id| t.ix_of(id)) {
                                         t.move_to(ix, to, window, cx)
@@ -286,7 +302,7 @@ impl TaskView {
                     }),
                 None => menu.when(all, |menu| menu.item(act("Close all", |t, _, pane, window, cx| t.close_many(pane, |_, _| true, window, cx)))),
             };
-            menu.when(reopen, |menu| menu.separator().item(act("Reopen closed tab", |t, _, _, window, cx| t.reopen_closed(window, cx))))
+            menu.when(reopen, |menu| menu.separator().item(act("Reopen closed tab", |t, _, _, window, cx| t.reopen_closed(window, cx)).icon(icon("rotate-ccw"))))
         })
     }
 

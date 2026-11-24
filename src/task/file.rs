@@ -3,7 +3,7 @@ use super::*;
 // ---------------------------------------------------------------- file
 
 actions!(ideae_git, [ShowBranches]);
-actions!(ideae_file, [SaveFile, ExpandSelection, ShrinkSelection, ToggleComment, ShowOutline, ShowUsages, SendToAgent, CompareFileWith]);
+actions!(ideae_file, [SaveFile, ExpandSelection, ShrinkSelection, ToggleComment, ShowOutline, ShowUsages, SendToAgent, CompareFileWith, CopyReference, CopyFilePath, ShowFileInFiles]);
 actions!(ideae_edit, [DeleteLine, DuplicateLine, MoveLineUp, MoveLineDown, JoinLines, ToggleCase, NextOccurrence, GoToLine, RenameSymbol, FormatFile, Fold, Unfold, FoldAll, UnfoldAll, ParameterInfo, NextProblem, PrevProblem]);
 actions!(ideae_task, [ToggleZoom, SendDiffToAgent, CommentOnDiff, FindInTerminal]);
 
@@ -1294,40 +1294,55 @@ impl Render for FileView {
                     Editor::new(&self.editor)
                         // Replaces the built-in menu, so its items are listed again.
                         .context_menu({
-                            let (editor, annotating, sql_file) = (self.editor.clone(), self.annotate, self.sql.is_some());
+                            let (editor, annotating, sql_file, server) = (self.editor.clone(), self.annotate, self.sql.is_some(), self.lsp_client.is_some());
                             move |menu, _, cx| {
+                            let icon = crate::sidebar::menu_icon;
                             // On the line numbers: what is about the lines.
                             if editor.read(cx).gutter_press().is_some() {
-                                let blame = if annotating { "Close Annotations" } else { "Annotate with Git Blame" };
-                                return menu.menu(blame, Box::new(ToggleBlame)).menu("Toggle Bookmark", Box::new(ToggleBookmark));
+                                let blame = if annotating { "Close annotations" } else { "Annotate with git blame" };
+                                return menu.menu_with_icon(blame, icon("history"), Box::new(ToggleBlame)).menu_with_icon("Toggle bookmark", icon("bookmark"), Box::new(ToggleBookmark));
                             }
-                            use gpui_kit::component::input::{Copy, Cut, GoToDefinition, Paste, SelectAll};
+                            use gpui_kit::component::input::{Copy, Cut, GoToDefinition, Paste, SelectAll, ToggleCodeActions};
+                            let fixes = editor.read(cx).context_menu_capabilities().has_code_actions();
                             // What a name is in SQL: there are no implementations to list.
                             let menu = if sql_file {
-                                menu.menu("Run", Box::new(super::sql::RunStatement))
+                                menu.menu_with_icon("Run", icon("play"), Box::new(super::sql::RunStatement))
                                     .menu("Explain", Box::new(super::sql::ExplainStatement))
-                                    .menu("Format", Box::new(FormatFile))
+                                    .menu_with_icon("Format", icon("wand-sparkles"), Box::new(FormatFile))
                                     .separator()
-                                    .menu("Go to Definition / Schema", Box::new(super::sql::SqlDefinition))
-                                    .menu("Find Usages", Box::new(ShowUsages))
-                                    .menu("Show Table Data", Box::new(super::sql::ShowTableData))
-                                    .menu("Show Table DDL", Box::new(super::sql::ShowTableDefinition))
+                                    .menu("Go to definition or schema", Box::new(super::sql::SqlDefinition))
+                                    .menu("Find usages", Box::new(ShowUsages))
+                                    .menu("Show table data", Box::new(super::sql::ShowTableData))
+                                    .menu("Show table DDL", Box::new(super::sql::ShowTableDefinition))
                             } else {
                                 // Ctrl+B on a declaration lists its usages.
-                                menu.menu("Go to Definition / Usages", Box::new(GoToDefinition))
-                                    .menu("Implementations and Usages", Box::new(ShowUsages))
+                                let menu = menu.menu("Go to declaration or usages", Box::new(GoToDefinition)).menu("Implementations and usages", Box::new(ShowUsages));
+                                // What only a language server can do: shown where there is one.
+                                if server {
+                                    menu.separator()
+                                        .menu_with_icon("Rename…", icon("pencil"), Box::new(RenameSymbol))
+                                        .menu_with_icon_disabled("Quick fixes", icon("lightbulb"), !fixes, Box::new(ToggleCodeActions))
+                                        .menu_with_icon("Reformat file", icon("wand-sparkles"), Box::new(FormatFile))
+                                } else {
+                                    menu
+                                }
                             };
                             menu.separator()
-                                .menu("Cut", Box::new(Cut))
-                                .menu("Copy", Box::new(Copy))
-                                .menu("Paste", Box::new(Paste))
-                                .menu("Select All", Box::new(SelectAll))
+                                .menu_with_icon("Send to agent", icon("send"), Box::new(SendToAgent))
                                 .separator()
-                                .menu("Comment / Uncomment", Box::new(ToggleComment))
-                                .menu("File Structure", Box::new(ShowOutline))
-                                .menu("Compare with Branch, Tag or Commit…", Box::new(CompareFileWith))
+                                .menu_with_icon("Cut", icon("scissors"), Box::new(Cut))
+                                .menu_with_icon("Copy", icon("copy"), Box::new(Copy))
+                                .menu_with_icon("Paste", icon("clipboard-paste"), Box::new(Paste))
+                                .menu("Select all", Box::new(SelectAll))
                                 .separator()
-                                .menu("Send to Agent", Box::new(SendToAgent))
+                                .menu("Comment / uncomment", Box::new(ToggleComment))
+                                .menu_with_icon("File structure", icon("list-tree"), Box::new(ShowOutline))
+                                .separator()
+                                .menu("Copy reference", Box::new(CopyReference))
+                                .menu("Copy path", Box::new(CopyFilePath))
+                                .menu_with_icon("Show in Files", icon("locate-fixed"), Box::new(ShowFileInFiles))
+                                .separator()
+                                .menu_with_icon("Compare with branch, tag or commit…", icon("git-compare"), Box::new(CompareFileWith))
                         }})
                         .bordered(false)
                         .p_0()

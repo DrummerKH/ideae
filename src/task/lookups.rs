@@ -51,6 +51,33 @@ impl TaskView {
         }
     }
 
+    /// The file in the editor as an agent or a search takes it: its path from
+    /// the project, and the line of the cursor, or those of the selection.
+    pub(super) fn copy_reference(&mut self, cx: &mut Context<Self>) {
+        let Some(TabKind::File(file)) = self.focused_ix().map(|ix| &self.tabs[ix].kind) else { return };
+        let f = file.read(cx);
+        let state = f.editor.read(cx);
+        let range = state.selected_range();
+        let from = state.text().offset_to_position(range.start).line + 1;
+        // A selection ending at a line's start does not take that line.
+        let end = state.text().offset_to_position(range.end);
+        let to = if end.character == 0 && end.line + 1 > from { end.line } else { end.line + 1 };
+        let relative = f.path.strip_prefix(&self.root).unwrap_or(&f.path).to_string_lossy().replace('\\', "/");
+        let reference = if range.is_empty() || to <= from { format!("{relative}:{from}") } else { format!("{relative}:{from}-{to}") };
+        cx.write_to_clipboard(ClipboardItem::new_string(reference));
+    }
+
+    pub(super) fn copy_file_path(&mut self, cx: &mut Context<Self>) {
+        let Some(TabKind::File(file)) = self.focused_ix().map(|ix| &self.tabs[ix].kind) else { return };
+        cx.write_to_clipboard(ClipboardItem::new_string(file.read(cx).path.display().to_string()));
+    }
+
+    pub(super) fn show_file_in_files(&mut self, cx: &mut Context<Self>) {
+        let Some(TabKind::File(file)) = self.focused_ix().map(|ix| &self.tabs[ix].kind) else { return };
+        let path = file.read(cx).path.clone();
+        self.show_in_files(&path, cx);
+    }
+
     pub(super) fn send_editor_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(TabKind::File(file)) = self.focused_ix().map(|ix| &self.tabs[ix].kind) else { return };
         let (path, text, range) = {

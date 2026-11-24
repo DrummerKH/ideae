@@ -160,6 +160,9 @@ impl TaskView {
                 .on_action(cx.listener(|this, _: &ShowBookmarks, window, cx| this.show_bookmarks(window, cx)))
                 .on_action(cx.listener(|this, _: &ShowUsages, window, cx| this.show_usages_at_cursor(window, cx)))
                 .on_action(cx.listener(|this, _: &SendToAgent, window, cx| this.send_editor_selection(window, cx)))
+                .on_action(cx.listener(|this, _: &CopyReference, _, cx| this.copy_reference(cx)))
+                .on_action(cx.listener(|this, _: &CopyFilePath, _, cx| this.copy_file_path(cx)))
+                .on_action(cx.listener(|this, _: &ShowFileInFiles, _, cx| this.show_file_in_files(cx)))
                 .child(self.render_pane(pane, cx))
                 .into_any_element(),
         )
