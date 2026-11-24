@@ -323,8 +323,8 @@ impl Workspace {
             Rename => self.rename_task_dialog(&path, window, cx),
             AnotherVariant => self.another_variant_dialog(&path, window, cx),
             KeepVariant => self.keep_variant_dialog(&path, window, cx),
-            Pause => self.close_task(&path, window, cx),
-            Archive => self.archive_task(&path, window, cx),
+            Pause => self.end_with_children(&path, false, window, cx),
+            Archive => self.end_with_children(&path, true, window, cx),
             Defer => self.defer_task(&path, window, cx),
             RemoveSide => self.remove_side(&path, window, cx),
         }

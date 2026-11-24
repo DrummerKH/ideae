@@ -891,7 +891,7 @@ fn agents_page(draft: &Draft, lsp_switch: SettingItem, dials: [SettingItem; 2], 
         .group(SettingGroup::new().title("Profiles").item(list))
         .group(choose)
         .group(
-            SettingGroup::new().title("Chat agents").item(
+            SettingGroup::new().title("Agents out of view").item(
                 SettingItem::new("Stop an idle one out of view after", {
                     let (read, write) = (draft.clone(), draft.clone());
                     SettingField::number_input(NumberFieldOptions { min: 0., max: 24. * 60., step: 5. }, move |_| f64::from(read.borrow().agent_idle_minutes), move |value, _| {
@@ -899,8 +899,15 @@ fn agents_page(draft: &Draft, lsp_switch: SettingItem, dials: [SettingItem; 2], 
                     })
                     .default_value(f64::from(state::Settings::default().agent_idle_minutes))
                 })
-                .description("Minutes; 0 means never. A chat agent that is neither working nor waiting for an answer, in a task you have not opened for this long, is stopped to free its memory (hundreds of MB each). Its conversation is kept, and it resumes when you open the task. Terminal agents keep running."),
+                .description("Minutes; 0 means never. A chat agent that is neither working nor waiting for an answer, in a task you have not opened for this long, is stopped to free its memory (hundreds of MB each). Its conversation is kept, and it resumes when you open the task."),
             )
+            .item(switch(
+                draft,
+                "Terminal agents too",
+                "Claude Code in a terminal is stopped the same way, unless it has something of its own running: a command in the background, a timer it set, text you typed and did not send. Its tab says it is asleep; opening the task resumes its session. Agents that do not report their status, or whose session is not known, keep running.",
+                |s| s.sleep_terminal_agents,
+                |s, v| s.sleep_terminal_agents = v,
+            ))
             .item(
                 SettingItem::new("Decline an unanswered question after", {
                     let (read, write) = (draft.clone(), draft.clone());
@@ -912,6 +919,13 @@ fn agents_page(draft: &Draft, lsp_switch: SettingItem, dials: [SettingItem; 2], 
                 .description("Minutes; 0 means never. A chat agent keeps working after the window closes; its questions come as desktop notifications and wait for you. With a limit, a question is declined after this long and the agent moves on."),
             ),
         )
+        .group(SettingGroup::new().title("Agents starting agents").item(switch(
+            draft,
+            "Agents may start agents",
+            "A task's agent can ask other agents of its project a question, which starts at once, can only read and spends tokens, and propose tasks of their own, which you start or decline in Needs you. For agents started after this is turned on.",
+            |s| s.agents_start_agents,
+            |s, v| s.agents_start_agents = v,
+        )))
         .group(SettingGroup::new().title("Claude Code").item(lsp_switch))
         .group(
             SettingGroup::new().title("Context and tokens").items(dials).item(

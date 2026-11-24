@@ -67,6 +67,9 @@ pub struct Hook {
     /// Which of the task's agents, when not its own (`q-<n>`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// A tool call, as `tool:print` ([`crate::agent::HookEvent::call`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call: Option<String>,
     /// When the daemon heard it, Unix seconds: a window that hears it again
     /// on connect tells whether it came after the task was last looked at.
     #[serde(default, skip_serializing_if = "is_zero")]

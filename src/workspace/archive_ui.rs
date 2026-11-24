@@ -140,6 +140,13 @@ struct Choice {
     branch: String,
 }
 
+/// The branch a restored task is offered: the one it had (its agent or you
+/// may have named it by the project's rules), else one named from its title.
+fn restored_branch(m: &archive::Meta) -> String {
+    let had = m.branch.trim();
+    if had.is_empty() || had.starts_with('(') { naming::branch_name(&m.title) } else { had.to_string() }
+}
+
 impl Workspace {
     /// Archives a task: one click, nothing is lost. Only an agent in the
     /// middle of a turn is asked about first.
@@ -621,7 +628,7 @@ impl Workspace {
         let choice = Rc::new(RefCell::new(Choice { pr: if m.pr.is_some() { None } else { Some(None) }, on_branch: false, commits: true, changes: true, summary, branch: String::new() }));
         let branch_input = cx.new(|cx| {
             let mut input = InputState::new(window, cx);
-            input.set_value(naming::branch_name(&m.title), window, cx);
+            input.set_value(restored_branch(&m), window, cx);
             input
         });
         let typed = cx.subscribe_in(&branch_input, window, |_, _, event: &InputEvent, window, _| {
@@ -850,7 +857,7 @@ impl Workspace {
         // Its sessions' files go to profiles of the same kind only.
         let profiles: Vec<Option<agents::Profile>> = m.sessions.iter().map(|s| settings.profile(&s.profile).filter(|p| p.kind == s.kind).cloned()).collect();
         let wanted = match &start {
-            Start::Origin if choice.branch.trim().is_empty() => naming::branch_name(&m.title),
+            Start::Origin if choice.branch.trim().is_empty() => restored_branch(&m),
             Start::Origin => choice.branch.trim().to_string(),
             Start::PrBranch(head) => head.clone(),
         };
@@ -1169,7 +1176,9 @@ exec cat > "$OUT/$name.told"
             back.is_some()
         });
         let (again, ..) = back.unwrap();
-        assert_ne!(again, path, "a new worktree");
+        // On the branch it had, made again: the old worktree and branch went with the archive.
+        let on = std::process::Command::new("git").args(["branch", "--show-current"]).current_dir(&again).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&on.stdout).trim(), branch, "the branch it had");
         // Asked again: the task that is here, not a second one writing the same archive.
         let mut asked = true;
         step(cx, &mut |w, window, cx| {
@@ -1182,11 +1191,11 @@ exec cat > "$OUT/$name.told"
         assert_eq!(std::fs::read_to_string(again.join("new.txt")).unwrap(), "kept\n");
         let transcript = dir.join("claude/projects").join(crate::agents::claude::project_dir(&again)).join(format!("{id}.jsonl"));
         assert!(std::fs::read_to_string(&transcript).unwrap().contains("Made the form."), "the conversation under the new folder, by its id");
-        wait(cx, "the agent to start", &mut |_| !out(&again, "args").is_empty());
-        assert!(out(&again, "args").contains(&format!("--resume {id}")), "{}", out(&again, "args"));
+        // Its folder may be the one it had: what the agent wrote then is there too.
+        wait(cx, "the agent to resume", &mut |_| out(&again, "args").contains(&format!("--resume {id}")));
 
         // It is up: the note goes in first.
-        let up = HookEvent { task: again.clone(), agent: None, event: "SessionStart".into(), message: None, kind: None, file: None, said: None, replayed: None, session: Some(id.clone()), guessed: false, worktree: None };
+        let up = HookEvent { task: again.clone(), agent: None, event: "SessionStart".into(), message: None, kind: None, file: None, said: None, replayed: None, session: Some(id.clone()), guessed: false, worktree: None, call: None };
         step(cx, &mut |w, window, cx| w.on_hook(up.clone(), window, cx));
         wait(cx, "the note to reach the agent", &mut |_| out(&again, "told").contains("comes in my next message"));
         let told = out(&again, "told");
@@ -1229,5 +1238,17 @@ exec cat > "$OUT/$name.told"
             }
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod branch_tests {
+    #[test]
+    fn a_restored_task_is_offered_the_branch_it_had() {
+        let meta = |title: &str, branch: &str| crate::archive::Meta { title: title.into(), branch: branch.into(), ..Default::default() };
+        // Renamed by its agent: that name, not one made again from a title in another language.
+        assert_eq!(super::restored_branch(&meta("DEV-26674 Маскирование пароля", "DEV-26674_maskBasicAuthPassword")), "DEV-26674_maskBasicAuthPassword");
+        assert_eq!(super::restored_branch(&meta("DEV-1 Fix login", "")), "DEV-1_fixLogin", "none known: from the title");
+        assert_eq!(super::restored_branch(&meta("DEV-1 Fix login", "(detached)")), "DEV-1_fixLogin");
     }
 }

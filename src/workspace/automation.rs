@@ -76,6 +76,7 @@ pub(super) struct Local {
     space: Option<String>,
     lsp_off: bool,
     pr_off: bool,
+    check_to_agent: u32,
 }
 
 impl Workspace {
@@ -122,13 +123,13 @@ impl Workspace {
                         let _ = answer.try_send(Answer::error("This project has no check set up in ideae (Project settings… → Check): run its tests yourself."));
                         return;
                     }
-                    this.trusting(&root, &resolved, window, cx, move |_, allowed, _, cx| {
+                    this.trusting(&root, &resolved, window, cx, move |_, allowed, window, cx| {
                         if !allowed {
                             let _ = answer.try_send(Answer::error("The user has not allowed this repository's .ideae.toml commands to run."));
                             return;
                         }
                         let before = view.read(cx).mcp_check_started();
-                        view.update(cx, |t, cx| t.start_check(check, true, cx));
+                        view.update(cx, |t, cx| t.start_check(check, true, window, cx));
                         // Its end, as the task's badge shows it; not past the task's,
                         // nor past the check's own limit.
                         let view = view.downgrade();
@@ -152,6 +153,7 @@ impl Workspace {
                     });
                 });
             }
+            "ask_agent" | "start_task" | "wait_for" | "tell_agent" | "agent_changes" => self.on_crew(request, answer, window, cx),
             other => reply(Answer::error(format!("ideae has no tool {other}"))),
         }
     }
@@ -268,6 +270,10 @@ impl Workspace {
             return;
         }
         let variant = !self.projects[pi].tasks[ti].group.is_empty();
+        let fixes = self.projects[pi].check_to_agent;
+        if let Some(view) = &self.projects[pi].tasks[ti].view {
+            view.update(cx, |t, _| t.set_check_to_agent(fixes));
+        }
         let root = path.to_path_buf();
         self.resolved(path, window, cx, move |this, resolved, window, cx| {
             let Some(view) = this.view_of(&root) else { return };
@@ -280,9 +286,9 @@ impl Workspace {
                 }
                 return;
             }
-            this.trusting(&root, &resolved, window, cx, move |_, allowed, _, cx| {
+            this.trusting(&root, &resolved, window, cx, move |_, allowed, window, cx| {
                 if allowed {
-                    view.update(cx, |t, cx| t.start_check(check, false, cx));
+                    view.update(cx, |t, cx| t.start_check(check, false, window, cx));
                 }
             });
         });
@@ -295,6 +301,16 @@ impl Workspace {
         }
         if let TaskEvent::Worktrees = event {
             return self.sync_worktrees(window, cx);
+        }
+        if let TaskEvent::OwnBranch(branch) = event {
+            let root = view.read(cx).root.clone();
+            if let Some(entry) = self.entry_mut(&root) {
+                entry.branch = branch.clone();
+                entry.head = None;
+            }
+            view.update(cx, |t, cx| t.set_own_branch(branch.clone(), None, cx));
+            self.save_later(cx);
+            return cx.notify();
         }
         if let TaskEvent::Asked(asked) = event {
             return self.on_asked(view, asked, window, cx);
@@ -325,7 +341,7 @@ impl Workspace {
                         }
                         view.update(cx, |t, cx| match ask {
                             AutoAsk::Setup => t.start_setup(task.setup, window, cx),
-                            _ => t.start_check(task.check, true, cx),
+                            _ => t.start_check(task.check, true, window, cx),
                         });
                     });
                 });
@@ -513,7 +529,7 @@ impl Workspace {
         let section = Rc::new(Cell::new(0usize));
         let p = &self.projects[pi];
         // Kept on this machine, set here and applied on Save.
-        let local = Rc::new(RefCell::new(Local { agent: p.agent.clone(), space: p.space.clone(), lsp_off: p.lsp_off, pr_off: p.pr_off }));
+        let local = Rc::new(RefCell::new(Local { agent: p.agent.clone(), space: p.space.clone(), lsp_off: p.lsp_off, pr_off: p.pr_off, check_to_agent: p.check_to_agent }));
         let profiles: Vec<(String, String)> = crate::state::with_settings(|s| s.agents.iter().map(|a| (a.id.clone(), a.name.clone())).collect());
         let spaces: Vec<(String, String)> = self.spaces.iter().map(|s| (s.name.clone(), s.mark())).collect();
         let stale = p.merged_branches.len();
@@ -782,7 +798,19 @@ impl Workspace {
                             .children(trust_row)
                             .child(field("Setup", "Runs in each new task's worktree, next to the agent", Textarea::new(&setup).into_any_element()))
                             .child(field("Teardown", "Runs when a task is paused or archived", Textarea::new(&teardown).into_any_element()))
-                            .child(field("Check", "Runs when the agent finishes a turn; ✓ or ✗ on the task", Input::new(&check).into_any_element()))
+                            .child(field(
+                                "Check",
+                                "Runs when the agent finishes a turn; ✓ or ✗ on the task",
+                                v_flex()
+                                    .gap_2()
+                                    .child(Input::new(&check))
+                                    // Whose turns are spent is yours: kept on this machine, not in the file.
+                                    .child(toggle("check-to-agent", "A failed check goes back to the agent by itself, twice in a row at most (on this machine)", local.borrow().check_to_agent > 0, {
+                                        let local = local.clone();
+                                        Rc::new(move |on| local.borrow_mut().check_to_agent = if on { 2 } else { 0 })
+                                    }))
+                                    .into_any_element(),
+                            ))
                             .child(field("Files to copy", "Ignored files a new worktree gets from the main checkout", Input::new(&copy).into_any_element()))
                             .child(field("New tasks from", "The branch new tasks start from; on this machine", Input::new(&base).into_any_element()))
                             .child(field("Worktrees in", "The folder new tasks' worktrees go in; on this machine", Input::new(&worktrees).into_any_element()))
@@ -914,6 +942,7 @@ impl Workspace {
         crate::git::set_project_worktrees(&p.path, &worktrees);
         p.worktrees = worktrees;
         p.pr_off = local.pr_off;
+        p.check_to_agent = local.check_to_agent;
         if p.lsp_off != local.lsp_off {
             p.lsp_off = local.lsp_off;
             let on = !local.lsp_off;
@@ -1115,7 +1144,7 @@ mod tests {
         }
         // The file's commands were allowed before.
         let key = crate::project_config::trust_key(&crate::project_config::parse(&toml).unwrap().task).unwrap();
-        let project = ProjectState { path: repo.clone(), trusted: [(key, true)].into(), ..Default::default() };
+        let project = ProjectState { path: repo.clone(), trusted: [(key, true)].into(), check_to_agent: 2, ..Default::default() };
         let saved = State { projects: vec![project], ..Default::default() };
         std::fs::write(dir.join("state.json"), serde_json::to_string(&saved).unwrap()).unwrap();
         crate::state::set_settings(crate::state::Settings { notifications: false, pr_status: false, ..Default::default() });
@@ -1173,16 +1202,25 @@ mod tests {
             pid.unwrap()
         });
 
-        let hook = |event: &str| HookEvent { task: path.clone(), agent: None, event: event.into(), message: None, kind: None, file: None, said: None, replayed: None, session: None, guessed: false, worktree: None };
+        let hook = |event: &str| HookEvent { task: path.clone(), agent: None, event: event.into(), message: None, kind: None, file: None, said: None, replayed: None, session: None, guessed: false, worktree: None, call: None };
         let turn = |cx: &mut TestAppContext| {
             step(cx, &mut |w, window, cx| w.on_hook(hook("UserPromptSubmit"), window, cx));
             step(cx, &mut |w, window, cx| w.on_hook(hook("Stop"), window, cx));
         };
+        let fixes = |cx: &mut TestAppContext| workspace.update(cx, |w, cx| w.projects[0].tasks.iter().find(|t| !t.main).and_then(|t| Some(t.view.as_ref()?.read(cx).check_fixes())).unwrap_or_default());
         turn(cx);
         until(cx, "the check to fail", &mut |cx| mark(cx) == "✗ check");
+        // Failed, it goes back to the agent by itself: twice, as the file says, then no more.
+        until(cx, "the failure to go to the agent", &mut |cx| fixes(cx) == 1);
+        for (n, file) in [(2, "try.txt"), (3, "again.txt")] {
+            std::fs::write(path.join(file), "").unwrap();
+            turn(cx);
+            until(cx, "the next failure", &mut |cx| fixes(cx) == n);
+        }
         std::fs::write(path.join("ok.txt"), "").unwrap();
         turn(cx);
         until(cx, "the check to pass", &mut |cx| mark(cx) == "✓ check");
+        assert_eq!(fixes(cx), 0, "a check that passes starts the count again");
 
         // A worktree its agent makes beside the repository, where nothing
         // else tells whose it is, folds under the task.

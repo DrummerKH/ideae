@@ -447,10 +447,14 @@ pub fn run(commands: &[String], cwd: &Path, env: &[(String, String)], timeout: D
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
-        // SAFETY: setsid only changes the child's own session.
+        // SAFETY: setsid and nice only change the child itself.
         unsafe {
             command.pre_exec(|| {
                 libc::setsid();
+                // Below the window and the agents: several tasks' tests at once
+                // would hold up the machine, not themselves. On a machine at
+                // rest this costs nothing.
+                libc::nice(10);
                 Ok(())
             });
         }

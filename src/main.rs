@@ -15,6 +15,7 @@ mod build_watch;
 mod daemon;
 mod db;
 mod desktop;
+mod digest;
 mod edit;
 mod file_icons;
 mod finder;

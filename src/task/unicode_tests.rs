@@ -7,7 +7,7 @@ use gpui_kit::component::Rope;
 
 use super::helpers::{markdown_link_at, plain_parent, text_before, toggle_comment_lines};
 use super::outline::outline;
-use crate::{db, edit, naming, said};
+use crate::{db, digest, edit, naming, said};
 
 const TEXT: &str = "Привет, мир — «слово» 你好世界 こんにちは 🎉👍🏽 é e\u{301} مرحبا\n\
     \tfn main() { let ñ = \"строка 🎉\"; } // комментарий — ещё\n\
@@ -143,5 +143,20 @@ fn matches_in_any_case_are_of_the_text_itself() {
         for range in folded_matches(tail, "о", false).into_iter().chain(folded_matches(head, "е", false)) {
             assert!(range.end <= tail.len().max(head.len()));
         }
+    }
+}
+
+#[test]
+fn output_for_an_agent() {
+    // Long lines in any script, errors among them: each cut at a character.
+    let long = TEXT.replace('\n', " ").repeat(8);
+    let output = format!("{long}\nerror: {long}\n  --> {long}\n\n{long}\n");
+    for most in [1, 5, 20, 80] {
+        let digest = digest::for_agent(&output, most);
+        assert!(digest.contains('…'), "a long line is cut");
+    }
+    // Held to a number of bytes: cut between characters at every size.
+    for most in (1..TEXT.len()).step_by(7) {
+        let _ = digest::within(TEXT.repeat(3), most);
     }
 }

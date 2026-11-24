@@ -17,6 +17,10 @@ const CLOSED_KEPT: usize = 50;
 /// How much of an answer its row can show.
 const ANSWER_KEPT: usize = 1200;
 
+/// What is done once a question is asked: with its task and its number,
+/// none when it could not be (no agent to ask).
+pub(super) type AskedThen = Box<dyn FnOnce(&mut Workspace, &Path, Option<u32>, &mut Context<Workspace>)>;
+
 /// An agent of the project a question can start from.
 #[derive(Clone)]
 struct QuestionSource {
@@ -87,7 +91,7 @@ impl Workspace {
                 }
                 window.close_dialog(cx);
                 let (profile, source) = (agent.borrow().clone(), source.borrow().clone());
-                let _ = this.update(cx, |this, cx| this.ask(pi, text, profile, source, window, cx));
+                let _ = this.update(cx, |this, cx| this.ask(pi, text, profile, source, None, window, cx));
             }
         };
         // Runs inside this entity's update, so it cannot go through `submit`.
@@ -99,7 +103,7 @@ impl Workspace {
                 if !text.is_empty() {
                     window.close_dialog(cx);
                     let (profile, source) = (agent.borrow().clone(), source.borrow().clone());
-                    this.ask(pi, text, profile, source, window, cx);
+                    this.ask(pi, text, profile, source, None, window, cx);
                 }
             }
         };
@@ -148,14 +152,22 @@ impl Workspace {
         });
     }
 
+    /// A question asked by a task's agent (crew.rs), in the task's project,
+    /// from that agent's conversation when `from` names its task; `then`
+    /// has the main thread and the question's number once it is asked.
+    pub(super) fn ask_for_agent(&mut self, pi: usize, prompt: String, from: Option<&Path>, then: AskedThen, window: &mut Window, cx: &mut Context<Self>) {
+        let source = from.and_then(|from| self.question_sources(pi).into_iter().find(|s| s.root == from));
+        self.ask(pi, prompt, String::new(), source, Some(then), window, cx);
+    }
+
     /// A question of the project's main thread: its agent starts there (the
     /// main thread's own only when it is opened), told `prompt`.
-    fn ask(&mut self, pi: usize, prompt: String, profile: String, source: Option<QuestionSource>, window: &mut Window, cx: &mut Context<Self>) {
+    fn ask(&mut self, pi: usize, prompt: String, profile: String, source: Option<QuestionSource>, then: Option<AskedThen>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(p) = self.projects.get(pi) else { return };
         let path = p.path.clone();
         let Some(ti) = p.tasks.iter().position(|t| t.main) else {
             self.open_main(pi, window, cx);
-            return self.ask(pi, prompt, profile, source, window, cx);
+            return self.ask(pi, prompt, profile, source, then, window, cx);
         };
         let entry = &p.tasks[ti];
         // The first question: the main thread's own session, when its id is
@@ -183,23 +195,34 @@ impl Workspace {
                         view.update(cx, |t, _| t.agent.learned_session(&id));
                     }
                 }
-                this.ask_now(pi, &path, prompt, profile, given, window, cx);
+                let asked = this.ask_now(pi, &path, prompt, profile, given, then.is_some(), window, cx);
+                if let Some(then) = then {
+                    then(this, &path, asked, cx);
+                }
             });
         })
         .detach();
     }
 
-    fn ask_now(&mut self, pi: usize, path: &Path, prompt: String, profile: String, given: Given, window: &mut Window, cx: &mut Context<Self>) {
+    /// The question's number, once asked.
+    /// `quiet`: asked by an agent, the window stays on what you look at.
+    fn ask_now(&mut self, pi: usize, path: &Path, prompt: String, profile: String, given: Given, quiet: bool, window: &mut Window, cx: &mut Context<Self>) -> Option<u32> {
         let settings = state::settings();
         let project_agent = self.projects[pi].agent.clone();
         let Some(profile) = crate::agents::resolve(&settings.agents, &[&profile], project_agent.as_deref(), &settings.default_agent).cloned() else {
             window.push_notification(Notification::warning("No agent to ask: add one in Settings → Agents."), cx);
-            return;
+            return None;
         };
         let id = profile.adapter().chooses_session_id().then(crate::agents::uuid);
         // Loaded before the question is listed, which it would take for one of before.
-        self.switch_quietly(path, window, cx);
-        let Some(entry) = self.entry_mut(path) else { return };
+        if quiet {
+            self.quiet_start.insert(path.to_path_buf());
+            self.load(path, window, cx);
+            self.quiet_start.remove(path);
+        } else {
+            self.switch_quietly(path, window, cx);
+        }
+        let entry = self.entry_mut(path)?;
         entry.asked += 1;
         let n = entry.asked;
         let title = first_line(&prompt);
@@ -239,6 +262,7 @@ impl Workspace {
             })
             .detach();
         }
+        Some(n)
     }
 
     /// A name of your own for a question.
@@ -630,7 +654,9 @@ impl Workspace {
         let status = if agent::asked_again(&was, &event) { was.clone() } else { status };
         let turn_over = status == agent::AgentStatus::Done && matches!(was, agent::AgentStatus::Working | agent::AgentStatus::NeedsInput(_));
         let seen = self.active.as_deref() == Some(event.task.as_path()) && window.is_window_active();
-        if turn_over && event.replayed.is_none() && !(seen && view.read(cx).questions_in_front().contains(&n)) {
+        // An agent's question: its answer goes to that agent; you are told only when it asks you.
+        let for_agent = self.entry_mut(&event.task).and_then(|e| e.questions.iter().find(|q| q.id == n)).is_some_and(|q| q.asked_by.is_some());
+        if turn_over && event.replayed.is_none() && !for_agent && !(seen && view.read(cx).questions_in_front().contains(&n)) {
             if let Some(q) = self.entry_mut(&event.task).and_then(|e| e.questions.iter_mut().find(|q| q.id == n)) {
                 q.unread = true;
             }
@@ -652,7 +678,8 @@ impl Workspace {
             }
         });
         // Told on the desktop only with the window in the back: in front, its row says it.
-        if status.is_attention() && status != was && !seen && !window.is_window_active() && event.replayed.is_none() && state::settings().notifications && self.shows(pi, ti) {
+        let attention = if for_agent { matches!(status, agent::AgentStatus::NeedsInput(_)) } else { status.is_attention() };
+        if attention && status != was && !seen && !window.is_window_active() && event.replayed.is_none() && state::settings().notifications && self.shows(pi, ti) {
             let said = view.read(cx).agent_of(who).and_then(|a| a.shown_said().map(|s| s.whole.clone()));
             let words = state::with_settings(|s| s.notify_said && s.show_said) && !self.is_presenting();
             let body = crate::said::notice(&status, said.as_deref(), words);
@@ -771,14 +798,31 @@ fn prompt_says_more(prompt: &str, title: &str) -> bool {
 /// A few words for what is asked, by the agent for quick questions; none
 /// when there is no such agent or it did not answer. Not for the UI thread.
 fn name_question(prompt: &str) -> Option<String> {
-    use std::io::Write as _;
-    let profile = state::with_settings(|s| s.quick_profile().cloned())?;
-    let asked = profile.adapter().one_shot(&profile, &crate::agents::Ask::Quick)?;
-    let text = format!(
+    quick_title(format!(
         "Give a title of at most six words for the question below, asked about a code repository, \
          in the question's language. Answer with the title only, no quotes, no period.\n\n{}",
         crate::said::cap(prompt, 4000)
-    );
+    ))
+}
+
+/// A task named by its ticket's key alone: what the ticket asks for, from
+/// what its agent said after reading it. Not on the UI thread.
+pub(super) fn name_ticket(key: &str, said: &str) -> Option<String> {
+    let name = quick_title(format!(
+        "An agent was given the ticket {key} and, after reading it, said what follows. Give a title of at most \
+         six words for the work the ticket asks for, in the ticket's language, without the key. Answer with the \
+         title only, no quotes, no period.\n\n{}",
+        crate::said::cap(said, 4000)
+    ))?;
+    let name = name.trim_start_matches(key).trim_start_matches([':', ' ', '-']).to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+/// One line the agent for quick questions answers `text` with.
+fn quick_title(text: String) -> Option<String> {
+    use std::io::Write as _;
+    let profile = state::with_settings(|s| s.quick_profile().cloned())?;
+    let asked = profile.adapter().one_shot(&profile, &crate::agents::Ask::Quick)?;
     let mut child = asked.command().stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().ok()?;
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(text.as_bytes());
@@ -904,7 +948,7 @@ mod tests {
 
         // Its reports are its own: the main thread's agent is not touched.
         let path = repo.clone();
-        let hook = |event: &str, agent: Option<&str>| HookEvent { task: path.clone(), agent: agent.map(str::to_string), event: event.into(), message: None, kind: None, file: None, said: None, replayed: None, session: None, guessed: false, worktree: None };
+        let hook = |event: &str, agent: Option<&str>| HookEvent { task: path.clone(), agent: agent.map(str::to_string), event: event.into(), message: None, kind: None, file: None, said: None, replayed: None, session: None, guessed: false, worktree: None, call: None };
         step(cx, &mut |w, window, cx| w.on_hook(hook("UserPromptSubmit", Some("q-1")), window, cx));
         workspace.update(cx, |w, cx| {
             let v = main_entry(w).view.as_ref().unwrap().read(cx);
@@ -1099,7 +1143,7 @@ mod tests {
         });
 
         // Another question writes a note, then goes on as a task of its own.
-        step(cx, &mut |w, window, cx| w.ask(0, "Sketch a plan for reading f.txt".into(), String::new(), None, window, cx));
+        step(cx, &mut |w, window, cx| w.ask(0, "Sketch a plan for reading f.txt".into(), String::new(), None, None, window, cx));
         wait(cx, "the second question's agent", &mut |_| !args("q-2").is_empty());
         let second = workspace.update(cx, |w, _| main_entry(w).questions.iter().find(|q| q.id == 2).and_then(|q| q.session.clone()).expect("its id"));
         std::fs::write(transcripts.join(format!("{second}.jsonl")), "{\"second\":1}\n").unwrap();

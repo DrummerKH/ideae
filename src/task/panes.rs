@@ -340,6 +340,7 @@ impl TaskView {
                     }),
             )
             .children(shown.and_then(|id| self.ix_of(id)).and_then(|ix| self.render_question_bar(ix, cx)))
+            .children(shown.and_then(|id| self.ix_of(id)).and_then(|ix| self.render_loop_bar(ix, cx)))
             .child(div().flex_1().min_h_0().child(self.tab_content(shown.and_then(|id| self.ix_of(id)), cx)))
             .when(layer, |el| {
                 el.child(

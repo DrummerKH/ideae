@@ -98,15 +98,19 @@ impl TaskView {
             })
             .when_some(b.base.clone().filter(|_| b.behind_base > 0 && self.off_default().is_none()), |this, base| {
                 let busy = self.busy.is_some();
+                let clash = !b.base_conflicts.is_empty();
                 this.child(
                     Button::new("rebase")
                         .xsmall()
                         .ghost()
                         .disabled(busy)
-                        .label(format!("{base} ↓{} · Rebase", b.behind_base))
-                        .tooltip(format!(
-                            "Rebase this branch onto {base}. On a conflict nothing changes, and the agent's prompt gets a request to do it."
-                        ))
+                        .label(format!("{base} ↓{} · Rebase{}", b.behind_base, if clash { " ⚠" } else { "" }))
+                        .when(clash, |button| button.text_color(gpui_kit::yellow()))
+                        .tooltip(if clash {
+                            format!("{base} has changed the same lines as this branch in {}: a rebase would stop there. A click asks the agent to do it and resolve them.", b.base_conflicts.join(", "))
+                        } else {
+                            format!("Rebase this branch onto {base}. On a conflict nothing changes, and the agent's prompt gets a request to do it.")
+                        })
                         .on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
                             this.rebase_onto_base(base.clone(), window, cx)
@@ -291,21 +295,36 @@ impl TaskView {
 
     /// Says the task's worktree is not on the task's branch, and puts it
     /// back: an agent detached it, or went to another branch.
+    /// Not while its agent works: a checkout or a rebase of a moment is
+    /// its own business, and a button then would undo it under it.
     pub(super) fn render_off_own(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let off = self.off_own.clone().filter(|_| !self.main_thread)?;
+        let off = self.off_own.clone().filter(|_| !self.main_thread && !self.agent_busy())?;
         let own = self.own_branch.clone();
         let theme = cx.theme();
         let doing = ["rebasing", "merging", "cherry-picking", "reverting", "bisecting"].iter().any(|d| off.starts_with(d));
+        // On a branch of its own: maybe meant, so kept as the task's at a click.
+        let other = off.strip_prefix("on ").map(str::to_string);
         let said = if doing {
             format!("The worktree is {off}: finish or abort it, and the task is on {own} again.")
         } else {
-            format!("The worktree is {off}, not on the task's branch {own}.")
+            format!("The worktree is {off}; the task's branch is {own}.")
         };
+        let keep = other.map(|other| {
+            Button::new("off-own-keep")
+                .xsmall()
+                .ghost()
+                .label(format!("Keep {other} as the task's"))
+                .tooltip(format!("The task goes on with {other}: its PR, archive and Changes follow it; {own} is left as it is"))
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.emit(TaskEvent::OwnBranch(other.clone()));
+                }))
+        });
         let back = (!doing).then(|| {
             let own = own.clone();
             Button::new("off-own-back")
                 .xsmall()
-                .primary()
+                .outline()
                 .disabled(self.busy.is_some())
                 .label(format!("Back on {own}"))
                 .tooltip(format!("With all of {own} here, {own} is moved here; else the worktree goes to {own}, and commits here on no branch get one"))
@@ -327,6 +346,7 @@ impl TaskView {
                 .border_b_1()
                 .border_color(theme.border)
                 .child(div().flex_1().min_w_0().truncate().child(said))
+                .children(keep)
                 .children(back)
                 .into_any_element(),
         )

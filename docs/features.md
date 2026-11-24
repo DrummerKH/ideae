@@ -33,6 +33,15 @@ Projects, tasks, open tabs, cursor lines and open folders survive a restart
 (`~/.local/share/ideae/state.json`). A task that is done is archived, not
 deleted: see below.
 
+A Jira link pasted as the title (`…/browse/DEV-123`) becomes its key, and
+the agent is told to read the issue (the link with it); a prompt the dialog
+filled in and you left as it was is sent at once. After the agent's first
+turn, the task gets a title from what it said (`DEV-123 Fix login`). The
+branch keeps the key: ideae renames no branch under an agent at work, and
+how a project names its branches is for its agent (its CLAUDE.md) or you. A
+Linear link has the issue's title in it: the task and its branch are named
+from it at once (`ENG-123_fixTheLoginForm`).
+
 ## Pause, archive, restore
 
 A task's menu ends with **Pause** and **Archive**. Pause stops its agent,
@@ -73,8 +82,9 @@ background with `gh` every half hour, and when a task's PR is merged.
 command palette for all projects in the window; Recent tasks, Ctrl+E, once
 something is typed, after the tasks there are) lists them, newest first,
 searched by title, prompt, branch, PR and date. Restore takes the goal up
-again: a new worktree from origin, as a new task is made, on a branch named
-from the title that you can change, or, when its PR is
+again: a new worktree from origin, as a new task is made, on the branch it
+had (renamed by its agent or you, as the project names them; from its title
+only when it had none), which you can change, or, when its PR is
 still open, its branch fetched from origin. The commits on no remote are
 cherry-picked onto it and the changes not committed applied, if you like;
 what does not apply is kept in the worktree's git folder, and you and the
@@ -120,6 +130,24 @@ or its question; Settings → General → "What the agent said, in
 notifications" off, they say only Finished or Needs your answer.
 The Changes and Files panels mark the file the agent is writing to and those
 it wrote to since your last prompt.
+
+An agent that goes round in circles (Claude Code making the same tool call
+four times running, or two calls in turn three times each, within one turn)
+is not stopped, since that may be meant: its row says `↻ round in circles: …`
+with what it repeats, a notification says so, and a bar above its tab stops
+its turn (as Esc) or lets it go on, not told again that turn.
+Reading a background command's output again and a command with `sleep` in it
+are waiting, not repeating.
+
+Settings → Agents → "Agents out of view" stops a chat agent that has had
+nothing to do in a task you have not opened for a while (30 minutes), to free
+its memory; "Terminal agents too" does the same for Claude Code in a terminal.
+Its tab and row say asleep, and opening the task resumes its session. It is
+left running while it works or asks, while something of its own would end
+with it (a command it runs in the background, a timer it set with
+CronCreate or ScheduleWakeup, text typed into it since it last reported, a
+message waiting for it), and when its session is not known or it does not
+report its status.
 
 By a task in the sidebar, a small dial shows how full its agent's context is
 (yellow from three quarters, red from nine tenths; the numbers when the
@@ -170,6 +198,33 @@ opened. An open one with no message for days (3), yours or its agent's, goes
 to the closed ones, unless its answer was not read. Once a question was asked, every agent there is resumed by its own
 session: the main thread's session, if its id was never told, is found when
 the first question is asked.
+
+## Agents that start agents
+
+With Settings → Agents → "Agents may start agents" on (it is off at first; it
+reaches agents started after), a task's agent can, through ideae's MCP server
+(Claude Code gets it with the hooks), start other agents of the same project
+and wait for what they say; off, it is not shown those tools at all:
+
+- `ask_agent`: a question beside the main thread, as Ctrl+I asks one, from
+  nothing or from a copy of the asking agent's conversation. It can only read,
+  so it starts at once; its row and tab are where yours are.
+- `start_task`: a task of its own, with a title and a prompt. You are asked
+  first (Start it / Decline); allowed, its worktree is made out of view, its
+  agent sent the prompt, and it is listed under the task whose agent asked.
+- `wait_for`: waits, a few minutes a call, for that agent to end its turn or
+  ask you something, and gives what it said; `tell_agent` sends it more;
+  `agent_changes` gives a task's commits and diff since it left the base, to
+  review or take over its work.
+
+Only a task's own agent starts others, four at work at once at most: not a
+question's agent, not the agent of a task another agent started. A proposed
+task waits in Needs you (Start / Decline) and is told of, nothing comes over
+what you do; a started one is listed under the task whose agent asked, and
+Pause or Archive of that task asks whether its tasks go too. Questions an
+agent asks are its to read: they are not unread for you, their row says
+whose, and only one that asks you something notifies. The ids are kept in
+the state (the latest hundred).
 
 ## Variants
 
@@ -276,8 +331,21 @@ lists one git does not ignore.
 
 - Changes with stage, unstage and discard, single hunks reverted or staged;
   commit, push, a pull request (`gh`), the branch against its base.
+- Review comments on lines of the diff go to the agent together (Send to
+  agent) and stay, marked sent. When its turn ends each is looked for in its
+  file: its code gone or changed, it says "changed: look again"; still there
+  as it was, "still open": it moves to where the code is now and goes again
+  with the next Send. Remove changed takes those you have looked at; × is
+  done with one.
+- A task follows its branch: renamed (`git branch -m`) or grown into a new
+  one by its agent, the new name is the task's. Left on another branch that
+  was there before, or detached, the task says so once its agent's turn is
+  over (not during it), and offers to keep that branch as the task's or to
+  go back on its own; nothing is switched or renamed by itself.
 - Safe pull: Pull is marked when what comes would conflict with your work,
-  and is then not tried. Where a pull, rebase, pick or revert would conflict,
+  and is then not tried. So is the base branch, as last fetched: when it
+  changed the same lines as the task, its Rebase button turns yellow with the
+  files, and the task's row says so (`⚠ conflicts with main`), before a PR would. Where a pull, rebase, pick or revert would conflict,
   nothing changes and the agent is asked to do it and resolve the conflicts.
 - The working tree, or one file of it, compares with any branch, tag or
   commit.

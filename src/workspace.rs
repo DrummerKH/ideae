@@ -83,6 +83,8 @@ pub struct TaskEntry {
     /// it was ever asked (questions.rs).
     pub questions: Vec<state::QuestionState>,
     pub asked: u32,
+    /// Started by the agent of this task (crew.rs).
+    pub spawned_by: Option<PathBuf>,
     /// Made this run and not started yet, or its latest session recorded
     /// and not run: its agent starts a new session.
     pub fresh: bool,
@@ -101,6 +103,7 @@ mod merged_ui;
 pub mod automation;
 pub mod present;
 pub mod questions;
+mod crew;
 pub mod side;
 pub mod spaces;
 pub mod variants;
@@ -156,6 +159,8 @@ pub struct Project {
     /// No language servers in its tasks; its pull requests not asked of gh.
     pub lsp_off: bool,
     pub pr_off: bool,
+    /// A failed check back to the agent by itself, this many times in a row.
+    pub check_to_agent: u32,
     /// Branches of origin whose PR was merged, and when they were looked for.
     pub merged_branches: Vec<crate::merged_branches::MergedBranch>,
     pub merged_checked: Option<std::time::Instant>,
@@ -190,6 +195,7 @@ impl Project {
             worktrees: String::new(),
             lsp_off: false,
             pr_off: false,
+            check_to_agent: 0,
             merged_branches: Vec::new(),
             merged_checked: None,
             made_by_agents: Default::default(),
@@ -249,6 +255,13 @@ pub struct Workspace {
     last_run: std::collections::HashSet<PathBuf>,
     /// Started for a question alone: its own agent waits until it is opened.
     quiet_start: std::collections::HashSet<PathBuf>,
+    /// Agents tasks' agents started (crew.rs).
+    crew: crew::Crew,
+    /// The next task made sends its prompt: the dialog filled it, nobody
+    /// has anything to add.
+    send_next_prompt: bool,
+    /// Tasks named by a ticket's key alone, named once from their agent.
+    naming_tasks: std::collections::HashSet<PathBuf>,
     /// Conversations copied for a question to start from, until it has.
     fork_copies: std::collections::HashMap<(PathBuf, u32), Vec<PathBuf>>,
     /// What questions' sessions were last read at, for how full they are.
@@ -424,6 +437,7 @@ impl Workspace {
                 session: h.session,
                 guessed: false,
                 worktree: h.worktree,
+                call: h.call,
             };
             match crate::daemon::client::connect(move |h| {
                 let _ = live.send_blocking(to_event(h, false));
@@ -737,6 +751,9 @@ impl Workspace {
             restoring: Vec::new(),
             last_run: Default::default(),
             quiet_start: Default::default(),
+            crew: crew::Crew::from_records(&saved.crew),
+            send_next_prompt: false,
+            naming_tasks: Default::default(),
             fork_copies: Default::default(),
             question_usage: Default::default(),
             answer_hover: Task::ready(()),
@@ -899,7 +916,7 @@ impl Workspace {
             project.collapsed = p.collapsed;
             project.check = p.check.clone();
             project.check_auto = p.check_auto;
-            (project.base, project.lsp_off, project.pr_off) = (p.base.clone(), p.lsp_off, p.pr_off);
+            (project.base, project.lsp_off, project.pr_off, project.check_to_agent) = (p.base.clone(), p.lsp_off, p.pr_off, p.check_to_agent);
             project.worktrees = p.worktrees.clone();
             git::set_project_worktrees(&project.path, &project.worktrees);
             project.trusted = p.trusted.clone();
@@ -955,6 +972,7 @@ impl Workspace {
                     woke: t.woke.clone(),
                     questions: t.questions.clone(),
                     asked: t.asked,
+                    spawned_by: t.spawned_by.clone(),
                 })
                 .collect();
             self.projects.push(project);
@@ -1022,6 +1040,7 @@ impl Workspace {
             settings: state::settings(),
             active_task: self.active.clone(),
             zoom: crate::zoom::current(cx),
+            crew: self.crew.records(),
             projects: self
                 .projects
                 .iter()
@@ -1035,6 +1054,7 @@ impl Workspace {
                     worktrees: p.worktrees.clone(),
                     lsp_off: p.lsp_off,
                     pr_off: p.pr_off,
+                    check_to_agent: p.check_to_agent,
                     own: crate::project_config::own(&p.path),
                     trusted: p.trusted.clone(),
                     hints_off: p.hints_off.iter().cloned().collect(),
@@ -1083,6 +1103,7 @@ impl Workspace {
                             woke: t.woke.clone(),
                             questions: t.questions.clone(),
                             asked: t.asked,
+                            spawned_by: t.spawned_by.clone(),
                         })
                         .collect(),
                 })
@@ -1136,9 +1157,12 @@ impl Workspace {
         let kept: Vec<String> = self.find(path).map(|(pi, _)| self.projects[pi].hints_off.iter().filter_map(|key| key.strip_prefix(automation::KEPT_BRANCH)).map(str::to_string).collect()).unwrap_or_default();
         let lsp_off = self.find(path).is_some_and(|(pi, _)| self.projects[pi].lsp_off);
         // Its own agent was not running when the app last stopped.
-        let quiet = self.quiet_start.contains(path) || (self.last_run.remove(path) && session.tabs.iter().any(|tab| tab.kind == "paused-agent"));
+        let slept = session.tabs.iter().any(|tab| tab.kind == "slept-agent");
+        let quiet = slept || self.quiet_start.contains(path) || (self.last_run.remove(path) && session.tabs.iter().any(|tab| tab.kind == "paused-agent"));
         let view = cx.new(|cx| {
             let mut t = TaskView::new(root, branch, launch, !quiet, socket, slot, window, cx);
+            // Put to sleep in the last run: it resumes when the task is shown.
+            t.set_agent_slept(slept);
             t.context_fill = fill;
             // Servers start when the task comes into view (switch).
             t.lsp_asleep = true;
@@ -1243,7 +1267,7 @@ impl Workspace {
         view.update(cx, |t, cx| {
             t.unseen = false;
             t.wake_language_servers(cx);
-            t.wake_agent(cx);
+            t.wake_agent(window, cx);
             t.set_visible(true, window, cx)
         });
         // A question in front is read by coming into view.
@@ -1745,12 +1769,23 @@ impl Workspace {
             }
         };
         let this = cx.weak_entity();
+        // A ticket in the title fills the prompt, unless you wrote one yourself.
+        // Left as it was filled, it is sent: there is nothing to finish.
+        let filled: Rc<RefCell<String>> = Rc::default();
+        let as_filled = {
+            let filled = filled.clone();
+            move |text: &str| !text.is_empty() && text == filled.borrow().trim()
+        };
         let submit = {
-            let (this, filled_in) = (this.clone(), filled_in.clone());
+            let (this, filled_in, as_filled) = (this.clone(), filled_in.clone(), as_filled.clone());
             move |window: &mut Window, cx: &mut App| {
                 let Some((title, text, notes, agents)) = filled_in(cx) else { return };
                 window.close_dialog(cx);
-                let _ = this.update(cx, |this, cx| this.create_task(project, title, text, notes, agents, window, cx));
+                let send = as_filled(&text);
+                let _ = this.update(cx, |this, cx| {
+                    this.send_next_prompt = send;
+                    this.create_task(project, title, text, notes, agents, window, cx)
+                });
             }
         };
         // Runs inside this entity's update, so it cannot go through `submit`.
@@ -1761,14 +1796,16 @@ impl Workspace {
                 let InputEvent::PressEnter { secondary: true, .. } = event else { return };
                 if let Some((title, text, notes, agents)) = filled_in(cx) {
                     window.close_dialog(cx);
+                    this.send_next_prompt = as_filled(&text);
                     this.create_task(project, title, text, notes, agents, window, cx);
                 }
             }
         };
         // Kept by the dialog and gone with it: detached, they would hold the inputs they listen to for good.
         let mut listening = Vec::new();
-        // A ticket in the title fills the prompt, unless you wrote one yourself.
-        let filled: Rc<RefCell<String>> = Rc::default();
+        // A key that came from a link (Jira, Linear), and the prompt made from
+        // it: the title set to the key afterwards gives the same.
+        let from_link: Rc<RefCell<Option<(String, String)>>> = Rc::default();
         let fetch: Rc<RefCell<Option<Task<()>>>> = Rc::default();
         let repo = p.path.clone();
         {
@@ -1786,9 +1823,33 @@ impl Workspace {
                     *filled.borrow_mut() = text.clone();
                     prompt.update(cx, |p, cx| p.set_value(text, window, cx));
                 };
+                // A link pasted: the key names the task, the link goes to the agent.
+                // A Linear link has the issue's words too: the branch is named at once.
+                if let Some((key, words, url)) = linear_link(&title) {
+                    *fetch.borrow_mut() = None;
+                    let told = format!("Linear issue {key} ({url}): read it, its description and comments, and do what it asks.");
+                    *from_link.borrow_mut() = Some((key.clone(), told.clone()));
+                    set(told, window, cx);
+                    let short = title.replace(&url, &format!("{key} {words}")).split_whitespace().collect::<Vec<_>>().join(" ");
+                    let input = input.clone();
+                    window.defer(cx, move |window, cx| input.update(cx, |i, cx| i.set_value(short, window, cx)));
+                    return;
+                }
+                // Filled now: the title set from here is no change the input tells of.
+                if let Some((key, url)) = jira_link(&title) {
+                    *fetch.borrow_mut() = None;
+                    let told = format!("Jira issue {key} ({url}): read it, its description and comments, and do what it asks.");
+                    *from_link.borrow_mut() = Some((key.clone(), told.clone()));
+                    set(told, window, cx);
+                    let short = title.replace(&url, &key).split_whitespace().collect::<Vec<_>>().join(" ");
+                    let input = input.clone();
+                    window.defer(cx, move |window, cx| input.update(cx, |i, cx| i.set_value(short, window, cx)));
+                    return;
+                }
                 if let Some(key) = jira_key(&title) {
                     *fetch.borrow_mut() = None;
-                    set(format!("Jira issue {key}: read it, its description and comments, and do what it asks."), window, cx);
+                    let linked = from_link.borrow().clone().filter(|(k, _)| k == key).map(|(_, told)| told);
+                    set(linked.unwrap_or_else(|| format!("Jira issue {key}: read it, its description and comments, and do what it asks.")), window, cx);
                 } else if let Some(number) = github_issue(&title) {
                     let (repo, input, prompt, filled) = (repo.clone(), input.clone(), prompt.clone(), filled.clone());
                     let task = window.spawn(cx, async move |cx| {
@@ -1816,6 +1877,9 @@ impl Workspace {
                 }
             }));
         }
+        // Ctrl+Enter creates it from the title too, as from the prompt.
+        let on_title_enter = on_enter.clone();
+        listening.push(cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, window, cx| on_title_enter(this, event, window, cx)));
         listening.push(cx.subscribe_in(&prompt, window, move |this, _, event: &InputEvent, window, cx| on_enter(this, event, window, cx)));
         let listening = Rc::new(listening);
         let focused = std::rc::Rc::new(std::cell::Cell::new(false));
@@ -1945,6 +2009,8 @@ impl Workspace {
     /// cannot be one (no git, another version control), the work is done in
     /// the folder, by the project's main task.
     fn create_task(&mut self, project: usize, title: String, prompt: String, notes: Vec<String>, agents: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+        // Taken now, for this task alone, whatever way it is made.
+        let given = std::mem::take(&mut self.send_next_prompt);
         let Some(repo) = self.projects.get(project).map(|p| p.path.clone()) else { return };
         cx.spawn_in(window, async move |this, cx| {
             let folder = repo.clone();
@@ -1952,12 +2018,12 @@ impl Workspace {
             let _ = this.update_in(cx, |this, window, cx| {
                 let Some(project) = this.projects.iter().position(|p| p.path == repo) else { return };
                 if has_commit {
-                    return this.create_worktree_task(project, title, prompt, notes, agents, window, cx);
+                    return this.create_worktree_task(project, title, prompt, notes, agents, given, window, cx);
                 }
                 this.open_main(project, window, cx);
                 let view = this.entry_mut(&repo).and_then(|entry| entry.view.clone());
                 if let (false, Some(view)) = (prompt.is_empty(), view) {
-                    view.update(cx, |t, cx| t.queue_prompt(prompt, state::settings().send_new_prompt, window, cx));
+                    view.update(cx, |t, cx| t.queue_prompt(prompt, given || state::settings().send_new_prompt, window, cx));
                 }
                 let told = "Tasks get a worktree of their own from a git commit. There is none here yet, so this one works right in the folder.";
                 window.push_notification(Notification::info(told).title("Working in the folder"), cx);
@@ -1966,7 +2032,9 @@ impl Workspace {
         .detach();
     }
 
-    fn create_worktree_task(&mut self, project: usize, title: String, prompt: String, notes: Vec<String>, agents: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+    /// `given`: its prompt is sent, not left for you to finish.
+    pub(super) fn create_worktree_task(&mut self, project: usize, title: String, prompt: String, notes: Vec<String>, agents: Vec<String>, given: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // Variants are sent their prompt anyway.
         if notes.len() > 1 {
             return self.create_variants(project, title, prompt, notes, agents, window, cx);
         }
@@ -2007,13 +2075,20 @@ impl Workspace {
                         if let Some(entry) = this.entry_mut(&path) {
                             entry.busy = None;
                         }
-                        this.switch(&path, window, cx);
+                        // One an agent started runs out of view: what you look at stays.
+                        let spawned = this.entry_mut(&path).is_some_and(|entry| entry.spawned_by.is_some());
+                        if spawned {
+                            this.load(&path, window, cx);
+                        } else {
+                            this.switch(&path, window, cx);
+                        }
                         this.task_made(&path, window, cx);
                         // To its own agent: the task in view is another when the switch did not happen.
                         let view = this.entry_mut(&path).and_then(|entry| entry.view.clone());
                         if let (false, Some(view)) = (prompt.is_empty(), view) {
-                            // A run of IDEAE_NEW_TASK has nobody to press Enter: its prompts are sent.
-                            let send = state::settings().send_new_prompt || std::env::var_os("IDEAE_NEW_TASK").is_some();
+                            // Sent when Settings say so, and always when nobody is there to press Enter (IDEAE_NEW_TASK,
+                            // an agent's task) or there is nothing to finish (a prompt the dialog filled).
+                            let send = state::settings().send_new_prompt || spawned || given || std::env::var_os("IDEAE_NEW_TASK").is_some();
                             view.update(cx, |t, cx| t.queue_prompt(prompt, send, window, cx));
                         }
                     }
@@ -2361,6 +2436,10 @@ impl Workspace {
         let Some((pi, ti)) = self.find(&event.task) else { return };
         let entry = &self.projects[pi].tasks[ti];
         let Some(view) = entry.view.clone() else { return };
+        // Its end, of an agent put to sleep: it is not gone.
+        if event.event == "SessionEnd" && view.read(cx).agent_slept() {
+            return;
+        }
         let group = (!entry.group.is_empty()).then(|| entry.group.clone());
         let mut label = format!("{} · {}", self.projects[pi].name, entry.label());
         let variant = variants::letter(entry.variant);
@@ -2379,9 +2458,12 @@ impl Workspace {
         let turn_over = status == agent::AgentStatus::Done && matches!(was, agent::AgentStatus::Working | agent::AgentStatus::NeedsInput(_));
         // A message that waited for this goes out now: the agent is not done yet.
         let more_coming = turn_over && view.read(cx).has_queued_message();
-        let heard = view.update(cx, |t, cx| {
+        let (heard, looping) = view.update(cx, |t, cx| {
             let said = (t.agent.said.clone(), t.agent.asks.clone());
-            t.agent.hear(&event, &status);
+            let looping = t.agent.hear(&event, &status).then(|| t.agent.looping.clone()).flatten();
+            if looping.is_some() {
+                cx.emit(TaskEvent::Changed);
+            }
             t.agent.guessed = event.guessed;
             t.set_agent_status(crate::task::Who::Main, status.clone(), seen, cx);
             let before = t.agent_shown();
@@ -2398,9 +2480,17 @@ impl Workspace {
             if turn_over && event.replayed.is_none() {
                 t.deliver_queued(crate::task::Who::Main, window, cx);
                 t.reload_own_pages(cx);
+                t.recheck_review(cx);
             }
-            said != (t.agent.said.clone(), t.agent.asks.clone())
+            (said != (t.agent.said.clone(), t.agent.asks.clone()), looping)
         });
+        // Not stopped: a run of the same call may be meant. Told, as a question would be.
+        if let Some(doing) = looping.filter(|_| !seen && event.replayed.is_none() && !window.is_window_active() && state::settings().notifications) {
+            let (tx, path) = (self.open_task_tx.clone(), event.task.clone());
+            crate::desktop::notify_with(&label, &format!("Goes round in circles: {doing}"), move || {
+                let _ = tx.send_blocking((path, None));
+            });
+        }
         // A variant at work again: what the judge said is of before.
         if let (Some(group), "UserPromptSubmit") = (&group, event.event.as_str()) {
             if self.judges.contains_key(group) {
@@ -2415,6 +2505,7 @@ impl Workspace {
         }
         if turn_over && event.replayed.is_none() && !more_coming {
             self.after_turn(&event.task, window, cx);
+            self.name_ticket_task(&event.task, window, cx);
         }
         if turn_over {
             self.projects[pi].tasks[ti].done_at = state::now();
@@ -2456,6 +2547,37 @@ impl Workspace {
         if status != was || turn_over || heard {
             cx.notify();
         }
+    }
+
+    /// A task titled by its ticket's key alone (a link pasted, nothing else)
+    /// gets a title from what its agent said after reading the ticket. Once,
+    /// after the first turn that says something. Its branch is left as it
+    /// is: renamed under its agent, it would surprise it, and how branches
+    /// are named is the project's rule, which its agent knows, not ideae.
+    fn name_ticket_task(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(entry) = self.entry_mut(path) else { return };
+        let key = entry.title.trim().to_string();
+        if entry.main || !entry.group.is_empty() || jira_key(&key) != Some(key.as_str()) {
+            return;
+        }
+        let said = entry.view.as_ref().and_then(|v| v.read(cx).agent.said.as_ref().map(|s| s.whole.to_string()));
+        let Some(said) = said.filter(|_| self.naming_tasks.insert(path.to_path_buf())) else { return };
+        let path = path.to_path_buf();
+        cx.spawn_in(window, async move |this, cx| {
+            let job_key = key.clone();
+            let named = cx
+                .background_spawn(crate::procs::on_thread(move || questions::name_ticket(&job_key, &said).map(|name| format!("{job_key} {name}"))))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(title) = named else { return };
+                if let Some(entry) = this.entry_mut(&path).filter(|e| e.title.trim() == key) {
+                    entry.title = title;
+                }
+                this.save_later(cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// The agent reported its session id: kept as the task's latest
@@ -3129,6 +3251,31 @@ fn jira_key(title: &str) -> Option<&str> {
     ok.then_some(first)
 }
 
+/// A Jira issue's link in a title (`…/browse/DEV-123`, `…?selectedIssue=DEV-123`):
+/// its key and the link.
+fn jira_link(title: &str) -> Option<(String, String)> {
+    title.split_whitespace().filter(|w| w.starts_with("http")).find_map(|url| {
+        let (_, after) = url.split_once("/browse/").or_else(|| url.split_once("selectedIssue="))?;
+        // A link has the key as Jira writes it; one typed by hand may not.
+        let key: String = after.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '-').collect::<String>().to_ascii_uppercase();
+        jira_key(&key)?;
+        Some((key, url.to_string()))
+    })
+}
+
+/// A Linear issue's link in a title (`linear.app/team/issue/ENG-123/fix-the-login`):
+/// its key, the words of its title as the link has them, and the link.
+fn linear_link(title: &str) -> Option<(String, String, String)> {
+    title.split_whitespace().filter(|w| w.starts_with("http") && w.contains("linear.app/")).find_map(|url| {
+        let (_, after) = url.split_once("/issue/")?;
+        let mut parts = after.split(['/', '?', '#']);
+        let key = parts.next()?.to_ascii_uppercase();
+        jira_key(&key)?;
+        let words = parts.next().unwrap_or_default().replace('-', " ");
+        Some((key, words.trim().to_string(), url.to_string()))
+    })
+}
+
 /// "#123" at the start of a title, or a GitHub issue link in it.
 fn github_issue(title: &str) -> Option<u64> {
     let first = title.split_whitespace().next()?;
@@ -3158,6 +3305,8 @@ fn branch_hint(title: &str) -> String {
     let title = title.trim();
     if title.is_empty() {
         "The branch name comes from the title.".into()
+    } else if jira_key(title) == Some(title) {
+        format!("Branch: {title}. The title is named from what its agent reads in the issue")
     } else {
         let branch = naming::preview(title);
         format!("Branch: {branch}")
@@ -3166,3 +3315,119 @@ fn branch_hint(title: &str) -> String {
 
 use gpui_kit::component::{ActiveTheme as _, Selectable as _, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
+
+#[cfg(test)]
+mod ticket_tests {
+    use super::{ProjectState, State, Workspace, state};
+
+    /// A task titled by a ticket's key alone is named after its agent's
+    /// first turn, by the agent for quick questions: its title only, the
+    /// branch left to its agent and the project's rules.
+    ///
+    /// `cargo test -- --ignored a_ticket_task_is_named` after changing it.
+    #[cfg(unix)]
+    #[gpui_kit::test]
+    #[ignore]
+    fn a_ticket_task_is_named_by_its_agent(cx: &mut gpui_kit::TestAppContext) {
+        use crate::agent::HookEvent;
+        use crate::agents::Profile;
+        use gpui_kit::{AppContext as _, Bounds, Point, WindowBounds, WindowOptions, px, size};
+        use std::os::unix::fs::PermissionsExt as _;
+        let _one = crate::workspace::variants::tests::ONE_WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+        cx.executor().allow_parking();
+        let dir = std::env::temp_dir().join(format!("ideae-ticket-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        let sh = |script: &str| assert!(std::process::Command::new("sh").arg("-ec").arg(script).current_dir(&dir).status().unwrap().success(), "{script}");
+        sh("git init -q --bare -b main remote.git; git init -q -b main repo; cd repo; git config user.email t@t; git config user.name t; echo one > f.txt; git add f.txt; git commit -qm base; git remote add origin \"$(cd ../remote.git && pwd)\"; git push -q -u origin main; git remote set-head origin main");
+        let repo = dir.join("repo").canonicalize().unwrap();
+        // Claude Code's stand-in: asked once (-p), it names the task; else it waits.
+        let claude = dir.join("bin").join("claude");
+        std::fs::write(&claude, "#!/bin/sh\nif [ \"$1\" = -p ]; then cat >/dev/null; echo 'Fix login'; exit 0; fi\nexec sleep 60\n").unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // SAFETY: set before anything of the app reads them.
+        unsafe {
+            std::env::set_var("IDEAE_STATE", dir.join("state.json"));
+            std::env::set_var("IDEAE_NO_DAEMON", "1");
+        }
+        let saved = State { projects: vec![ProjectState { path: repo.clone(), ..Default::default() }], ..Default::default() };
+        std::fs::write(dir.join("state.json"), serde_json::to_string(&saved).unwrap()).unwrap();
+        let mut settings = state::Settings { notifications: false, pr_status: false, ..Default::default() };
+        settings.agents = vec![Profile { command: claude.display().to_string(), ..Profile::claude_code() }];
+        state::set_settings(settings);
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            gpui_cn::init(cx);
+            crate::theme::init(cx);
+        });
+        let (handle, workspace) = cx.update(|cx| {
+            let bounds = Bounds { origin: Point::default(), size: size(px(1300.), px(800.)) };
+            let options = WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() };
+            gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| Workspace::new(Vec::new(), None, None, window, cx))).expect("a test window")
+        });
+        let step = |cx: &mut gpui_kit::TestAppContext, act: &mut dyn FnMut(&mut Workspace, &mut gpui_kit::Window, &mut gpui_kit::Context<Workspace>)| {
+            cx.update_window(handle.into(), |_, window, cx| workspace.update(cx, |w, cx| act(w, window, cx))).unwrap();
+            cx.run_until_parked();
+        };
+        let wait = |cx: &mut gpui_kit::TestAppContext, what: &str, done: &mut dyn FnMut(&mut gpui_kit::TestAppContext) -> bool| {
+            for _ in 0..1500 {
+                cx.run_until_parked();
+                if done(cx) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                cx.executor().advance_clock(std::time::Duration::from_millis(100));
+            }
+            panic!("waited in vain for {what}");
+        };
+        let made = |cx: &mut gpui_kit::TestAppContext, key: &str| -> std::path::PathBuf {
+            let key = key.to_string();
+            step(cx, &mut |w, window, cx| w.create_task(0, key.clone(), String::new(), vec![String::new()], Vec::new(), window, cx));
+            let mut path = None;
+            wait(cx, "the task", &mut |cx| {
+                path = workspace.update(cx, |w, _| w.projects[0].tasks.iter().find(|t| t.title == key && t.busy.is_none() && t.view.is_some()).map(|t| t.path.clone()));
+                path.is_some()
+            });
+            path.unwrap()
+        };
+        let turn = |cx: &mut gpui_kit::TestAppContext, task: &std::path::Path| {
+            for (event, said) in [("UserPromptSubmit", None), ("Stop", Some("The issue asks to fix the login form."))] {
+                let hook = HookEvent { task: task.to_path_buf(), agent: None, event: event.into(), message: None, kind: None, file: None, said: said.map(str::to_string), replayed: None, session: None, guessed: false, worktree: None, call: None };
+                step(cx, &mut |w, window, cx| w.on_hook(hook.clone(), window, cx));
+            }
+        };
+        let named = |cx: &mut gpui_kit::TestAppContext, task: &std::path::Path| workspace.update(cx, |w, _| w.projects[0].tasks.iter().find(|t| t.path == task).map(|t| (t.title.clone(), t.branch.clone())).unwrap());
+        let head = |task: &std::path::Path| String::from_utf8(std::process::Command::new("git").args(["branch", "--show-current"]).current_dir(task).output().unwrap().stdout).unwrap().trim().to_string();
+
+        let one = made(cx, "DEV-1");
+        turn(cx, &one);
+        wait(cx, "DEV-1 named", &mut |cx| named(cx, &one).0 == "DEV-1 Fix login");
+        assert_eq!((named(cx, &one).1, head(&one)), ("DEV-1".to_string(), "DEV-1".to_string()), "the branch is not renamed under its agent");
+        // Named once: a title of yours after it stays.
+        step(cx, &mut |w, _, _| w.entry_mut(&one).unwrap().title = "DEV-1".into());
+        turn(cx, &one);
+        assert_eq!(named(cx, &one).0, "DEV-1");
+
+        step(cx, &mut |w, _, cx| {
+            for view in w.views() {
+                view.update(cx, |t, cx| t.shut_down_at_quit(cx));
+            }
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_jira_link_is_its_key() {
+        let link = "https://example.atlassian.net/browse/DEV-26674";
+        assert_eq!(super::jira_link(link), Some(("DEV-26674".into(), link.into())));
+        let board = "see https://example.atlassian.net/jira/software/projects/DEV/boards/1?selectedIssue=DEV-7&x=1";
+        assert_eq!(super::jira_link(board).map(|(key, _)| key), Some("DEV-7".into()));
+        assert_eq!(super::jira_link("https://example.atlassian.net/browse/dev-5").map(|(key, _)| key), Some("DEV-5".into()));
+        assert_eq!(super::jira_link("https://example.com/browse/notakey"), None);
+        assert_eq!(super::jira_link("DEV-1 Fix login"), None, "a key typed is not a link");
+        let linear = "https://linear.app/acme/issue/ENG-123/fix-the-login-form";
+        assert_eq!(super::linear_link(linear), Some(("ENG-123".into(), "fix the login form".into(), linear.into())));
+        assert_eq!(crate::naming::branch_name("ENG-123 fix the login form"), "ENG-123_fixTheLoginForm");
+        assert_eq!(super::linear_link("https://linear.app/acme/issue/ENG-9").map(|l| l.1), Some(String::new()), "no words: named after the first turn");
+    }
+}

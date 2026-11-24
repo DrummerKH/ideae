@@ -308,7 +308,7 @@ mod tests {
         }
         let saved = State { projects: vec![ProjectState { path: repo.clone(), ..Default::default() }], ..Default::default() };
         std::fs::write(dir.join("state.json"), serde_json::to_string(&saved).unwrap()).unwrap();
-        let mut settings = crate::state::Settings { notifications: false, pr_status: false, ..Default::default() };
+        let mut settings = crate::state::Settings { notifications: false, pr_status: false, sleep_terminal_agents: true, ..Default::default() };
         settings.agents = vec![
             Profile { command: claude.display().to_string(), ..Profile::claude_code() },
             Profile { id: "other".into(), name: "Other".into(), kind: Kind::Generic, command: other.display().to_string(), env: [("OTHER_ACCOUNT".to_string(), "second".to_string())].into(), ..Default::default() },
@@ -364,7 +364,7 @@ mod tests {
 
         // Claude Code says it runs another session (a /clear): a restart resumes that one.
         step(cx, &mut |w, window, cx| {
-            let event = HookEvent { task: a.clone(), agent: None, event: "SessionStart".into(), message: None, kind: None, file: None, said: None, replayed: None, session: Some("after-clear".into()), guessed: false, worktree: None };
+            let event = HookEvent { task: a.clone(), agent: None, event: "SessionStart".into(), message: None, kind: None, file: None, said: None, replayed: None, session: Some("after-clear".into()), guessed: false, worktree: None, call: None };
             w.on_hook(event, window, cx);
         });
         workspace.update(cx, |w, cx| {
@@ -374,6 +374,58 @@ mod tests {
             assert!(again.contains("--resume after-clear"), "{again}");
             assert_eq!(w.snapshot(cx).projects[0].tasks.iter().find(|t| !t.main).unwrap().sessions[0].id.as_deref(), Some("after-clear"), "kept in the state");
         });
+
+        // A's turn over, out of sight: its agent is stopped, its tab says so,
+        // and coming into view it resumes the same session.
+        let view_a = workspace.update(cx, |w, _| w.projects[0].work()[0].view.clone().unwrap());
+        let hear = |cx: &mut gpui_kit::TestAppContext, event: &str, call: Option<&str>| {
+            let event = HookEvent { task: a.clone(), agent: None, event: event.into(), message: None, kind: None, file: None, said: None, replayed: None, session: None, guessed: false, worktree: None, call: call.map(str::to_string) };
+            step(cx, &mut |w, window, cx| w.on_hook(event.clone(), window, cx));
+        };
+        let asleep = |cx: &mut gpui_kit::TestAppContext, view: &gpui_kit::Entity<crate::task::TaskView>| view.read_with(cx, |t, _| t.agent_slept() && t.agent_tabs().contains(&(crate::task::Who::Main, true)));
+        let started_again = std::fs::metadata(a.join(".claude-args")).unwrap().modified().unwrap();
+        hear(cx, "UserPromptSubmit", None);
+        wait(cx, "A's agent in the foreground", &mut |cx| {
+            // After the variant's prompt is typed in, as the agent would say.
+            hear(cx, "Stop", None);
+            cx.update_window(handle.into(), |_, window, cx| view_a.update(cx, |t, cx| {
+                t.set_visible(false, window, cx);
+                t.put_agent_to_sleep(cx);
+            }))
+            .unwrap();
+            asleep(cx, &view_a)
+        });
+        // As after a restart: its view gone, what was saved of it left; shown, it wakes by itself.
+        let saved = workspace.update(cx, |w, cx| w.snapshot(cx).projects[0].tasks.iter().find(|t| t.path == a).unwrap().session.clone());
+        assert!(saved.tabs.iter().any(|tab| tab.kind == "slept-agent"), "saved as asleep, not paused");
+        step(cx, &mut |w, _, cx| {
+            let entry = w.entry_mut(&a).unwrap();
+            if let Some(view) = entry.view.take() {
+                view.update(cx, |t, cx| t.shut_down_at_quit(cx));
+            }
+            entry.session = saved.clone();
+        });
+        step(cx, &mut |w, window, cx| w.switch(&a, window, cx));
+        let view_a = workspace.update(cx, |w, _| w.projects[0].work()[0].view.clone().unwrap());
+        wait(cx, "A's agent resumed", &mut |_| {
+            std::fs::metadata(a.join(".claude-args")).and_then(|m| m.modified()).is_ok_and(|at| at > started_again)
+                && std::fs::read_to_string(a.join(".claude-args")).is_ok_and(|args| args.contains("--resume after-clear"))
+        });
+        assert!(!asleep(cx, &view_a), "awake again");
+        // A timer it set would not go off: it is left running.
+        hear(cx, "UserPromptSubmit", None);
+        hear(cx, "PreToolUse", Some("CronCreate:0"));
+        hear(cx, "Stop", None);
+        for _ in 0..50 {
+            cx.update_window(handle.into(), |_, window, cx| view_a.update(cx, |t, cx| {
+                t.set_visible(false, window, cx);
+                t.put_agent_to_sleep(cx);
+            }))
+            .unwrap();
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!asleep(cx, &view_a), "a timer keeps it running");
 
         // B tells nothing: it is seen to work while it writes, and to be done at the bell.
         wait(cx, "B guessed at work", &mut |cx| workspace.update(cx, |w, cx| w.projects[0].work()[1].view.as_ref().unwrap().read(cx).agent.status == AgentStatus::Working));

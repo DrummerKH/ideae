@@ -650,6 +650,9 @@ pub struct BranchInfo {
     /// The files a pull would leave in conflict, with what is committed
     /// here or only written; empty when none, or when it cannot be told.
     pub pull_conflicts: Vec<String>,
+    /// The same for the base branch as last fetched: what a rebase onto it
+    /// would stop at, known before the PR says so.
+    pub base_conflicts: Vec<String>,
     /// The repository's own checkout is on another branch than the default.
     pub off_default: Option<OffDefault>,
     /// A folder without git: nothing here has a branch.
@@ -833,6 +836,9 @@ fn stamp(path: &Path) -> Stamp {
 pub struct Known {
     /// What a pull was last tried on in the mind, and how it came out.
     pull: (String, Vec<String>),
+    /// The same for the base branch taken in (a rebase or a merge of it):
+    /// HEAD and how far behind, what the worktree held, when, and the files.
+    onto_base: (String, u64, Option<std::time::Instant>, Vec<String>),
     age: u32,
     git_dir: Option<PathBuf>,
     refs: Option<PathBuf>,
@@ -1212,6 +1218,18 @@ pub fn refresh(root: &Path, picked: Option<String>, light: bool, known: &mut Kno
         stamp(&root.join(path)).hash(&mut made_of);
     }
     let made_of = made_of.finish();
+    // Asked again at once when HEAD or the base has moved (a fetch brings
+    // more commits to be behind); for the work written meanwhile, twice a
+    // minute at most: each asking writes a tree and runs a merge.
+    if let Some(onto) = info.base.clone().filter(|_| info.behind_base > 0) {
+        let key = format!("{oid} {}", info.behind_base);
+        let (seen, written, at, _) = &known.onto_base;
+        let wrote = *written != made_of && at.is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(30));
+        if *seen != key || wrote {
+            known.onto_base = (key, made_of, Some(std::time::Instant::now()), merge_conflicts(root, None, &onto).unwrap_or_default());
+        }
+        info.base_conflicts = known.onto_base.3.clone();
+    }
     let base = compared.filter(|_| history.fork.is_some());
     // The log of the stash is there as long as something is stashed, and
     // is written to whenever the list changes.
@@ -3741,7 +3759,13 @@ mod refresh_tests {
         // The base moves (a fetch): how far behind it is, is counted again.
         sh(&base, "git clone -q remote.git c 2>/dev/null; cd c; git config user.email t@t; git config user.name t; echo z > z.txt; git add z.txt; git commit -qm more; git push -q origin main");
         sh(&root, "git fetch -q");
-        assert_eq!(refresh(&root, None, false, &mut known).info.behind_base, 1);
+        let read = refresh(&root, None, false, &mut known);
+        assert_eq!((read.info.behind_base, read.info.base_conflicts.len()), (1, 0), "a file of its own: no conflict");
+        // The base changes a line this branch changed too: told before a rebase is tried.
+        sh(&base, "cd c; echo theirs > f.txt; git commit -qam clash; git push -q origin main");
+        sh(&root, "echo ours > f.txt; git commit -qam ours; git fetch -q");
+        let read = refresh(&root, None, false, &mut known);
+        assert_eq!((read.info.behind_base, read.info.base_conflicts.clone()), (2, vec!["f.txt".to_string()]));
         let _ = std::fs::remove_dir_all(&base);
     }
 }

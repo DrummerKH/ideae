@@ -14,6 +14,7 @@ src/workspace/spaces.rs    spaces: projects sorted into sets, one in the window 
 src/workspace/side.rs      worktrees an agent made for itself: told apart, folded under their task, no agent of their own
 src/workspace/automation.rs  a project's setup, teardown and check, the trust its .ideae.toml needs, hints, Project settings…
 src/workspace/agents_ui.rs choosing agents: the picker, a project's agent, Continue with another agent
+src/workspace/crew.rs      agents a task's agent starts through the MCP server: a question beside the main thread, a task the user allows; waiting for what they say
 src/workspace/questions.rs questions asked aside: an agent of their own beside the main thread's (`Who::Question`), their rows, closing and asking again
 src/workspace/archive_ui.rs Archive (a task's everyday end), the archived list, Restore, an agent's worktree removed
 src/workspace/present.rs   presenting: only the tasks chosen stay in the window, the rest out of the list and the notifications
@@ -99,6 +100,7 @@ src/desktop.rs     launcher entry, dash pin, restart, `--install` / `--uninstall
 src/predict/       edit prediction: llama-server and a model downloaded on consent, run for the app, ghost text at the cursor;
                    tests and UI checks use local files: IDEAE_PREDICT_SERVER, IDEAE_PREDICT_MODEL (IDEAE_DEBUG_PREDICT logs misses; IDEAE_PREDICT_GHOST="text" shows that as the suggestion, for screenshots)
 src/naming.rs      branch names from task titles
+src/digest.rs      what of a long output (a check's, a CI log) an agent reads: the errors, each once, and the end
 src/services.rs    `.ideae.toml` services (Run ▾): per-task port slots, IDEAE_PORT_<NAME>
 src/project_config.rs  `.ideae.toml` [task] (setup, teardown, check, copy), your own over the file, suggestions, runs
 vendor/            patched gpui-component, gpui-base, gpui-cn, gpui-fast-linux, gpui-fast-macos; changes marked `ideae patch`
@@ -114,6 +116,8 @@ scripts/           Xvfb driver for UI checks, wayland.sh (the same in a headless
 - Variants have an end-to-end test on a real repository with real terminals, `#[ignore]` too: `cargo test -- --ignored two_variants` after changing them.
 - So do agent profiles (two agents, session ids, guessed status, carrying a task on): `cargo test -- --ignored two_agents` after changing agents/ or how an agent is started.
 - And questions asked aside (their agent, its reports apart from the task's, the main thread's session kept): `cargo test -- --ignored a_question_beside` after changing questions or how a task's agents are told apart.
+- And agents started by agents (a question, a task the user allows, waiting for their answers): `cargo test -- --ignored agents_start_agents` after changing crew.rs or the MCP server's tools.
+- And a task made from a ticket's key alone, named after its agent's first turn (its title, not its branch): `cargo test -- --ignored a_ticket_task_is_named` after changing how a new task's title comes about.
 - Saving a file and following it on disk have one too: `cargo test -- --ignored an_open_file` after changing how an open file is written, reloaded or refreshed.
 - So has the start: `cargo test -- --ignored the_tasks_of_the_last_run` after changing how the tasks of the last run are restored.
 - So has archiving and restoring: `cargo test -- --ignored an_archived_task` after changing either.

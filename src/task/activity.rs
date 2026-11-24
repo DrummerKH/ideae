@@ -102,6 +102,7 @@ impl TaskView {
             session: None,
             guessed: true,
             worktree: None,
+            call: None,
         }));
     }
 }

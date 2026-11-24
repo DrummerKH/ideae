@@ -51,6 +51,12 @@ pub struct Auto {
     checked: Option<String>,
     output_open: bool,
     ci_busy: bool,
+    /// Failed checks sent to the agent by themselves since a turn of yours.
+    fixes: u32,
+    /// The agent's turn now is one such a check started.
+    fixing: bool,
+    /// How many in a row, as the project is set on this machine; 0: none.
+    fix_most: u32,
 }
 
 impl Auto {
@@ -202,7 +208,9 @@ impl TaskView {
     /// Runs the project's check in the worktree, off the UI thread: one at
     /// a time, the one before stopped. Not again for a worktree as it was
     /// at the last one, unless `again`.
-    pub fn start_check(&mut self, command: String, again: bool, cx: &mut Context<Self>) {
+    /// The one after a turn (`again` false) may go back to the agent by
+    /// itself when it fails, as the project says.
+    pub fn start_check(&mut self, command: String, again: bool, window: &mut Window, cx: &mut Context<Self>) {
         if command.trim().is_empty() {
             return;
         }
@@ -210,10 +218,12 @@ impl TaskView {
         let cancel = Arc::new(AtomicBool::new(false));
         let last = if again { None } else { self.auto.checked.clone() };
         let (root, env, job_cancel) = (self.root.clone(), self.service_env(), cancel.clone());
-        let job = cx.spawn(async move |this, cx| {
+        let job = cx.spawn_in(window, async move |this, cx| {
             let print_root = root.clone();
             let print = cx.background_spawn(async move { crate::project_config::fingerprint(&print_root) }).await;
             if print.is_some() && print == last {
+                // A turn that changed nothing: no fix came of it.
+                let _ = this.update(cx, |t, _| t.auto.fixing = false);
                 return;
             }
             let started = this.update(cx, |t, cx| {
@@ -234,14 +244,18 @@ impl TaskView {
             if outcome.cancelled {
                 return;
             }
-            let _ = this.update(cx, |t, cx| {
+            let _ = this.update_in(cx, |t, window, cx| {
                 let mut output = crate::project_config::tail(&outcome.output, SHOWN_LINES);
                 if outcome.timed_out {
                     output.push_str("\n… stopped after 30 minutes");
                 }
                 let state = if outcome.ok() { RunState::Passed } else { RunState::Failed(outcome.code) };
+                let failed = matches!(state, RunState::Failed(_));
                 t.auto.check = Some(CheckRun { state, command, output: output.into(), at: crate::state::now() });
                 t.auto.check_job = None;
+                if !again {
+                    t.check_after_turn(failed, window, cx);
+                }
                 cx.emit(TaskEvent::Changed);
                 cx.notify();
             });
@@ -251,13 +265,66 @@ impl TaskView {
 
     /// The end of the failed check's output to the agent, to fix.
     pub(super) fn send_check_to_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(check) = self.auto.check.as_ref().filter(|c| matches!(c.state, RunState::Failed(_))) else { return };
-        let text = format!(
+        let Some(text) = self.failed_check_text() else { return };
+        self.tell_agent(text, "Check output", window, cx);
+    }
+
+    pub fn set_check_to_agent(&mut self, most: u32) {
+        self.auto.fix_most = most;
+    }
+
+    /// Failed checks the agent was sent by themselves in a row, and past
+    /// the most when you were told.
+    #[cfg(test)]
+    pub fn check_fixes(&self) -> u32 {
+        self.auto.fixes
+    }
+
+    fn failed_check_text(&self) -> Option<String> {
+        let check = self.auto.check.as_ref().filter(|c| matches!(c.state, RunState::Failed(_)))?;
+        Some(format!(
             "The check `{}` failed after your last turn. The end of its output:\n```\n{}\n```\nFix what makes it fail.",
             check.command,
-            crate::project_config::tail(&check.output, TO_AGENT_LINES)
-        );
-        self.tell_agent(text, "Check output", window, cx);
+            crate::digest::for_agent(&check.output, TO_AGENT_LINES)
+        ))
+    }
+
+    /// A check after the agent's turn ended. Failed, it goes back to the
+    /// agent by itself as many times in a row as the project says
+    /// (`check_to_agent`), then you are told; a turn of yours starts the
+    /// count again. Not while you type to the agent, nor into a question
+    /// it asks.
+    fn check_after_turn(&mut self, failed: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let ours = std::mem::take(&mut self.auto.fixing);
+        if !failed || !ours {
+            self.auto.fixes = 0;
+        }
+        let most = self.auto.fix_most;
+        if !failed || most == 0 {
+            return;
+        }
+        let name = self.root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        if self.auto.fixes >= most {
+            if self.auto.fixes == most {
+                self.auto.fixes += 1;
+                let tries = if most == 1 { "one try".to_string() } else { format!("{most} tries") };
+                window.push_notification(Notification::warning(format!("Still failing after the agent's {tries}: your turn.")).title(format!("Check in {name}")), cx);
+            }
+            return;
+        }
+        let typing = self.agent_terminal(Who::Main, cx).and_then(|s| s.read(cx).typed_at()).is_some_and(|at| at.elapsed() < Duration::from_secs(30));
+        if typing || self.agent.status != crate::agent::AgentStatus::Done || self.agent.has_queued_message() {
+            return;
+        }
+        let Some(text) = self.failed_check_text() else { return };
+        // Not written by the user: said so, as it shows in the agent's input.
+        let text = format!("[Sent by ideae, not typed: the check failed after your turn; try {} of {most}.]\n{text}", self.auto.fixes + 1);
+        if matches!(self.message_agent(text, window, cx), Told::Now) {
+            self.auto.fixes += 1;
+            self.auto.fixing = true;
+            self.action = Some((true, format!("The failed check went to the agent ({} of {most})", self.auto.fixes)));
+            cx.notify();
+        }
     }
 
     fn tell_agent(&mut self, text: String, what: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -329,7 +396,7 @@ impl TaskView {
                     .xsmall()
                     .ghost()
                     .label("→ agent")
-                    .tooltip(format!("Send the last {TO_AGENT_LINES} lines of the check's output to the agent, to fix"))
+                    .tooltip("Send the errors in the check's output and its end to the agent, to fix")
                     .on_click(cx.listener(|this, _, window, cx| {
                         cx.stop_propagation();
                         this.send_check_to_agent(window, cx);
@@ -469,7 +536,7 @@ impl TaskView {
                         .xsmall()
                         .outline()
                         .label("Send to agent")
-                        .tooltip(format!("The last {TO_AGENT_LINES} lines of the output, and a word to fix it"))
+                        .tooltip("The errors in the output and its end, and a word to fix it")
                         .on_click(cx.listener(|this, _, window, cx| {
                             cx.stop_propagation();
                             this.send_check_to_agent(window, cx);

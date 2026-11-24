@@ -423,6 +423,8 @@ pub enum TaskEvent {
     Heard(crate::agent::HookEvent),
     /// The main thread stays on this branch: not to be told again.
     KeepBranch(String),
+    /// A task's worktree is on another branch, which becomes the task's.
+    OwnBranch(String),
     /// A worktree was added, or this one put on another branch.
     Worktrees,
     /// Of a question asked aside (agent_tab.rs).
@@ -583,6 +585,12 @@ pub struct TaskView {
     /// Out of view long enough (or never shown): no language servers run;
     /// they start when the task comes into view.
     pub lsp_asleep: bool,
+    /// Its agent in a terminal was stopped for having nothing to do: it
+    /// resumes when the task comes into view.
+    agent_slept: bool,
+    /// When its agent's processes were last looked at, before it is
+    /// stopped: once a minute at most, for one that keeps a command running.
+    agent_sleep_probe: Option<std::time::Instant>,
     /// Its project said no language servers.
     pub lsp_off: bool,
     /// When its agent last asked a language server through ideae's MCP
@@ -898,6 +906,8 @@ impl TaskView {
             folded_viewed: HashMap::new(),
             folded_changes: HashSet::new(),
             lsp_asleep: false,
+            agent_slept: false,
+            agent_sleep_probe: None,
             lsp_off: false,
             file_states: HashMap::new(),
             commit_input,
@@ -1549,6 +1559,23 @@ impl TaskView {
 
     pub fn change_count(&self) -> usize {
         self.files.len()
+    }
+
+    /// The agent's turn ended: what became of the review comments it was sent.
+    pub fn recheck_review(&mut self, cx: &mut Context<Self>) {
+        self.changes.update(cx, |c, cx| c.recheck_review(false, cx));
+    }
+
+    /// The branch work starts from, as compared with (`origin/main`).
+    pub fn base_ref(&self) -> Option<&str> {
+        self.branch_info.base.as_deref()
+    }
+
+    /// The base branch, as named for short (`main`), when it changed, as
+    /// last fetched, the same lines as this branch.
+    pub fn base_clash(&self) -> Option<&str> {
+        let base = self.branch_info.base.as_deref().filter(|_| !self.branch_info.base_conflicts.is_empty())?;
+        Some(base.strip_prefix("origin/").unwrap_or(base))
     }
 
     /// Commits not pushed: ahead of the upstream, or the branch's own ones

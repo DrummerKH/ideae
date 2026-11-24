@@ -35,6 +35,27 @@ pub struct State {
     /// Text size per kind of view.
     pub zoom: crate::zoom::Zoom,
     pub projects: Vec<ProjectState>,
+    /// Agents tasks' agents started, by the ids they were given.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub crew: Vec<CrewRecord>,
+}
+
+/// One agent a task's agent started (workspace/crew.rs): a question
+/// (`main`, `n`), a task (`path`), one proposed (`title`, `prompt`) or declined.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct CrewRecord {
+    pub id: u32,
+    pub parent: PathBuf,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub n: u32,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub prompt: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
@@ -102,6 +123,12 @@ pub struct Settings {
     /// Minutes a chat agent with nothing to do keeps running in a task out
     /// of view; 0: no end.
     pub agent_idle_minutes: u32,
+    /// A terminal agent too, when it can be resumed and nothing of its own
+    /// runs on (`TaskView::put_agent_to_sleep`).
+    pub sleep_terminal_agents: bool,
+    /// A task's agent may ask other agents of its project and propose tasks
+    /// (workspace/crew.rs): its MCP server lists those tools.
+    pub agents_start_agents: bool,
     /// Minutes a question's agent with nothing to do keeps running out of
     /// sight, and days an open question nobody came back to stays open; 0:
     /// no end.
@@ -272,6 +299,8 @@ impl Default for Settings {
             lsp_separate: false,
             lsp_idle_minutes: 15,
             agent_idle_minutes: 30,
+            sleep_terminal_agents: false,
+            agents_start_agents: false,
             question_sleep_minutes: 15,
             question_close_days: 3,
             agent_unanswered_minutes: 0,
@@ -487,6 +516,10 @@ pub struct ProjectState {
     /// Its tasks' pull requests are not asked of gh.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub pr_off: bool,
+    /// How many times in a row a check failed after its agent's turn goes
+    /// back to it by itself, on this machine; 0: only by a click.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub check_to_agent: u32,
     /// Worktrees an agent made with `git worktree add` outside the places
     /// that tell (beside the repository), and the task whose agent did.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -555,6 +588,10 @@ pub struct TaskState {
     /// How many questions it was ever asked: the next one's number.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub asked: u32,
+    /// Started by the agent of this task (workspace/crew.rs): it starts
+    /// none of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawned_by: Option<PathBuf>,
 }
 
 /// A question asked of an agent of its own beside a task's agent.
@@ -588,6 +625,10 @@ pub struct QuestionState {
     /// Its agent has answered and the answer was not looked at.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub unread: bool,
+    /// Asked by the agent of this task (crew.rs): its answers are that
+    /// agent's to read, not yours.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asked_by: Option<PathBuf>,
     /// Its agent's last answer, to read from its row.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub answer: String,
@@ -652,6 +693,50 @@ pub struct ReviewNote {
     pub path: String,
     pub modified_side: bool,
     pub line: usize,
+    /// Times it went to the agent; 0: not yet. It stays after, until you
+    /// are done with it.
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub sent: u32,
+    /// After the agent's turn: whether the code it is on is gone or
+    /// changed (true), or still there as it was (false), moved to where it
+    /// is now. None: not looked at since it was sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changed: Option<bool>,
+}
+
+#[cfg(test)]
+#[test]
+fn a_review_note_is_found_where_its_code_went() {
+    let note = ReviewNote { code: "let a = 1;\nlet b = 2;\n".into(), line: 8, sent: 1, ..Default::default() };
+    // Moved down by lines written above it; the nearer of two copies.
+    assert_eq!(note.find_in("x\nlet a = 1;\nlet b = 2;\ny\nz\nw\nq\nlet a = 1;\nlet b = 2;\n"), Some(9));
+    assert_eq!(note.find_in("fn f() {}\n"), None, "changed: not there");
+    assert!(!note.open() && ReviewNote { changed: Some(false), ..note.clone() }.open());
+}
+
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
+}
+
+impl ReviewNote {
+    /// To go with the next Send: never sent, or sent and its code is still
+    /// as it was after the agent's turn.
+    pub fn open(&self) -> bool {
+        self.sent == 0 || self.changed == Some(false)
+    }
+
+    /// Where its code is in `text` (the file now): the place nearest to
+    /// where it was, its end line; none when the code is no longer there.
+    pub fn find_in(&self, text: &str) -> Option<usize> {
+        let code = self.code.trim_end_matches('\n');
+        if code.trim().is_empty() {
+            return None;
+        }
+        let span = code.matches('\n').count();
+        text.match_indices(code)
+            .map(|(at, _)| text.as_bytes().iter().take(at).filter(|&&b| b == b'\n').count() + 1 + span)
+            .min_by_key(|end| end.abs_diff(self.line))
+    }
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq)]

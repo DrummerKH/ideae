@@ -87,6 +87,16 @@ pub struct HookEvent {
     pub guessed: bool,
     /// A worktree the agent is about to make with `git worktree add`.
     pub worktree: Option<String>,
+    /// Of a tool call: the tool's name, a colon, and a print of the call with
+    /// its input, the same for the same call made again.
+    pub call: Option<String>,
+}
+
+impl HookEvent {
+    /// The tool a call is of, as Claude Code names it (`Bash`, `CronCreate`).
+    pub fn tool(&self) -> Option<&str> {
+        self.call.as_deref().and_then(|c| c.split_once(':')).map(|(tool, _)| tool)
+    }
 }
 
 impl HookEvent {
@@ -354,6 +364,7 @@ fn parse_line(line: &str) -> Option<HookEvent> {
         session: v["session"].as_str().map(str::to_string),
         guessed: false,
         worktree: v["worktree"].as_str().map(str::to_string),
+        call: v["call"].as_str().map(str::to_string),
     })
 }
 
@@ -481,6 +492,21 @@ fn normal(path: &Path) -> PathBuf {
     out
 }
 
+/// `Bash:1f…`: the tool and a print of its input, to tell the same call
+/// made again.
+fn call_print(payload: &Value) -> Option<String> {
+    use std::hash::{Hash as _, Hasher as _};
+    let tool = payload["tool_name"].as_str()?;
+    // Waiting on purpose: output of a shell in the background read again, a pause.
+    let polls = matches!(tool, "BashOutput" | "TaskOutput") || payload["tool_input"]["command"].as_str().is_some_and(|c| c.contains("sleep "));
+    if polls {
+        return None;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    payload["tool_input"].to_string().hash(&mut hasher);
+    Some(format!("{tool}:{:016x}", hasher.finish()))
+}
+
 /// Whether a tool call waits for the user to answer.
 fn asks_user(payload: &Value) -> bool {
     payload["tool_name"].as_str().is_some_and(|tool| ASKING_TOOLS.split('|').any(|t| t == tool))
@@ -556,6 +582,7 @@ pub fn run_hook(args: &[String]) {
         "said": said,
         "session": payload["session_id"].as_str(),
         "worktree": if event == "PreToolUse" { worktree_added(&payload) } else { None },
+        "call": if event == "PreToolUse" && !asks_user { call_print(&payload) } else { None },
     });
     #[cfg(unix)]
     if Path::new(&socket).file_name().is_some_and(|name| name.to_string_lossy().starts_with("daemon")) {
@@ -568,6 +595,7 @@ pub fn run_hook(args: &[String]) {
             said,
             session: line["session"].as_str().map(str::to_string),
             worktree: line["worktree"].as_str().map(str::to_string),
+            call: line["call"].as_str().map(str::to_string),
             agent,
             at: 0,
         });
@@ -657,7 +685,7 @@ mod tests {
     }
 
     fn note(message: &str, kind: Option<&str>) -> Option<AgentStatus> {
-        HookEvent { task: PathBuf::new(), agent: None, event: "Notification".into(), message: Some(message.into()), kind: kind.map(Into::into), file: None, said: None, replayed: None, session: None, guessed: false, worktree: None }
+        HookEvent { task: PathBuf::new(), agent: None, event: "Notification".into(), message: Some(message.into()), kind: kind.map(Into::into), file: None, said: None, replayed: None, session: None, guessed: false, worktree: None, call: None }
             .status()
     }
 
@@ -710,6 +738,7 @@ mod tests {
             session: None,
             guessed: false,
             worktree: None,
+            call: None,
         };
         let asked = event("PreToolUse", Some(ASKS_USER), Some("Which database?")).status().unwrap();
         assert_eq!(asked, AgentStatus::NeedsInput("Which database?".into()));

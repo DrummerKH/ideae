@@ -47,6 +47,16 @@ pub struct AgentState {
     queued: Option<String>,
     /// What a chat agent was last reported doing, not to report it twice.
     told: Option<(String, Option<String>)>,
+    /// When it last reported anything.
+    pub heard_at: Option<std::time::Instant>,
+    /// The tool calls of its turn so far, the latest last, a few.
+    calls: std::collections::VecDeque<String>,
+    /// It makes the same call over and over in this turn: what it does.
+    pub looping: Option<String>,
+    /// You said to let it go on: not told again this turn.
+    loop_allowed: bool,
+    /// It set itself a timer (a cron, a wakeup): stopped, it would not go off.
+    pub(super) timers: bool,
 }
 
 impl AgentState {
@@ -63,19 +73,42 @@ impl AgentState {
             pending_prompt: None,
             queued: None,
             told: None,
+            heard_at: None,
+            calls: Default::default(),
+            looping: None,
+            loop_allowed: false,
+            timers: false,
         }
     }
 
     /// Keeps what the agent said: a turn's last words until the next
     /// prompt, a question until it is answered. A report without words (the
     /// reminder after a turn) leaves them as they were.
-    pub fn hear(&mut self, event: &crate::agent::HookEvent, status: &crate::agent::AgentStatus) {
+    /// True when it has just begun to go round in circles.
+    pub fn hear(&mut self, event: &crate::agent::HookEvent, status: &crate::agent::AgentStatus) -> bool {
         use crate::said::Said;
+        self.heard_at = Some(std::time::Instant::now());
+        let was_looping = self.looping.is_some();
+        if let Some(call) = &event.call {
+            if matches!(event.tool(), Some("CronCreate" | "ScheduleWakeup")) {
+                self.timers = true;
+            }
+            if self.calls.len() == LOOP_WINDOW {
+                self.calls.pop_front();
+            }
+            self.calls.push_back(call.clone());
+            if self.looping.is_none() && !self.loop_allowed && goes_round(self.calls.make_contiguous()) {
+                self.looping = Some(event.message.clone().or_else(|| event.tool().map(str::to_string)).unwrap_or_default());
+            }
+        }
         match (event.event.as_str(), status) {
             ("SessionStart" | "UserPromptSubmit", _) => {
                 self.said = None;
                 self.asks = None;
                 self.pending = None;
+                self.calls.clear();
+                self.looping = None;
+                self.loop_allowed = false;
             }
             // A question or a plan, which waits for the user.
             ("PreToolUse", crate::agent::AgentStatus::NeedsInput(_)) => {
@@ -89,6 +122,9 @@ impl AgentState {
             }
             ("Stop", _) => {
                 self.asks = None;
+                self.calls.clear();
+                self.looping = None;
+                self.loop_allowed = false;
                 if let Some(said) = event.said.as_deref().and_then(Said::new) {
                     self.said = Some(said);
                 }
@@ -104,6 +140,7 @@ impl AgentState {
             }
             _ => {}
         }
+        !was_looping && self.looping.is_some()
     }
 
     /// What it said, as the row shows it: the question while it asks one.
@@ -136,6 +173,22 @@ impl AgentState {
     fn reports(&self) -> bool {
         self.launch.as_ref().is_some_and(|l| l.profile.adapter().reports_ready() && crate::agents::hooks().is_some())
     }
+}
+
+/// The calls looked at for going round in circles.
+const LOOP_WINDOW: usize = 6;
+
+/// The latest calls are one made four times running, or two in turn three
+/// times each: an agent that goes round in circles. A test run between
+/// edits is not: the edits differ.
+fn goes_round(calls: &[String]) -> bool {
+    let n = calls.len();
+    let same = n >= 4 && calls[n - 4..].iter().all(|c| *c == calls[n - 1]);
+    let pair = n >= 6 && {
+        let w = &calls[n - 6..];
+        w[0] != w[1] && (2..6).all(|i| w[i] == w[i % 2])
+    };
+    same || pair
 }
 
 /// An agent asked a question aside, in the task's folder.
@@ -379,6 +432,7 @@ impl TaskView {
         let who = self.tabs[ix].agent;
         let (text, label) = match who {
             Some(Who::Question(_)) => ("This question's agent is asleep. Its conversation goes on when it starts.", "Continue"),
+            _ if self.agent_slept => ("The agent was stopped after it had nothing to do for a while. Its conversation goes on when it starts.", "Continue"),
             _ => ("The agent is paused. Its conversation goes on when it starts.", "Start the agent"),
         };
         v_flex()
@@ -508,6 +562,11 @@ impl TaskView {
             return;
         }
         let Some(launch) = self.agent.launch.clone() else { return };
+        self.agent_slept = false;
+        self.agent.status = crate::agent::AgentStatus::Unknown;
+        self.agent.guessed = false;
+        // A new process: what the old one set to go off went with it.
+        self.agent.timers = false;
         let tab = self.agent_tab(Who::Main, &launch, self.terminal_env(), window, cx);
         // In the shell's place, which stood for it.
         match self.tabs.iter().position(|t| (t.title == "shell" && t.agent.is_none()) || (t.agent == Some(Who::Main) && matches!(t.kind, TabKind::Asleep))) {
@@ -522,6 +581,67 @@ impl TaskView {
         }
         self.watch_activity(Who::Main, cx);
         cx.emit(TaskEvent::Changed);
+    }
+
+    /// Above the tab of an agent that goes round in circles: what it
+    /// repeats, its turn stopped (Esc) or let go on.
+    pub(super) fn render_loop_bar(&self, ix: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let who = self.tabs.get(ix)?.agent?;
+        let doing = self.agent_of(who)?.looping.clone()?;
+        Some(
+            h_flex()
+                .flex_none()
+                .gap_2()
+                .px_3()
+                .py_1()
+                .text_xs()
+                .bg(cx.theme().warning.opacity(0.15))
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .child(div().flex_1().min_w_0().truncate().child(format!("↻ It goes round in circles: {doing}")))
+                .child(
+                    Button::new("loop-stop")
+                        .xsmall()
+                        .outline()
+                        .label("Stop its turn")
+                        .tooltip("As Esc in its terminal: it stops and waits for you")
+                        .on_click(cx.listener(move |this, _, window, cx| this.stop_turn(who, window, cx))),
+                )
+                .child(
+                    Button::new("loop-ok")
+                        .xsmall()
+                        .ghost()
+                        .label("Let it go on")
+                        .tooltip("Not told again this turn")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(agent) = this.agent_of_mut(who) {
+                                agent.looping = None;
+                                agent.loop_allowed = true;
+                            }
+                            cx.emit(TaskEvent::Changed);
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The agent's turn stopped, as Esc does.
+    fn stop_turn(&mut self, who: Who, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(chat) = self.agent_chat(who) {
+            chat.update(cx, |c, _| c.send(crate::acp::wire::ToHost::Cancel));
+        } else if let Some(state) = self.agent_terminal(who, cx) {
+            state.update(cx, |s, cx| s.send_text("\u{1b}", cx));
+        }
+        if let Some(agent) = self.agent_of_mut(who) {
+            agent.looping = None;
+            agent.loop_allowed = true;
+        }
+        if let Some(ix) = self.agent_ix(who) {
+            self.activate(ix, window, cx);
+        }
+        cx.emit(TaskEvent::Changed);
+        cx.notify();
     }
 
     /// Above a question's tab: what it is, and its ends.
@@ -665,6 +785,7 @@ impl TaskView {
             agent.launch = Some(launch);
             agent.status = crate::agent::AgentStatus::Unknown;
             agent.guessed = false;
+            agent.timers = false;
         }
         self.activate(ix, window, cx);
         cx.emit(TaskEvent::Changed);
@@ -1036,6 +1157,7 @@ impl TaskView {
             session,
             guessed: false,
             worktree: None,
+            call: None,
         }));
         cx.notify();
     }
@@ -1096,12 +1218,87 @@ impl TaskView {
         for chat in self.chats().collect::<Vec<_>>() {
             chat.update(cx, |c, cx| c.sleep(cx));
         }
+        self.sleep_terminal_agent(cx);
     }
 
-    pub fn wake_agent(&mut self, cx: &mut Context<Self>) {
+    pub fn wake_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         for chat in self.chats().collect::<Vec<_>>() {
             chat.update(cx, |c, cx| c.wake(cx));
         }
+        if self.agent_slept {
+            self.start_main_agent(window, cx);
+        }
+    }
+
+    /// Stopped for having nothing to do; it resumes when shown.
+    pub fn agent_slept(&self) -> bool {
+        self.agent_slept
+    }
+
+    pub fn set_agent_slept(&mut self, slept: bool) {
+        self.agent_slept = slept && self.agent_ix(Who::Main).is_none();
+    }
+
+    /// The task's agent in a terminal, stopped as a chat's is (Settings):
+    /// only one that says what it does and whose session is known, which
+    /// resumes as it was; not while it works or asks, nor while something of
+    /// its own would end with it: a message for it, text typed since it last
+    /// spoke and maybe not sent, a timer it set, a shell it runs (a command
+    /// in the background), looked for off the UI thread.
+    fn sleep_terminal_agent(&mut self, cx: &mut Context<Self>) {
+        use crate::agent::AgentStatus::*;
+        let probed = self.agent_sleep_probe.is_some_and(|at| at.elapsed() < Duration::from_secs(60));
+        if probed || self.visible || !crate::state::with_settings(|s| s.sleep_terminal_agents) {
+            return;
+        }
+        let Some(ix) = self.agent_ix(Who::Main) else { return };
+        let TabKind::Terminal(view) = &self.tabs[ix].kind else { return };
+        let a = &self.agent;
+        let resumable = a.launch.as_ref().is_some_and(|l| {
+            let adapter = l.profile.adapter();
+            l.session_id().is_some() && adapter.resumes() && adapter.events() == crate::agents::Events::All && crate::agents::hooks().is_some()
+        });
+        if !resumable || !matches!(a.status, Idle | Done) || a.timers || a.queued.is_some() || a.pending_prompt.is_some() {
+            return;
+        }
+        let state = view.read(cx).state.read(cx);
+        if state.typed_at().is_some_and(|typed| a.heard_at.is_none_or(|heard| typed > heard)) {
+            return;
+        }
+        let Some(pid) = state.foreground().filter(|p| !p.is_shell()).map(|p| p.pid()) else { return };
+        self.agent_sleep_probe = Some(std::time::Instant::now());
+        cx.spawn(async move |this, cx| {
+            let busy = cx.background_spawn(async move { crate::procs::runs_a_shell(pid) }).await;
+            let _ = this.update(cx, |t, cx| {
+                // A minute before it is looked at again only when it was busy.
+                if !busy {
+                    t.agent_sleep_probe = None;
+                    t.sleep_main_agent(pid, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Its tab keeps its place, saying it is asleep; the agent ends.
+    fn sleep_main_agent(&mut self, pid: u32, cx: &mut Context<Self>) {
+        use crate::agent::AgentStatus::*;
+        let Some(ix) = self.agent_ix(Who::Main) else { return };
+        let TabKind::Terminal(view) = &self.tabs[ix].kind else { return };
+        let view = view.clone();
+        // Looked at again: it may have been given work meanwhile.
+        let same = view.read(cx).state.read(cx).foreground().map(|p| p.pid()) == Some(pid);
+        if !same || self.visible || !matches!(self.agent.status, Idle | Done) || self.agent.queued.is_some() {
+            return;
+        }
+        let (id, pane, title) = (self.tabs[ix].id, self.tabs[ix].pane, self.tabs[ix].title.clone());
+        self.tabs[ix] = TabItem { id, pane, agent: Some(Who::Main), ..TabItem::new(title, TabKind::Asleep) };
+        TermView::end(&view, cx);
+        self.agent.launch = self.agent.launch.as_ref().map(|l| l.again());
+        self.agent.watch = activity::Watch::default();
+        self.agent_slept = true;
+        cx.emit(TaskEvent::Changed);
+        cx.notify();
     }
 
     /// An open file's text when it has edits not on disk: what the agent
@@ -1174,6 +1371,18 @@ mod follow_tests {
 #[cfg(test)]
 mod who_tests {
     use super::Who;
+
+    #[test]
+    fn going_round_in_circles() {
+        let calls = |s: &str| s.chars().map(|c| c.to_string()).collect::<Vec<_>>();
+        assert!(super::goes_round(&calls("xaaaa")));
+        assert!(super::goes_round(&calls("ababab")));
+        assert!(!super::goes_round(&calls("aaa")));
+        // Tests run between edits that differ, a file read again now and then.
+        assert!(!super::goes_round(&calls("tetftg")));
+        assert!(!super::goes_round(&calls("abcabc")));
+        assert!(!super::goes_round(&calls("aabaab")));
+    }
 
     #[test]
     fn an_agent_by_its_tag() {

@@ -9,6 +9,8 @@
 //! project's check run in the task, as the window runs it, and questions
 //! for the task's language servers (definition, references, hover,
 //! symbols), which start them when asleep: the agent need run none of its own.
+//! And other agents of its project: a question to one, a task proposed to
+//! the user, waiting for what they say (workspace/crew.rs).
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -22,6 +24,10 @@ use serde_json::{Value, json};
 const ROOT_ENV: &str = "IDEAE_MCP_ROOT";
 const TOKEN_ENV: &str = "IDEAE_MCP_TOKEN";
 const SOCK_ENV: &str = "IDEAE_MCP_SOCK";
+/// Set when the agent may start other agents (Settings): its tools are listed.
+const CREW_ENV: &str = "IDEAE_MCP_CREW";
+/// The tools of agents starting agents (workspace/crew.rs).
+pub const CREW_TOOLS: &[&str] = &["ask_agent", "start_task", "wait_for", "agent_changes", "tell_agent"];
 
 /// A question from an agent's server to the window.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -31,6 +37,10 @@ pub struct Request {
     pub tool: String,
     #[serde(default)]
     pub args: Value,
+    /// A question's agent (`q-<n>`), not the task's own: from its terminal's
+    /// variables, as its reports say it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 /// The window's answer: text for the agent, or why there is none.
@@ -127,7 +137,10 @@ fn socket_path() -> PathBuf {
 /// What an agent's server is started with, for the worktree `root`.
 pub fn server_for(root: &Path) -> Option<(String, Vec<String>, Vec<(String, String)>)> {
     let exe = std::env::current_exe().ok()?;
-    let env = vec![(ROOT_ENV.to_string(), root.display().to_string()), (TOKEN_ENV.to_string(), token(root)), (SOCK_ENV.to_string(), address())];
+    let mut env = vec![(ROOT_ENV.to_string(), root.display().to_string()), (TOKEN_ENV.to_string(), token(root)), (SOCK_ENV.to_string(), address())];
+    if crate::state::with_settings(|s| s.agents_start_agents) {
+        env.push((CREW_ENV.to_string(), "1".to_string()));
+    }
     Some((exe.display().to_string(), vec!["--mcp".to_string()], env))
 }
 
@@ -274,6 +287,43 @@ fn tools() -> Value {
             }, "required": ["query"] }
         },
         {
+            "name": "ask_agent",
+            "description": "Asks another agent of this project a question, to find something out, not to change code: it starts beside the project's main thread (its default branch, not this task's worktree), can only read, and the user sees it in ideae. Returns at once with an id; wait_for gives its answer. Put what it needs to know into the question, or set with_my_context to start it from a copy of your conversation.",
+            "inputSchema": { "type": "object", "properties": {
+                "question": { "type": "string", "description": "What to find out, whole: the agent knows nothing else unless with_my_context." },
+                "with_my_context": { "type": "boolean", "description": "Start it from a copy of your conversation so far." }
+            }, "required": ["question"] }
+        },
+        {
+            "name": "start_task",
+            "description": "Proposes a task of its own to the user, in this project: a new worktree and branch from the base, with an agent told `prompt`, for work apart from yours (a separate change, another approach to try). The user is asked first; it returns at once with an id, and wait_for tells whether it was allowed and later what its agent says when its turn ends. An agent you start cannot start others.",
+            "inputSchema": { "type": "object", "properties": {
+                "title": { "type": "string", "description": "A short title; the branch is named after it." },
+                "prompt": { "type": "string", "description": "What its agent is to do, whole: it does not see your conversation." }
+            }, "required": ["title", "prompt"] }
+        },
+        {
+            "name": "wait_for",
+            "description": "Waits for an agent started with ask_agent or start_task to end its turn, ask the user something, or be declined, and gives what it said; at most timeout_seconds (default 300, at most 600), then says it is still at work, and you can call it again.",
+            "inputSchema": { "type": "object", "properties": {
+                "id": { "type": "integer" },
+                "timeout_seconds": { "type": "integer" }
+            }, "required": ["id"] }
+        },
+        {
+            "name": "agent_changes",
+            "description": "What a task started with start_task has done in its worktree: its commits since it left the base branch, and the diff of its files against that point, what is not committed included, and the new files it has not added. To review its work or take it over; it is on a branch of its own.",
+            "inputSchema": { "type": "object", "properties": { "id": { "type": "integer" } }, "required": ["id"] }
+        },
+        {
+            "name": "tell_agent",
+            "description": "Sends a message to an agent started with ask_agent or start_task: a follow-up question, more to do. Busy, it gets it when its turn ends. Then wait_for again.",
+            "inputSchema": { "type": "object", "properties": {
+                "id": { "type": "integer" },
+                "message": { "type": "string" }
+            }, "required": ["id", "message"] }
+        },
+        {
             "name": "run_check",
             "description": "Runs the project's check (its tests or build, as set up in ideae for this project) in this task's worktree, as ideae does after a turn, and gives its result and the end of its output. Can take minutes.",
             "inputSchema": { "type": "object", "properties": {} }
@@ -281,11 +331,19 @@ fn tools() -> Value {
     ])
 }
 
+/// The tools an agent is shown: those of starting agents only when allowed.
+fn listed(crew: bool) -> Value {
+    let all = tools();
+    Value::Array(all.as_array().into_iter().flatten().filter(|t| crew || !t["name"].as_str().is_some_and(|n| CREW_TOOLS.contains(&n))).cloned().collect())
+}
+
 /// `ideae --mcp`: an MCP server on standard input and output.
 pub fn run_server() {
     let root = PathBuf::from(std::env::var(ROOT_ENV).unwrap_or_default());
     let token = std::env::var(TOKEN_ENV).unwrap_or_default();
     let address = std::env::var(SOCK_ENV).unwrap_or_default();
+    let agent = std::env::var(crate::agent::AGENT_ENV).ok().filter(|a| !a.is_empty());
+    let crew = std::env::var_os(CREW_ENV).is_some();
     let stdin = std::io::stdin();
     let mut out = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -298,14 +356,14 @@ pub fn run_server() {
                 "protocolVersion": msg.pointer("/params/protocolVersion").cloned().unwrap_or(json!("2025-06-18")),
                 "capabilities": { "tools": {} },
                 "serverInfo": { "name": "ideae", "version": env!("CARGO_PKG_VERSION") },
-                "instructions": "ideae is the IDE this task runs in. Its tools tell what the user sees of this task (open files and selection, the language servers' problems, the project's check) and ask its language servers: where a name is declared, where it is used, what it is, which names the project declares. The task is this git worktree and its branch: work and commit here, not in the repository's main checkout; once its work is merged, keep the worktree on the task's branch (reset or rebase it onto the base) rather than detaching it or putting it on another branch.",
+                "instructions": "ideae is the IDE this task runs in. Its tools tell what the user sees of this task (open files and selection, the language servers' problems, the project's check) and ask its language servers: where a name is declared, where it is used, what it is, which names the project declares. Where the user allows it, it can also ask another agent of this project a question (ask_agent), propose a task of its own to the user (start_task), and wait for what they say (wait_for). The task is this git worktree and its branch: work and commit here, not in the repository's main checkout; once its work is merged, keep the worktree on the task's branch (reset or rebase it onto the base) rather than detaching it or putting it on another branch. Renaming the task's branch (git branch -m) to the project's naming rules is fine: ideae follows it.",
             })),
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({ "tools": tools() })),
+            "tools/list" => Ok(json!({ "tools": listed(crew) })),
             "tools/call" => {
                 let tool = msg.pointer("/params/name").and_then(Value::as_str).unwrap_or_default().to_string();
                 let args = msg.pointer("/params/arguments").cloned().unwrap_or(Value::Null);
-                let answer = ask(&address, &Request { root: root.clone(), token: token.clone(), tool, args });
+                let answer = ask(&address, &Request { root: root.clone(), token: token.clone(), tool, args, agent: agent.clone() });
                 Ok(json!({ "content": [{ "type": "text", "text": answer.text }], "isError": answer.error }))
             }
             _ => Err(json!({ "code": -32601, "message": format!("{method} is not supported") })),
@@ -322,6 +380,13 @@ pub fn run_server() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agents_start_agents_only_when_allowed() {
+        let names = |crew| listed(crew).as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        assert!(names(false).iter().all(|n| !CREW_TOOLS.contains(&n.as_str())) && names(false).contains(&"run_check".to_string()));
+        assert!(CREW_TOOLS.iter().all(|t| names(true).iter().any(|n| n == t)));
+    }
 
     #[test]
     fn a_token_is_its_worktree_s_alone() {
@@ -345,7 +410,7 @@ mod tests {
         unsafe { std::env::set_var("IDEAE_STATE", dir.join("state.json")) };
         let address = address();
         let root = PathBuf::from("/w/task");
-        let asked = Request { root: root.clone(), token: token(&root), tool: "open_files".into(), args: Value::Null };
+        let asked = Request { root: root.clone(), token: token(&root), tool: "open_files".into(), args: Value::Null, agent: None };
         assert!(ask(&address, &asked).text.contains("not open"), "no window");
 
         listen(|request, answer| {

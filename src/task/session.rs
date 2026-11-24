@@ -22,7 +22,8 @@ impl TaskView {
                 match &tab.kind {
                     // The task's first terminal: the agent, or the shell without one.
                     // Not started: a restart leaves it so.
-                    TabKind::Asleep if tab.agent == Some(Who::Main) => s.kind = "paused-agent".into(),
+                    // Asleep for having nothing to do, it wakes when shown; paused, it waits for a click.
+                    TabKind::Asleep if tab.agent == Some(Who::Main) => s.kind = if self.agent_slept { "slept-agent" } else { "paused-agent" }.into(),
                     TabKind::Terminal(_) | TabKind::Chat(_) if tab.agent == Some(Who::Main) || tab.title == "shell" => s.kind = "agent".into(),
                     TabKind::Terminal(_) | TabKind::Chat(_) | TabKind::Asleep if tab.agent.is_some() => {
                         s.kind = "question".into();
@@ -92,7 +93,7 @@ impl TaskView {
         for saved in &session.tabs {
             let before: HashSet<usize> = self.tabs.iter().map(|t| t.id).collect();
             match saved.kind.as_str() {
-                "agent" | "paused-agent" => {
+                "agent" | "paused-agent" | "slept-agent" => {
                     ids.push(self.tabs.iter().find(|t| t.agent == Some(Who::Main) || t.title == "shell").map(|t| t.id));
                     continue;
                 }

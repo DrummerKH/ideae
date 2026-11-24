@@ -135,6 +135,7 @@ impl ChangesView {
             path: range.path().to_string(),
             modified_side: modified,
             line: range.end(),
+            ..Default::default()
         }
     }
 
@@ -188,24 +189,34 @@ impl ChangesView {
         });
     }
 
-    /// Every review comment to the agent in one message, pasted for the user
-    /// to send; the review starts over.
+    /// The open review comments to the agent in one message, pasted for
+    /// the user to send: new ones, and those sent before whose code is
+    /// still as it was after the agent's turn. They stay, marked sent, to
+    /// be looked at again when its turn ends ([`Self::recheck_review`]).
     pub(super) fn send_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.review.is_empty() {
+        let item = |n: usize, c: &crate::state::ReviewNote| format!("\n{n}. {}\n```{}\n{}\n```\n{}\n", c.location, c.language, c.code.trim_end_matches('\n'), c.text);
+        let (new, again): (Vec<&crate::state::ReviewNote>, Vec<&crate::state::ReviewNote>) = self.review.iter().filter(|c| c.open()).partition(|c| c.sent == 0);
+        if new.is_empty() && again.is_empty() {
             return;
         }
-        let mut message = String::from("Review comments on the changes:\n");
-        for (i, c) in self.review.iter().enumerate() {
-            message.push_str(&format!(
-                "\n{}. {}\n```{}\n{}\n```\n{}\n",
-                i + 1,
-                c.location,
-                c.language,
-                c.code.trim_end_matches('\n'),
-                c.text
-            ));
+        let mut message = String::new();
+        if !new.is_empty() {
+            message.push_str("Review comments on the changes:\n");
+            for (i, c) in new.iter().enumerate() {
+                message.push_str(&item(i + 1, c));
+            }
         }
-        self.review.clear();
+        if !again.is_empty() {
+            message.push_str(if new.is_empty() { "" } else { "\n" });
+            message.push_str("Still open from the review before: the code there has not changed.\n");
+            for (i, c) in again.iter().enumerate() {
+                message.push_str(&item(new.len() + i + 1, c));
+            }
+        }
+        for c in self.review.iter_mut().filter(|c| c.open()) {
+            c.sent += 1;
+            c.changed = None;
+        }
         cx.notify();
         // Once this view's own update is over: the task may show this view
         // a newer diff on the way, which reads it.
@@ -213,6 +224,51 @@ impl ChangesView {
         window.defer(cx, move |window, cx| {
             let _ = task.update(cx, |t, cx| t.paste_to_agent(message, window, cx));
         });
+    }
+
+    /// The agent's turn ended (`again` false): each comment sent is looked
+    /// for in its file, off the UI thread. Its code still there moves the
+    /// comment to where it is now; gone or changed, the comment says to look
+    /// again. `again`, the files changed: those looked at after a turn are
+    /// looked at once more (you may have changed the code yourself); one
+    /// just sent waits for the agent's turn.
+    pub(super) fn recheck_review(&mut self, again: bool, cx: &mut Context<Self>) {
+        let asked: Vec<(usize, crate::state::ReviewNote)> =
+            self.review.iter().cloned().enumerate().filter(|(_, n)| n.sent > 0 && n.modified_side && n.changed.is_some() == again).collect();
+        if asked.is_empty() {
+            return;
+        }
+        let root = self.root.clone();
+        cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_spawn(async move {
+                    asked
+                        .into_iter()
+                        .map(|(i, note)| {
+                            let at = std::fs::read_to_string(root.join(&note.path)).ok().and_then(|text| note.find_in(&text));
+                            (i, note, at)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            let _ = this.update(cx, |c, cx| {
+                for (i, before, at) in found {
+                    // Not one removed or sent again meanwhile.
+                    let Some(note) = c.review.get_mut(i).filter(|n| **n == before) else { continue };
+                    if note.changed == Some(at.is_none()) && at.is_none_or(|end| end == note.line) {
+                        continue;
+                    }
+                    note.changed = Some(at.is_none());
+                    if let Some(end) = at {
+                        let lines = before.code.trim_end_matches('\n').matches('\n').count();
+                        note.line = end;
+                        note.location = if lines == 0 { format!("{}:{end}", note.path) } else { format!("{}:{}-{end}", note.path, end - lines) };
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub(super) fn render_review(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -235,6 +291,19 @@ impl ChangesView {
                         .child(
                             h_flex()
                                 .gap_1()
+                                .when(self.review.iter().any(|c| c.changed == Some(true)), |row| {
+                                    row.child(
+                                        Button::new("review-done")
+                                            .xsmall()
+                                            .ghost()
+                                            .label("Remove changed")
+                                            .tooltip("The comments whose code the agent changed, once you have looked")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.review.retain(|c| c.changed != Some(true));
+                                                cx.notify();
+                                            })),
+                                    )
+                                })
                                 .child(
                                     Button::new("review-clear")
                                         .xsmall()
@@ -245,13 +314,16 @@ impl ChangesView {
                                             cx.notify();
                                         })),
                                 )
-                                .child(
+                                .child({
+                                    let open = self.review.iter().filter(|c| c.open()).count();
                                     Button::new("review-send")
                                         .xsmall()
                                         .primary()
-                                        .label("Send to agent")
-                                        .on_click(cx.listener(|this, _, window, cx| this.send_review(window, cx))),
-                                ),
+                                        .disabled(open == 0)
+                                        .label(if open == self.review.len() { "Send to agent".to_string() } else { format!("Send {open} to agent") })
+                                        .tooltip("New comments, and those sent before whose code the agent has not changed")
+                                        .on_click(cx.listener(|this, _, window, cx| this.send_review(window, cx)))
+                                }),
                         ),
                 )
                 .children(self.review.iter().enumerate().map(|(i, c)| {
@@ -260,6 +332,7 @@ impl ChangesView {
                         .text_sm()
                         .child(div().flex_none().font_family(cx.theme().mono_font_family.clone()).text_xs().text_color(muted).child(c.location.clone()))
                         .child(div().flex_1().min_w_0().truncate().child(c.text.clone()))
+                        .children(note_state(c, cx).map(|(state, color)| div().flex_none().text_xs().text_color(color).child(state)))
                         .child(
                             Button::new(("review-remove", i))
                                 .xsmall()
@@ -701,6 +774,7 @@ impl Render for ChangesView {
                                     _ => usize::MAX,
                                 };
                                 let text = notes.get(i).map(|n| n.text.clone()).unwrap_or_default();
+                                let state = notes.get(i).and_then(|n| note_state(n, cx));
                                 let view = view.clone();
                                 h_flex()
                                     .mx_2()
@@ -713,8 +787,15 @@ impl Render for ChangesView {
                                     .border_color(cx.theme().primary)
                                     .bg(cx.theme().secondary)
                                     .text_sm()
-                                    .child(div().flex_1().min_w_0().child(text))
-                                    .child(Button::new(("review-note-remove", i)).xsmall().ghost().label("×").on_click(move |_, _, cx| {
+                                    // What became of it under its words, which keep the width.
+                                    .child(
+                                        v_flex()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .child(text)
+                                            .children(state.map(|(state, color)| div().text_xs().text_color(color).child(state))),
+                                    )
+                                    .child(Button::new(("review-note-remove", i)).xsmall().ghost().label("×").tooltip("Done with it").on_click(move |_, _, cx| {
                                         let _ = view.update(cx, |c, cx| {
                                             if i < c.review.len() {
                                                 c.review.remove(i);
@@ -877,4 +958,16 @@ fn hunk_actions(
         }));
     }
     Some(row.into_any_element())
+}
+
+/// What became of a comment sent to the agent, in the theme's colors: the
+/// accent when it asks you to look.
+fn note_state(note: &crate::state::ReviewNote, cx: &App) -> Option<(&'static str, Hsla)> {
+    let (muted, look) = (cx.theme().muted_foreground, cx.theme().primary);
+    match (note.sent, note.changed) {
+        (0, _) => None,
+        (_, None) => Some(("sent", muted)),
+        (_, Some(true)) => Some(("changed: look again", look)),
+        (_, Some(false)) => Some(("still open: goes with the next Send", muted)),
+    }
 }

@@ -27,6 +27,8 @@ cargo test -- --ignored \
   two_variants \
   two_agents \
   a_question_beside \
+  agents_start_agents \
+  a_ticket_task_is_named \
   the_tasks_of_the_last_run \
   a_window_that_does_not_read \
   a_task_is_set_up_checked_and_torn_down \

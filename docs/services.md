@@ -56,8 +56,21 @@ Runs in the task's worktree when its agent finishes a turn, in the
 background: one at a time for each task (a new turn stops the run before),
 and not again when nothing changed in the worktree since the last one. The
 sidebar shows `✓ check` or `✗ check`; the Run panel has the output, and on a
-failure **Send to agent** gives the agent the last 80 lines to fix. The Run
-panel's **Run** runs it whenever you like.
+failure **Send to agent** gives the agent what it needs to fix it: the
+errors and failures found in the output (Rust, Go, Jest, pytest, a
+compiler's `file:line: error`), each once with the lines that go with it,
+and the output's end; with none found, its last 80 lines. The Run panel's
+**Run** runs it whenever you like. A failed CI job's log goes to the agent
+the same way.
+
+With the box under Check in Project settings (kept on this machine, not in
+the file: the agent's turns are yours to spend), a check that fails after the
+agent's turn goes back to it by itself, marked as sent by ideae, as **Send to agent**
+would, that many times in a row; then a notification says it still fails and
+it is your turn. A turn you start, or a check that passes, starts the count
+again. Nothing is sent while you are typing to the agent or while it asks
+you something, and a check run from **Run** or by the agent itself is never
+sent.
 
 When a task's pull request has a failed CI run, **CI ✗ → agent** in the
 branch bar sends the end of the failed job's log (`gh run view --log-failed`)

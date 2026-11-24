@@ -157,8 +157,10 @@ impl Workspace {
         // Read once: Needs you lists them, Starred leaves them out.
         let active = if query.is_empty() { self.active_rows(cx) } else { Vec::new() };
         let waiting: std::collections::HashSet<(usize, usize)> = active.iter().copied().collect();
+        // Tasks agents propose, of what the window shows.
+        let proposals: Vec<_> = if query.is_empty() { self.proposals().into_iter().filter(|p| self.find(&p.1).is_some_and(|(pi, ti)| self.shows(pi, ti))).collect() } else { Vec::new() };
         if query.is_empty() {
-            if !active.is_empty() {
+            if !active.is_empty() || !proposals.is_empty() {
                 let collapsed = self.active_collapsed;
                 list = list.child(
                     section_header(if collapsed { "▸ NEEDS YOU" } else { "▾ NEEDS YOU" }, cx)
@@ -170,6 +172,9 @@ impl Workspace {
                         })),
                 );
                 if !collapsed {
+                    for proposal in proposals {
+                        list = list.child(self.render_proposal(proposal, cx));
+                    }
                     // A group that is done is one row, not one per variant.
                     let mut groups = std::collections::HashSet::new();
                     for (pi, ti) in active {
@@ -244,6 +249,14 @@ impl Workspace {
             tasks.sort_by_key(|&ti| (!p.tasks[ti].main, !p.tasks[ti].starred));
             let sides = if query.is_empty() { sides } else { Vec::new() };
             let parents: std::collections::HashSet<&std::path::Path> = tasks.iter().map(|&ti| p.tasks[ti].path.as_path()).collect();
+            // Tasks an agent started go under the task whose agent did, when that is a row of
+            // its own (a variant's are in its group's rows, which have none under them).
+            let alone: std::collections::HashSet<&std::path::Path> = tasks.iter().filter(|&&ti| p.tasks[ti].group.is_empty()).map(|&ti| p.tasks[ti].path.as_path()).collect();
+            let (children, tasks): (Vec<usize>, Vec<usize>) = if query.is_empty() {
+                tasks.into_iter().partition(|&ti| p.tasks[ti].spawned_by.as_deref().is_some_and(|by| alone.contains(by)))
+            } else {
+                (Vec::new(), tasks)
+            };
             let side_parent = |ti: usize| p.tasks[ti].side.as_ref().and_then(|s| s.parent.as_deref()).filter(|parent| parents.contains(parent));
             // A project with nothing to show is not shown: of another space, while presenting, or when the search has no hit in it.
             if !self.in_space(pi) || (tasks.is_empty() && (self.is_presenting() || (!query.is_empty() && !project_hit))) {
@@ -260,6 +273,10 @@ impl Workspace {
                     if group.is_empty() || !query.is_empty() {
                         list = list.child(self.render_task(pi, ti, false, cx));
                         list = self.render_questions(list, pi, ti, QuestionRows::All, cx);
+                        for &child in children.iter().filter(|&&c| p.tasks[c].spawned_by.as_deref() == Some(p.tasks[ti].path.as_path())) {
+                            list = list.child(self.render_task(pi, child, false, cx));
+                            list = self.render_questions(list, pi, child, QuestionRows::All, cx);
+                        }
                         let under: Vec<usize> = sides.iter().copied().filter(|&s| side_parent(s) == Some(p.tasks[ti].path.as_path())).collect();
                         list = self.render_sides(list, pi, p.tasks[ti].path.clone(), "", under, cx);
                     } else if groups.insert(group.clone()) {
@@ -400,8 +417,34 @@ impl Workspace {
         // As the list has them, above the projects: what waits for you, then what is starred.
         let heading = |name: &'static str, color: Hsla| div().w_full().px_2().pt_1().text_size(px(10.)).font_weight(FontWeight::SEMIBOLD).text_color(color).child(name);
         let waiting = self.active_rows(cx);
-        if !waiting.is_empty() {
+        let proposals: Vec<_> = self.proposals().into_iter().filter(|p| self.find(&p.1).is_some_and(|(pi, ti)| self.shows(pi, ti))).collect();
+        if !waiting.is_empty() || !proposals.is_empty() {
             rail = rail.child(heading("NEEDS YOU", hsla(0.08, 0.9, 0.55, 1.)));
+            // A task an agent proposes: its title; a click brings the list, where it is started or declined.
+            for (id, parent, title, _) in proposals {
+                let by = self.find(&parent).map(|(pi, ti)| self.projects[pi].tasks[ti].label()).unwrap_or_default();
+                let told: SharedString = format!("{title}\nproposed by {by}: Start or Decline in the list").into();
+                rail = rail.child(
+                    v_flex()
+                        .id(SharedString::from(format!("rail-proposal-{id}")))
+                        .test_support()
+                        .w_full()
+                        .px_2()
+                        .py_0p5()
+                        .cursor_pointer()
+                        .border_l_2()
+                        .border_color(hsla(0.08, 0.9, 0.55, 1.))
+                        .hover(|row| row.bg(cx.theme().accent.opacity(0.6)))
+                        .child(h_flex().w_full().gap_1().child(div().w(px(10.)).flex_none().text_xs().text_color(muted).child("+")).child(div().flex_1().min_w_0().truncate().text_size(px(12.)).child(title)))
+                        .child(div().w_full().pl(px(14.)).text_size(px(10.)).line_height(px(12.)).text_color(muted).truncate().child("proposed"))
+                        .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(told.clone()).build(window, cx))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.peek_wait = Task::ready(());
+                            this.sidebar_peek = true;
+                            cx.notify();
+                        })),
+                );
+            }
             for &(pi, ti) in &waiting {
                 rail = rail.child(self.render_rail_row(pi, ti, "waiting", dialed, cx));
                 rail = self.render_rail_questions(rail, pi, ti, QuestionRows::Needed, "waiting", cx);
@@ -986,7 +1029,7 @@ impl Workspace {
             // of one, which a restore takes up again.
             .when(can(T::Pause), |m| {
                 m.item(PopupMenuItem::new("Pause").icon(menu_icon("pause")).on_click(move |_, window, cx| {
-                    let _ = b.update(cx, |w, cx| w.close_task(&pb, window, cx));
+                    let _ = b.update(cx, |w, cx| w.end_with_children(&pb, false, window, cx));
                 }))
             })
             // Archived and kept, back on a day: a task to come back to.
@@ -998,7 +1041,7 @@ impl Workspace {
             .when(can(T::Archive) || can(T::RemoveSide), |m| {
                 // In a row of its own the task needs no naming: "Pause", not "Pause task".
                 m.item(PopupMenuItem::new(if side { "Remove" } else { "Archive" }).icon(menu_icon(if side { "trash" } else { "archive" })).on_click(move |_, window, cx| {
-                    let _ = c.update(cx, |w, cx| if side { w.remove_side(&pc, window, cx) } else { w.archive_task(&pc, window, cx) });
+                    let _ = c.update(cx, |w, cx| if side { w.remove_side(&pc, window, cx) } else { w.end_with_children(&pc, true, window, cx) });
                 }))
             })
         };
@@ -1186,8 +1229,15 @@ impl Workspace {
                 AgentStatus::NeedsInput(message) => Some(message.clone()),
                 _ => None,
             });
+            // Asked by a task's agent, for it: whose, when nothing else is to say.
+            let by = q.asked_by.as_ref().map(|by| match self.projects[pi].tasks.iter().find(|o| o.path == *by) {
+                Some(o) => format!("for {}", o.label()),
+                None => "for an agent".to_string(),
+            });
             let doing = if q.unread && !asks && !works {
                 Some("answered".to_string())
+            } else if !asks && !works && by.is_some() {
+                by
             } else if v.is_none_or(|v| v.question_asleep(n)) {
                 Some("asleep".to_string())
             } else {
@@ -1247,6 +1297,32 @@ impl Workspace {
             );
         }
         list
+    }
+
+    /// A task an agent proposes: whose agent, its title, Start and Decline;
+    /// its prompt in the tooltip.
+    fn render_proposal(&self, (id, parent, title, prompt): (u32, PathBuf, String, String), cx: &mut Context<Self>) -> AnyElement {
+        let by = self.find(&parent).map(|(pi, ti)| self.projects[pi].tasks[ti].label()).unwrap_or_default();
+        let tip = format!("The agent of {by} asks for a task of its own, with an agent of its own, told:\n\n{}", crate::said::cap(&prompt, 1200));
+        v_flex()
+            .id(SharedString::from(format!("proposal-{id}")))
+            .test_support()
+            .px_3()
+            .py_1()
+            .gap_0p5()
+            .border_l_2()
+            .border_color(hsla(0.08, 0.9, 0.55, 1.))
+            .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx))
+            .child(div().text_sm().truncate().child(format!("+ {title}")))
+            .child(
+                h_flex()
+                    .gap_1()
+                    .text_xs()
+                    .child(div().flex_1().min_w_0().truncate().text_color(cx.theme().muted_foreground).child(format!("proposed by {by}")))
+                    .child(Button::new(("proposal-start", id)).xsmall().primary().label("Start").on_click(cx.listener(move |this, _, window, cx| this.answer_proposal(id, true, window, cx))))
+                    .child(Button::new(("proposal-decline", id)).xsmall().ghost().label("Decline").on_click(cx.listener(move |this, _, window, cx| this.answer_proposal(id, false, window, cx)))),
+            )
+            .into_any_element()
     }
 
     /// The agents' worktrees of one task, or of the project for those in
@@ -1330,6 +1406,12 @@ impl Workspace {
         // A working agent's latest step says more than when it last moved.
         let activity = t.view.as_ref().and_then(|v| {
             let v = v.read(cx);
+            if let Some(doing) = &v.agent.looping {
+                return Some(format!("↻ round in circles: {doing}"));
+            }
+            if v.agent_slept() {
+                return Some("asleep".to_string());
+            }
             (v.agent.status == AgentStatus::Working).then(|| v.agent.doing.clone()).flatten()
         });
         // A deferred task come back on its own stays marked till it is opened.
@@ -1356,7 +1438,14 @@ impl Workspace {
         if let Some(info) = self.variant_info.get(&path).filter(|i| listed && i.files > 0) {
             details.push(format!("+{} −{}", info.additions, info.deletions));
         }
+        // Started by another task's agent: whose, where it is not listed under that task.
+        if let Some(by) = t.spawned_by.as_ref().filter(|_| in_active).and_then(|by| project.tasks.iter().find(|o| o.path == *by)) {
+            details.push(format!("↳ by {}", by.label()));
+        }
         if let Some(view) = &t.view {
+            if let Some(base) = view.read(cx).base_clash() {
+                fixed.push(format!("⚠ conflicts with {base}"));
+            }
             for (name, port) in view.read(cx).running_services(cx) {
                 details.push(match port {
                     Some(port) => format!("▶ {name} :{port}"),
@@ -1411,7 +1500,7 @@ impl Workspace {
         let id = SharedString::from(format!("{}task-{}", if in_active { "active-" } else { "" }, path.display()));
         let mut row = v_flex()
             .id(id)
-            .pl(if listed || (t.side.is_some() && !in_active) { px(26.) } else { px(12.) })
+            .pl(if listed || ((t.side.is_some() || t.spawned_by.is_some()) && !in_active) { px(26.) } else { px(12.) })
             .pr_3()
             .py_0p5()
             .cursor_pointer()

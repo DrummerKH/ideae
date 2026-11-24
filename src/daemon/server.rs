@@ -509,6 +509,7 @@ fn event_of(hook: &Hook) -> crate::agent::HookEvent {
         session: hook.session.clone(),
         guessed: false,
         worktree: hook.worktree.clone(),
+        call: hook.call.clone(),
         agent: hook.agent.clone(),
         replayed: None,
     }
@@ -786,6 +787,7 @@ mod tests {
             worktree: None,
             said: Some("x".into()),
             agent: None,
+            call: None,
             at: 0,
         };
         let (stop, tool) = (hook("Stop", None, None), hook("PreToolUse", None, Some("Running ls")));

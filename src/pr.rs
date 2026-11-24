@@ -338,15 +338,7 @@ fn log_tail(log: &str) -> String {
             }
         })
         .collect();
-    let mut out = crate::project_config::plain(lines[lines.len().saturating_sub(LOG_LINES)..].join("\n").as_bytes());
-    if out.len() > LOG_BYTES {
-        let mut cut = out.len() - LOG_BYTES;
-        while !out.is_char_boundary(cut) {
-            cut += 1;
-        }
-        out = out[cut..].to_string();
-    }
-    out
+    crate::digest::within(crate::digest::for_agent(&crate::project_config::plain(lines.join("\n").as_bytes()), LOG_LINES), LOG_BYTES)
 }
 
 #[cfg(test)]

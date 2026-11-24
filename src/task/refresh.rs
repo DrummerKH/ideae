@@ -170,6 +170,8 @@ impl TaskView {
             c.counts = counts;
             c.first_lines = lines;
             c.set_hunks(hunks, cx);
+            // Comments the agent's turn was looked at for follow what happens to their code since.
+            c.recheck_review(true, cx);
             cx.notify();
         });
     }

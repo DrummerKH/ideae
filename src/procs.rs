@@ -402,6 +402,21 @@ pub fn running_with_parents() -> Vec<(i32, i32, String)> {
         .collect()
 }
 
+/// Whether a process has a shell of its own that runs: an agent's command
+/// in the background (Claude Code runs each in a shell it starts), which
+/// would end with it. Its servers (MCP) are no shells. Not known: yes.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn runs_a_shell(pid: u32) -> bool {
+    const SHELLS: &[&str] = &["sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "nu"];
+    let pid = pid as i32;
+    pids().into_iter().filter(|&p| ppid(p) == Some(pid) && running(p)).any(|p| name(p as u32).is_some_and(|n| SHELLS.contains(&n.as_str())))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn runs_a_shell(_: u32) -> bool {
+    true
+}
+
 /// A process's name, such as `bash`.
 #[cfg(target_os = "linux")]
 pub fn name(pid: u32) -> Option<String> {
