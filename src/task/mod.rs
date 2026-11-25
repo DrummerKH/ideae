@@ -520,6 +520,11 @@ pub struct TaskView {
     recent: Vec<(PathBuf, u32, u32)>,
     /// Its pull request, as last seen on GitHub.
     pub pr: Option<crate::pr::Pr>,
+    /// Its tickets, request and addresses: told to what runs in it.
+    pub links: Vec<crate::state::TaskLink>,
+    /// The key its commit box starts with: its ticket's, where the
+    /// project's commits carry keys.
+    pub commit_key: Option<String>,
     /// Its share of the ports of `.ideae.toml`'s services, and those services.
     pub port_slot: u32,
     services: Vec<crate::services::Service>,
@@ -905,6 +910,8 @@ impl TaskView {
             changed_paths: Rc::default(),
             recent: Vec::new(),
             pr: None,
+            links: Vec::new(),
+            commit_key: None,
             viewed: BTreeMap::new(),
             bookmarks: BTreeMap::new(),
             port_slot,
@@ -1353,6 +1360,7 @@ impl TaskView {
         if !crate::hosts::is_remote(&self.root) {
             env.push(crate::browser::task_env(&self.root));
         }
+        env.extend(ticket_env(&self.links));
         env
     }
 
@@ -3099,6 +3107,55 @@ mod open_file_scenario {
         cx.update_window(handle.into(), |_, window, _| window.remove_window()).ok();
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// A commit box holding its ticket's key alone is empty: Amend fills it
+    /// with the last message, Commit asks for one, the key comes back after.
+    #[gpui_kit::test]
+    #[ignore]
+    fn an_open_file_s_task_commits_with_its_key(cx: &mut TestAppContext) {
+        let _one = crate::workspace::variants::tests::ONE_WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+        cx.executor().allow_parking();
+        let dir = std::env::temp_dir().join(format!("ideae-commit-key-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("repo")).unwrap();
+        let script = "cd repo; git init -q -b main; git config user.email t@t; git config user.name t; echo a > f; git add .; git commit -qm 'DEV-1 First' -m 'Its body'; echo b >> f";
+        assert!(std::process::Command::new("sh").arg("-ec").arg(script).current_dir(&dir).status().unwrap().success());
+        let repo = dir.join("repo").canonicalize().unwrap();
+        // SAFETY: set before anything of the app reads them.
+        unsafe {
+            std::env::set_var("IDEAE_STATE", dir.join("state.json"));
+            std::env::set_var("IDEAE_NO_DAEMON", "1");
+        }
+        let saved = State { projects: vec![ProjectState { path: repo.clone(), ..Default::default() }], ..Default::default() };
+        std::fs::write(dir.join("state.json"), serde_json::to_string(&saved).unwrap()).unwrap();
+        crate::state::set_settings(crate::state::Settings { notifications: false, pr_status: false, ..Default::default() });
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            gpui_cn::init(cx);
+            crate::theme::init(cx);
+        });
+        let (handle, workspace) = cx.update(|cx| {
+            let bounds = Bounds { origin: Point::default(), size: size(px(1300.), px(800.)) };
+            let options = WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() };
+            gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| Workspace::new(Vec::new(), Some(None), None, window, cx))).expect("a test window")
+        });
+        cx.update_window(handle.into(), |_, window, cx| workspace.update(cx, |w, cx| w.open_main(0, window, cx))).unwrap();
+        cx.run_until_parked();
+        let task: Entity<TaskView> = workspace.update(cx, |w, _| w.active_view().expect("the main checkout in view"));
+        let typed = |cx: &mut TestAppContext| task.update(cx, |t, cx| t.commit_input.read(cx).value().to_string());
+        cx.update_window(handle.into(), |_, window, cx| task.update(cx, |t, cx| t.set_commit_key(Some("DEV-1".into()), window, cx))).unwrap();
+        assert_eq!(typed(cx), "DEV-1 ");
+        cx.update_window(handle.into(), |_, window, cx| task.update(cx, |t, cx| t.commit(window, cx))).unwrap();
+        assert_eq!(task.update(cx, |t, _| t.action.clone()), Some((false, "Write a commit message first".into())), "the key alone is no message");
+        cx.update_window(handle.into(), |_, window, cx| task.update(cx, |t, cx| t.toggle_amend(window, cx))).unwrap();
+        cx.run_until_parked();
+        assert_eq!(typed(cx).trim(), "DEV-1 First\n\nIts body", "Amend: the last message, not the key");
+        cx.update_window(handle.into(), |_, window, cx| task.update(cx, |t, cx| t.toggle_amend(window, cx))).unwrap();
+        assert_eq!(typed(cx), "DEV-1 ", "Amend off: the key again");
+        cx.update_window(handle.into(), |_, window, cx| window.remove_window()).unwrap();
+        cx.run_until_parked();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
@@ -3188,4 +3245,32 @@ fn closed_in_bulk(tab: &TabItem, cx: &App) -> bool {
             TabKind::Binary(_) | TabKind::Browser(_) | TabKind::Diff(_) | TabKind::Changes | TabKind::History => true,
             TabKind::Terminal(_) | TabKind::Chat(_) | TabKind::Asleep => false,
         }
+}
+
+/// What a task's terminals are told of its tickets and request: ids and
+/// addresses, never a ticket's words (they grow stale, and could carry
+/// instructions). None while tickets are off.
+pub fn ticket_env(links: &[crate::state::TaskLink]) -> Vec<(String, String)> {
+    if !crate::state::with_settings(|s| s.tickets) {
+        return Vec::new();
+    }
+    let mut env = Vec::new();
+    let tickets: Vec<&crate::state::TaskLink> = links.iter().filter(|l| l.is_ticket()).collect();
+    if let Some(first) = tickets.first() {
+        env.push(("IDEAE_TICKET".to_string(), first.key.clone()));
+        if !first.url.is_empty() {
+            env.push(("IDEAE_TICKET_URL".to_string(), first.url.clone()));
+        }
+        if !first.tracker.is_empty() {
+            env.push(("IDEAE_TICKET_KIND".to_string(), first.tracker.clone()));
+        }
+        let urls: Vec<&str> = tickets.iter().map(|t| t.url.as_str()).filter(|u| !u.is_empty()).collect();
+        if !urls.is_empty() {
+            env.push(("IDEAE_TICKET_URLS".to_string(), urls.join(" ")));
+        }
+    }
+    if let Some(pr) = links.iter().find(|l| l.what == "pr").filter(|l| !l.url.is_empty()) {
+        env.push(("IDEAE_PR_URL".to_string(), pr.url.clone()));
+    }
+    env
 }

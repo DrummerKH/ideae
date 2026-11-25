@@ -175,7 +175,7 @@ impl Workspace {
         let unpinned = (entry.asked == 0).then(|| entry.session_ref()).flatten().filter(|who| who.id.is_none());
         let root = path.clone();
         let settings = state::settings();
-        let asked = crate::agents::resolve(&settings.agents, &[&profile], p.agent.as_deref(), &settings.default_agent).map(|profile| profile.id.clone());
+        let asked = crate::agents::resolve(&settings.agents, &[&profile], Some(&p.values().agent), &settings.default_agent).map(|profile| profile.id.clone());
         let to = path.clone();
         cx.spawn_in(window, async move |this, cx| {
             let pinned = match unpinned {
@@ -208,8 +208,8 @@ impl Workspace {
     /// `quiet`: asked by an agent, the window stays on what you look at.
     fn ask_now(&mut self, pi: usize, path: &Path, prompt: String, profile: String, given: Given, quiet: bool, window: &mut Window, cx: &mut Context<Self>) -> Option<u32> {
         let settings = state::settings();
-        let project_agent = self.projects[pi].agent.clone();
-        let Some(profile) = crate::agents::resolve(&settings.agents, &[&profile], project_agent.as_deref(), &settings.default_agent).cloned() else {
+        let project_agent = self.projects[pi].values().agent.clone();
+        let Some(profile) = crate::agents::resolve(&settings.agents, &[&profile], Some(&project_agent), &settings.default_agent).cloned() else {
             window.push_notification(Notification::warning("No agent to ask: add one in Settings → Agents."), cx);
             return None;
         };
@@ -513,8 +513,8 @@ impl Workspace {
         }
         self.projects[pi].tasks[ti].questions.retain(|q| q.id != n);
         let p = &mut self.projects[pi];
-        let branch = naming::branch_name(&q.title);
-        let (repo, base) = (p.path.clone(), p.base.clone());
+        let branch = naming::branch_name_as(&q.title, &p.values().branch);
+        let (repo, base) = (p.path.clone(), p.values().base.clone());
         let task = git::task_worktree_dir(&repo, &branch);
         p.collapsed = false;
         p.tasks.push(TaskEntry {

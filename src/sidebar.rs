@@ -787,7 +787,7 @@ impl Workspace {
                 figures.push((if services == 1 { "▶".into() } else { format!("▶{services}") }, Some(gpui_kit::green())));
             }
         }
-        if let Some(pr) = task.pr.as_ref().filter(|_| crate::state::with_settings(|s| s.pr_status)) {
+        if let Some(pr) = task.pr.as_ref().filter(|_| self.projects[pi].values().pull_requests) {
             use crate::pr::{Checks, PrState};
             if pr.open_feedback > 0 {
                 figures.push((format!("{} rev", pr.open_feedback), None));
@@ -838,7 +838,7 @@ impl Workspace {
             None if task.busy.is_none() => notes.push(("paused".into(), None)),
             None => {}
         }
-        let pr_status = crate::state::with_settings(|s| s.pr_status);
+        let pr_status = self.projects[pi].values().pull_requests;
         if let Some(pr) = task.pr.as_ref().filter(|pr| pr.open_feedback > 0 && pr_status) {
             notes.push((format!("{} review", pr.open_feedback), None));
         }
@@ -851,7 +851,7 @@ impl Workspace {
     fn task_matches(&self, pi: usize, ti: usize, query: &str, cx: &App) -> bool {
         let t = &self.projects[pi].tasks[ti];
         let title = self.task_title(pi, ti, cx).to_lowercase();
-        title.contains(query) || t.branch.to_lowercase().contains(query)
+        title.contains(query) || t.branch.to_lowercase().contains(query) || t.links.iter().any(|l| l.key.to_lowercase().contains(query))
     }
 
     /// What a task is called in the list: its own title, or for the main
@@ -934,11 +934,16 @@ impl Workspace {
         let merged = p.tasks.iter().filter(|t| !t.main && t.side.is_none() && t.busy.is_none() && t.pr.as_ref().is_some_and(|pr| pr.state == crate::pr::PrState::Merged)).count();
         // Which agent its new tasks run, when there is a choice.
         let profiles: Vec<(String, String)> = crate::state::with_settings(|s| if s.several_agents() { s.agents.iter().map(|a| (a.id.clone(), a.name.clone())).collect() } else { Vec::new() });
-        let project_agent = p.agent.clone();
+        let project_agent = p.settings.agent.clone();
+        // Not chosen here: what its space says, or Settings.
+        let inherited = match p.resolved.from.agent {
+            crate::layers::Layer::Space => format!("New tasks: as its space says ({})", Workspace::describe_value("agent", p.values())),
+            _ => "New tasks: the default agent".to_string(),
+        };
         let stale = if self.is_presenting() { 0 } else { p.merged_branches.len() };
         let closed_questions = p.tasks.iter().any(|t| t.main && t.questions.iter().any(|q| q.closed > 0));
         let menu = move |menu: PopupMenu, this: WeakEntity<Workspace>| {
-            let (profiles, project_agent, agent_w) = (profiles.clone(), project_agent.clone(), this.clone());
+            let (profiles, project_agent, agent_w, inherited) = (profiles.clone(), project_agent.clone(), this.clone(), inherited.clone());
             let settings = this.clone();
             let (a, b, d) = (this.clone(), this.clone(), this.clone());
             let (archived, ask, asked, stale_w) = (this.clone(), this.clone(), this.clone(), this);
@@ -980,7 +985,7 @@ impl Workspace {
                     return menu;
                 }
                 let w = agent_w.clone();
-                menu = menu.item(PopupMenuItem::new("New tasks: the default agent").checked(project_agent.is_none()).on_click(move |_, _, cx| {
+                menu = menu.item(PopupMenuItem::new(inherited).checked(project_agent.is_none()).on_click(move |_, _, cx| {
                     let _ = w.update(cx, |w, cx| w.set_project_agent(pi, None, cx));
                 }));
                 for (id, name) in &profiles {
@@ -1011,7 +1016,10 @@ impl Workspace {
         use crate::commands::TaskCommand as T;
         let menu_path = path.clone();
         let branch = t.branch.clone();
+        let ticket = t.ticket().cloned().filter(|_| crate::state::with_settings(|s| s.tickets));
         let menu = move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
+            let (ticket, open_w, open_p, link_w, link_p) = (ticket.clone(), this.clone(), menu_path.clone(), this.clone(), menu_path.clone());
+            let (follow_w, follow_p) = (this.clone(), menu_path.clone());
             let (a, b, c, d) = (this.clone(), this.clone(), this.clone(), this.clone());
             let (pa, pb, pc, pd) = (menu_path.clone(), menu_path.clone(), menu_path.clone(), menu_path.clone());
             let (e, f, pe, pf) = (this.clone(), this.clone(), menu_path.clone(), menu_path.clone());
@@ -1031,6 +1039,24 @@ impl Workspace {
             .item(PopupMenuItem::new(named(T::CopyBranchName)).on_click(move |_, _, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(branch.clone()));
             }))
+            // Its ticket: opened, its link and key copied; a link added by hand.
+            .when_some(ticket, |m, ticket| {
+                let key = ticket.key.clone();
+                m.separator()
+                    .item(PopupMenuItem::new(format!("Open {key}")).icon(menu_icon("external-link")).on_click(move |_, window, cx| {
+                        let _ = open_w.update(cx, |w, cx| w.open_ticket(&open_p, window, cx));
+                    }))
+                    .when(!ticket.url.is_empty(), |m| m.item(crate::copying::item("Copy Ticket Link", ticket.url.clone())))
+                    .item(crate::copying::item("Copy Ticket Key", key.clone()))
+                    .item(PopupMenuItem::new("New Task for This Ticket…").on_click(move |_, window, cx| {
+                        let _ = follow_w.update(cx, |w, cx| w.new_task_for_ticket(&follow_p, window, cx));
+                    }))
+            })
+            .when(!main && !side, |m| {
+                m.item(PopupMenuItem::new("Add a Link…").on_click(move |_, window, cx| {
+                    let _ = link_w.update(cx, |w, cx| w.add_link_dialog(&link_p, window, cx));
+                }))
+            })
             .when(can(T::AnotherVariant), |m| {
                 m.separator()
                     .item(PopupMenuItem::new(named(T::AnotherVariant)).icon(menu_icon("git-fork")).on_click(move |_, window, cx| {
@@ -1491,7 +1517,14 @@ impl Workspace {
                 });
             }
         }
-        let pr_status = crate::state::with_settings(|s| s.pr_status);
+        let pr_status = project.values().pull_requests;
+        // Its ticket's mark: the first one's key, and how many more.
+        let ticket = crate::state::with_settings(|s| s.tickets).then(|| t.ticket().cloned().zip(crate::integrations::tickets::mark(&t.links))).flatten();
+        // Why its link goes where it does: the integration owning it, and the layer it came from.
+        let why = ticket.as_ref().and_then(|(l, _)| project.resolved.integrations.iter().find(|(e, _)| e.id == l.integration)).map(|(e, from)| {
+            let name = e.name.clone().unwrap_or_else(|| e.id.clone());
+            format!("\nIts link: integration {name} ({}), set in {}", e.kind.as_deref().unwrap_or("?"), self.source_label(pi, *from))
+        });
         if let Some(pr) = t.pr.as_ref().filter(|p| p.open_feedback > 0 && pr_status) {
             details.push(format!("{} review comment{}", pr.open_feedback, if pr.open_feedback == 1 { "" } else { "s" }));
         }
@@ -1503,6 +1536,10 @@ impl Workspace {
         }
         if t.locked.is_some() {
             details.push("locked".into());
+        }
+        // A colleague's request: to review, not yours.
+        if t.review {
+            details.push("review".into());
         }
         // What an agent's own worktree holds beyond where it came from.
         if let Some(side) = &t.side {
@@ -1640,6 +1677,39 @@ impl Workspace {
                                     .on_click(move |_, _, cx| {
                                         cx.stop_propagation();
                                         cx.open_url(&url);
+                                    }),
+                            )
+                        })
+                        .when_some(ticket, |row, (ticket, mark)| {
+                            let why = why.clone().unwrap_or_default();
+                            // Without a link it only looks like a ticket: grey, and a click says how to give it one.
+                            // Read and not found: red, its key mistyped or the ticket gone.
+                            let linked = !ticket.url.is_empty();
+                            let missing = ticket.missing;
+                            let mark = if missing { format!("{mark} not found") } else { mark };
+                            let (this, at) = (cx.weak_entity(), click_path.clone());
+                            row.child(
+                                div()
+                                    .id(SharedString::from(format!("ticket-{}", path.display())))
+                                    .flex_none()
+                                    .text_color(if missing { gpui_kit::red() } else if linked { cx.theme().link } else { muted })
+                                    .hover(|s| s.underline())
+                                    .child(mark)
+                                    .tooltip(move |window, cx| {
+                                        let read = if ticket.title.is_empty() { String::new() } else { format!("{}: {} ({})\n", ticket.key, ticket.title, ticket.status) };
+                                        let say = if missing {
+                                            format!("{} was not found by its tracker: a mistyped key, or a ticket gone", ticket.key)
+                                        } else if linked {
+                                            format!("{read}Open {} in the browser{why}", ticket.url)
+                                        } else {
+                                            format!("{} looks like a ticket: no integration owns its prefix", ticket.key)
+                                        };
+                                        gpui_kit::component::tooltip::Tooltip::new(say).build(window, cx)
+                                    })
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                    .on_click(move |_, window, cx| {
+                                        cx.stop_propagation();
+                                        let _ = this.update(cx, |w, cx| w.open_ticket(&at, window, cx));
                                     }),
                             )
                         })

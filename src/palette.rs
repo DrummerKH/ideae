@@ -281,7 +281,7 @@ impl Workspace {
                 .detail("space: the projects in the window")
             };
             to_spaces.push(go("All spaces".into(), None));
-            to_spaces.extend(self.spaces.iter().map(|space| go(format!("Space: {}", space.name), Some(space.name.clone()))));
+            to_spaces.extend(self.spaces.iter().map(|space| go(format!("Space: {}", space.name), Some(space.id.clone()))));
         }
         to_spaces.push(own("Spaces…", "space: add, name, remove", |w, window, cx| w.spaces_dialog(window, cx)));
         // The task's own and git's, where the task in hand has them to do.
@@ -310,6 +310,25 @@ impl Workspace {
             use T::*;
             of_task.extend([NewTerminal, NewBrowserTab, RestartAgent, CompareThisFile, Star, CopyTitle, CopyBranchName, Rename, AnotherVariant, KeepVariant, StartServices, StopServices, Pause, Archive, Defer, RemoveSide].into_iter().filter(|what| hand.is_some_and(|t| t.allows(*what))).map(task));
             of_git = G::ALL.into_iter().filter(|what| hand.is_some_and(|t| t.git(*what))).map(git).collect();
+        }
+        // The ticket of the task in view: opened, its link and key copied.
+        if let Some(path) = self.active.clone()
+            && crate::state::with_settings(|s| s.tickets)
+            && let Some(ticket) = self.find(&path).and_then(|(pi, ti)| self.projects[pi].tasks[ti].ticket().cloned())
+        {
+            let open = this.clone();
+            let key = ticket.key.clone();
+            of_task.push(
+                Entry::new(format!("Open ticket {key}"), move |window, cx| {
+                    let _ = open.update(cx, |w, cx| w.open_ticket(&path, window, cx));
+                })
+                .detail("task: in the browser"),
+            );
+            if !ticket.url.is_empty() {
+                let url = ticket.url.clone();
+                of_task.push(Entry::new("Copy ticket link", move |_, cx| cx.write_to_clipboard(ClipboardItem::new_string(url.clone()))).detail("task"));
+            }
+            of_task.push(Entry::new("Copy ticket key", move |_, cx| cx.write_to_clipboard(ClipboardItem::new_string(key.clone()))).detail("task"));
         }
         let mut entries = vec![
             keyed("New task…", "new_task", "task"),
@@ -377,6 +396,9 @@ impl Workspace {
             own(if saving { "Leave power save mode" } else { "Power save mode" }, "window: language servers and background work", |w, _, cx| w.toggle_power_saving(cx)),
             keyed("Settings…", "settings", "app"),
             own("Keyboard shortcuts…", "app", |w, window, cx| w.open_settings_at(crate::settings_ui::KEYS_PAGE, window, cx)),
+            own("Integrations…", "app: trackers and code hosts", |w, window, cx| w.open_settings_at(crate::settings_ui::INTEGRATIONS_PAGE, window, cx)),
+            own("Copy a ticket's branch name…", "task: the branch its task would have, no task made", |w, window, cx| w.copy_branch_for_ticket_dialog(window, cx)),
+            own("Copy today's tasks", "task: for a stand-up, as Markdown, by ticket", |w, window, cx| w.copy_todays_tasks(window, cx)),
             own("Restart", "app", |w, window, cx| w.restart(window, cx)),
             keyed("Quit", "quit", "app"),
         ];

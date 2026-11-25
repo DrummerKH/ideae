@@ -67,16 +67,12 @@ impl Hint {
 }
 
 /// The pages of a project's settings.
-const SECTIONS: [&str; 7] = ["Tasks", "Services", "Agent", "Language servers", "Git", "Archive", "Look"];
+const SECTIONS: [&str; 6] = ["Tasks", "Services", "On this machine", "Git", "Archive", "Look"];
 
 /// What a project keeps on this machine, as its settings dialog has it.
 #[derive(Clone)]
 pub(super) struct Local {
-    agent: Option<String>,
     space: Option<String>,
-    lsp_off: bool,
-    pr_off: bool,
-    check_to_agent: u32,
 }
 
 impl Workspace {
@@ -154,6 +150,7 @@ impl Workspace {
                 });
             }
             "ask_agent" | "start_task" | "wait_for" | "tell_agent" | "agent_changes" => self.on_crew(request, answer, window, cx),
+            "ticket" => self.mcp_ticket(request, answer, window, cx),
             other => reply(Answer::error(format!("ideae has no tool {other}"))),
         }
     }
@@ -270,7 +267,7 @@ impl Workspace {
             return;
         }
         let variant = !self.projects[pi].tasks[ti].group.is_empty();
-        let fixes = self.projects[pi].check_to_agent;
+        let fixes = self.projects[pi].values().check_to_agent;
         if let Some(view) = &self.projects[pi].tasks[ti].view {
             view.update(cx, |t, _| t.set_check_to_agent(fixes));
         }
@@ -535,9 +532,14 @@ impl Workspace {
         let section = Rc::new(Cell::new(0usize));
         let p = &self.projects[pi];
         // Kept on this machine, set here and applied on Save.
-        let local = Rc::new(RefCell::new(Local { agent: p.agent.clone(), space: p.space.clone(), lsp_off: p.lsp_off, pr_off: p.pr_off, check_to_agent: p.check_to_agent }));
-        let profiles: Vec<(String, String)> = crate::state::with_settings(|s| s.agents.iter().map(|a| (a.id.clone(), a.name.clone())).collect());
-        let spaces: Vec<(String, String)> = self.spaces.iter().map(|s| (s.name.clone(), s.mark())).collect();
+        let local = Rc::new(RefCell::new(Local { space: p.space.clone() }));
+        // What applies here of the settings kept on this machine, and where each comes from: changed in Settings.
+        let here: Vec<(&'static str, String, String)> = crate::layers::FIELDS
+            .iter()
+            .filter(|f| f.allowed(crate::layers::Layer::Project))
+            .map(|f| (f.title, Self::describe_value(f.id, p.values()), self.source_label(pi, p.resolved.from.of(f.id))))
+            .collect();
+        let spaces: Vec<(String, String)> = self.spaces.iter().map(|s| (s.id.clone(), format!("{}  {}", s.mark(), s.name))).collect();
         let stale = p.merged_branches.len();
         let archived = Rc::new(RefCell::new(archived));
         let (project, name) = (p.path.clone(), p.name.clone());
@@ -569,9 +571,6 @@ impl Workspace {
         let copy_default = if crate::state::settings().copy_env { "the ignored .env* files, as Settings say" } else { "none" };
         let copy_hint = if suggested.copy.is_empty() { copy_default.to_string() } else { format!("{}; empty: {copy_default}", suggested.copy.join(" ")) };
         let copy = line(start.task.copy.clone().unwrap_or_default().join(" "), copy_hint, window, cx);
-        let base = line(p.base.clone(), "the remote's default branch".to_string(), window, cx);
-        let worktrees_now = crate::git::task_worktrees(&p.path).display().to_string();
-        let worktrees = line(p.worktrees.clone(), format!("as Settings say: {worktrees_now}"), window, cx);
         let rows: Rc<RefCell<Vec<ServiceRow>>> = Rc::new(RefCell::new(Vec::new()));
         for service in &start.service {
             let row = ServiceRow::new_in(service.clone(), window, cx);
@@ -618,16 +617,14 @@ impl Workspace {
         };
         let this = cx.weak_entity();
         let save = {
-            let (this, project, only_me, collect, local, base, worktrees) = (this.clone(), project.clone(), only_me.clone(), collect.clone(), local.clone(), base.clone(), worktrees.clone());
+            let (this, project, only_me, collect, local) = (this.clone(), project.clone(), only_me.clone(), collect.clone(), local.clone());
             move |window: &mut Window, cx: &mut App| {
                 let config = collect(cx);
                 let only_me = only_me.get();
                 let local = local.borrow().clone();
-                let base = base.read(cx).value().trim().to_string();
-                let worktrees = worktrees.read(cx).value().trim().to_string();
                 window.close_dialog(cx);
                 let _ = this.update(cx, |w, cx| {
-                    w.apply_local_project_settings(&project, local, base, worktrees, window, cx);
+                    w.apply_local_project_settings(&project, local, window, cx);
                     w.save_project_settings(&project, config, only_me, window, cx)
                 });
             }
@@ -669,8 +666,7 @@ impl Workspace {
             let (save, ask, fill, allow, file_trust, file_key, file_error) =
                 (save.clone(), ask.clone(), fill.clone(), allow.clone(), file_trust.clone(), file_key.clone(), file_error.clone());
             let remove = remove.clone();
-            let (section, local, profiles, spaces, archived, base, this, project, worktrees) =
-                (section.clone(), local.clone(), profiles.clone(), spaces.clone(), archived.clone(), base.clone(), this.clone(), project.clone(), worktrees.clone());
+            let (section, local, here, spaces, archived, this, project) = (section.clone(), local.clone(), here.clone(), spaces.clone(), archived.clone(), this.clone(), project.clone());
             let (page_ask, page_fill) = (ask.clone(), fill.clone());
             dialog
                 .title(format!("Project settings · {name}"))
@@ -774,12 +770,6 @@ impl Workspace {
                                     .on_click(move |_, window, cx| ask(window, cx)),
                             )
                     };
-                    let toggle = |id: &'static str, label: &'static str, on: bool, set: Rc<dyn Fn(bool)>| {
-                        Checkbox::new(id).label(label).checked(on).on_click(move |checked, window, _| {
-                            set(*checked);
-                            window.refresh();
-                        })
-                    };
                     let page: AnyElement = match now {
                         // Tasks: what runs in them, kept in .ideae.toml or for you alone.
                         0 => v_flex()
@@ -807,54 +797,42 @@ impl Workspace {
                             .child(field(
                                 "Check",
                                 "Runs when the agent finishes a turn; ✓ or ✗ on the task",
-                                v_flex()
-                                    .gap_2()
-                                    .child(Input::new(&check))
-                                    // Whose turns are spent is yours: kept on this machine, not in the file.
-                                    .child(toggle("check-to-agent", "A failed check goes back to the agent by itself, twice in a row at most (on this machine)", local.borrow().check_to_agent > 0, {
-                                        let local = local.clone();
-                                        Rc::new(move |on| local.borrow_mut().check_to_agent = if on { 2 } else { 0 })
-                                    }))
-                                    .into_any_element(),
+                                Input::new(&check).into_any_element(),
                             ))
                             .child(field("Files to copy", "Ignored files a new worktree gets from the main checkout", Input::new(&copy).into_any_element()))
-                            .child(field("New tasks from", "The branch new tasks start from; on this machine", Input::new(&base).into_any_element()))
-                            .child(field("Worktrees in", "The folder new tasks' worktrees go in; on this machine", Input::new(&worktrees).into_any_element()))
                             .child(helpers("tasks-fill"))
                             .into_any_element(),
                         1 => v_flex().gap_3().child(field("Services", "Started from Run: name, command, port", services.into_any_element())).child(helpers("services-fill")).into_any_element(),
-                        // The agent: whose subscription runs is personal, so on this machine.
+                        // What is kept on this machine, in layers over Settings and the space: shown here, changed in Settings.
                         2 => {
-                            let chosen = local.borrow().agent.clone();
-                            let mut list = v_flex().gap_1().child(div().text_xs().text_color(muted).child("The agent this project's new tasks run; a task can still be given another when it is made."));
-                            let default = std::iter::once((None, "The default agent (Settings)".to_string()));
-                            for (ix, (id, label)) in default.chain(profiles.iter().map(|(id, name)| (Some(id.clone()), name.clone()))).enumerate() {
-                                let local = local.clone();
-                                let on = chosen == id;
-                                list = list.child(Checkbox::new(("project-agent", ix)).label(label).checked(on).on_click(move |_, window, _| {
-                                    local.borrow_mut().agent = id.clone();
-                                    window.refresh();
-                                }));
+                            let mut list = v_flex().gap_1p5().child(
+                                div().text_xs().text_color(muted).child("Kept on this machine, not in the repository: whose agent runs and where tasks go are yours. Each comes from Settings, the project's space or the project itself."),
+                            );
+                            for (title, value, from) in here.iter() {
+                                list = list.child(
+                                    h_flex()
+                                        .gap_3()
+                                        .child(div().w(px(220.)).flex_none().text_sm().child(*title))
+                                        .child(div().flex_1().min_w_0().truncate().text_sm().child(value.clone()))
+                                        .child(div().flex_none().text_xs().text_color(muted).child(from.clone())),
+                                );
                             }
-                            list.into_any_element()
+                            let (this, project) = (this.clone(), project.clone());
+                            list.child(h_flex().pt_2().child(Button::new("project-open-settings").small().outline().label("Open in Settings").on_click(move |_, window, cx| {
+                                window.close_dialog(cx);
+                                let _ = this.update(cx, |w, cx| {
+                                    if let Some(pi) = w.projects.iter().position(|p| p.path == project) {
+                                        w.open_project_settings_layer(pi, window, cx);
+                                    }
+                                });
+                            })))
+                            .into_any_element()
                         }
                         3 => {
-                            let off = local.borrow().lsp_off;
-                            let set = { let local = local.clone(); Rc::new(move |on: bool| local.borrow_mut().lsp_off = !on) as Rc<dyn Fn(bool)> };
-                            v_flex()
-                                .gap_2()
-                                .child(toggle("project-lsp", "Language servers in this project's tasks", !off, set))
-                                .child(div().text_xs().text_color(muted).child("Off: no completion, types or go to definition from a server; a search finds definitions instead. Which servers run is in Settings → Language servers."))
-                                .into_any_element()
-                        }
-                        4 => {
-                            let off = local.borrow().pr_off;
-                            let set = { let local = local.clone(); Rc::new(move |on: bool| local.borrow_mut().pr_off = !on) as Rc<dyn Fn(bool)> };
                             let (this, project) = (this.clone(), project.clone());
                             v_flex()
                                 .gap_2()
-                                .child(toggle("project-pr", "Pull request status of its tasks (gh)", !off, set))
-                                .child(div().text_xs().text_color(muted).child("Off: gh is not asked about this project's branches."))
+                                .child(div().text_xs().text_color(muted).child("Whether gh is asked about this project's pull requests is under On this machine."))
                                 .when(stale > 0, |page| {
                                     page.child(h_flex().pt_2().child(Button::new("project-stale").small().outline().label(format!("Delete remote branches of my merged PRs ({stale})…")).on_click(move |_, window, cx| {
                                         window.close_dialog(cx);
@@ -867,7 +845,7 @@ impl Workspace {
                                 })
                                 .into_any_element()
                         }
-                        5 => {
+                        4 => {
                             let all = archived.borrow();
                             let size: u64 = all.iter().map(|(_, size, _)| size).sum();
                             let deferred = all.iter().filter(|(_, _, d)| *d).count();
@@ -892,7 +870,7 @@ impl Workspace {
                             let chosen = local.borrow().space.clone();
                             let mut list = v_flex().gap_1().child(div().text_xs().text_color(muted).child("The space the project is in; in none, it shows in every space."));
                             let none = std::iter::once((None, "In no space".to_string()));
-                            for (ix, (space, label)) in none.chain(spaces.iter().map(|(name, mark)| (Some(name.clone()), format!("{mark}  {name}")))).enumerate() {
+                            for (ix, (space, label)) in none.chain(spaces.iter().map(|(id, label)| (Some(id.clone()), label.clone()))).enumerate() {
                                 let local = local.clone();
                                 let on = chosen == space;
                                 list = list.child(Checkbox::new(("project-space", ix)).label(label).checked(on).on_click(move |_, window, _| {
@@ -935,32 +913,10 @@ impl Workspace {
     }
 
     /// What the settings dialog changed of what the project keeps here.
-    fn apply_local_project_settings(&mut self, project: &Path, local: Local, base: String, worktrees: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn apply_local_project_settings(&mut self, project: &Path, local: Local, window: &mut Window, cx: &mut Context<Self>) {
         let Some(pi) = self.projects.iter().position(|p| p.path == project) else { return };
-        if self.projects[pi].agent != local.agent {
-            self.set_project_agent(pi, local.agent, cx);
-        }
         if self.projects[pi].space != local.space {
             self.set_project_space(pi, local.space, window, cx);
-        }
-        let p = &mut self.projects[pi];
-        p.base = base;
-        crate::git::set_project_worktrees(&p.path, &worktrees);
-        p.worktrees = worktrees;
-        p.pr_off = local.pr_off;
-        p.check_to_agent = local.check_to_agent;
-        if p.lsp_off != local.lsp_off {
-            p.lsp_off = local.lsp_off;
-            let on = !local.lsp_off;
-            for view in p.tasks.iter().filter_map(|t| t.view.clone()) {
-                view.update(cx, |t, cx| {
-                    t.lsp_off = !on;
-                    t.set_language_servers(false, cx);
-                    if on && !crate::lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed) {
-                        t.set_language_servers(true, cx);
-                    }
-                });
-            }
         }
         self.save_later(cx);
         cx.notify();

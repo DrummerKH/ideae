@@ -7,11 +7,11 @@
 #   cargo build --release
 #   scripts/macos-app.sh --link target/release/ideae ~/Applications/ideae.app
 set -e
-link= name=ideae id=io.github.scillarium.ideae
+link= name=ideae id=io.github.scillarium.ideae scheme=ideae
 while :; do
   case $1 in
     --link) link=1 ;;
-    --dev) name="ideae (dev)" id=io.github.scillarium.ideae-dev ;;
+    --dev) name="ideae (dev)" id=io.github.scillarium.ideae-dev scheme=ideae-dev ;;
     *) break ;;
   esac
   shift
@@ -46,6 +46,10 @@ cat > "$app/Contents/Info.plist" <<PLIST
   <key>CFBundleVersion</key><string>$version</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>CFBundleURLTypes</key><array><dict>
+    <key>CFBundleURLName</key><string>$id</string>
+    <key>CFBundleURLSchemes</key><array><string>$scheme</string></array>
+  </dict></array>
   <key>NSMicrophoneUsageDescription</key><string>Programs in ideae's terminals, such as an agent's voice input, use the microphone.</string>
 </dict></plist>
 PLIST

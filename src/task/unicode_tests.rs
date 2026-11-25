@@ -114,7 +114,7 @@ fn names_and_what_is_shown_short() {
     for end in places(TEXT) {
         let head = &TEXT[..end];
         naming::branch_name(head);
-        naming::preview(&format!("DEV-1 {head}"));
+        naming::preview(&format!("DEV-1 {head}"), "{key}-{slug}");
         for max in [1, 2, 5, 40] {
             said::cap(head, max);
             said::lead(head, max);
@@ -122,6 +122,35 @@ fn names_and_what_is_shown_short() {
     }
     let long = "ё".repeat(100);
     assert!(naming::branch_name(&long).is_ascii());
+}
+
+#[test]
+fn tickets_read_out_of_any_text() {
+    use crate::integrations::{Integration, Kind, tickets};
+    let jira = Integration {
+        id: "acme".into(),
+        kind: Kind::Jira,
+        name: "Acme".into(),
+        base: "https://example.atlassian.net".into(),
+        keys: vec!["DEV".into()],
+        from: crate::layers::Layer::Global,
+        account: String::new(),
+        connected: false,
+        agent_read: false,
+    };
+    let all = [jira];
+    for end in places(TEXT) {
+        let head = &TEXT[..end];
+        let with_key = format!("{head} DEV-12 {head} https://example.atlassian.net/browse/DEV-3?ü={head}");
+        tickets::keys_in(&with_key);
+        tickets::links_in(&with_key);
+        tickets::ticket_in(&with_key, &all);
+        tickets::key_at_start(head);
+        if let Some(linked) = tickets::link_keys(&with_key, &all) {
+            assert!(linked.contains("[DEV-12](https://example.atlassian.net/browse/DEV-12)"));
+        }
+        crate::deep_link::parse(&format!("ticket {head}"));
+    }
 }
 
 #[test]

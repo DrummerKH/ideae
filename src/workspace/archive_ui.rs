@@ -142,9 +142,9 @@ struct Choice {
 
 /// The branch a restored task is offered: the one it had (its agent or you
 /// may have named it by the project's rules), else one named from its title.
-fn restored_branch(m: &archive::Meta) -> String {
+fn restored_branch(m: &archive::Meta, template: &str) -> String {
     let had = m.branch.trim();
-    if had.is_empty() || had.starts_with('(') { naming::branch_name(&m.title) } else { had.to_string() }
+    if had.is_empty() || had.starts_with('(') { naming::branch_name_as(&m.title, template) } else { had.to_string() }
 }
 
 impl Workspace {
@@ -273,6 +273,7 @@ impl Workspace {
             agent: t.agent.clone(),
             note: t.note.clone(),
             created: t.created,
+            links: t.links.clone(),
             ..Default::default()
         };
         // Archived again after a restore: in the place of the one it came from.
@@ -630,7 +631,7 @@ impl Workspace {
         let choice = Rc::new(RefCell::new(Choice { pr: if m.pr.is_some() { None } else { Some(None) }, on_branch: false, commits: true, changes: true, summary, branch: String::new() }));
         let branch_input = cx.new(|cx| {
             let mut input = InputState::new(window, cx);
-            input.set_value(restored_branch(&m), window, cx);
+            input.set_value(restored_branch(&m, &self.branch_template_of(&m.project)), window, cx);
             input
         });
         let typed = cx.subscribe_in(&branch_input, window, |_, _, event: &InputEvent, window, _| {
@@ -859,7 +860,7 @@ impl Workspace {
         // Its sessions' files go to profiles of the same kind only.
         let profiles: Vec<Option<agents::Profile>> = m.sessions.iter().map(|s| settings.profile(&s.profile).filter(|p| p.kind == s.kind).cloned()).collect();
         let wanted = match &start {
-            Start::Origin if choice.branch.trim().is_empty() => restored_branch(&m),
+            Start::Origin if choice.branch.trim().is_empty() => restored_branch(&m, &self.branch_template_of(&m.project)),
             Start::Origin => choice.branch.trim().to_string(),
             Start::PrBranch(head) => head.clone(),
         };
@@ -914,6 +915,8 @@ impl Workspace {
                 entry.busy = None;
                 entry.prompt = m.prompt.clone();
                 entry.agent = m.agent.clone();
+                entry.links = m.links.clone();
+                entry.links_read = !m.links.is_empty();
                 entry.base = restored.base.clone();
                 entry.archive = key.clone();
                 entry.archive_keep = restored.left_something();
@@ -1249,8 +1252,8 @@ mod branch_tests {
     fn a_restored_task_is_offered_the_branch_it_had() {
         let meta = |title: &str, branch: &str| crate::archive::Meta { title: title.into(), branch: branch.into(), ..Default::default() };
         // Renamed by its agent: that name, not one made again from a title in another language.
-        assert_eq!(super::restored_branch(&meta("DEV-26674 Маскирование пароля", "DEV-26674_maskBasicAuthPassword")), "DEV-26674_maskBasicAuthPassword");
-        assert_eq!(super::restored_branch(&meta("DEV-1 Fix login", "")), "DEV-1_fixLogin", "none known: from the title");
-        assert_eq!(super::restored_branch(&meta("DEV-1 Fix login", "(detached)")), "DEV-1_fixLogin");
+        assert_eq!(super::restored_branch(&meta("DEV-26674 Маскирование пароля", "DEV-26674_maskBasicAuthPassword"), crate::naming::DEFAULT_TEMPLATE), "DEV-26674_maskBasicAuthPassword");
+        assert_eq!(super::restored_branch(&meta("DEV-1 Fix login", ""), crate::naming::DEFAULT_TEMPLATE), "DEV-1_fixLogin", "none known: from the title");
+        assert_eq!(super::restored_branch(&meta("DEV-1 Fix login", "(detached)"), crate::naming::DEFAULT_TEMPLATE), "DEV-1_fixLogin");
     }
 }

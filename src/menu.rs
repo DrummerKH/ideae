@@ -35,7 +35,7 @@ struct Shown {
     task: Option<InHand>,
     /// Find and Replace has an editor to act in.
     replace: bool,
-    spaces: Vec<String>,
+    spaces: Vec<(String, String)>,
     space: Option<String>,
     /// What the focused view takes, which AppKit tells by itself on macOS:
     /// Edit's items, Save, Find.
@@ -129,7 +129,7 @@ impl Workspace {
             dialog,
             switches: Switches::now(),
             replace: window.is_action_available(&input::Replace, cx),
-            spaces: self.spaces.iter().map(|s| s.name.clone()).collect(),
+            spaces: self.spaces.iter().map(|s| (s.id.clone(), s.name.clone())).collect(),
             space: self.space.clone(),
             power_saving: crate::lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed),
             presenting: self.is_presenting(),
@@ -750,7 +750,7 @@ fn menus(shown: Shown) -> Vec<Menu> {
         item => item,
     };
     let mut space_items = vec![checked(space.is_none(), when(true, act("All Projects", GoToSpace(None)))), sep()];
-    space_items.extend(spaces.iter().map(|name| checked(space.as_ref() == Some(name), when(true, act(name.clone(), GoToSpace(Some(name.clone())))))));
+    space_items.extend(spaces.iter().map(|(id, name)| checked(space.as_ref() == Some(id), when(true, act(name.clone(), GoToSpace(Some(id.clone())))))));
     if !spaces.is_empty() {
         space_items.push(sep());
     }
@@ -995,7 +995,7 @@ mod tests {
     /// Every item has an action, and no menu says the same thing twice.
     #[test]
     fn the_menus_are_made() {
-        let menus = super::menus(Shown { projects: true, project: true, task: Some(InHand { main: false, remote: false, side: false, ready: true, grouped: true, starred: false, open: true, agent: true, agent_ended: true, closable: true, file: true, back: true, forward: true, reopen: true, services: true, services_running: true, services_waiting: true, git: [true; 9], front: Some(FrontTab::Agent), panels: [false; 5] }), spaces: vec!["Work".into()], ..Default::default() });
+        let menus = super::menus(Shown { projects: true, project: true, task: Some(InHand { main: false, remote: false, side: false, ready: true, grouped: true, starred: false, open: true, agent: true, agent_ended: true, closable: true, file: true, back: true, forward: true, reopen: true, services: true, services_running: true, services_waiting: true, git: [true; 9], front: Some(FrontTab::Agent), panels: [false; 5] }), spaces: vec![("w".into(), "Work".into())], ..Default::default() });
         let titles: Vec<_> = menus.iter().map(|m| m.name.as_ref()).collect();
         // Linux and Windows have no menu named after the app: its items are in File and Help.
         assert_eq!(titles[usize::from(cfg!(target_os = "macos"))..], ["File", "Edit", "View", "Navigate", "Task", "Git", "Window", "Help"]);

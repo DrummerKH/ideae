@@ -125,16 +125,10 @@ pub fn select(merged: &[ListedPr], open: &[ListedPr], branches: &[RemoteBranch],
     out
 }
 
-fn gh(repo: &Path, args: &[&str]) -> Option<String> {
-    let out = crate::procs::command("gh").current_dir(repo).env("GH_PROMPT_DISABLED", "1").args(args).stdin(std::process::Stdio::null()).output().ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-const FIELDS: &str = "number,title,headRefName,headRefOid,mergedAt,headRepository,headRepositoryOwner,isCrossRepository";
-
-/// The branches of your own merged PRs in the project at `repo`, `in_use`
-/// left out: the branches its tasks have checked out. A colleague's branch
-/// is theirs to delete. Off the UI thread: asks GitHub.
+/// The branches of your own merged requests in the project at `repo`,
+/// `in_use` left out: the branches its tasks have checked out. A colleague's
+/// branch is theirs to delete. Off the UI thread: asks its code host
+/// (GitHub, GitLab), from here; git runs where the checkout is.
 pub fn find(repo: &Path, in_use: &HashSet<String>) -> Vec<MergedBranch> {
     let git = |args: &[&str]| crate::git::git_status(repo, args).ok();
     let Some(default) = crate::git::remote_default(repo) else { return Vec::new() };
@@ -142,8 +136,8 @@ pub fn find(repo: &Path, in_use: &HashSet<String>) -> Vec<MergedBranch> {
     if refs.lines().all(|line| line.starts_with("HEAD\0") || line.starts_with(&format!("{default}\0"))) {
         return Vec::new();
     }
-    let Some(merged) = gh(repo, &["pr", "list", "--state", "merged", "--author", "@me", "--limit", "300", "--json", FIELDS]) else { return Vec::new() };
-    let merged = parse_prs(&merged);
+    let Ok(host) = crate::integrations::code_host(repo) else { return Vec::new() };
+    let Ok((merged, open)) = host.merged_and_open(repo) else { return Vec::new() };
     if merged.is_empty() {
         return Vec::new();
     }
@@ -152,7 +146,6 @@ pub fn find(repo: &Path, in_use: &HashSet<String>) -> Vec<MergedBranch> {
     if !refs.lines().any(|line| line.split('\0').next().is_some_and(|name| heads.contains(name))) {
         return Vec::new();
     }
-    let Some(open) = gh(repo, &["pr", "list", "--state", "open", "--limit", "300", "--json", FIELDS]) else { return Vec::new() };
     let in_default: HashSet<String> =
         git(&["for-each-ref", &format!("--merged=refs/remotes/origin/{default}"), "refs/remotes/origin", "--format=%(refname:strip=3)"]).unwrap_or_default().lines().map(str::to_string).collect();
     let branches: Vec<RemoteBranch> = refs
@@ -164,7 +157,7 @@ pub fn find(repo: &Path, in_use: &HashSet<String>) -> Vec<MergedBranch> {
         })
         .collect();
     let origin = git(&["remote", "get-url", "origin"]).and_then(|url| owner_repo(&url));
-    select(&merged, &parse_prs(&open), &branches, &default, in_use, origin.as_deref())
+    select(&merged, &open, &branches, &default, in_use, origin.as_deref())
 }
 
 /// What a deletion did, branch by branch.
@@ -178,16 +171,13 @@ pub struct Deleted {
 /// Deletes `branches` from `origin` in one push, then drops the
 /// remote-tracking refs of all branches gone from it. Off the UI thread.
 pub fn delete(repo: &Path, branches: &[String]) -> Deleted {
-    let git = || {
-        let mut command = crate::procs::command("git");
-        command.arg("-C").arg(repo).env("GIT_TERMINAL_PROMPT", "0").stdin(std::process::Stdio::null());
-        command
-    };
+    // Where the checkout is: here, or on its machine.
+    let git = |args: &[&str]| crate::hostfs::run(repo, "git", args, &[("GIT_TERMINAL_PROMPT", "0")], None);
     // One branch gone from origin already fails the whole push: those
     // count as deleted, and are not asked for.
     let mut ls = vec!["ls-remote", "--heads", "origin"];
     ls.extend(branches.iter().map(String::as_str));
-    let there: Option<HashSet<String>> = git().args(&ls).output().ok().filter(|o| o.status.success()).map(|o| {
+    let there: Option<HashSet<String>> = git(&ls).ok().filter(|o| o.success()).map(|o| {
         String::from_utf8_lossy(&o.stdout).lines().filter_map(|l| l.split_once("refs/heads/").map(|(_, b)| b.trim().to_string())).collect()
     });
     let (asked, gone): (Vec<String>, Vec<String>) = branches.iter().cloned().partition(|b| there.as_ref().is_none_or(|there| there.contains(b)));
@@ -196,8 +186,8 @@ pub fn delete(repo: &Path, branches: &[String]) -> Deleted {
         let push = |asked: &[String]| {
             let mut args = vec!["push", "--porcelain", "origin", "--delete"];
             args.extend(asked.iter().map(String::as_str));
-            match git().args(&args).output() {
-                Ok(out) => parse_push(&String::from_utf8_lossy(&out.stdout), &String::from_utf8_lossy(&out.stderr), asked),
+            match git(&args) {
+                Ok(out) => parse_push(&String::from_utf8_lossy(&out.stdout), &out.stderr, asked),
                 Err(e) => Deleted { deleted: Vec::new(), failed: asked.iter().map(|b| (b.clone(), e.to_string())).collect() },
             }
         };

@@ -507,7 +507,7 @@ impl Workspace {
     fn create_variants_named(&mut self, repo: PathBuf, taken: &git::TakenNames, title: String, prompt: String, notes: Vec<String>, agents: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(project) = self.projects.iter().position(|p| p.path == repo) else { return };
         // A name nothing has yet: a ticket's title gives the same branch each time.
-        let wanted = naming::branch_name(&title);
+        let wanted = naming::branch_name_as(&title, &self.projects[project].values().branch);
         let free = |group: &str| {
             self.members(group).is_empty() && (1..=MOST as u32).all(|v| !self.name_taken(&repo, &branch_for(group, v), taken)) && !self.name_taken(&repo, group, taken)
         };
@@ -516,8 +516,11 @@ impl Workspace {
         let created = state::now();
         let branches: Vec<String> = (1..=notes.len() as u32).map(|v| branch_for(&group, v)).collect();
         p.collapsed = false;
+        let links = crate::integrations::tickets::links_for_task(&title, &prompt, &crate::integrations::of_resolved(&p.resolved));
         for (branch, (variant, note)) in branches.iter().zip((1..).zip(notes)) {
             p.tasks.push(TaskEntry {
+                links: links.clone(),
+                links_read: true,
                 path: git::task_worktree_dir(&repo, branch),
                 branch: branch.clone(),
                 title: title.clone(),
@@ -543,7 +546,7 @@ impl Workspace {
     fn start_variants(&mut self, repo: PathBuf, branches: Vec<String>, like: Option<(PathBuf, String)>, window: &mut Window, cx: &mut Context<Self>) {
         cx.spawn_in(window, async move |this, cx| {
             let copy_env = state::settings().copy_env;
-            let base = this.read_with(cx, |w, _| w.projects.iter().find(|p| p.path == repo).map(|p| p.base.clone()).unwrap_or_default()).unwrap_or_default();
+            let base = this.read_with(cx, |w, _| w.projects.iter().find(|p| p.path == repo).map(|p| p.values().base.clone()).unwrap_or_default()).unwrap_or_default();
             let (job_repo, job_branches) = (repo.clone(), branches.clone());
             let like_path = like.as_ref().map(|(path, _)| path.clone());
             let made = cx
@@ -699,6 +702,7 @@ impl Workspace {
         let taken = |v: u32| members.iter().any(|&(pi, ti)| self.projects[pi].tasks[ti].variant == v) || self.name_taken(&repo, &branch_for(&group, v), taken_names);
         let Some(variant) = (1..=26).find(|&v| !taken(v)) else { return };
         let base = self.projects[pi].tasks[ti].base.clone();
+        let links = self.projects[pi].tasks[ti].links.clone();
         let after = members.iter().filter(|m| m.0 == pi).map(|m| m.1).max().unwrap_or(ti) + 1;
         let branch = branch_for(&group, variant);
         let created = state::now();
@@ -716,6 +720,8 @@ impl Workspace {
                 prompt,
                 created,
                 agent,
+                links,
+                links_read: true,
                 fresh: true,
                 ..Default::default()
             },
@@ -2405,17 +2411,17 @@ pub(crate) mod tests {
         });
         // Spaces: the project is sorted into one; in another nothing of it is in the window or told, in all of them it is back.
         step(cx, &mut |w, window, cx| {
-            let space = |name: &str| crate::workspace::spaces::Space { name: name.into(), ..Default::default() };
-            w.set_spaces(vec![space("Work"), space("Home")], &[], window, cx);
-            w.set_project_space(0, Some("Work".into()), window, cx);
+            let space = |id: &str, name: &str| crate::workspace::spaces::Space { id: id.into(), name: name.into(), ..Default::default() };
+            w.set_spaces(vec![space("w", "Work"), space("h", "Home")], window, cx);
+            w.set_project_space(0, Some("w".into()), window, cx);
             w.switch(&paths[0], window, cx);
-            w.switch_space(Some("Work".into()), window, cx);
+            w.switch_space(Some("w".into()), window, cx);
         });
         workspace.update(cx, |w, cx| {
             assert!(w.in_space(0) && w.active.as_deref() == Some(paths[0].as_path()), "its own space: as before");
             assert_eq!(w.waiting_elsewhere(cx), 0);
         });
-        step(cx, &mut |w, window, cx| w.switch_space(Some("Home".into()), window, cx));
+        step(cx, &mut |w, window, cx| w.switch_space(Some("h".into()), window, cx));
         step(cx, &mut |w, window, cx| {
             w.on_hook(hook(&paths[1], "UserPromptSubmit"), window, cx);
             w.on_hook(hook(&paths[1], "Stop"), window, cx);
@@ -2426,11 +2432,12 @@ pub(crate) mod tests {
             assert!(w.waiting_elsewhere(cx) >= 1, "that one waits there is a number by the switch");
             assert_eq!(w.tokens_of_the_day(), 0, "what its agents took is not this space's");
             let saved = w.snapshot(cx);
-            assert_eq!((saved.space.as_deref(), saved.projects[0].space.as_deref()), (Some("Home"), Some("Work")));
+            assert_eq!((saved.space.as_deref(), saved.projects[0].space.as_deref()), (Some("Home"), Some("Work")), "by name, for older versions");
+            assert_eq!((saved.space_id.as_deref(), saved.projects[0].space_id.as_deref()), (Some("h"), Some("w")));
             assert!(!saved.tells_of(&paths[1]), "nor is it told of with the window closed");
             let folder = paths[1].file_name().unwrap().to_string_lossy().into_owned();
             assert!(crate::sysmon::OUT_OF_WINDOW.lock().unwrap().contains(&folder), "nor named in the load readout");
-            let long = crate::workspace::spaces::Space { name: "Client".into(), icon: "CLIENT".into(), color: 2 };
+            let long = crate::workspace::spaces::Space { name: "Client".into(), icon: "CLIENT".into(), color: 2, ..Default::default() };
             assert_eq!((long.mark(), crate::workspace::spaces::Space { name: "home".into(), ..Default::default() }.mark()), ("CLI".to_string(), "H".to_string()));
         });
         cx.update_window(handle.into(), |_, window, cx| {
@@ -2440,13 +2447,16 @@ pub(crate) mod tests {
         .unwrap();
         // Renamed, the space keeps its projects; removed, they are in none and in every one.
         step(cx, &mut |w, window, cx| {
-            let space = |name: &str| crate::workspace::spaces::Space { name: name.into(), ..Default::default() };
-            w.set_spaces(vec![space("Job"), space("Home")], &[("Work".into(), "Job".into())], window, cx);
+            let space = |id: &str, name: &str| crate::workspace::spaces::Space { id: id.into(), name: name.into(), ..Default::default() };
+            w.set_spaces(vec![space("w", "Job"), space("h", "Home")], window, cx);
         });
-        workspace.update(cx, |w, _| assert_eq!(w.projects[0].space.as_deref(), Some("Job")));
+        workspace.update(cx, |w, cx| {
+            assert_eq!(w.projects[0].space.as_deref(), Some("w"));
+            assert_eq!(w.snapshot(cx).projects[0].space.as_deref(), Some("Job"), "its name follows");
+        });
         step(cx, &mut |w, window, cx| w.switch_space(None, window, cx));
         workspace.update(cx, |w, _| assert!(w.in_space(0) && w.active.is_some(), "all of them: a task is in hand again"));
-        step(cx, &mut |w, window, cx| w.set_spaces(Vec::new(), &[], window, cx));
+        step(cx, &mut |w, window, cx| w.set_spaces(Vec::new(), window, cx));
         workspace.update(cx, |w, cx| {
             assert!(w.projects[0].space.is_none() && w.space.is_none() && w.snapshot(cx).tells_of(&paths[1]));
             assert!(crate::sysmon::OUT_OF_WINDOW.lock().unwrap().is_empty(), "all in the window: all named");

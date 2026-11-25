@@ -27,7 +27,11 @@ pub struct State {
     /// The spaces projects are sorted into, and the one in the window;
     /// none for all of them.
     pub spaces: Vec<crate::workspace::spaces::Space>,
+    /// By its name, as older versions read it; and by its id, which a
+    /// rename does not change.
     pub space: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub space_id: Option<String>,
     pub power_saving: bool,
     pub window: Option<WindowPlace>,
     pub settings: Settings,
@@ -69,12 +73,39 @@ pub struct PresentingState {
 }
 
 impl State {
+    /// Spaces get ids, and projects and the space in the window are found
+    /// by them, else by name (a state of before ids, or one an older
+    /// version wrote, which keeps names alone); a project's old fields
+    /// changed by an older version go into its layer.
+    pub fn normalize_layers(&mut self) {
+        for at in 0..self.spaces.len() {
+            let taken: Vec<String> = self.spaces.iter().map(|s| s.id.clone()).collect();
+            if self.spaces[at].id.is_empty() || taken[..at].contains(&self.spaces[at].id) {
+                let taken: Vec<&str> = taken.iter().map(String::as_str).collect();
+                self.spaces[at].id = crate::layers::new_space_id(&taken);
+            }
+        }
+        let spaces = &self.spaces;
+        let find = |id: &Option<String>, name: &Option<String>| -> Option<String> {
+            id.as_ref()
+                .and_then(|id| spaces.iter().find(|s| &s.id == id && name.as_ref().is_none_or(|n| n == &s.name)))
+                .or_else(|| name.as_ref().and_then(|name| spaces.iter().find(|s| &s.name == name)))
+                .map(|s| s.id.clone())
+        };
+        self.space_id = find(&self.space_id, &self.space);
+        for p in &mut self.projects {
+            p.space_id = find(&p.space_id, &p.space);
+            let old = crate::layers::OldFields { agent: p.agent.clone(), base: p.base.clone(), worktrees: p.worktrees.clone(), lsp_off: p.lsp_off, pr_off: p.pr_off, check_to_agent: p.check_to_agent };
+            old.reconcile(&mut p.settings);
+        }
+    }
+
     /// Whether a task is one to tell of, as the window was left: of the
     /// space that was in it, and not left out of a presentation.
     #[cfg_attr(not(unix), allow(dead_code))]
     pub fn tells_of(&self, task: &std::path::Path) -> bool {
         let project = self.projects.iter().find(|p| p.tasks.iter().any(|t| t.path == task));
-        let in_space = match (&self.space, project.and_then(|p| p.space.as_ref())) {
+        let in_space = match (&self.space_id, project.and_then(|p| p.space_id.as_ref())) {
             (Some(shown), Some(its)) => shown == its,
             _ => true,
         };
@@ -90,6 +121,22 @@ pub struct Settings {
     /// The default agent's command, as older versions read it: kept in step
     /// with `agents`, of which it is the first when a state has none.
     pub agent: String,
+    /// Trackers and code hosts for every project (crate::integrations),
+    /// the Global layer of the list a space and a project add to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub integrations: Vec<crate::layers::Entry>,
+    /// Tickets off: no marks, questions, variables or tools of tickets,
+    /// and the integrations of a team's file stay silent.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub tickets: bool,
+    /// Global's layer of how a ticket's task names its branch, its request's
+    /// title, and what the request says of its tickets (crate::layers).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub branch_template: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pr_title: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pr_closes: String,
     /// The agents to choose from (agents/mod.rs); none, and tasks get a
     /// plain shell. `--agent` and `--no-agent` on the command line win.
     #[serde(default)]
@@ -282,6 +329,10 @@ pub struct Settings {
     pub menu_bar_shown: bool,
 }
 
+fn is_true(on: &bool) -> bool {
+    *on
+}
+
 fn yes() -> bool {
     true
 }
@@ -293,6 +344,11 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             agent: "claude".into(),
+            integrations: Vec::new(),
+            tickets: true,
+            branch_template: String::new(),
+            pr_title: String::new(),
+            pr_closes: String::new(),
             agents: vec![crate::agents::Profile::claude_code()],
             default_agent: crate::agents::DEFAULT_ID.into(),
             quick_agent: String::new(),
@@ -482,8 +538,17 @@ pub struct WindowPlace {
 pub struct ProjectState {
     /// The main worktree.
     pub path: PathBuf,
-    /// The space it is sorted into, by its name; none, and it is in every one.
+    /// The space it is sorted into, by its name (for older versions) and
+    /// by its id; none, and it is in every one.
     pub space: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub space_id: Option<String>,
+    /// Its own layer of the settings (crate::layers). `agent`, `base`,
+    /// `worktrees`, `lsp_off`, `pr_off` and `check_to_agent` below are
+    /// written from it for older versions, and read into it when an older
+    /// version changed them.
+    #[serde(skip_serializing_if = "crate::layers::Overrides::is_empty")]
+    pub settings: crate::layers::Overrides,
     pub collapsed: bool,
     pub tasks: Vec<TaskState>,
     /// The command last run in every variant of a task, and whether it
@@ -598,6 +663,51 @@ pub struct TaskState {
     /// none of its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawned_by: Option<PathBuf>,
+    /// Its tickets, its request and the addresses it was given; the first
+    /// ticket is its own (the PR's title, `IDEAE_TICKET`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<TaskLink>,
+    /// Its links were read once out of its prompt and branch (a task of
+    /// before links): not again, or one removed would come back.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub links_read: bool,
+    /// On a colleague's request (made from its link): to review, not yours.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub review: bool,
+}
+
+/// A task's link: a ticket, its pull or merge request, or any address
+/// (an error's page, a thread). Its data, not a setting: kept with the
+/// task and its archive, the integration's id and the address made then.
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq, Eq, Debug)]
+#[serde(default)]
+pub struct TaskLink {
+    /// "ticket", "pr" or "url".
+    pub what: String,
+    /// A ticket's key (`DEV-123`, `group/app#4`, `#4`), a request's `#12`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub key: String,
+    /// The tracker's kind (`jira`), and the integration that owns the key.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub tracker: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub integration: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub url: String,
+    /// What reading it with your token found, when it was read: its title
+    /// and status; `missing` when the tracker has no such ticket.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub status: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub missing: bool,
+}
+
+impl TaskLink {
+    pub fn is_ticket(&self) -> bool {
+        self.what == "ticket"
+    }
 }
 
 /// A question asked of an agent of its own beside a task's agent.
@@ -842,6 +952,7 @@ pub fn load() -> State {
     match std::fs::read(&path) {
         Ok(bytes) => serde_json::from_slice::<State>(&bytes).map(|mut state| {
             state.settings.normalize();
+            state.normalize_layers();
             state
         }).unwrap_or_else(|e| {
             // Keep the unreadable file for a look rather than overwrite it.
@@ -935,12 +1046,113 @@ mod spaces_tests {
     fn what_is_out_of_the_window_is_not_told_of() {
         let task = |path: &str| TaskState { path: path.into(), ..Default::default() };
         let project = |space: Option<&str>, path: &str| ProjectState { space: space.map(str::to_string), tasks: vec![task(path)], ..Default::default() };
-        let mut state = State { projects: vec![project(Some("Work"), "/w/a"), project(Some("Home"), "/h/b"), project(None, "/n/c")], ..Default::default() };
+        let space = |name: &str| crate::workspace::spaces::Space { name: name.into(), ..Default::default() };
+        let mut state = State { spaces: vec![space("Work"), space("Home")], projects: vec![project(Some("Work"), "/w/a"), project(Some("Home"), "/h/b"), project(None, "/n/c")], ..Default::default() };
+        state.normalize_layers();
         let told = |state: &State| ["/w/a", "/h/b", "/n/c", "/elsewhere"].map(|path| state.tells_of(Path::new(path)));
         assert_eq!(told(&state), [true, true, true, true], "all of them in the window");
-        state.space = Some("Work".into());
+        state.space_id = state.spaces.iter().find(|s| s.name == "Work").map(|s| s.id.clone());
         assert_eq!(told(&state), [true, false, true, true], "one sorted into no space is in every one");
         state.presenting = Some(PresentingState { kept: vec![PathBuf::from("/n/c")], since: 0 });
         assert_eq!(told(&state), [false, false, true, false], "and of those, the ones chosen to present");
+    }
+}
+
+#[cfg(test)]
+mod layers_tests {
+    use super::{ProjectState, State};
+    use crate::layers::{OldFields, Overrides};
+
+    /// A project of an older version, as it read and wrote the state:
+    /// unknown fields dropped on the way.
+    #[derive(serde::Serialize, serde::Deserialize, Default, Debug, PartialEq)]
+    #[serde(default)]
+    struct OldProject {
+        path: std::path::PathBuf,
+        space: Option<String>,
+        agent: Option<String>,
+        base: String,
+        worktrees: String,
+        lsp_off: bool,
+        pr_off: bool,
+        check_to_agent: u32,
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize, Default, Debug)]
+    #[serde(default)]
+    struct OldSpace {
+        name: String,
+        icon: String,
+        color: u8,
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize, Default, Debug)]
+    #[serde(default)]
+    struct OldState {
+        spaces: Vec<OldSpace>,
+        space: Option<String>,
+        projects: Vec<OldProject>,
+    }
+
+    fn load(json: &str) -> State {
+        let mut state: State = serde_json::from_str(json).unwrap();
+        state.normalize_layers();
+        state
+    }
+
+    /// What the window writes of a project: its layer, and the old fields from it.
+    fn written(p: &ProjectState) -> ProjectState {
+        let old = OldFields::from_overrides(&p.settings);
+        ProjectState { agent: old.agent, base: old.base, worktrees: old.worktrees, lsp_off: old.lsp_off, pr_off: old.pr_off, check_to_agent: old.check_to_agent, ..p.clone() }
+    }
+
+    #[test]
+    fn a_state_of_before_layers_is_read_and_an_older_version_reads_what_is_written() {
+        let before = r#"{"spaces":[{"name":"Work","icon":"W","color":1}],"space":"Work",
+            "projects":[{"path":"/w/api","space":"Work","agent":"codex","base":"develop","pr_off":true,"tasks":[]}]}"#;
+        let state = load(before);
+        let id = state.spaces[0].id.clone();
+        assert!(!id.is_empty());
+        assert_eq!((state.space_id.as_deref(), state.projects[0].space_id.as_deref()), (Some(id.as_str()), Some(id.as_str())));
+        assert_eq!(
+            state.projects[0].settings,
+            Overrides { agent: Some("codex".into()), base: Some("develop".into()), pull_requests: Some(false), ..Default::default() }
+        );
+
+        // Written again, with a space's setting and a rename: an older version reads names and its own fields.
+        let mut state = state;
+        state.spaces[0].name = "Job".into();
+        state.spaces[0].settings.agent = Some("claude".into());
+        state.space = Some("Job".into());
+        state.projects[0].space = Some("Job".into());
+        state.projects[0].settings.language_servers = Some(false);
+        state.projects[0] = written(&state.projects[0]);
+        let json = serde_json::to_string(&state).unwrap();
+        let old: OldState = serde_json::from_str(&json).unwrap();
+        assert_eq!(old.space.as_deref(), Some("Job"));
+        assert_eq!(
+            old.projects[0],
+            OldProject { path: "/w/api".into(), space: Some("Job".into()), agent: Some("codex".into()), base: "develop".into(), lsp_off: true, pr_off: true, ..Default::default() }
+        );
+        // And reads it back the same.
+        let again = load(&json);
+        assert_eq!((again.spaces[0].id.as_str(), again.projects[0].settings.clone()), (id.as_str(), state.projects[0].settings.clone()));
+
+        // What the older version writes in turn: ids and layers gone, names kept; its changes are taken.
+        let mut old = old;
+        old.projects[0].pr_off = false;
+        let back = load(&serde_json::to_string(&old).unwrap());
+        assert_eq!(back.projects[0].space_id, back.space_id, "found by name again");
+        assert_eq!(back.spaces[0].name, "Job");
+        assert_eq!(back.projects[0].settings.pull_requests, None, "turned on again by the older version");
+        assert_eq!(back.projects[0].settings.language_servers, Some(false));
+    }
+
+    #[test]
+    fn a_project_whose_space_id_is_gone_is_found_by_name() {
+        let json = r#"{"spaces":[{"id":"s1","name":"Work"}],"projects":[{"path":"/a","space":"Work","space_id":"gone"},{"path":"/b","space":"Nowhere"}]}"#;
+        let state = load(json);
+        assert_eq!(state.projects[0].space_id.as_deref(), Some("s1"));
+        assert_eq!(state.projects[1].space_id, None, "a space that is not there: in none");
     }
 }

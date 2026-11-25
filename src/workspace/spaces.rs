@@ -18,15 +18,21 @@ use gpui_kit::{prelude::FluentBuilder as _, *};
 use super::Workspace;
 use crate::agent::AgentStatus;
 
-/// A set of projects, by its name; the mark it is known by in the title bar.
+/// A set of projects; the mark it is known by in the title bar.
 #[derive(Clone, Debug, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Space {
+    /// What projects find it by: a rename keeps it (`State::normalize_layers`).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub id: String,
     pub name: String,
     /// A sign or a few letters; drawn on `color` when it has one.
     pub icon: String,
     /// One of [`COLORS`], counted from 1; 0 for none.
     pub color: u8,
+    /// Its layer of the settings, over Global, under its projects' own.
+    #[serde(skip_serializing_if = "crate::layers::Overrides::is_empty")]
+    pub settings: crate::layers::Overrides,
 }
 
 /// The colors a space's mark can be drawn on: they show on a light
@@ -124,11 +130,16 @@ impl Workspace {
             .count()
     }
 
-    /// Goes to a space, or to all of them. The task in hand leaves the
+    /// The name of a space, by its id.
+    pub fn space_name(&self, id: Option<&str>) -> Option<String> {
+        id.and_then(|id| self.spaces.iter().find(|s| s.id == id)).map(|s| s.name.clone())
+    }
+
+    /// Goes to a space (by id), or to all of them. The task in hand leaves the
     /// window when it is not of that space; the one last looked at there
     /// takes its place.
     pub fn switch_space(&mut self, space: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
-        let space = space.filter(|name| self.spaces.iter().any(|s| &s.name == name));
+        let space = space.filter(|id| self.spaces.iter().any(|s| &s.id == id));
         if space == self.space {
             return;
         }
@@ -158,10 +169,18 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Puts a project into a space, or into none: it is then in every one.
+    /// Puts a project into a space (by id), or into none: it is then in
+    /// every one. What it gets and loses of the spaces' settings is told.
     pub fn set_project_space(&mut self, pi: usize, space: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let space = space.filter(|id| self.spaces.iter().any(|s| &s.id == id));
         let Some(project) = self.projects.get_mut(pi) else { return };
-        project.space = space.filter(|name| self.spaces.iter().any(|s| &s.name == name));
+        if project.space == space {
+            return;
+        }
+        project.space = space;
+        let before = project.resolved.clone();
+        self.resolve_projects(cx);
+        self.tell_layer_changes(pi, &before, window, cx);
         // The task in hand may have left the space in the window with it.
         if self.active.clone().is_some_and(|path| self.find(&path).is_some_and(|(pi, _)| !self.in_space(pi))) {
             self.leave_task(window, cx);
@@ -171,15 +190,12 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The spaces as they are after an edit: projects of one renamed
-    /// follow it, those of one removed are in none.
-    pub fn set_spaces(&mut self, spaces: Vec<Space>, renamed: &[(String, String)], window: &mut Window, cx: &mut Context<Self>) {
-        let follow = |name: &mut Option<String>| {
-            if let Some((_, new)) = name.as_ref().and_then(|old| renamed.iter().find(|(from, _)| from == old)) {
-                *name = Some(new.clone());
-            }
-            if name.as_ref().is_some_and(|name| !spaces.iter().any(|s| &s.name == name)) {
-                *name = None;
+    /// The spaces as they are after an edit: projects find theirs by id,
+    /// so a rename changes nothing; those of one removed are in none.
+    pub fn set_spaces(&mut self, spaces: Vec<Space>, window: &mut Window, cx: &mut Context<Self>) {
+        let follow = |id: &mut Option<String>| {
+            if id.as_ref().is_some_and(|id| !spaces.iter().any(|s| &s.id == id)) {
+                *id = None;
             }
         };
         for project in &mut self.projects {
@@ -192,6 +208,7 @@ impl Workspace {
             crate::menu::install_soon(cx);
         }
         self.spaces = spaces;
+        self.resolve_projects(cx);
         if shown != self.space {
             self.space = shown;
             if self.active.clone().is_some_and(|path| self.find(&path).is_some_and(|(pi, _)| !self.in_space(pi))) {
@@ -208,10 +225,10 @@ impl Workspace {
     pub fn render_space_switch(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let this = cx.weak_entity();
         let (spaces, shown) = (self.spaces.clone(), self.space.clone());
-        let here = shown.as_ref().and_then(|name| spaces.iter().find(|s| &s.name == name));
+        let here = shown.as_ref().and_then(|id| spaces.iter().find(|s| &s.id == id));
         let (mark, color) = here.map_or((ALL.to_string(), 0), |space| (space.mark(), space.color));
         let waiting = self.waiting_elsewhere(cx);
-        let tip = match &shown {
+        let tip = match here.map(|s| &s.name) {
             Some(name) => format!("Space: {name}. Other projects are out of the window; their agents go on working."),
             None => "All spaces: every project is in the window.".to_string(),
         };
@@ -232,7 +249,7 @@ impl Workspace {
                 };
                 let mut menu = go(menu, ALL.to_string(), 0, "All".into(), None, shown.is_none());
                 for space in &spaces {
-                    menu = go(menu, space.mark(), space.color, space.name.clone(), Some(space.name.clone()), shown.as_ref() == Some(&space.name));
+                    menu = go(menu, space.mark(), space.color, space.name.clone(), Some(space.id.clone()), shown.as_ref() == Some(&space.id));
                 }
                 let edit = this.clone();
                 menu.separator().item(PopupMenuItem::new("Spaces…").on_click(move |_, window, cx| {
@@ -243,7 +260,7 @@ impl Workspace {
 
     /// The spaces to add, name, mark and remove.
     pub fn spaces_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Each row: the name it had (to follow a rename), and its two fields.
+        // Each row: the space's id, and its two fields.
         type Row = (String, Entity<InputState>, Entity<InputState>, std::rc::Rc<std::cell::Cell<u8>>);
         let rows: std::rc::Rc<std::cell::RefCell<Vec<Row>>> = Default::default();
         let field = |text: &str, hint: &'static str, window: &mut Window, cx: &mut App| {
@@ -252,7 +269,7 @@ impl Workspace {
             input
         };
         for space in &self.spaces {
-            rows.borrow_mut().push((space.name.clone(), field(&space.icon, "mark", window, cx), field(&space.name, "name", window, cx), std::rc::Rc::new(std::cell::Cell::new(space.color))));
+            rows.borrow_mut().push((space.id.clone(), field(&space.icon, "mark", window, cx), field(&space.name, "name", window, cx), std::rc::Rc::new(std::cell::Cell::new(space.color))));
         }
         let this = cx.weak_entity();
         // The projects and the space each is of, as the window draws them:
@@ -265,21 +282,18 @@ impl Workspace {
             let (rows, this, projects) = (rows.clone(), this.clone(), projects.clone());
             std::rc::Rc::new(move |window: &mut Window, cx: &mut App| {
                 let mut spaces: Vec<Space> = Vec::new();
-                let mut renamed = Vec::new();
-                for (was, icon, name, color) in rows.borrow_mut().iter_mut() {
+                let had = this.read_with(cx, |w, _| w.spaces.clone()).unwrap_or_default();
+                for (id, icon, name, color) in rows.borrow().iter() {
                     let (icon, name) = (icon.read(cx).value().trim().to_string(), name.read(cx).value().trim().to_string());
                     // One without a name, or with another's, is not one yet.
                     if name.is_empty() || spaces.iter().any(|s| s.name == name) {
                         continue;
                     }
-                    if !was.is_empty() && *was != name {
-                        renamed.push((was.clone(), name.clone()));
-                    }
-                    *was = name.clone();
-                    spaces.push(Space { name, icon, color: color.get() });
+                    let settings = had.iter().find(|s| &s.id == id).map(|s| s.settings.clone()).unwrap_or_default();
+                    spaces.push(Space { id: id.clone(), name, icon, color: color.get(), settings });
                 }
                 let now = this.update(cx, |w, cx| {
-                    w.set_spaces(spaces, &renamed, window, cx);
+                    w.set_spaces(spaces, window, cx);
                     w.projects.iter().map(|p| (p.name.clone(), p.space.clone())).collect::<Vec<_>>()
                 });
                 if let Ok(now) = now {
@@ -312,7 +326,7 @@ impl Workspace {
             dialog.title("Spaces").w(px(500.)).content(move |content, _, cx| {
                 let mut list = v_flex().gap_1p5();
                 for (ix, (_, icon, name, color)) in rows.borrow().iter().enumerate() {
-                    let (rows, keep) = (rows.clone(), keep.clone());
+                    let (rows, keep, owner) = (rows.clone(), keep.clone(), sort.clone());
                     let (shade, next, again) = (color.get(), color.clone(), keep.clone());
                     // The mark as it will be drawn; a click gives it the next color, the last being none.
                     let drawn: String = match icon.read(cx).value().trim() {
@@ -340,32 +354,44 @@ impl Workspace {
                             .child(div().flex_1().child(Input::new(name).small()))
                             .child(Button::new(("space-remove", ix)).xsmall().ghost().label("×").tooltip("Remove: its projects are then in no space, and in every one").on_click(
                                 move |_, window, cx| {
-                                    rows.borrow_mut().remove(ix);
-                                    keep(window, cx);
-                                    window.refresh();
+                                    let Some(id) = rows.borrow().get(ix).map(|row| row.0.clone()) else { return };
+                                    let (rows, keep, gone) = (rows.clone(), keep.clone(), id.clone());
+                                    let removed: std::rc::Rc<dyn Fn(&mut Window, &mut App)> = std::rc::Rc::new(move |window: &mut Window, cx: &mut App| {
+                                        rows.borrow_mut().retain(|row| row.0 != gone);
+                                        keep(window, cx);
+                                        window.refresh();
+                                    });
+                                    // Its own settings are not dropped unasked.
+                                    let held = owner.read_with(cx, |w, _| w.spaces.iter().find(|s| s.id == id).map(|s| (s.name.clone(), s.settings.count()))).ok().flatten();
+                                    match held {
+                                        Some((name, n)) if n > 0 => {
+                                            let _ = owner.update(cx, |w, cx| w.ask_space_settings(id, name, n, removed, window, cx));
+                                        }
+                                        _ => removed(window, cx),
+                                    }
                                 },
                             )),
                     );
                 }
                 // The projects, each with where it can be: the one chosen is lit, a click on another chooses that.
-                let spaces: Vec<(String, String, u8)> = rows
+                // Each by its id, its name (what the chips are known by in tests), mark and color.
+                let spaces: Vec<(String, String, String, u8)> = rows
                     .borrow()
                     .iter()
-                    .filter_map(|(_, icon, name, color)| {
+                    .filter_map(|(id, icon, name, color)| {
                         let name = name.read(cx).value().trim().to_string();
-                        (!name.is_empty()).then(|| (Space { name: name.clone(), icon: icon.read(cx).value().trim().to_string(), color: color.get() }.mark(), name, color.get()))
+                        let mark = Space { name: name.clone(), icon: icon.read(cx).value().trim().to_string(), color: color.get(), ..Default::default() }.mark();
+                        (!name.is_empty()).then(|| (id.clone(), name, mark, color.get()))
                     })
-                    .map(|(mark, name, color)| (name, mark, color))
                     .collect();
                 let mut table = v_flex().id("space-projects").gap_0p5().max_h(px(260.)).overflow_y_scroll();
                 for (pi, (project, its)) in projects.borrow().iter().enumerate() {
                     let mut row = h_flex().gap_1p5().child(div().flex_1().min_w_0().truncate().text_sm().child(project.clone()));
                     // One of them is chosen, as of a row of radio buttons: all (in no space, so in every one), or one space.
-                    let choices = std::iter::once((None, ALL.to_string(), 7)).chain(spaces.iter().map(|(name, mark, color)| (Some(name.clone()), mark.clone(), *color)));
-                    for (to, mark, color) in choices {
+                    let choices = std::iter::once((None, "all".to_string(), ALL.to_string(), 7)).chain(spaces.iter().map(|(id, name, mark, color)| (Some(id.clone()), name.clone(), mark.clone(), *color)));
+                    for (to, name, mark, color) in choices {
                         let on = *its == to;
                         let (projects, sort) = (projects.clone(), sort.clone());
-                        let name = to.clone().unwrap_or_else(|| "all".into());
                         row = row.child(
                             div()
                                 .id(SharedString::from(format!("sort-{pi}-{name}")))
@@ -395,7 +421,9 @@ impl Workspace {
                         watch(&mark, window, cx);
                         watch(&name, window, cx);
                         name.read(cx).focus_handle(cx).focus(window, cx);
-                        rows.borrow_mut().push((String::new(), mark, name, Default::default()));
+                        let taken: Vec<String> = rows.borrow().iter().map(|row| row.0.clone()).collect();
+                        let id = crate::layers::new_space_id(&taken.iter().map(String::as_str).collect::<Vec<_>>());
+                        rows.borrow_mut().push((id, mark, name, Default::default()));
                         window.refresh();
                     })))
                     .when(sortable, |content| {
@@ -403,5 +431,45 @@ impl Workspace {
                     })
             })
         });
+    }
+
+    /// A space about to go holds settings of its own: they move to Global,
+    /// or go with it; or the space stays.
+    pub fn ask_space_settings(&mut self, id: String, name: String, held: usize, removed: std::rc::Rc<dyn Fn(&mut Window, &mut App)>, window: &mut Window, cx: &mut Context<Self>) {
+        let this = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (this, id, removed, also) = (this.clone(), id.clone(), removed.clone(), removed.clone());
+            let what = if held == 1 { "a setting".to_string() } else { format!("{held} settings") };
+            dialog
+                .title(format!("Remove the space {name}?"))
+                .w(px(460.))
+                .child(div().text_sm().child(format!(
+                    "It has {what} of its own, over Settings, for its projects. Moved to Settings, they apply to every project that sets none of its own. Its projects are then in no space."
+                )))
+                .footer(
+                    h_flex()
+                        .w_full()
+                        .gap_2()
+                        .child(div().flex_1())
+                        .child(Button::new("space-keep").ghost().label("Keep the space").on_click(|_, window, cx| window.close_dialog(cx)))
+                        .child(Button::new("space-drop-settings").outline().label("Remove with them").on_click(move |_, window, cx| {
+                            window.close_dialog(cx);
+                            also(window, cx);
+                        }))
+                        .child(Button::new("space-move-settings").primary().label("Move them to Settings").on_click(move |_, window, cx| {
+                            window.close_dialog(cx);
+                            let _ = this.update(cx, |w, cx| w.space_settings_to_global(&id, cx));
+                            removed(window, cx);
+                        })),
+                )
+        });
+    }
+
+    /// What a space sets, put into Settings (Global).
+    pub fn space_settings_to_global(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(space) = self.spaces.iter().find(|s| s.id == id) else { return };
+        let mut settings = crate::state::settings();
+        crate::layers::into_global(&space.settings, &mut settings);
+        self.apply_settings(settings, cx);
     }
 }

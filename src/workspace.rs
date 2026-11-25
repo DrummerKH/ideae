@@ -95,6 +95,28 @@ pub struct TaskEntry {
     /// A deferred task come back on its own: when it is first opened, its
     /// project's setup runs and its agent is told this (empty: nothing).
     pub woke: Option<String>,
+    /// Its tickets, request and addresses (state::TaskLink), and whether a
+    /// task of before them had them read out of its prompt and branch.
+    pub links: Vec<state::TaskLink>,
+    pub links_read: bool,
+    /// On a colleague's request, not one of yours: to review or go on with.
+    pub review: bool,
+}
+
+impl TaskEntry {
+    /// Its request as a link: added, or brought up to date.
+    pub fn set_pr_link(&mut self, pr: &crate::pr::Pr) {
+        let link = state::TaskLink { what: "pr".into(), key: format!("#{}", pr.number), url: pr.url.clone(), ..Default::default() };
+        match self.links.iter_mut().find(|l| l.what == "pr") {
+            Some(known) => *known = link,
+            None => self.links.push(link),
+        }
+    }
+
+    /// Its own ticket: the first.
+    pub fn ticket(&self) -> Option<&state::TaskLink> {
+        self.links.iter().find(|l| l.is_ticket())
+    }
 }
 
 pub mod agents_ui;
@@ -102,6 +124,9 @@ pub mod archive_ui;
 mod hosts_ui;
 mod merged_ui;
 pub mod automation;
+pub mod layered;
+mod links_ui;
+mod tickets_ui;
 pub mod present;
 pub mod questions;
 mod crew;
@@ -138,7 +163,7 @@ impl TaskEntry {
 pub struct Project {
     pub path: PathBuf,
     pub name: String,
-    /// The space it is sorted into; none, and it is in every one.
+    /// The space it is sorted into, by id; none, and it is in every one.
     pub space: Option<String>,
     pub collapsed: bool,
     pub tasks: Vec<TaskEntry>,
@@ -151,17 +176,17 @@ pub struct Project {
     /// in project_config, read from any thread.
     pub trusted: std::collections::BTreeMap<String, bool>,
     pub hints_off: std::collections::BTreeSet<String>,
-    /// The agent of its new tasks, by profile id; none for the default.
-    pub agent: Option<String>,
-    /// Where its new tasks branch from; empty for the remote's default.
-    pub base: String,
-    /// The folder its tasks' worktrees go in; empty for what Settings say.
-    pub worktrees: String,
-    /// No language servers in its tasks; its pull requests not asked of gh.
-    pub lsp_off: bool,
-    pub pr_off: bool,
-    /// A failed check back to the agent by itself, this many times in a row.
-    pub check_to_agent: u32,
+    /// Its own layer of the settings, and its team's: the `.ideae.toml` of
+    /// its main checkout, as last read (`team_read`, the text's hash).
+    pub settings: crate::layers::Overrides,
+    pub team: crate::layers::Overrides,
+    pub team_read: Option<u64>,
+    /// Whether its recent commits have tickets' keys in their subjects: a
+    /// task's commit box then starts with its ticket's key. Read once a run.
+    pub keys_in_history: Option<bool>,
+    /// What applies, all layers put together: worked out when one changes
+    /// (`Workspace::resolve_projects`), never while drawing.
+    pub resolved: std::sync::Arc<crate::layers::Resolved>,
     /// Branches of origin whose PR was merged, and when they were looked for.
     pub merged_branches: Vec<crate::merged_branches::MergedBranch>,
     pub merged_checked: Option<std::time::Instant>,
@@ -179,6 +204,11 @@ impl Project {
 }
 
 impl Project {
+    /// What applies to it of the layered settings.
+    pub fn values(&self) -> &crate::layers::Values {
+        &self.resolved.values
+    }
+
     fn new(path: PathBuf) -> Self {
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
         Self {
@@ -191,12 +221,11 @@ impl Project {
             check_auto: false,
             trusted: Default::default(),
             hints_off: Default::default(),
-            agent: None,
-            base: String::new(),
-            worktrees: String::new(),
-            lsp_off: false,
-            pr_off: false,
-            check_to_agent: 0,
+            settings: Default::default(),
+            team: Default::default(),
+            team_read: None,
+            keys_in_history: None,
+            resolved: Default::default(),
             merged_branches: Vec::new(),
             merged_checked: None,
             made_by_agents: Default::default(),
@@ -301,6 +330,9 @@ pub struct Workspace {
     shared: std::collections::HashMap<PathBuf, Vec<(PathBuf, Vec<String>)>>,
     /// When each project's base branch was last fetched in the background.
     fetched: std::collections::HashMap<PathBuf, std::time::Instant>,
+    /// Integrations whose reading went wrong this run: told once, and left
+    /// alone a while when the tracker asked to slow down.
+    pub(crate) ticket_trouble: std::collections::HashMap<String, (crate::integrations::IntError, std::time::Instant)>,
     /// The group of variants whose screen is in view, in place of a task.
     pub active_group: Option<String>,
     /// On the group's screen, the variant the menu bar's task items act on: the one clicked last.
@@ -377,13 +409,14 @@ impl Workspace {
 
     /// As `new`, with the state already read.
     pub fn with_state(
-        saved: State,
+        mut saved: State,
         repos: Vec<PathBuf>,
         agent: Option<Option<String>>,
         appearance: Option<Appearance>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        saved.normalize_layers();
         // Keys an older version kept in the state go to the sealed store.
         let mut settings = saved.settings.clone();
         if settings.agents.iter_mut().fold(false, |any, p| p.seal_secrets() || any) {
@@ -625,6 +658,22 @@ impl Workspace {
         })
         .detach();
 
+        // A ticket asked for from outside (deep_link): its task, or a new one.
+        let (asked_tx, asked_rx) = async_channel::unbounded::<String>();
+        // Not in the tests: one process's windows would take each other's.
+        if !cfg!(test) {
+            crate::deep_link::connect(asked_tx);
+            crate::deep_link::listen();
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            while let Ok(line) = asked_rx.recv().await {
+                if this.update_in(cx, |this, window, cx| this.open_asked(&line, window, cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+
         // Closing the window the window manager's way is the same as ×.
         let closing = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
@@ -690,6 +739,11 @@ impl Workspace {
                     if n % 5 == 2 {
                         this.fetch_bases(cx);
                     }
+                    // The team's settings: a minute after its file changed, five for a project elsewhere.
+                    if n % 20 == 11 {
+                        this.read_team_layers_of(n % 100 == 11, cx);
+                        this.read_key_history(window, cx);
+                    }
                     // Once a day, the first soon after start.
                     if n % 28_800 == 5 {
                         this.clean_up_archives(cx);
@@ -712,7 +766,7 @@ impl Workspace {
             starred_collapsed: saved.starred_collapsed,
             presenting: saved.presenting.as_ref().map(|p| present::Presenting::new(p.kept.iter().cloned().collect(), p.since)),
             spaces: saved.spaces.clone(),
-            space: saved.space.clone().filter(|name| saved.spaces.iter().any(|s| &s.name == name)),
+            space: saved.space_id.clone(),
             last_in_space: Default::default(),
             agent_override,
             hook_socket,
@@ -811,6 +865,7 @@ impl Workspace {
             touched: Default::default(),
             shared: Default::default(),
             fetched: Default::default(),
+            ticket_trouble: Default::default(),
             build: crate::build_watch::BuildWatch::new(),
             auto: Default::default(),
             archive_dir: crate::archive::root(),
@@ -822,6 +877,10 @@ impl Workspace {
             hook_tx: hook_tx.clone(),
         };
         this.restore(&saved, window, cx);
+        this.resolve_projects(cx);
+        // Tasks of before get their links once the teams' layers are read.
+        this.read_team_layers(cx);
+        this.read_key_history(window, cx);
         this.tell_what_is_hidden();
         // A presentation that was on is on again, with all that goes with it.
         if this.presenting.is_some() {
@@ -960,16 +1019,13 @@ impl Workspace {
     fn restore(&mut self, saved: &State, window: &mut Window, cx: &mut Context<Self>) {
         for p in &saved.projects {
             let mut project = Project::new(p.path.clone());
-            project.space = p.space.clone().filter(|name| saved.spaces.iter().any(|s| &s.name == name));
+            project.space = p.space_id.clone();
             project.collapsed = p.collapsed;
             project.check = p.check.clone();
             project.check_auto = p.check_auto;
-            (project.base, project.lsp_off, project.pr_off, project.check_to_agent) = (p.base.clone(), p.lsp_off, p.pr_off, p.check_to_agent);
-            project.worktrees = p.worktrees.clone();
-            git::set_project_worktrees(&project.path, &project.worktrees);
+            project.settings = p.settings.clone();
             project.trusted = p.trusted.clone();
             project.hints_off = p.hints_off.iter().cloned().collect();
-            project.agent = p.agent.clone();
             project.made_by_agents = p.made_by_agents.clone();
             crate::project_config::set_own(&p.path, p.own.clone());
             // What the judge said and how the checks went: paid for, kept.
@@ -1021,6 +1077,9 @@ impl Workspace {
                     questions: t.questions.clone(),
                     asked: t.asked,
                     spawned_by: t.spawned_by.clone(),
+                    links: t.links.clone(),
+                    links_read: t.links_read,
+                    review: t.review,
                 })
                 .collect();
             self.projects.push(project);
@@ -1083,7 +1142,8 @@ impl Workspace {
             starred_collapsed: self.starred_collapsed,
             presenting: self.presenting.as_ref().map(|p| state::PresentingState { kept: p.kept.iter().cloned().collect(), since: p.since }),
             spaces: self.spaces.clone(),
-            space: self.space.clone(),
+            space: self.space_name(self.space.as_deref()),
+            space_id: self.space.clone(),
             power_saving: crate::lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed),
             window: self.window_place.clone(),
             settings: state::settings(),
@@ -1094,21 +1154,25 @@ impl Workspace {
             projects: self
                 .projects
                 .iter()
-                .map(|p| ProjectState {
+                .map(|p| {
+                let old = crate::layers::OldFields::from_overrides(&p.settings);
+                ProjectState {
                     path: p.path.clone(),
-                    space: p.space.clone(),
+                    space: self.space_name(p.space.as_deref()),
+                    space_id: p.space.clone(),
+                    settings: p.settings.clone(),
                     collapsed: p.collapsed,
                     check: p.check.clone(),
                     check_auto: p.check_auto,
-                    base: p.base.clone(),
-                    worktrees: p.worktrees.clone(),
-                    lsp_off: p.lsp_off,
-                    pr_off: p.pr_off,
-                    check_to_agent: p.check_to_agent,
+                    base: old.base,
+                    worktrees: old.worktrees,
+                    lsp_off: old.lsp_off,
+                    pr_off: old.pr_off,
+                    check_to_agent: old.check_to_agent,
                     own: crate::project_config::own(&p.path),
                     trusted: p.trusted.clone(),
                     hints_off: p.hints_off.iter().cloned().collect(),
-                    agent: p.agent.clone(),
+                    agent: old.agent,
                     made_by_agents: p.made_by_agents.clone(),
                     verdicts: self
                         .judges
@@ -1154,8 +1218,12 @@ impl Workspace {
                             questions: t.questions.clone(),
                             asked: t.asked,
                             spawned_by: t.spawned_by.clone(),
+                            links: t.links.clone(),
+                            links_read: t.links_read,
+                            review: t.review,
                         })
                         .collect(),
+                }
                 })
                 .collect(),
         }
@@ -1204,11 +1272,12 @@ impl Workspace {
             crate::project_config::register(path, &self.projects[pi].path);
         }
         let entry = self.entry_mut(path)?;
-        let (root, branch, session, pr) = (entry.path.clone(), entry.branch.clone(), entry.session.clone(), entry.pr.clone());
+        let (root, branch, session, pr, links) = (entry.path.clone(), entry.branch.clone(), entry.session.clone(), entry.pr.clone(), entry.links.clone());
+        let commit_key = self.find(path).and_then(|(pi, ti)| self.commit_key(pi, ti));
         let fill = self.usage.get(path).map_or(0., |(_, usage)| usage.fill());
         let main = self.entry_mut(path).is_some_and(|entry| entry.main);
         let kept: Vec<String> = self.find(path).map(|(pi, _)| self.projects[pi].hints_off.iter().filter_map(|key| key.strip_prefix(automation::KEPT_BRANCH)).map(str::to_string).collect()).unwrap_or_default();
-        let lsp_off = self.find(path).is_some_and(|(pi, _)| self.projects[pi].lsp_off);
+        let lsp_off = self.find(path).is_some_and(|(pi, _)| !self.projects[pi].values().language_servers);
         // Its own agent was not running when the app last stopped.
         let slept = session.tabs.iter().any(|tab| tab.kind == "slept-agent");
         let quiet = slept || self.quiet_start.contains(path) || (self.last_run.remove(path) && session.tabs.iter().any(|tab| tab.kind == "paused-agent"));
@@ -1223,6 +1292,8 @@ impl Workspace {
             if let Some(entry) = self.find(path).map(|(pi, ti)| &self.projects[pi].tasks[ti]) {
                 self.give_questions(entry, &mut t);
             }
+            t.links = links;
+            t.set_commit_key(commit_key, window, cx);
             t.restore(&session, window, cx);
             t.pr = pr;
             t.main_thread = main;
@@ -1345,14 +1416,14 @@ impl Workspace {
     fn refresh_prs(&mut self, now: bool, window: &mut Window, cx: &mut Context<Self>) {
         use crate::pr::PrState;
         // Not while saving power: each asks GitHub. What is known stays on the rows.
-        if !state::settings().pr_status || crate::lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed) {
+        if crate::lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
         use std::time::Duration;
         let mut due = Vec::new();
         // A remote project's too, once its host is connected: gh is asked here,
         // of the repository its origin there names.
-        for p in self.projects.iter_mut().filter(|p| !p.pr_off && crate::hostfs::reachable(&p.path)) {
+        for p in self.projects.iter_mut().filter(|p| p.values().pull_requests && crate::hostfs::reachable(&p.path)) {
             for t in &mut p.tasks {
                 if t.main || t.busy.is_some() {
                     continue;
@@ -1399,8 +1470,11 @@ impl Workspace {
                     found
                 }))
                 .await;
-            let _ = this.update(cx, |this, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
                 for (path, pr) in found {
+                    if let Some(old) = this.find(&path).and_then(|(pi, ti)| this.projects[pi].tasks[ti].pr.clone()) {
+                        this.request_changed(&path, &old, pr.as_ref(), window, cx);
+                    }
                     // A PR merged since: its branch may be left on origin.
                     let merged = |pr: &Option<crate::pr::Pr>| pr.as_ref().is_some_and(|pr| pr.state == PrState::Merged);
                     if merged(&pr) && this.entry_mut(&path).is_some_and(|entry| !merged(&entry.pr)) {
@@ -1409,9 +1483,14 @@ impl Workspace {
                         }
                     }
                     if let Some(entry) = this.entry_mut(&path) {
+                        if let Some(pr) = &pr {
+                            entry.set_pr_link(pr);
+                        }
                         if let Some(view) = &entry.view {
+                            let links = entry.links.clone();
                             view.update(cx, |t, cx| {
                                 t.pr = pr.clone();
+                                t.links = links;
                                 cx.notify();
                             });
                         }
@@ -1789,7 +1868,13 @@ impl Workspace {
     /// Asks for a title and, if you like, what to tell the agent; then makes
     /// the branch and worktree.
     pub fn new_task_dialog(&mut self, project: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.new_task_dialog_with(project, None, window, cx)
+    }
+
+    /// New task, its title and prompt filled in: a follow-up of a ticket's task.
+    pub fn new_task_dialog_with(&mut self, project: usize, filled: Option<(String, String)>, window: &mut Window, cx: &mut Context<Self>) {
         use gpui_kit::component::input::{Textarea, TextareaState};
+        let prefill = filled;
         let Some(p) = self.projects.get(project) else { return };
         let name = p.name.clone();
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("What is it about? DEV-123 Fix login, or plain words"));
@@ -1833,6 +1918,7 @@ impl Workspace {
         // A ticket in the title fills the prompt, unless you wrote one yourself.
         // Left as it was filled, it is sent: there is nothing to finish.
         let filled: Rc<RefCell<String>> = Rc::default();
+        let filled_by_dialog = filled.clone();
         let as_filled = {
             let filled = filled.clone();
             move |text: &str| !text.is_empty() && text == filled.borrow().trim()
@@ -1869,13 +1955,55 @@ impl Workspace {
         let from_link: Rc<RefCell<Option<(String, String)>>> = Rc::default();
         let fetch: Rc<RefCell<Option<Task<()>>>> = Rc::default();
         let repo = p.path.clone();
+        let integrations = crate::integrations::of_resolved(&p.resolved);
+        let template = p.values().branch.clone();
+        let keyed_history = p.keys_in_history == Some(true);
+        // The same ticket's task, open or archived: one ticket, one task.
+        let existing: Rc<RefCell<Option<Existing>>> = Rc::default();
+        let read_texts: Rc<RefCell<std::collections::HashMap<String, String>>> = Rc::default();
+        let archived: Rc<RefCell<Vec<(String, crate::archive::Archived)>>> = Rc::default();
+        {
+            // Read once, off the UI thread, as the dialog opens: no network, the archives here.
+            let (root, project_path, archived) = (self.archive_dir.clone(), repo.clone(), archived.clone());
+            cx.spawn(async move |_, cx| {
+                let found = cx
+                    .background_spawn(async move {
+                        crate::archive::list(&root)
+                            .into_iter()
+                            .filter(|a| a.meta.project == project_path)
+                            .flat_map(|a| {
+                                let mut keys: Vec<String> = a.meta.links.iter().filter(|l| l.is_ticket()).map(|l| l.key.clone()).collect();
+                                keys.extend(crate::integrations::tickets::key_at_start(&a.meta.title).map(str::to_string));
+                                keys.extend(crate::integrations::tickets::keys_in(&a.meta.branch));
+                                keys.dedup();
+                                keys.into_iter().map(move |k| (k, a.clone()))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .await;
+                *archived.borrow_mut() = found;
+            })
+            .detach();
+        }
         {
             let prompt = prompt.clone();
-            listening.push(cx.subscribe_in(&input, window, move |_, input, event: &InputEvent, window, cx| {
+            let (existing, archived, integrations, read_texts) = (existing.clone(), archived.clone(), integrations.clone(), read_texts.clone());
+            listening.push(cx.subscribe_in(&input, window, move |this, input, event: &InputEvent, window, cx| {
                 if !matches!(event, InputEvent::Change) {
                     return;
                 }
                 let title = input.read(cx).value().trim().to_string();
+                let key = crate::integrations::tickets::ticket_in(&title, &integrations).filter(|f| f.own_issue.is_none()).map(|f| f.ticket.key);
+                *existing.borrow_mut() = key.and_then(|key| {
+                    let open = this.projects.iter().flat_map(|p| &p.tasks).find(|t| {
+                        !t.main && (t.links.iter().any(|l| l.is_ticket() && l.key == key) || crate::integrations::tickets::key_at_start(&t.title) == Some(key.as_str()))
+                    });
+                    match open {
+                        Some(t) => Some(Existing::Open(key, t.path.clone(), t.label())),
+                        None => archived.borrow().iter().find(|(k, _)| *k == key).map(|(_, a)| Existing::Archived(key, a.clone())),
+                    }
+                });
+                window.refresh();
                 let current = prompt.read(cx).value().to_string();
                 if !current.trim().is_empty() && current != *filled.borrow() {
                     return;
@@ -1886,48 +2014,72 @@ impl Workspace {
                 };
                 // A link pasted: the key names the task, the link goes to the agent.
                 // A Linear link has the issue's words too: the branch is named at once.
-                if let Some((key, words, url)) = linear_link(&title) {
-                    *fetch.borrow_mut() = None;
-                    let told = format!("Linear issue {key} ({url}): read it, its description and comments, and do what it asks.");
-                    *from_link.borrow_mut() = Some((key.clone(), told.clone()));
-                    set(told, window, cx);
-                    let short = title.replace(&url, &format!("{key} {words}")).split_whitespace().collect::<Vec<_>>().join(" ");
-                    let input = input.clone();
-                    window.defer(cx, move |window, cx| input.update(cx, |i, cx| i.set_value(short, window, cx)));
-                    return;
-                }
                 // Filled now: the title set from here is no change the input tells of.
-                if let Some((key, url)) = jira_link(&title) {
+                let found = crate::integrations::tickets::ticket_in(&title, &integrations);
+                if let Some(found) = found.as_ref().filter(|f| f.pasted.is_some() && f.ticket.kind.is_some_and(|k| k.keyed())) {
                     *fetch.borrow_mut() = None;
-                    let told = format!("Jira issue {key} ({url}): read it, its description and comments, and do what it asks.");
+                    let (key, url) = (found.ticket.key.clone(), found.pasted.clone().unwrap_or_default());
+                    let told = told_of(found, keyed_history);
                     *from_link.borrow_mut() = Some((key.clone(), told.clone()));
                     set(told, window, cx);
-                    let short = title.replace(&url, &key).split_whitespace().collect::<Vec<_>>().join(" ");
+                    let named = if found.words.is_empty() { key } else { format!("{key} {}", found.words) };
+                    let short = title.replace(&url, &named).split_whitespace().collect::<Vec<_>>().join(" ");
                     let input = input.clone();
                     window.defer(cx, move |window, cx| input.update(cx, |i, cx| i.set_value(short, window, cx)));
                     return;
                 }
-                if let Some(key) = jira_key(&title) {
+                // An issue of the project's own repository: `#12`, or its link.
+                let own = found.as_ref().and_then(|f| f.own_issue.or_else(|| f.ticket.kind.filter(|k| !k.keyed()).and_then(|_| f.ticket.key.rsplit_once('#')?.1.parse().ok())));
+                if let Some(key) = found.as_ref().filter(|f| f.ticket.kind.is_none_or(|k| k.keyed()) && f.own_issue.is_none()).map(|f| f.ticket.key.clone()) {
                     *fetch.borrow_mut() = None;
-                    let linked = from_link.borrow().clone().filter(|(k, _)| k == key).map(|(_, told)| told);
-                    set(linked.unwrap_or_else(|| format!("Jira issue {key}: read it, its description and comments, and do what it asks.")), window, cx);
-                } else if let Some(number) = github_issue(&title) {
+                    let linked = from_link.borrow().clone().filter(|(k, _)| *k == key).map(|(_, told)| told);
+                    // A ticket read already in this dialog: its words again, not asked twice.
+                    let read_before = read_texts.borrow().get(&key).cloned();
+                    set(read_before.clone().or(linked).unwrap_or_else(|| told_of(found.as_ref().expect("found"), keyed_history)), window, cx);
+                    // Read with your token, once typing pauses: the ticket's title names the task and its
+                    // branch at once, its words go into the prompt you see.
+                    let reader = found.as_ref().and_then(|f| f.ticket.integration.clone()).and_then(|id| integrations.iter().find(|i| i.id == id && i.connected).cloned());
+                    if let Some(reader) = reader.filter(|_| read_before.is_none()) {
+                        let (input, prompt, filled, this, read_texts) = (input.clone(), prompt.clone(), filled.clone(), cx.weak_entity(), read_texts.clone());
+                        let task = window.spawn(cx, async move |cx| {
+                            cx.background_executor().timer(std::time::Duration::from_millis(400)).await;
+                            let Ok(read) = this.update_in(cx, |w, window, cx| w.read_ticket(reader.clone(), key.clone(), window, cx)) else { return };
+                            let Ok(body) = read.await else { return };
+                            let _ = cx.update(|window, cx| {
+                                let typed = input.read(cx).value().trim().to_string();
+                                let current = prompt.read(cx).value().to_string();
+                                if current.trim().is_empty() || current == *filled.borrow() {
+                                    let url = reader.tracker().map(|t| t.url_for(&body.key)).unwrap_or_default();
+                                    let text = crate::integrations::read::told(&body, reader.kind, &url);
+                                    read_texts.borrow_mut().insert(key.clone(), text.clone());
+                                    read_texts.borrow_mut().insert(body.key.clone(), text.clone());
+                                    *filled.borrow_mut() = text.clone();
+                                    prompt.update(cx, |p, cx| p.set_value(text, window, cx));
+                                }
+                                if typed == key && !body.title.is_empty() {
+                                    input.update(cx, |i, cx| i.set_value(format!("{} {}", body.key, body.title), window, cx));
+                                }
+                            });
+                        });
+                        *fetch.borrow_mut() = Some(task);
+                    }
+                } else if let Some(number) = own {
                     let (repo, input, prompt, filled) = (repo.clone(), input.clone(), prompt.clone(), filled.clone());
                     let task = window.spawn(cx, async move |cx| {
                         cx.background_executor().timer(std::time::Duration::from_millis(400)).await;
-                        let issue = cx.background_spawn(crate::procs::on_thread(move || { gh_issue(&repo, number) })).await;
+                        let issue = cx.background_spawn(crate::procs::on_thread(move || repo_issue(&repo, number))).await;
                         let Some((issue_title, body)) = issue else { return };
                         let _ = cx.update(|window, cx| {
                             let current = prompt.read(cx).value().to_string();
                             if !current.trim().is_empty() && current != *filled.borrow() {
                                 return;
                             }
-                            let text = format!("GitHub issue #{number}: {issue_title}\n\n{}\n", body.trim());
+                            let text = format!("Issue #{number}: {issue_title}\n\n{}\n", body.trim());
                             *filled.borrow_mut() = text.clone();
                             prompt.update(cx, |p, cx| p.set_value(text, window, cx));
                             // Only the reference typed: the issue's title names the task.
                             let typed = input.read(cx).value().trim().to_string();
-                            if github_issue(&typed) == Some(number) && typed.split_whitespace().count() == 1 {
+                            if typed == format!("#{number}") {
                                 input.update(cx, |i, cx| i.set_value(format!("#{number} {issue_title}"), window, cx));
                             }
                         });
@@ -1944,8 +2096,37 @@ impl Workspace {
         listening.push(cx.subscribe_in(&prompt, window, move |this, _, event: &InputEvent, window, cx| on_enter(this, event, window, cx)));
         let listening = Rc::new(listening);
         let focused = std::rc::Rc::new(std::cell::Cell::new(false));
+        let this_for_existing = cx.weak_entity();
+        // A ticket's link copied before New task: offered, not put in unasked.
+        let from_clipboard = if prefill.is_none() && state::with_settings(|s| s.tickets) {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .map(|text| text.trim().to_string())
+                .filter(|text| text.len() < 2048 && text.starts_with("http") && !text.contains(char::is_whitespace))
+                .and_then(|url| crate::integrations::tickets::ticket_of_url(&url, &integrations).map(|f| (f.ticket.key, url)))
+        } else {
+            None
+        };
+        // Filled in: the title as typed (its ticket read from it), then the prompt over what that gave.
+        if let Some((title, mut text)) = prefill {
+            // Set here, the title tells no change: its ticket's prompt is made here too.
+            if text.is_empty()
+                && let Some(found) = crate::integrations::tickets::ticket_in(&title, &integrations).filter(|f| f.own_issue.is_none())
+            {
+                text = told_of(&found, keyed_history);
+                *filled_by_dialog.borrow_mut() = text.clone();
+            }
+            input.update(cx, |i, cx| i.set_value(title, window, cx));
+            let prompt = prompt.clone();
+            if !text.is_empty() {
+                window.defer(cx, move |window, cx| prompt.update(cx, |p, cx| p.set_value(text, window, cx)));
+            }
+        }
         window.open_dialog(cx, move |dialog, _, cx| {
             let (input, prompt, submit, focused) = (input.clone(), prompt.clone(), submit.clone(), focused.clone());
+            let (same, go) = (existing.borrow().clone(), this_for_existing.clone());
+            let template = template.clone();
+            let clipboard = from_clipboard.clone().filter(|_| input.read(cx).value().trim().is_empty());
             let (count, notes, agents) = (count.clone(), notes.clone(), agents.clone());
             let _ = &listening;
             let many = count.get();
@@ -1975,8 +2156,20 @@ impl Workspace {
                                 div()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(branch_hint(&input.read(cx).value())),
+                                    .child(branch_hint(&input.read(cx).value(), &template)),
                             )
+                            .when_some(same.clone(), |form, same| form.child(existing_row(same, go.clone(), cx)))
+                            .when_some(clipboard.clone(), |form, (key, url)| {
+                                let input = input.clone();
+                                form.child(
+                                    h_flex()
+                                        .gap_2()
+                                        .child(div().flex_1().text_xs().text_color(cx.theme().muted_foreground).child(format!("Copied: {key}")))
+                                        .child(Button::new("clipboard-ticket").xsmall().outline().label(format!("Create from {key}")).on_click(move |_, window, cx| {
+                                            input.update(cx, |i, cx| i.set_value(url.clone(), window, cx));
+                                        })),
+                                )
+                            })
                             .child(Textarea::new(&prompt))
                             .when(many == 1 && (several || agents_ui::model_picker("probe", agents[0].clone()).is_some()), |form| {
                                 form.child(
@@ -2110,14 +2303,21 @@ impl Workspace {
         if notes.len() > 1 {
             return self.create_variants(project, title, prompt, notes, agents, window, cx);
         }
+        // A colleague's request pasted: a task on its branch.
+        if let Some((kind, number, url)) = title.split_whitespace().find_map(|w| crate::integrations::request_of_url(w).map(|(k, n)| (k, n, w.to_string()))) {
+            return self.create_request_task(project, kind, number, url, prompt, agents, given, window, cx);
+        }
         let Some(p) = self.projects.get_mut(project) else { return };
-        let branch = naming::branch_name(&title);
-        let (repo, base) = (p.path.clone(), p.base.clone());
+        let branch = naming::branch_name_as(&title, &p.values().branch);
+        let (repo, base) = (p.path.clone(), p.values().base.clone());
         let path = git::task_worktree_dir(&repo, &branch);
         p.collapsed = false;
+        let links = crate::integrations::tickets::links_for_task(&title, &prompt, &crate::integrations::of_resolved(&p.resolved));
         p.tasks.push(TaskEntry {
             path: path.clone(),
             branch: branch.clone(),
+            links,
+            links_read: true,
             title,
             last_active: state::now(),
             busy: Some("creating…".into()),
@@ -2128,6 +2328,9 @@ impl Workspace {
             fresh: true,
             ..Default::default()
         });
+        if let Some(link) = self.projects[project].tasks.last().and_then(|t| t.ticket().cloned()) {
+            self.ask_for_integration(project, &link, window, cx);
+        }
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let copy_env = state::settings().copy_env;
@@ -2155,6 +2358,7 @@ impl Workspace {
                             this.switch(&path, window, cx);
                         }
                         this.task_made(&path, window, cx);
+                        this.check_ticket(&path, window, cx);
                         // To its own agent: the task in view is another when the switch did not happen.
                         let view = this.entry_mut(&path).and_then(|entry| entry.view.clone());
                         if let (false, Some(view)) = (prompt.is_empty(), view) {
@@ -2636,7 +2840,7 @@ impl Workspace {
     fn name_ticket_task(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
         let Some(entry) = self.entry_mut(path) else { return };
         let key = entry.title.trim().to_string();
-        if entry.main || !entry.group.is_empty() || jira_key(&key) != Some(key.as_str()) {
+        if entry.main || !entry.group.is_empty() || crate::integrations::tickets::key_at_start(&key) != Some(key.as_str()) {
             return;
         }
         let said = entry.view.as_ref().and_then(|v| v.read(cx).agent.said.as_ref().map(|s| s.whole.to_string()));
@@ -2880,7 +3084,7 @@ impl Workspace {
     fn launch_for(&mut self, path: &Path) -> Option<crate::agents::Launch> {
         use crate::agents::{Launch, Start};
         let (pi, ti) = self.find(path)?;
-        let project_agent = self.projects[pi].agent.clone();
+        let project_agent = self.projects[pi].values().agent.clone();
         let t = &mut self.projects[pi].tasks[ti];
         if t.side.is_some() {
             return None;
@@ -2893,7 +3097,7 @@ impl Workspace {
             None => {
                 let settings = state::settings();
                 let last = t.sessions.last().map(|s| s.profile.clone()).unwrap_or_default();
-                crate::agents::resolve(&settings.agents, &[&last, &t.agent], project_agent.as_deref(), &settings.default_agent)?.clone()
+                crate::agents::resolve(&settings.agents, &[&last, &t.agent], Some(&project_agent), &settings.default_agent)?.clone()
             }
         };
         let same = t.sessions.last().is_some_and(|s| s.profile == profile.id);
@@ -2930,9 +3134,10 @@ impl Workspace {
             None => {}
         }
         state::set_settings(new.clone());
+        self.resolve_projects(cx);
         // The keys of profiles that are gone.
         for scope in crate::secrets::scopes() {
-            if scope.starts_with("lsp:") {
+            if scope.starts_with("lsp:") || crate::integrations::secret_store::is_token_scope(&scope) {
                 continue;
             }
             let (profile, name) = scope.split_once('/').unwrap_or_default();
@@ -3336,84 +3541,71 @@ fn yield_now() -> impl std::future::Future<Output = ()> {
     })
 }
 
-/// Names of standards and the like that look like a ticket's key: a title
-/// "SHA-256 for uploads" asks for no Jira issue.
-const NOT_TICKETS: [&str; 22] = [
-    "AES", "BASE", "COVID", "CP", "ECMA", "ES", "GPT", "HTTP", "IEC", "IEEE", "ISO", "MD", "PEP", "PSR", "RFC", "RSA", "SHA", "SSL", "TLS", "UCS",
-    "UTF", "WCAG",
-];
-
-fn jira_key(title: &str) -> Option<&str> {
-    let first = title.split_whitespace().next()?;
-    let (project, number) = first.split_once('-')?;
-    // Jira's project keys have two characters at least.
-    let ok = project.len() >= 2
-        && !NOT_TICKETS.contains(&project)
-        && project.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-        && project.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
-        && !number.is_empty()
-        && number.chars().all(|c| c.is_ascii_digit());
-    ok.then_some(first)
+/// What a new task's agent is told of the ticket its title names.
+fn told_of(found: &crate::integrations::tickets::Found, keyed_history: bool) -> String {
+    let what = match found.ticket.kind {
+        Some(kind) => format!("{} issue", kind.label()),
+        None => "Ticket".to_string(),
+    };
+    let key = &found.ticket.key;
+    let told = match &found.ticket.url {
+        Some(url) => format!("{what} {key} ({url}): read it, its description and comments, and do what it asks."),
+        None => format!("{what} {key}: read it, its description and comments, and do what it asks."),
+    };
+    // Where the project's commits carry keys, its tracker finds them by it.
+    if keyed_history && crate::integrations::tickets::is_key(key) { format!("{told} Start each commit's subject with {key}.") } else { told }
 }
 
-/// A Jira issue's link in a title (`…/browse/DEV-123`, `…?selectedIssue=DEV-123`):
-/// its key and the link.
-fn jira_link(title: &str) -> Option<(String, String)> {
-    title.split_whitespace().filter(|w| w.starts_with("http")).find_map(|url| {
-        let (_, after) = url.split_once("/browse/").or_else(|| url.split_once("selectedIssue="))?;
-        // A link has the key as Jira writes it; one typed by hand may not.
-        let key: String = after.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '-').collect::<String>().to_ascii_uppercase();
-        jira_key(&key)?;
-        Some((key, url.to_string()))
-    })
+/// An issue's title and body, asked of the project's code host (GitHub,
+/// GitLab) from here: its repository read where it is, here or on its host.
+fn repo_issue(repo: &Path, number: u64) -> Option<(String, String)> {
+    crate::integrations::code_host(repo).and_then(|host| host.issue(repo, number)).ok()
 }
 
-/// A Linear issue's link in a title (`linear.app/team/issue/ENG-123/fix-the-login`):
-/// its key, the words of its title as the link has them, and the link.
-fn linear_link(title: &str) -> Option<(String, String, String)> {
-    title.split_whitespace().filter(|w| w.starts_with("http") && w.contains("linear.app/")).find_map(|url| {
-        let (_, after) = url.split_once("/issue/")?;
-        let mut parts = after.split(['/', '?', '#']);
-        let key = parts.next()?.to_ascii_uppercase();
-        jira_key(&key)?;
-        let words = parts.next().unwrap_or_default().replace('-', " ");
-        Some((key, words.trim().to_string(), url.to_string()))
-    })
+/// A task of the same ticket as the one being made: open, or archived.
+#[derive(Clone)]
+enum Existing {
+    Open(String, PathBuf, String),
+    Archived(String, crate::archive::Archived),
 }
 
-/// "#123" at the start of a title, or a GitHub issue link in it.
-fn github_issue(title: &str) -> Option<u64> {
-    let first = title.split_whitespace().next()?;
-    if let Some(n) = first.strip_prefix('#') {
-        return n.parse().ok();
-    }
-    let (_, rest) = title.split_once("/issues/")?;
-    rest.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+/// Under a new task's title: the ticket has a task already; go to it, or
+/// restore it. Making a new one anyway is the dialog's own button.
+fn existing_row(same: Existing, this: WeakEntity<Workspace>, cx: &App) -> impl IntoElement {
+    let muted = cx.theme().muted_foreground;
+    let (said, button): (String, Button) = match same {
+        Existing::Open(key, path, label) => (
+            format!("{key} has a task already: {label}."),
+            Button::new("same-ticket-switch").xsmall().outline().label("Switch to it").on_click(move |_, window, cx| {
+                window.close_dialog(cx);
+                let _ = this.update(cx, |w, cx| w.switch(&path, window, cx));
+            }),
+        ),
+        Existing::Archived(key, item) => (
+            format!("{key} was worked on in an archived task: {}.", item.meta.title),
+            Button::new("same-ticket-restore").xsmall().outline().label("Restore…").on_click(move |_, window, cx| {
+                window.close_dialog(cx);
+                let item = item.clone();
+                let _ = this.update(cx, |w, cx| w.restore_dialog(item, window, cx));
+            }),
+        ),
+    };
+    h_flex()
+        .id("same-ticket")
+        .test_support()
+        .gap_2()
+        .child(div().flex_1().text_xs().text_color(muted).child(said))
+        .child(button)
 }
 
-/// The issue's title and body, by `gh` in the repository.
-fn gh_issue(repo: &Path, number: u64) -> Option<(String, String)> {
-    let out = crate::procs::command("gh")
-        .current_dir(repo)
-        .env("GH_PROMPT_DISABLED", "1")
-        .args(["issue", "view", &number.to_string(), "--json", "title,body"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    Some((v["title"].as_str()?.to_string(), v["body"].as_str().unwrap_or_default().to_string()))
-}
-
-fn branch_hint(title: &str) -> String {
+fn branch_hint(title: &str, template: &str) -> String {
     let title = title.trim();
     if title.is_empty() {
         "The branch name comes from the title.".into()
-    } else if jira_key(title) == Some(title) {
+    } else if crate::integrations::tickets::key_at_start(title) == Some(title) {
         format!("Branch: {title}. The title is named from what its agent reads in the issue")
     } else {
-        let branch = naming::preview(title);
+        let branch = naming::preview(title, template);
         format!("Branch: {branch}")
     }
 }
@@ -3522,22 +3714,10 @@ mod ticket_tests {
     }
 
     #[test]
-    fn a_jira_link_is_its_key() {
-        let link = "https://example.atlassian.net/browse/DEV-26674";
-        assert_eq!(super::jira_link(link), Some(("DEV-26674".into(), link.into())));
-        let board = "see https://example.atlassian.net/jira/software/projects/DEV/boards/1?selectedIssue=DEV-7&x=1";
-        assert_eq!(super::jira_link(board).map(|(key, _)| key), Some("DEV-7".into()));
-        assert_eq!(super::jira_link("https://example.atlassian.net/browse/dev-5").map(|(key, _)| key), Some("DEV-5".into()));
-        assert_eq!(super::jira_link("https://example.com/browse/notakey"), None);
-        assert_eq!(super::jira_link("DEV-1 Fix login"), None, "a key typed is not a link");
-        assert_eq!(super::jira_key("DEV-1 Fix login"), Some("DEV-1"));
-        assert_eq!(super::jira_key("AB2-77"), Some("AB2-77"));
-        for title in ["SHA-256 for uploads", "UTF-8 file names", "ISO-8601 dates", "GPT-4 prompts", "A-1 grid", "dev-1"] {
-            assert_eq!(super::jira_key(title), None, "{title}");
-        }
+    fn a_ticket_s_words_name_its_branch() {
         let linear = "https://linear.app/acme/issue/ENG-123/fix-the-login-form";
-        assert_eq!(super::linear_link(linear), Some(("ENG-123".into(), "fix the login form".into(), linear.into())));
-        assert_eq!(crate::naming::branch_name("ENG-123 fix the login form"), "ENG-123_fixTheLoginForm");
-        assert_eq!(super::linear_link("https://linear.app/acme/issue/ENG-9").map(|l| l.1), Some(String::new()), "no words: named after the first turn");
+        let found = crate::integrations::tickets::ticket_in(linear, &[]).unwrap();
+        assert_eq!(crate::naming::branch_name(&format!("{} {}", found.ticket.key, found.words)), "ENG-123_fixTheLoginForm");
+        assert_eq!(super::told_of(&found, false), format!("Linear issue ENG-123 ({linear}): read it, its description and comments, and do what it asks."));
     }
 }

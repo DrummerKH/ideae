@@ -282,6 +282,49 @@ pub fn write_file(dir: &Path, config: &Config) -> Result<(), String> {
     crate::hostfs::write(&path, out.as_bytes()).map_err(|e| format!("{FILE}: {e}"))
 }
 
+/// `text` (a `.ideae.toml`, or none) with an integration for the team
+/// under `[integrations.<id>]`: its kind, address and keys; no secret, no
+/// one's agent. What else the file says stays.
+pub fn render_integration(text: Option<&str>, entry: &crate::layers::Entry) -> Result<String, String> {
+    use toml_edit::{Array, DocumentMut, Item, Table, value};
+    let mut doc: DocumentMut = text.unwrap_or("").parse().map_err(|e| format!("{FILE}: {e}"))?;
+    if !doc.get("integrations").is_some_and(Item::is_table) {
+        let mut all = Table::new();
+        all.set_implicit(true);
+        doc.insert("integrations", Item::Table(all));
+    }
+    let all = doc["integrations"].as_table_mut().expect("a table");
+    let mut table = Table::new();
+    if let Some(kind) = &entry.kind {
+        table.insert("kind", value(kind.as_str()));
+    }
+    if let Some(url) = &entry.url {
+        table.insert("url", value(url.as_str()));
+    }
+    if let Some(name) = &entry.name {
+        table.insert("name", value(name.as_str()));
+    }
+    if let Some(keys) = entry.keys.as_ref().filter(|k| !k.is_empty()) {
+        let mut array = Array::new();
+        for key in keys {
+            array.push(key.as_str());
+        }
+        table.insert("keys", value(array));
+    }
+    all.insert(&entry.id, Item::Table(table));
+    let out = doc.to_string();
+    Ok(if text.is_none() { format!("{HEADER}\n{}", out.trim_start()) } else { out })
+}
+
+/// Adds an integration for the team to the `.ideae.toml` in `dir`: on an
+/// explicit choice only, never by itself.
+pub fn write_integration(dir: &Path, entry: &crate::layers::Entry) -> Result<(), String> {
+    let path = dir.join(FILE);
+    let text = crate::hostfs::read_to_string(&path).ok();
+    let out = render_integration(text.as_deref(), entry)?;
+    crate::hostfs::write(&path, out.as_bytes()).map_err(|e| format!("{FILE}: {e}"))
+}
+
 // ---------------------------------------------------------------- suggestions
 
 /// What the project's own files say it needs, offered, never put in by itself.
@@ -786,6 +829,17 @@ mod tests {
         assert_ne!(trust_key(&a), trust_key(&moved), "the same command elsewhere is another");
         assert_eq!(trust_key(&TaskSetup::default()), None);
         assert_eq!(trust_key(&a).map(|k| k.len()), Some(32));
+    }
+
+    #[test]
+    fn an_integration_for_the_team_goes_into_the_file() {
+        let entry = crate::layers::Entry { id: "acme".into(), kind: Some("jira".into()), url: Some("https://example.atlassian.net".into()), keys: Some(vec!["DEV".into()]), ..Default::default() };
+        let text = "# ours\n[task]\ncheck = \"cargo test\"\n";
+        let out = super::render_integration(Some(text), &entry).unwrap();
+        assert!(out.starts_with("# ours\n[task]"), "{out}");
+        let layer = crate::layers::team_layer(&out).unwrap();
+        assert_eq!(layer.integrations, vec![entry]);
+        assert_eq!(super::parse(&out).unwrap().task.check, "cargo test");
     }
 
     #[test]

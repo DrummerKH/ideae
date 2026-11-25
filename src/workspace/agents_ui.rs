@@ -100,18 +100,17 @@ pub fn handoff(title: &str, prompt: &str, before: &str, said: Option<&str>, base
 
 impl Workspace {
     /// The agent new tasks of a project run, by profile id: its own
-    /// choice, else the default.
+    /// choice, else its space's, else the default.
     pub fn project_agent(&self, pi: usize) -> String {
-        let own = self.projects.get(pi).and_then(|p| p.agent.clone());
-        state::with_settings(|s| own.filter(|id| s.profile(id).is_some()).or_else(|| s.default_profile().map(|p| p.id.clone())).unwrap_or_default())
+        let chosen = self.projects.get(pi).map(|p| p.values().agent.clone());
+        state::with_settings(|s| chosen.filter(|id| s.profile(id).is_some()).or_else(|| s.default_profile().map(|p| p.id.clone())).unwrap_or_default())
     }
 
+    /// The project's own choice of agent; none for its space's or the default.
     pub fn set_project_agent(&mut self, pi: usize, agent: Option<String>, cx: &mut Context<Self>) {
-        if let Some(p) = self.projects.get_mut(pi) {
-            p.agent = agent;
-            self.save_later(cx);
-            cx.notify();
-        }
+        let Some(p) = self.projects.get(pi) else { return };
+        let settings = crate::layers::Overrides { agent, ..p.settings.clone() };
+        self.set_project_settings(pi, settings, cx);
     }
 
     /// Which agent a task runs now.
@@ -127,8 +126,8 @@ impl Workspace {
             return Some(launch.profile);
         }
         let last = t.sessions.last().map(|s| s.profile.clone()).unwrap_or_default();
-        let project = self.projects[pi].agent.clone();
-        state::with_settings(|s| agents::resolve(&s.agents, &[&last, &t.agent], project.as_deref(), &s.default_agent).cloned())
+        let project = self.projects[pi].values().agent.clone();
+        state::with_settings(|s| agents::resolve(&s.agents, &[&last, &t.agent], Some(&project), &s.default_agent).cloned())
     }
 
     /// Asks which agent carries the task on.

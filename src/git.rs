@@ -1878,31 +1878,45 @@ pub fn push(root: &Path, has_upstream: bool) -> Result<String, String> {
     }
 }
 
-/// The branch's pull request URL, creating the PR (from the commits) if needed.
-pub fn pull_request(root: &Path, has_upstream: bool) -> Result<String, String> {
-    if crate::hosts::is_remote(root) {
-        return remote_pull_request(root, has_upstream);
-    }
-    if let Ok(url) = run(root, "gh", &["pr", "view", "--json", "url", "-q", ".url"]) {
-        return Ok(url);
-    }
-    push(root, has_upstream)?;
-    let out = run(root, "gh", &["pr", "create", "--fill"])?;
-    Ok(out.lines().rev().find(|l| l.starts_with("http")).unwrap_or(&out).to_string())
+/// The branch's pull request (GitHub) or merge request (GitLab), made
+/// from its commits if there is none: pushed where the checkout is, asked
+/// for here, where gh or glab has the user's sign-in. As `gh pr create
+/// --fill` does, one commit gives its subject and body, several the
+/// branch's name and their subjects.
+/// What a request says of its task's tickets: its key for the title, and
+/// a line for each (`Fixes DEV-1`, `Refs DEV-1`), none when `closes` is none.
+#[derive(Clone, Debug, Default)]
+pub struct RequestText {
+    pub title_template: String,
+    pub key: String,
+    pub tickets: Vec<(String, String)>,
+    pub closes: String,
 }
 
-/// A remote task's PR: pushed there, asked for here, where gh has the
-/// user's sign-in. With no checkout here gh cannot fill it in itself: as
-/// `--fill` does, one commit gives its subject and body, several the
-/// branch's name and their subjects.
-fn remote_pull_request(root: &Path, has_upstream: bool) -> Result<String, String> {
-    let gh = |args: &[&str]| {
-        let out = crate::pr::gh_for(root).ok_or("gh: no GitHub repository known for its origin")?.env("GH_PROMPT_DISABLED", "1").args(args).output().map_err(|e| format!("gh: {e}"))?;
-        let said = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if out.status.success() { Ok(said) } else { Err(String::from_utf8_lossy(&out.stderr).trim().to_string()) }
-    };
+impl RequestText {
+    pub fn title(&self, title: &str) -> String {
+        crate::layers::request_title(&self.title_template, &self.key, title)
+    }
+
+    pub fn body(&self, body: &str) -> String {
+        let word = match self.closes.as_str() {
+            "fixes" => "Fixes",
+            "refs" => "Refs",
+            _ => return body.to_string(),
+        };
+        let lines: Vec<String> = self.tickets.iter().map(|(key, url)| if url.is_empty() { format!("{word} {key}") } else { format!("{word} {key} ({url})") }).collect();
+        if lines.is_empty() {
+            return body.to_string();
+        }
+        let body = body.trim_end();
+        if body.is_empty() { lines.join("\n") } else { format!("{body}\n\n{}", lines.join("\n")) }
+    }
+}
+
+pub fn pull_request(root: &Path, has_upstream: bool, text: &RequestText) -> Result<String, String> {
+    let host = crate::integrations::code_host(root).map_err(|e| e.to_string())?;
     let branch = run(root, "git", &["rev-parse", "--abbrev-ref", "HEAD"])?;
-    if let Ok(url) = gh(&["pr", "view", &branch, "--json", "url", "-q", ".url"]) {
+    if let Ok(Some(url)) = host.existing_pr(root, &branch) {
         return Ok(url);
     }
     push(root, has_upstream)?;
@@ -1913,9 +1927,8 @@ fn remote_pull_request(root: &Path, has_upstream: bool) -> Result<String, String
         [(subject, body)] => (subject.to_string(), body.trim().to_string()),
         many => (branch.clone(), many.iter().map(|(subject, _)| format!("- {subject}")).collect::<Vec<_>>().join("\n")),
     };
-    let into = base.strip_prefix("origin/").unwrap_or(&base);
-    let out = gh(&["pr", "create", "--head", &branch, "--base", into, "--title", &title, "--body", &body])?;
-    Ok(out.lines().rev().find(|l| l.starts_with("http")).unwrap_or(&out).to_string())
+    let into = base.split_once('/').map_or(base.as_str(), |(_, b)| b);
+    host.create_pr(root, &branch, into, &text.title(&title), &text.body(&body)).map_err(|e| e.to_string())
 }
 
 /// The directories to watch so that any change to the worktree or its git
@@ -2963,6 +2976,46 @@ pub fn branch_worktree(root: &Path, branch: &BranchRow, copy_env: bool) -> Resul
     Ok(dir)
 }
 
+/// A worktree on a colleague's request: its head fetched from where the
+/// requests are (`upstream`, else `origin`) into a local branch of its
+/// name, which a branch of that name here already is used as it is. One
+/// of this repository's own branches follows it on origin; a fork's has
+/// nothing to push to.
+pub fn request_worktree(repo: &Path, kind: crate::integrations::Kind, number: u64, head: &str, cross: bool, copy_env: bool) -> Result<(PathBuf, String), String> {
+    let remote = ["upstream", "origin"].into_iter().find(|r| git(repo, &["remote", "get-url", r]).is_some()).ok_or("no remote named origin or upstream")?;
+    // The request's head as it is now, whatever a branch of its name here holds.
+    let refspec = match kind {
+        crate::integrations::Kind::GitLab => format!("refs/merge-requests/{number}/head"),
+        _ => format!("refs/pull/{number}/head"),
+    };
+    git_status(repo, &["fetch", "--quiet", remote, &refspec])?;
+    let tip = git(repo, &["rev-parse", "FETCH_HEAD"]).map(|h| h.trim().to_string()).filter(|h| !h.is_empty()).ok_or("the request's head was not fetched")?;
+    let has = |name: &str| git(repo, &["rev-parse", "--verify", "-q", &format!("refs/heads/{name}")]).is_some_and(|h| !h.trim().is_empty());
+    // A branch here only behind the request's head is moved on to it; one of
+    // other commits (an older copy, someone else's of that name) is left alone.
+    let behind = |name: &str| git_status(repo, &["merge-base", "--is-ancestor", &format!("refs/heads/{name}"), &tip]).is_ok();
+    let own = format!("request-{number}");
+    let named = !head.is_empty() && head != "main" && head != "master";
+    let local = if named && (!has(head) || behind(head)) { head.to_string() } else { own.clone() };
+    if has(&local) && !behind(&local) {
+        return Err(format!("{local} here has commits the request does not: delete or rename it first"));
+    }
+    let dir = task_worktree_dir(repo, &local);
+    if crate::hostfs::stat(&dir).is_ok() {
+        return Err(format!("{} already exists", crate::hosts::there(&dir).display()));
+    }
+    git_status(repo, &["branch", "-f", &local, &tip])?;
+    let dir_s = crate::hosts::there(&dir).to_string_lossy().into_owned();
+    git_status(repo, &["worktree", "add", &dir_s, &local])?;
+    if !cross && local == head && git_status(repo, &["fetch", "--quiet", "origin", head]).is_ok() {
+        let _ = git_status(repo, &["branch", &format!("--set-upstream-to=origin/{head}"), &local]);
+    }
+    if copy_env {
+        copy_env_files(repo, &dir);
+    }
+    Ok((dir, local))
+}
+
 /// What the worktree can be compared with: branches, tags, the latest
 /// commits. Each as git names it, and what it is.
 pub fn refs(root: &Path) -> Vec<(String, String)> {
@@ -3074,6 +3127,9 @@ pub fn fetch_base(repo: &Path) -> Result<(), String> {
 /// Every branch of `origin`, those gone from it dropped: for the graph of
 /// all branches.
 pub fn fetch_all(repo: &Path) -> Result<(), String> {
+    if crate::hosts::is_remote(repo) {
+        return git_status(repo, &["fetch", "--quiet", "--prune", "origin"]).map(|_| ());
+    }
     fetch_quietly(repo, &["fetch", "--quiet", "--no-auto-maintenance", "--prune", "origin"])
 }
 
@@ -4071,6 +4127,48 @@ mod edge_tests {
         assert_eq!(out(&dir, &format!("git show {made}:f.txt")), "one\ntwo\n");
         assert!(out(&dir, "git stash list").is_empty() && out(&dir, "git status --short").contains("A  staged.txt"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod request_tests {
+    #[cfg(unix)]
+    #[test]
+    fn a_request_s_task_has_its_head_as_it_is_now() {
+        let sh = |dir: &std::path::Path, script: &str| assert!(std::process::Command::new("bash").arg("-ec").arg(script).current_dir(dir).status().unwrap().success(), "{script}");
+        let base = std::env::temp_dir().join(format!("ideae-request-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let g = "git -c user.name=t -c user.email=t@t -c init.defaultBranch=main";
+        sh(&base, &format!("{g} init -q origin && cd origin && echo a > f && git add f && {g} commit -qm a && git checkout -qb fix && echo b >> f && {g} commit -qam b && git update-ref refs/pull/5/head HEAD && git checkout -q main"));
+        sh(&base, &format!("git clone -q origin here && cd here && git branch fix main && git checkout -qb other main && echo c > g && git add g && {g} commit -qm c && git update-ref refs/pull/6/head refs/remotes/origin/fix 2>/dev/null; true"));
+        let (repo, worktrees) = (base.join("here"), base.join("here.worktrees"));
+        let tip = |r: &str| super::git(&base.join("origin"), &["rev-parse", r]).unwrap().trim().to_string();
+        let head_of = |dir: &std::path::Path| super::git(dir, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        // An older `fix` here is moved on to the request's head.
+        let (dir, branch) = super::request_worktree(&repo, crate::integrations::Kind::GitHub, 5, "fix", false, false).unwrap();
+        assert_eq!((branch.as_str(), head_of(&dir)), ("fix", tip("fix")));
+        // A branch of that name with commits of its own is left alone: request-5.
+        sh(&repo, &format!("{g} worktree remove --force {} && git branch -f fix other", dir.display()));
+        let (dir, branch) = super::request_worktree(&repo, crate::integrations::Kind::GitHub, 5, "fix", false, false).unwrap();
+        assert_eq!((branch.as_str(), head_of(&dir)), ("request-5", tip("fix")));
+        assert_eq!(super::git(&repo, &["rev-parse", "other"]), super::git(&repo, &["rev-parse", "fix"]), "fix as it was");
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&worktrees);
+    }
+
+    #[test]
+    fn a_request_says_what_it_does_of_its_tickets() {
+        let text = super::RequestText {
+            title_template: crate::layers::DEFAULT_PR_TITLE.into(),
+            key: "DEV-1".into(),
+            tickets: vec![("DEV-1".into(), "https://example.atlassian.net/browse/DEV-1".into()), ("o/r#4".into(), String::new())],
+            closes: "fixes".into(),
+        };
+        assert_eq!(text.title("Fix the login"), "DEV-1 Fix the login");
+        assert_eq!(text.body("Body.\n"), "Body.\n\nFixes DEV-1 (https://example.atlassian.net/browse/DEV-1)\nFixes o/r#4");
+        assert_eq!(super::RequestText { closes: "none".into(), ..text.clone() }.body("Body."), "Body.");
+        assert_eq!(super::RequestText { closes: "refs".into(), ..text }.body(""), "Refs DEV-1 (https://example.atlassian.net/browse/DEV-1)\nRefs o/r#4");
     }
 }
 

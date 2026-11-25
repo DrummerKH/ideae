@@ -14,7 +14,7 @@ use gpui_kit::component::{
 use gpui_kit::*;
 
 use super::Workspace;
-use crate::{merged_branches, state};
+use crate::merged_branches;
 
 /// How often a project's merged branches are looked for: each look asks
 /// GitHub twice.
@@ -35,12 +35,14 @@ impl Workspace {
     /// Looks again for the merged branches of the projects not looked at
     /// lately, or whose task's PR was just merged.
     pub(super) fn refresh_merged_branches(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !state::with_settings(|s| s.pr_status) || crate::lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed) {
+        if crate::lsp::POWER_SAVING.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
         let mut due: Vec<(PathBuf, HashSet<String>)> = Vec::new();
         for pi in 0..self.projects.len() {
-            if crate::hosts::is_remote(&self.projects[pi].path) || self.projects[pi].merged_checked.is_some_and(|at| at.elapsed() < EVERY) {
+            // A remote project's once its host is connected: git runs there, its code host is asked here.
+            let p = &self.projects[pi];
+            if !p.values().pull_requests || !crate::hostfs::reachable(&p.path) || p.merged_checked.is_some_and(|at| at.elapsed() < EVERY) {
                 continue;
             }
             self.projects[pi].merged_checked = Some(std::time::Instant::now());
@@ -123,7 +125,7 @@ impl Workspace {
                             .gap_3()
                             .child(list)
                             .child(div().text_xs().text_color(muted).child(
-                                "Only the branches on origin go: each merged PR stays on GitHub with its commits and its review. Only your own PRs are listed: a colleague's branch is theirs to delete. Branches checked out by a task, with an open PR, or with commits since the merge are not listed either.",
+                                "Only the branches on origin go: each merged request stays on GitHub or GitLab with its commits and its review. Only your own PRs are listed: a colleague's branch is theirs to delete. Branches checked out by a task, with an open PR, or with commits since the merge are not listed either.",
                             )),
                     )
                 })

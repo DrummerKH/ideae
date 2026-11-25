@@ -635,7 +635,7 @@ exec cat
         // gh, here with the user's sign-in, is told the repository its origin there names.
         let origin = std::process::Command::new("git").args(["remote", "add", "origin", "git@github.com:owner/repo.git"]).current_dir(&repo).status().unwrap();
         assert!(origin.success());
-        let gh = crate::pr::gh_for(&task).expect("a GitHub repository");
+        let gh = crate::integrations::github::gh_for(&task).expect("a GitHub repository");
         let named = gh.get_envs().find(|(k, _)| *k == "GH_REPO").and_then(|(_, v)| v).map(|v| v.to_string_lossy().into_owned());
         assert_eq!(named.as_deref(), Some("github.com/owner/repo"));
         workspace.update(cx, |w, cx| assert!(crate::commands::InHand::of(w.entry_mut(&task).unwrap(), cx).remote));

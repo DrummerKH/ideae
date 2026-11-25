@@ -1106,7 +1106,8 @@ impl ChatView {
                     let text = kept.unwrap_or_else(|| {
                         let body = &text[b.start..b.end];
                         match (&b.opens, b.closes) {
-                            (None, false) => SharedString::from(body.to_string()),
+                            // Prose: the keys a tracker of the project owns made links, once as it comes.
+                            (None, false) => SharedString::from(ticket_links(body, &self.spec.cwd).unwrap_or_else(|| body.to_string())),
                             (opens, closes) => SharedString::from(format!("{}{body}{}", opens.as_deref().map(|f| format!("{f}\n")).unwrap_or_default(), if closes { "```\n" } else { "" })),
                         }
                     });
@@ -1820,4 +1821,12 @@ mod tests {
         assert!(parts[0].closes && parts[1].opens.as_deref() == Some("```rust") && parts[1].closes);
         assert!(parts.last().is_some_and(|p| p.opens.is_some() && !p.closes));
     }
+}
+
+/// An agent's prose with its project's tickets' keys as links, while tickets are on.
+fn ticket_links(text: &str, root: &std::path::Path) -> Option<String> {
+    if !crate::state::with_settings(|s| s.tickets) || !text.contains('-') {
+        return None;
+    }
+    crate::integrations::tickets::link_keys(text, &crate::integrations::of_root(root))
 }

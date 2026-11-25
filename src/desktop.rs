@@ -28,8 +28,9 @@ pub use ideae_core::paths::exe;
 
 fn entry(exe: &std::path::Path) -> String {
     format!(
-        "[Desktop Entry]\nType=Application\nName={name}\nComment=IDE in the agentic era\nExec=\"{}\" %F\nIcon={APP_ID}\nTerminal=false\nCategories=Development;\nStartupWMClass={APP_ID}\n",
+        "[Desktop Entry]\nType=Application\nName={name}\nComment=IDE in the agentic era\nExec=\"{}\" %U\nIcon={APP_ID}\nTerminal=false\nCategories=Development;\nMimeType=x-scheme-handler/{scheme};\nStartupWMClass={APP_ID}\n",
         exe.display(),
+        scheme = crate::deep_link::SCHEME,
         name = if cfg!(debug_assertions) { "ideae (dev)" } else { "ideae" },
     )
 }
@@ -215,6 +216,12 @@ fn write_entry() -> Result<(), String> {
     let exe = exe().map_err(|e| e.to_string())?;
     let file = desktop_file().ok_or("no home directory")?;
     crate::state::write_atomic(&file, entry(&exe).as_bytes()).map_err(|e| e.to_string())?;
+    // Links of the app's scheme (`ideae://ticket/DEV-1`) open in it.
+    let scheme = format!("x-scheme-handler/{}", crate::deep_link::SCHEME);
+    let _ = crate::procs::command("xdg-mime").args(["default", &desktop_id(), &scheme]).stdin(std::process::Stdio::null()).status();
+    if let Some(dir) = file.parent() {
+        let _ = crate::procs::command("update-desktop-database").arg(dir).stdin(std::process::Stdio::null()).status();
+    }
     if let Some(icon) = icon_file() {
         if crate::state::write_atomic(&icon, ICON.as_bytes()).is_ok() {
             refresh_icon_cache();
@@ -263,7 +270,20 @@ pub fn install() -> Result<String, String> {
             .env("IDEAE_EXE", &exe)
             .status()
             .map_err(|e| e.to_string())?;
-        return if done.success() { Ok(format!("In the Start menu: {}", link.display())) } else { Err("the shortcut was not made".into()) };
+        if !done.success() {
+            return Err("the shortcut was not made".into());
+        }
+        // Links of the app's scheme (`ideae://ticket/DEV-1`) open in it: the user's own classes, no admin.
+        let key = format!("HKCU\\Software\\Classes\\{}", crate::deep_link::SCHEME);
+        let command = format!("\"{}\" \"%1\"", exe.display());
+        for args in [
+            vec!["add", key.as_str(), "/ve", "/d", "URL:ideae", "/f"],
+            vec!["add", key.as_str(), "/v", "URL Protocol", "/d", "", "/f"],
+            vec!["add", &format!("{key}\\shell\\open\\command"), "/ve", "/d", &command, "/f"],
+        ] {
+            let _ = crate::procs::command("reg.exe").args(&args).stdin(std::process::Stdio::null()).status();
+        }
+        return Ok(format!("In the Start menu: {}", link.display()));
     }
     #[allow(unreachable_code)]
     Ok("Nothing to do: the app is where the system looks for apps.".into())
@@ -289,6 +309,8 @@ pub fn uninstall() -> Result<String, String> {
         if let Some(link) = start_menu_link() {
             let _ = std::fs::remove_file(link);
         }
+        let key = format!("HKCU\\Software\\Classes\\{}", crate::deep_link::SCHEME);
+        let _ = crate::procs::command("reg.exe").args(["delete", &key, "/f"]).stdin(std::process::Stdio::null()).status();
         // A running program cannot be deleted: a moment after it is gone.
         let script = "Start-Sleep 2; Remove-Item -Force $env:IDEAE_EXE; Remove-Item -Force ($env:IDEAE_EXE -replace '\\.exe$', '.old.exe') -ErrorAction SilentlyContinue; \
                       $dir = Split-Path $env:IDEAE_EXE; if (-not (Get-ChildItem $dir)) { Remove-Item $dir }";

@@ -10,7 +10,10 @@ One Rust binary on GPUI (`gpui-kit`), Linux first, Windows too.
 src/main.rs        CLI, key bindings, title bar, window
 src/workspace.rs   projects and tasks: load, switch, create/close/delete, state, hooks
 src/workspace/variants.rs  several tries at one task as a group: create, compare, keep one
-src/workspace/spaces.rs    spaces: projects sorted into sets, one in the window at a time; `Workspace::shows` is the one test of what is seen
+src/workspace/spaces.rs    spaces: projects sorted into sets, one in the window at a time; `Workspace::shows` is the one test of what is seen; found by id, a rename changes nothing
+src/workspace/layered.rs   each project's layers resolved into an `Arc<Resolved>` when one changes, the team's read from the main checkout (not a task's worktree)
+src/workspace/links_ui.rs  a task's links: its ticket opened, a link added, an integration offered for a tracker not set up, a request's changes told
+src/workspace/tickets_ui.rs  tickets read with your token: a new task named from its ticket, its mark checked, still open at a merge
 src/workspace/side.rs      worktrees an agent made for itself: told apart, folded under their task, no agent of their own
 src/workspace/automation.rs  a project's setup, teardown and check, the trust its .ideae.toml needs, hints, Project settings…
 src/workspace/agents_ui.rs choosing agents: the picker, a project's agent, Continue with another agent
@@ -60,6 +63,14 @@ src/menu.rs        the macOS menu bar, kept short: tasks, git and the window, no
 src/commands.rs    the commands on a task, its project, its variants, its git: names and what allows them, for the menu bar, the sidebar and the palette
 src/file_icons.rs  file and folder icons (assets/file-icons, JetBrains' new UI), by name
 src/state.rs       state.json; APP_ID (ideae vs ideae-dev)
+src/layers.rs      settings in layers: Global (Settings) → a space's → the team's (.ideae.toml [project], [integrations.<id>]) → a project's own; `resolve`, lists by id, a project's fields of before layers read and written back
+src/layers_ui.rs   Settings over a layer (its switch): a space's or a project's page, where each value comes from, ↺; integrations listed and added (docs/integrations.md)
+src/integrations/  trackers and code hosts, set up as layered entries: `Tracker` (links and keys, no I/O), `CodeHost` (requests, review, CI, merged branches; blocking)
+  mod.rs           kinds, an entry made an integration, which code host a remote is, IntError
+  tickets.rs       tickets in text: links of known trackers, keys owned by prefix, a task's links
+  github.rs gitlab.rs   through gh and glab, signed in here; a stand-in glab in the tests
+  http.rs read.rs  a tracker's API with your token (ureq, a stand-in server in the tests); a ticket read: Jira Cloud/DC, Linear, YouTrack
+  secret_store.rs  tokens by host and account in the keyring, asked on first use; sealed here where there is none
 src/archive.rs     an archived task's .tar.gz (task.json, sessions, unpushed bundle, patch): write, list, restore, clean up
 src/acp/           agents that speak ACP, shown as a chat (docs/agents.md)
   host.rs          the host process (`ideae --acp-host`): speaks ACP with the agent, keeps the thread and its journal, answers its file reads and writes
@@ -102,6 +113,7 @@ core/              ideae-core, no gpui: the daemon itself (daemon/: server, pipe
 src/hosts.rs       projects on another machine: their key `ssh:/<host>/<path there>`, never a path here; ssh_for (IDEAE_SSH)
 src/hostfs.rs      a task's programs and files there or here by its path: git, reads and writes of a remote task go through it
 src/workspace/hosts_ui.rs  a remote project: added (checked there), its host connected before its tasks open, a task's worktree made there
+src/deep_link.rs   `ideae ticket KEY` and `ideae://ticket/KEY`: handed to the running window (a socket per state), or taken at start
 src/desktop.rs     launcher entry, dash pin, restart, `--install` / `--uninstall` (run by scripts/install.sh, install.ps1)
 src/predict/       edit prediction: llama-server and a model downloaded on consent, run for the app, ghost text at the cursor;
                    tests and UI checks use local files: IDEAE_PREDICT_SERVER, IDEAE_PREDICT_MODEL (IDEAE_DEBUG_PREDICT logs misses; IDEAE_PREDICT_GHOST="text" shows that as the suggestion, for screenshots)

@@ -14,10 +14,12 @@ mod build_watch;
 #[cfg(unix)]
 mod daemon;
 mod hosts;
+mod integrations;
 #[cfg(unix)]
 mod askpass;
 mod hostfs;
 mod db;
+mod deep_link;
 mod desktop;
 mod digest;
 mod edit;
@@ -34,6 +36,8 @@ mod ide;
 mod keymap;
 mod learn;
 mod keys;
+mod layers;
+mod layers_ui;
 mod local_time;
 mod lsp;
 #[cfg(unix)]
@@ -656,6 +660,23 @@ fn main() {
         }
         return;
     }
+    // A ticket asked for (`ideae ticket DEV-1`, `ideae://ticket/DEV-1`): to the
+    // window that runs, else this one takes it once it is up.
+    let asked = match (argv.get(1).map(String::as_str), argv.get(2)) {
+        (Some("ticket"), Some(key)) => Some(format!("ticket {key}")),
+        (Some(link), _) if link.starts_with(&format!("{}://", deep_link::SCHEME)) => Some(link.to_string()),
+        _ => None,
+    };
+    if let Some(line) = &asked {
+        if deep_link::parse(line).is_none() {
+            eprintln!("ideae: not a ticket's key or link: {line}");
+            std::process::exit(2);
+        }
+        if deep_link::send(line) {
+            return;
+        }
+        deep_link::deliver(line.clone());
+    }
     secrets::preload();
     db::config::preload();
     db::tls::install_provider();
@@ -667,7 +688,7 @@ fn main() {
     let mut agent: Option<Option<String>> = None;
     let mut appearance: Option<Appearance> = None;
     let mut open_task: Option<PathBuf> = None;
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args().skip(if asked.is_some() { argv.len() } else { 1 });
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--agent" => agent = Some(args.next()),
@@ -681,9 +702,11 @@ fn main() {
                 return;
             }
             "--help" | "-h" => {
-                println!("usage: ideae [--agent CMD | --no-agent] [--theme auto|light|dark] [--task PATH] [--version] [REPO... | ssh://[user@]host[:port]/path...]\n       ideae --install | --uninstall   (list the app with the system's apps, or remove it)\nRepos join the project list, kept in {}.", state::data_dir().join("state.json").display());
+                println!("usage: ideae [--agent CMD | --no-agent] [--theme auto|light|dark] [--task PATH] [--version] [REPO... | ssh://[user@]host[:port]/path...]\n       ideae ticket KEY | {}://ticket/KEY   (the ticket's task, or a new one for it)\n       ideae --install | --uninstall   (list the app with the system's apps, or remove it)\nRepos join the project list, kept in {}.", deep_link::SCHEME, state::data_dir().join("state.json").display());
                 return;
             }
+            // A launcher passes what it opens as URLs (`%U`): a folder as file://.
+            _ if arg.starts_with("file://") => repos.extend(deep_link::file_url_path(&arg)),
             _ => repos.push(PathBuf::from(arg)),
         }
     }
@@ -693,8 +716,14 @@ fn main() {
     procs::catch_quit_signals();
 
     menu::before_launch();
-    gpui_kit::application()
-        .with_assets(task::Assets)
+    let app = gpui_kit::application().with_assets(task::Assets);
+    // macOS hands a link of the app's scheme to the app, not to a new process.
+    app.on_open_urls(|urls| {
+        for url in urls {
+            deep_link::deliver(url);
+        }
+    });
+    app
         .run(move |cx| {
             gpui_kit::init(cx);
             gpui_cn::init(cx);

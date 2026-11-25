@@ -4,21 +4,49 @@
 
 const SLUG_MAX: usize = 40;
 
+/// How a keyed title's branch is named unless a layer says otherwise
+/// (`layers`, `branch`): `{key}`, `{summary}` (camelCase words), `{slug}`
+/// (dashed words), `{rand}`.
+pub const DEFAULT_TEMPLATE: &str = "{key}_{summary}";
+
+#[cfg(test)]
 pub fn branch_name(title: &str) -> String {
-    build(title, &random_suffix())
+    build(title, &random_suffix(), DEFAULT_TEMPLATE)
+}
+
+/// A branch for a title, by a project's template.
+pub fn branch_name_as(title: &str, template: &str) -> String {
+    build(title, &random_suffix(), template)
 }
 
 /// The branch name shown while the title is typed; the random part is a
 /// placeholder.
-pub fn preview(title: &str) -> String {
-    build(title, "…")
+pub fn preview(title: &str, template: &str) -> String {
+    build(title, "…", template)
 }
 
-fn build(title: &str, suffix: &str) -> String {
+/// A template git can take a branch of: one with `{key}` in it, whose
+/// branch for a key and words git takes.
+pub fn template_problem(template: &str) -> Option<&'static str> {
+    if !template.contains("{key}") {
+        return Some("It needs {key}: the tracker finds the branch by it.");
+    }
+    branch_problem(&fill(template, "DEV-1", "fixIt", "fix-it", "abc12345"))
+}
+
+fn fill(template: &str, key: &str, summary: &str, slug: &str, rand: &str) -> String {
+    let out = template.replace("{key}", key).replace("{summary}", summary).replace("{slug}", slug).replace("{rand}", rand);
+    // A part left empty takes its separator with it: `DEV-5_` is `DEV-5`.
+    out.trim_matches(|c| matches!(c, '_' | '-' | '/' | '.')).to_string()
+}
+
+fn build(title: &str, suffix: &str, template: &str) -> String {
     let title = title.trim();
     if let Some((key, rest)) = split_key(title) {
-        let summary = camel(&words(rest));
-        return if summary.is_empty() { key } else { format!("{key}_{summary}") };
+        let words = words(rest);
+        let template = if template_problem(template).is_none() { template } else { DEFAULT_TEMPLATE };
+        let slug: String = words.join("-").chars().take(SLUG_MAX).collect();
+        return fill(template, &key, &camel(&words), &slug, suffix);
     }
     let mut slug = String::new();
     for word in words(title) {
@@ -180,6 +208,17 @@ mod tests {
         assert_eq!(branch_name("dev-12: Fix the Login"), "DEV-12_fixTheLogin");
         assert_eq!(branch_name("[ABC-7] Чиним вход"), "ABC-7_chinimVkhod");
         assert_eq!(branch_name("DEV-5"), "DEV-5");
+    }
+
+    #[test]
+    fn a_project_s_template() {
+        assert_eq!(branch_name_as("DEV-12 Fix the login", "feature/{key}-{slug}"), "feature/DEV-12-fix-the-login");
+        assert_eq!(branch_name_as("DEV-12", "feature/{key}-{slug}"), "feature/DEV-12");
+        assert_eq!(branch_name_as("DEV-12 Fix", "{summary}"), "DEV-12_fix", "no key in it: the default");
+        assert_eq!(branch_name_as("DEV-12 Fix", "a b {key}"), "DEV-12_fix", "one git would not take: the default");
+        assert!(branch_name_as("Fix the login", "feature/{key}").starts_with("fix-the-login-"), "no key: a slug as before");
+        assert_eq!(preview("DEV-3 x", "{key}"), "DEV-3");
+        assert!(template_problem("{summary}").is_some() && template_problem("{key}_{summary}").is_none());
     }
 
     #[test]

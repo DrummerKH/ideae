@@ -789,7 +789,13 @@ impl TaskView {
             let _ = this.update_in(cx, |this, window, cx| {
                 this.busy = None;
                 match result {
-                    Ok(message) => this.commit_input.update(cx, |i, cx| i.set_value(message, window, cx)),
+                    Ok(message) => {
+                        let message = match &this.commit_key {
+                            Some(key) if !message.contains(key.as_str()) => format!("{key} {message}"),
+                            _ => message,
+                        };
+                        this.commit_input.update(cx, |i, cx| i.set_value(message, window, cx))
+                    }
                     Err(e) => this.action = Some((false, format!("Message: {e}"))),
                 }
                 cx.notify();
@@ -808,20 +814,21 @@ impl TaskView {
     pub(super) fn toggle_amend(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(filled) = self.amend.take() {
             if !filled.is_empty() && self.commit_input.read(cx).value().trim() == filled.trim() {
-                self.commit_input.update(cx, |input, cx| input.set_value("", window, cx));
+                let start = self.commit_start();
+                self.commit_input.update(cx, |input, cx| input.set_value(start, window, cx));
             }
             return cx.notify();
         }
         self.amend = Some(String::new());
         cx.notify();
-        if !self.commit_input.read(cx).value().trim().is_empty() {
+        if !self.commit_box_blank(cx) {
             return;
         }
         let root = self.root.clone();
         cx.spawn_in(window, async move |this, cx| {
             let message = cx.background_spawn(async move { git::last_message(&root) }).await.unwrap_or_default();
             let _ = this.update_in(cx, |this, window, cx| {
-                if this.amend.as_ref().is_some_and(String::is_empty) && this.commit_input.read(cx).value().trim().is_empty() {
+                if this.amend.as_ref().is_some_and(String::is_empty) && this.commit_box_blank(cx) {
                     this.commit_input.update(cx, |input, cx| input.set_value(message.clone(), window, cx));
                     this.amend = Some(message);
                     cx.notify();
@@ -853,7 +860,7 @@ impl TaskView {
                 self.run_action("Stash", move |root| git::stash(&root, &message), false, window, cx)
             }
             GitCommand::Push => self.push(window, cx),
-            GitCommand::PullRequest => self.run_action("PR", move |root| git::pull_request(&root, upstream), true, window, cx),
+            GitCommand::PullRequest => self.make_request(upstream, window, cx),
             GitCommand::Fetch => self.run_action("Fetch", |root| git::fetch(&root), false, window, cx),
             GitCommand::Pull => {
                 // Known to conflict: not tried, the agent is asked to merge it.
@@ -925,7 +932,7 @@ impl TaskView {
 
     pub(super) fn commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let message = self.commit_input.read(cx).value().trim().to_string();
-        if message.is_empty() {
+        if self.commit_box_blank(cx) {
             self.action = Some((false, "Write a commit message first".into()));
             let input = self.commit_input.clone();
             window.defer(cx, move |window, cx| input.read(cx).focus_handle(cx).focus(window, cx));
@@ -1240,12 +1247,13 @@ impl TaskView {
                             cx.open_url(&out);
                         }
                         if label == "Commit" || label == "Amend" {
-                            this.commit_input.update(cx, |input, cx| input.set_value("", window, cx));
+                            let start = this.commit_start();
+                            this.commit_input.update(cx, |input, cx| input.set_value(start, window, cx));
                             this.amend = None;
                         }
                         // The message of the commit taken back, to make it again: unless another is being written.
                         if let (true, Some((_, message))) = (label == "Undo commit", out.split_once('\n')) {
-                            if this.commit_input.read(cx).value().trim().is_empty() {
+                            if this.commit_box_blank(cx) {
                                 let message = message.to_string();
                                 this.commit_input.update(cx, |input, cx| input.set_value(message, window, cx));
                             }

@@ -18,6 +18,15 @@ use gpui_kit::{TestSupportExt as _, prelude::FluentBuilder as _, *};
 use crate::{lsp, state, theme::Appearance, workspace::Workspace};
 
 type Draft = Rc<RefCell<state::Settings>>;
+use crate::layers_ui::{Layers, LayersDraft, Scope};
+
+/// A Global setting's description, with who sets it otherwise.
+fn about_layered(layers: &LayersDraft, id: &str, about: &str) -> String {
+    match layers.borrow().overridden(id) {
+        Some(note) => format!("{about} {note}"),
+        None => about.to_string(),
+    }
+}
 /// The text sizes, which Ctrl+wheel sets too: kept in the state apart
 /// from the settings, applied with them on Save.
 type Sizes = Rc<Cell<crate::zoom::Zoom>>;
@@ -173,6 +182,7 @@ fn text_group(draft: &Draft, sizes: &Sizes, fonts: Vec<SharedString>, code_size:
 #[allow(clippy::too_many_arguments)]
 fn pages(
     draft: &Draft,
+    layers: &LayersDraft,
     look: &Rc<Cell<Appearance>>,
     dark_now: bool,
     recording: &Rc<Cell<Option<&'static str>>>,
@@ -444,6 +454,7 @@ fn pages(
         ),
         agents_page(
             draft,
+            layers,
             switch(
                 draft,
                 "Agents' language servers",
@@ -494,7 +505,7 @@ fn pages(
                             move |value: SharedString, _| write.borrow_mut().worktrees_dir = value.trim().to_string(),
                         ),
                     )
-                    .description("Empty: beside each repository, in <repository>.worktrees, where the tools of the folders above it still apply. A folder (~/worktrees): one of each project's name in it, as for a repository in a synced folder. New tasks only; a project's settings can name its own.")
+                    .description(about_layered(layers, "worktrees_dir", "Empty: beside each repository, in <repository>.worktrees, where the tools of the folders above it still apply. A folder (~/worktrees): one of each project's name in it, as for a repository in a synced folder. New tasks only; a space or a project can name its own."))
                 }),
         ).group(
             SettingGroup::new().title("Questions aside")
@@ -624,13 +635,10 @@ fn pages(
                 .item(SettingItem::new("Fetch the base branch", fetch).description(
                     "Keeps origin's main branch up to date in the background, so each task can show how far behind it is.",
                 ))
-                .item(switch(
-                    draft,
-                    "Pull request status",
-                    "Asks gh about each task's pull request and shows its status on the task's row.",
-                    |s| s.pr_status,
-                    |s, v| s.pr_status = v,
-                )),
+                .item({
+                    let row = switch(draft, "Pull request status", "", |s| s.pr_status, |s, v| s.pr_status = v);
+                    row.description(about_layered(layers, "pull_requests", "Asks gh about each task's pull request and shows its status on the task's row. A space or a project can turn it off or on for itself."))
+                }),
         ),
         SettingPage::new("Language servers").default_open(true).groups([
             SettingGroup::new().title("Servers").items(servers),
@@ -710,6 +718,7 @@ fn pages(
                     )),
             ),
         databases_page(),
+        crate::layers_ui::integrations_page(draft, layers),
     ]
 }
 
@@ -843,9 +852,10 @@ fn databases_page() -> SettingPage {
 pub const KEYS_PAGE: usize = 6;
 pub const AGENTS_PAGE: usize = 1;
 pub const LSP_PAGE: usize = 5;
+pub const INTEGRATIONS_PAGE: usize = 10;
 
 /// The Agents page: the profiles, the default, the one for quick questions.
-fn agents_page(draft: &Draft, lsp_switch: SettingItem, dials: [SettingItem; 2], token_warn: SettingField<SharedString>) -> SettingPage {
+fn agents_page(draft: &Draft, layers: &LayersDraft, lsp_switch: SettingItem, dials: [SettingItem; 2], token_warn: SettingField<SharedString>) -> SettingPage {
     let list = {
         let draft = draft.clone();
         SettingItem::render(move |_, _, cx| {
@@ -932,7 +942,11 @@ fn agents_page(draft: &Draft, lsp_switch: SettingItem, dials: [SettingItem; 2], 
     let several = draft.borrow().agents.len() > 1;
     let mut choose = SettingGroup::new().title("Which one");
     if !draft.borrow().agents.is_empty() {
-        choose = choose.item(SettingItem::new("Default agent", default_agent).description("New tasks run it, unless their project or the new-task dialog chooses another."));
+        choose = choose.item(SettingItem::new("Default agent", default_agent).description(about_layered(
+            layers,
+            "agent",
+            "New tasks run it, unless their space, their project or the new-task dialog chooses another.",
+        )));
         choose = choose.item(
             SettingItem::new("Agent for quick questions", quick_agent)
                 .description("Writes commit messages and compares variants. It gets one question at a time, answers and exits."),
@@ -1398,6 +1412,11 @@ impl Workspace {
 
     /// Settings, open at one of its pages.
     pub fn open_settings_at(&mut self, page: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings_over(page, Scope::Global, window, cx)
+    }
+
+    /// Settings over a layer: Global at one of its pages, a space's or a project's.
+    pub fn open_settings_over(&mut self, page: usize, scope: Scope, window: &mut Window, cx: &mut Context<Self>) {
         let this = cx.weak_entity();
         let spaces = this.clone();
         EDIT_SPACES.with(|edit| {
@@ -1405,8 +1424,10 @@ impl Workspace {
                 let _ = spaces.update(cx, |w, cx| w.spaces_dialog(window, cx));
             }))
         });
-        open(state::settings(), self.appearance, page, window, cx, move |settings, appearance, window, cx| {
+        let layers = self.layer_drafts();
+        open_layered(state::settings(), self.appearance, page, layers, scope, window, cx, move |settings, appearance, layers, window, cx| {
             let _ = this.update(cx, |w, cx| {
+                w.apply_layer_drafts(layers, cx);
                 w.apply_settings(settings, cx);
                 if appearance != w.appearance {
                     w.set_appearance(appearance, window, cx);
@@ -1417,6 +1438,7 @@ impl Workspace {
 }
 
 /// The dialog over `current`, at the page `first`; Save hands `save` the result.
+#[cfg(test)]
 fn open(
     current: state::Settings,
     appearance: Appearance,
@@ -1425,7 +1447,25 @@ fn open(
     cx: &mut App,
     save: impl Fn(state::Settings, Appearance, &mut Window, &mut App) + 'static,
 ) {
+    open_layered(current, appearance, first, Layers::default(), Scope::Global, window, cx, move |settings, look, _, window, cx| save(settings, look, window, cx));
+}
+
+/// The dialog over `current` and the layers under it, on `scope` at the
+/// page `first`; Save hands `save` the result.
+#[allow(clippy::too_many_arguments)]
+fn open_layered(
+    current: state::Settings,
+    appearance: Appearance,
+    first: usize,
+    layers: Layers,
+    scope: Scope,
+    window: &mut Window,
+    cx: &mut App,
+    save: impl Fn(state::Settings, Appearance, Layers, &mut Window, &mut App) + 'static,
+) {
     let draft: Draft = Rc::new(RefCell::new(current));
+    let layers: LayersDraft = Rc::new(RefCell::new(layers));
+    let scope = Rc::new(Cell::new(scope));
     let look = Rc::new(Cell::new(appearance));
     let sizes: Sizes = Rc::new(Cell::new(crate::zoom::current(cx)));
     INSTALLED.with(|known| known.borrow_mut().clear());
@@ -1439,9 +1479,9 @@ fn open(
     window.open_dialog(cx, move |dialog, window, _| {
         // Room for the longer titles of the pages' list, as the window allows.
         let wide = (window.viewport_size().width - px(64.)).clamp(px(640.), px(1000.));
-        let (draft, look, sizes, recording, catcher) = (draft.clone(), look.clone(), sizes.clone(), recording.clone(), catcher.clone());
+        let (draft, layers, scope, look, sizes, recording, catcher) = (draft.clone(), layers.clone(), scope.clone(), look.clone(), sizes.clone(), recording.clone(), catcher.clone());
         let save = {
-            let (draft, look, sizes, save) = (draft.clone(), look.clone(), sizes.clone(), save.clone());
+            let (draft, layers, look, sizes, save) = (draft.clone(), layers.clone(), look.clone(), sizes.clone(), save.clone());
             move |window: &mut Window, cx: &mut App| {
                 let mut settings = draft.borrow().clone();
                 settings.normalize();
@@ -1449,7 +1489,7 @@ fn open(
                 for kind in [crate::zoom::Kind::Editor, crate::zoom::Kind::Changes, crate::zoom::Kind::Terminal] {
                     crate::zoom::set(kind, sizes.get().get(kind), cx);
                 }
-                save(settings, look.get(), window, cx);
+                save(settings, look.get(), layers.borrow().clone(), window, cx);
                 window.close_dialog(cx);
             }
         };
@@ -1460,21 +1500,45 @@ fn open(
                 let dark_now = matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark);
                 let (fonts, code_size) = (crate::theme::code_fonts(cx), f32::from(cx.theme().mono_font_size));
                 // The dialog is as tall as the window lets it; the pages scroll inside.
-                let height = (window.viewport_size().height - px(220.)).clamp(px(200.), px(620.));
-                content.child(
-                    div()
-                        .h(height)
-                        .border_1()
-                        .border_color(cx.theme().border)
-                        .rounded(cx.theme().radius)
-                        .overflow_hidden()
-                        .child(
-                            Settings::new("settings")
-                                .sidebar_width(px(240.))
-                                .default_selected_index(SelectIndex { page_ix: first, group_ix: None })
-                                .pages(pages(&draft, &look, dark_now, &recording, &catcher, &sizes, fonts, code_size)),
-                        ),
-                )
+                let height = (window.viewport_size().height - px(260.)).clamp(px(200.), px(620.));
+                let now = scope.get();
+                let layered = !layers.borrow().spaces.is_empty() || !layers.borrow().projects.is_empty();
+                // Each layer its own pages, and its own place in them.
+                let (id, pages): (SharedString, Vec<SettingPage>) = match now {
+                    Scope::Global => ("settings".into(), pages(&draft, &layers, &look, dark_now, &recording, &catcher, &sizes, fonts, code_size)),
+                    Scope::Space(si) => (format!("settings-space-{si}").into(), vec![crate::layers_ui::page(&draft, &layers, now)]),
+                    Scope::Project(pi) => (format!("settings-project-{pi}").into(), vec![crate::layers_ui::page(&draft, &layers, now)]),
+                };
+                let first = if now == Scope::Global { first } else { 0 };
+                content
+                    .when(layered, |content| {
+                        content.child(
+                            h_flex()
+                                .gap_2()
+                                .pb_2()
+                                .child(div().text_sm().child("Settings for"))
+                                .child(crate::layers_ui::switch(&layers, &scope))
+                                .child(div().flex_1().text_xs().text_color(cx.theme().muted_foreground).child(match now {
+                                    Scope::Global => "Every project, unless its space or itself sets otherwise.",
+                                    Scope::Space(_) => "The projects of this space: over Global, under each project's own.",
+                                    Scope::Project(_) => "This project alone, on this machine.",
+                                })),
+                        )
+                    })
+                    .child(
+                        div()
+                            .h(height)
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .rounded(cx.theme().radius)
+                            .overflow_hidden()
+                            .child(
+                                Settings::new(id)
+                                    .sidebar_width(px(240.))
+                                    .default_selected_index(SelectIndex { page_ix: first, group_ix: None })
+                                    .pages(pages),
+                            ),
+                    )
             })
             // Enter in a field or the search reaches the dialog: it stays, the edits with it.
             .on_ok(|_, _, _| false)
@@ -1632,7 +1696,7 @@ mod tests {
     #[gpui_kit::test]
     fn every_page_draws(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
-        for page in 0..10 {
+        for page in 0..=super::INTEGRATIONS_PAGE {
             let handle = window(cx);
             cx.update_window(handle, |_, window, cx| {
                 open(state::Settings::default(), Appearance::Auto, page, window, cx, |_, _, _, _| {});
@@ -1688,5 +1752,68 @@ mod tests {
         let saved = saved.as_ref().unwrap();
         assert_eq!(saved.agents.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["codex"]);
         assert_eq!((saved.default_agent.as_str(), saved.agent.as_str()), ("codex", "codex"));
+    }
+
+    /// Integrations: Global's listed with Edit and Remove; one removed is
+    /// gone on Save.
+    #[gpui_kit::test]
+    fn integrations_are_listed_and_removed(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = window(cx);
+        let saved: Rc<RefCell<Option<state::Settings>>> = Rc::default();
+        cx.update_window(handle, |_, window, cx| {
+            let mut current = state::Settings::default();
+            let entry = |id: &str, kind: &str, url: &str| crate::layers::Entry { id: id.into(), kind: Some(kind.into()), url: Some(url.into()), keys: Some(vec!["DEV".into()]), ..Default::default() };
+            current.integrations = vec![entry("acme", "jira", "https://example.atlassian.net"), entry("gl", "gitlab", "https://gitlab.example.com")];
+            let saved = saved.clone();
+            open(current, Appearance::Auto, super::INTEGRATIONS_PAGE, window, cx, move |settings, _, _, _| *saved.borrow_mut() = Some(settings));
+            window.render_frame(cx);
+            assert!(window.find("integration-row-1").visible(), "both listed");
+            window.click("integration-remove-0", cx);
+            window.render_frame(cx);
+            window.click("settings-save", cx);
+        })
+        .unwrap();
+        let saved = saved.borrow();
+        assert_eq!(saved.as_ref().unwrap().integrations.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["gl"]);
+    }
+
+    /// Over a project's layer: its settings alone, the one it sets with ↺,
+    /// which gives it back to the layer under it; Save hands the layers on.
+    #[gpui_kit::test]
+    fn a_project_s_layer_is_set_and_reset(cx: &mut TestAppContext) {
+        use crate::layers::Overrides;
+        use crate::layers_ui::{Layers, ProjectDraft, Scope, SpaceDraft};
+        cx.update(gpui_kit::init);
+        let handle = window(cx);
+        let saved: Rc<RefCell<Option<Layers>>> = Rc::default();
+        let layers = Layers {
+            spaces: vec![SpaceDraft { id: "w".into(), name: "Work".into(), settings: Overrides { language_servers: Some(false), ..Default::default() } }],
+            projects: vec![ProjectDraft {
+                path: "/w/api".into(),
+                name: "api".into(),
+                space: Some("w".into()),
+                settings: Overrides { pull_requests: Some(false), ..Default::default() },
+                team: Overrides::default(),
+            }],
+        };
+        cx.update_window(handle, |_, window, cx| {
+            let saved = saved.clone();
+            super::open_layered(state::Settings::default(), Appearance::Auto, 0, layers, Scope::Project(0), window, cx, move |_, _, layers, _, _| *saved.borrow_mut() = Some(layers));
+            window.render_frame(cx);
+            assert!(window.find("settings-layer").visible(), "the layer switch");
+            assert!(window.try_find("key-row-quit").is_none(), "Global's pages are not over a project");
+            window.click("reset-here", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("reset-here").is_none(), "nothing set here any more");
+            window.click("settings-save", cx);
+        })
+        .unwrap();
+        let saved = saved.borrow();
+        let saved = saved.as_ref().expect("saved");
+        assert_eq!(saved.projects[0].settings, Overrides::default());
+        assert_eq!(saved.spaces[0].settings.language_servers, Some(false), "the space's own untouched");
+        let under = saved.under(&state::Settings::default(), Scope::Project(0));
+        assert_eq!((under.values.language_servers, under.from.language_servers), (false, crate::layers::Layer::Space));
     }
 }

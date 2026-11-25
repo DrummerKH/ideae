@@ -42,6 +42,10 @@ how a project names its branches is for its agent (its CLAUDE.md) or you. A
 Linear link has the issue's title in it: the task and its branch are named
 from it at once (`ENG-123_fixTheLoginForm`).
 
+A task keeps its tickets and links; its key is a mark on its row that opens
+it. Which tracker a key is of, and settings for a space or a project of its
+own: [integrations](integrations.md).
+
 ## Projects on another machine
 
 A repository on a server or another computer, reached by ssh as a terminal
@@ -115,8 +119,8 @@ rebase merges) or is in the default branch and no newer than the merge. Not
 listed: the default branch, a branch a task has checked out, one with an
 open PR, one with commits since. One push deletes them, a
 `git fetch --prune` follows; a branch origin refuses (protected) is said and
-not offered again. The merged PRs stay on GitHub. Looked for in the
-background with `gh` every half hour, and when a task's PR is merged.
+not offered again. The merged requests stay on GitHub or GitLab. Looked for
+in the background with `gh` or `glab` every half hour, and when a task's PR is merged.
 
 **From an archived task…** (a project's + and menu; "Archived tasks…" in the
 command palette for all projects in the window; Recent tasks, Ctrl+E, once

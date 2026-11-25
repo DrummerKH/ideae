@@ -5,7 +5,7 @@ use gpui::{
 use std::{any::TypeId, ops::Deref, rc::Rc};
 
 use crate::{
-    ActiveTheme as _, AxisExt, StyledExt as _,
+    ActiveTheme as _, Sizable as _, button::ButtonVariants as _, AxisExt, StyledExt as _,
     label::Label,
     setting::{
         AnySettingField, ElementField, RenderOptions,
@@ -28,6 +28,8 @@ pub enum SettingItem {
         layout: Axis,
         disabled: bool,
         field: Rc<dyn AnySettingField>,
+        // ideae patch: a reset button beside the field, not only the page's.
+        reset_here: bool,
     },
     /// A full custom element to render.
     Element {
@@ -54,7 +56,17 @@ impl SettingItem {
             disabled: false,
             keywords: Vec::new(),
             field: Rc::new(field),
+            reset_here: false,
         }
+    }
+
+    /// ideae patch: a ↺ beside the field while it can be reset, which
+    /// resets this item alone.
+    pub fn reset_here(mut self) -> Self {
+        if let SettingItem::Item { reset_here, .. } = &mut self {
+            *reset_here = true;
+        }
+        self
     }
 
     /// Create a new custom element setting item with a render closure.
@@ -265,8 +277,10 @@ impl SettingItem {
                     layout,
                     disabled,
                     field,
+                    reset_here,
                     ..
                 } => {
+                    let reset = (reset_here && !disabled && field.is_resettable(cx)).then(|| field.clone());
                     let layout = if options.layout().is_vertical() {
                         Axis::Vertical
                     } else {
@@ -304,13 +318,30 @@ impl SettingItem {
                                     )
                                 }),
                         )
-                        .child(div().id("field").child(Self::render_field(
-                            title,
-                            field,
-                            options.with_layout(layout).with_disabled(disabled),
-                            window,
-                            cx,
-                        )))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(div().id("field").child(Self::render_field(
+                                    title,
+                                    field,
+                                    options.with_layout(layout).with_disabled(disabled),
+                                    window,
+                                    cx,
+                                )))
+                                // ideae patch: this item's own reset.
+                                .when_some(reset, |this, field| {
+                                    this.child(
+                                        crate::button::Button::new("reset-here")
+                                            .xsmall()
+                                            .ghost()
+                                            .label("↺")
+                                            .tooltip("Reset: take the value from the layer below")
+                                            .on_click(move |_, window, cx| field.reset(window, cx)),
+                                    )
+                                }),
+                        )
                         .into_any_element()
                 }
                 SettingItem::Element {

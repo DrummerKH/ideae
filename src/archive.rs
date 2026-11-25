@@ -76,6 +76,9 @@ pub struct Meta {
     pub unpushed: Vec<CommitLine>,
     /// The files with changes not committed: in the patch.
     pub uncommitted: Vec<String>,
+    /// Its tickets, request and addresses (`TaskState::links`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<crate::state::TaskLink>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
