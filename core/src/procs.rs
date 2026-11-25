@@ -130,3 +130,71 @@ pub fn in_sessions(leaders: &[i32]) -> Vec<i32> {
 pub fn in_sessions(_: &[i32]) -> Vec<i32> {
     Vec::new()
 }
+
+/// The program a process runs, by its path: unlike its name, it can be read
+/// of a process of another user, root's `login` among them.
+#[cfg(target_os = "macos")]
+pub fn path(pid: u32) -> Option<std::path::PathBuf> {
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: proc_pidpath writes at most the buffer's size.
+    let n = unsafe { libc::proc_pidpath(pid as libc::c_int, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    let n = usize::try_from(n).ok().filter(|&n| n > 0)?;
+    buf.truncate(n);
+    Some(std::path::PathBuf::from(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&buf)))
+}
+
+/// The name of the shell a terminal's session runs, `pid` being the
+/// session's first process. On macOS that process is login(1), root's, whose
+/// name cannot be read, and the shell is its child: a session handed over by
+/// another daemon has nothing else to tell its shell by.
+pub fn shell_of_session(pid: u32) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    if path(pid).is_some_and(|path| path.file_name().is_some_and(|name| name == "login")) {
+        let mut children = [0 as libc::pid_t; 8];
+        // SAFETY: proc_listchildpids writes at most the buffer's size, and returns how many pids it wrote.
+        let n = unsafe { libc::proc_listchildpids(pid as libc::pid_t, children.as_mut_ptr().cast(), std::mem::size_of_val(&children) as libc::c_int) };
+        let count = usize::try_from(n).unwrap_or(0).min(children.len());
+        return children.get(..count).and_then(|found| found.first()).and_then(|&child| name(child as u32));
+    }
+    name(pid)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use std::os::unix::process::CommandExt as _;
+
+    /// A session whose first process is a login (by its path): its shell
+    /// is its child.
+    #[test]
+    fn a_session_under_login_is_told_its_shell() {
+        let dir = std::env::temp_dir().join(format!("ideae-login-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A stand-in for login(1): bash under that name, with sleep as its child.
+        let login = dir.join("login");
+        std::fs::copy("/bin/bash", &login).unwrap();
+        // A group of its own: the sleep goes with it at the end.
+        let mut child = std::process::Command::new(&login).args(["-c", "sleep 30 & wait"]).process_group(0).spawn().unwrap();
+        let mut told = None;
+        for _ in 0..100 {
+            told = super::shell_of_session(child.id());
+            if told.as_deref() == Some("sleep") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // SAFETY: a signal to the group this test started.
+        unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(told.as_deref(), Some("sleep"));
+        assert_eq!(super::shell_of_session(std::process::id()), super::name(std::process::id()), "no login: its own name");
+    }
+
+    /// The real login is root's, whose name a user's process cannot read:
+    /// its path can be. launchd, root's too, stands for it.
+    #[test]
+    fn a_root_process_is_told_by_its_path() {
+        assert_eq!(super::path(1).as_deref(), Some(std::path::Path::new("/sbin/launchd")));
+    }
+}

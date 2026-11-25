@@ -843,7 +843,7 @@ mod handover {
                 (Box::new(crate::daemon::pipe::Handle(pipe.clone())), Some(pipe))
             } else {
                 let Some(fd) = fds.next() else { break };
-                let program = crate::procs::name(session.pid);
+                let program = crate::procs::shell_of_session(session.pid);
                 let Ok(handle) = cn_pty::adopt(fd, session.pid, program, sink) else { continue };
                 (handle, None)
             };
