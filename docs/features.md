@@ -106,13 +106,14 @@ local branch are removed. Remote branches are never touched. If the archive
 cannot be written, nothing is removed and you are told. A project's menu
 archives all of its tasks whose PR was merged at once.
 
-**Delete remote branches of merged PRs…** (a project's menu, shown when
-there are some) lists the branches on origin left after their PR was merged,
-each with a box, all on: a branch goes when the latest merged PR of its name
-has its head in this repository (not a fork) and its tip is the PR's head as
-merged (squash and rebase merges) or is in the default branch and no newer
-than the merge. Not listed: the default branch, a branch a task has checked
-out, one with an open PR, one with commits since. One push deletes them, a
+**Delete remote branches of my merged PRs…** (a project's menu, shown when
+there are some) lists the branches on origin left after a PR of yours was
+merged (a colleague's branch is theirs to delete), each with a box, all on:
+a branch goes when the latest merged PR of its name has its head in this
+repository (not a fork) and its tip is the PR's head as merged (squash and
+rebase merges) or is in the default branch and no newer than the merge. Not
+listed: the default branch, a branch a task has checked out, one with an
+open PR, one with commits since. One push deletes them, a
 `git fetch --prune` follows; a branch origin refuses (protected) is said and
 not offered again. The merged PRs stay on GitHub. Looked for in the
 background with `gh` every half hour, and when a task's PR is merged.

@@ -1,4 +1,4 @@
-//! Remote branches of merged PRs: looked for now and then in the
+//! Remote branches of your merged PRs: looked for now and then in the
 //! background, offered in the project's menu, deleted in one push.
 
 use std::{cell::RefCell, collections::HashSet, path::PathBuf, rc::Rc, time::Duration};
@@ -101,7 +101,7 @@ impl Workspace {
                 }
             };
             dialog
-                .title(format!("Remote branches of merged PRs in {name}"))
+                .title(format!("Remote branches of your merged PRs in {name}"))
                 .w(px(640.))
                 .content(move |content, _, cx| {
                     let muted = cx.theme().muted_foreground;
@@ -123,7 +123,7 @@ impl Workspace {
                             .gap_3()
                             .child(list)
                             .child(div().text_xs().text_color(muted).child(
-                                "Only the branches on origin go: each merged PR stays on GitHub with its commits and its review. Branches checked out by a task, with an open PR, or with commits since the merge are not listed.",
+                                "Only the branches on origin go: each merged PR stays on GitHub with its commits and its review. Only your own PRs are listed: a colleague's branch is theirs to delete. Branches checked out by a task, with an open PR, or with commits since the merge are not listed either.",
                             )),
                     )
                 })

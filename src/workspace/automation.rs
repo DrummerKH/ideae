@@ -856,7 +856,7 @@ impl Workspace {
                                 .child(toggle("project-pr", "Pull request status of its tasks (gh)", !off, set))
                                 .child(div().text_xs().text_color(muted).child("Off: gh is not asked about this project's branches."))
                                 .when(stale > 0, |page| {
-                                    page.child(h_flex().pt_2().child(Button::new("project-stale").small().outline().label(format!("Delete remote branches of merged PRs ({stale})…")).on_click(move |_, window, cx| {
+                                    page.child(h_flex().pt_2().child(Button::new("project-stale").small().outline().label(format!("Delete remote branches of my merged PRs ({stale})…")).on_click(move |_, window, cx| {
                                         window.close_dialog(cx);
                                         let _ = this.update(cx, |w, cx| {
                                             if let Some(pi) = w.projects.iter().position(|p| p.path == project) {
