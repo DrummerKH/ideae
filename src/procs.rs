@@ -717,16 +717,26 @@ mod stray_tests {
             .unwrap()
     }
 
-    /// The agent's sleep, once it has started it.
-    fn sleep_of(agent: &Child) -> i32 {
-        let started = std::time::Instant::now();
-        loop {
-            if let Some(pid) = super::pids().into_iter().find(|&p| super::ppid(p) == Some(agent.id() as i32) && super::running(p)) {
-                return pid;
+    /// An agent of `task` and its sleep, once it has started it. One that
+    /// ends before (macOS may stop a binary just built, run under a new
+    /// name, while it looks it over) is said and started again.
+    fn agent_and_sleep(task: &str, socket: &str) -> (Child, i32) {
+        for _ in 0..3 {
+            let mut agent = agent(task, socket);
+            let started = std::time::Instant::now();
+            loop {
+                if let Some(pid) = super::pids().into_iter().find(|&p| super::ppid(p) == Some(agent.id() as i32) && super::running(p)) {
+                    return (agent, pid);
+                }
+                if let Ok(Some(status)) = agent.try_wait() {
+                    eprintln!("the stand-in agent ended before its sleep ({status}): started again");
+                    break;
+                }
+                assert!(started.elapsed() < std::time::Duration::from_secs(30), "the agent starts its sleep");
+                std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            assert!(started.elapsed() < std::time::Duration::from_secs(10), "the agent starts its sleep");
-            std::thread::sleep(std::time::Duration::from_millis(20));
         }
+        panic!("the stand-in agent never started its sleep");
     }
 
     #[test]
@@ -759,11 +769,14 @@ mod stray_tests {
                 let _ = std::fs::remove_file(std::env::temp_dir().join(format!("stray-agent-{}", std::process::id())));
             }
         }
-        let (mut ours, mut left, mut other_task, mut other_app) =
-            (agent("/t/a", &socket), agent("/t/a", &socket), agent("/t/b", &socket), agent("/t/a", "elsewhere"));
-        let mut started = Started([&ours, &left, &other_task, &other_app].map(|c| c.id() as i32).to_vec());
-        let sleeps = [&ours, &left, &other_task, &other_app].map(sleep_of);
-        started.0.extend(sleeps);
+        let mut started = Started(Vec::new());
+        let mut take = |task: &str, socket: &str| {
+            let (agent, sleep) = agent_and_sleep(task, socket);
+            started.0.extend([agent.id() as i32, sleep]);
+            (agent, sleep)
+        };
+        let ((mut ours, a), (mut left, b), (mut other_task, c), (mut other_app, d)) = (take("/t/a", &socket), take("/t/a", &socket), take("/t/b", &socket), take("/t/a", "elsewhere"));
+        let sleeps = [a, b, c, d];
 
         // One agent is gone before its sleep is looked for again, as when a
         // task's terminals are ended first.

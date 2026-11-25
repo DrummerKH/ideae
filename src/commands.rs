@@ -245,11 +245,11 @@ impl InHand {
             KeepVariant => !self.main && !self.side && self.ready && self.grouped,
             RestartAgent => self.open && self.agent_ended,
             // With nothing in .ideae.toml yet, the Run panel tells how to begin.
-            StartServices => self.open && !self.remote && (!self.services || self.services_waiting),
+            StartServices => self.open && (!self.services || self.services_waiting),
             StopServices => self.services_running,
             CompareThisFile => self.file,
-            NewBrowserTab | CompareWithBranch => self.open && !self.remote,
-            NewTerminal | Pause => self.open,
+            CompareWithBranch => self.open && !self.remote,
+            NewTerminal | NewBrowserTab | Pause => self.open,
         }
     }
 

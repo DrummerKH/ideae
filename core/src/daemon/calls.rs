@@ -53,6 +53,8 @@ pub fn answer(call: Call, body: &[u8]) -> (Reply, Vec<u8>) {
             Ok(()) => (Reply::default(), Vec::new()),
             Err(e) => failed(e),
         },
+        // Answered by the server, which knows the sessions.
+        Call::Listening { .. } => failed("not here"),
         Call::Stat { path } => match std::fs::symlink_metadata(&path) {
             Ok(meta) => (Reply { stat: Some(stat_of(&meta)), ..Default::default() }, Vec::new()),
             Err(e) => failed(e),

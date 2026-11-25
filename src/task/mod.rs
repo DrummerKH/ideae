@@ -1002,6 +1002,9 @@ impl TaskView {
         if start_agent {
             this.watch_activity(Who::Main, cx);
         }
+        if remote {
+            this.load_services_there(cx);
+        }
         this
     }
 
@@ -1260,7 +1263,10 @@ impl TaskView {
     }
 
     pub fn open_browser(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.add_browser(crate::browser::Source::Url(url.to_string()), true, window, cx);
+        // A remote task's own address: once its port is forwarded here.
+        if let Some(url) = self.reached(url, window, cx, |t, url, window, cx| t.add_browser(crate::browser::Source::Url(url), true, window, cx)) {
+            self.add_browser(crate::browser::Source::Url(url), true, window, cx);
+        }
     }
 
     /// The pages of a task long out of view close, their addresses kept:

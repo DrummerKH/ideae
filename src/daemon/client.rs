@@ -572,6 +572,21 @@ impl Daemon {
         }
     }
 
+    /// Port `there` of a daemon's machine, reached at the port here this gives.
+    pub fn forward(&self, there: u16) -> Result<u16, String> {
+        match &self.wire {
+            Some(wire) => super::remote::forward(wire.remote(), there),
+            None => Ok(there),
+        }
+    }
+
+    /// Ends ssh's master connection to a daemon on another machine.
+    pub fn close_master(&self) {
+        if let Some(wire) = &self.wire {
+            super::remote::close_master(wire.remote());
+        }
+    }
+
     /// Lets go of a daemon on another machine: its sessions run on there,
     /// for this window or another to attach to later.
     pub fn disconnect(&self) {
@@ -595,6 +610,10 @@ impl Daemon {
         self.quitting.store(true, std::sync::atomic::Ordering::Relaxed);
         self.send(proto::encode_msg(&Msg::Shutdown));
         let _ = self.writer.lock().unwrap().flush();
+        // Told before its link goes: the daemon ends, and with it the ssh of the link.
+        if let Some(wire) = &self.wire {
+            wire.wait_gone(Duration::from_secs(2));
+        }
     }
 }
 

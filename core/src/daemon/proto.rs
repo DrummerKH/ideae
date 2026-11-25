@@ -38,6 +38,9 @@ pub enum Call {
     Read { path: PathBuf },
     Write { path: PathBuf },
     Stat { path: PathBuf },
+    /// The TCP ports the processes of task `task`'s sessions listen on, as
+    /// JSON `[{port, pid, name}]`: its servers, for the window to reach.
+    Listening { task: String },
 }
 
 /// A file as [`Call::Stat`] finds it, its links not followed.

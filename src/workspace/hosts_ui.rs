@@ -4,6 +4,9 @@
 
 use super::*;
 
+/// Something to do once a host is connected.
+pub(super) type Then = Box<dyn FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>)>;
+
 impl Workspace {
     /// A project on another machine, from the command line:
     /// `ssh://me@box/home/me/proj`.
@@ -125,6 +128,66 @@ impl Workspace {
         Some((host, None))
     }
 
+    /// Does `then` now if `path`'s host is connected (or `path` is here),
+    /// else once it is: it is being connected.
+    pub(super) fn with_host(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>, then: Then) {
+        let Some((host, _)) = crate::hosts::split(path) else { return then(self, window, cx) };
+        #[cfg(unix)]
+        if crate::daemon::client::for_path(path).is_some() {
+            return then(self, window, cx);
+        }
+        self.host_then.entry(host.clone()).or_default().push(then);
+        if !self.host_waiting.contains_key(&host) {
+            self.host_waiting.insert(host.clone(), Vec::new());
+            self.connect_host(host, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// What ssh asks, asked here: a password or a passphrase hidden as it
+    /// is typed, a host's key to trust as it is. Put away, it is answered no.
+    #[cfg(unix)]
+    pub(super) fn ask_for_ssh(&mut self, ask: crate::askpass::Ask, window: &mut Window, cx: &mut Context<Self>) {
+        let secret = ask.is_secret();
+        let input = cx.new(|cx| InputState::new(window, cx).masked(secret));
+        let reply = std::rc::Rc::new(std::cell::RefCell::new(Some(ask.reply)));
+        let prompt: SharedString = ask.prompt.trim().to_string().into();
+        let answer = {
+            let (input, reply) = (input.clone(), reply.clone());
+            move |given: bool, cx: &mut App| {
+                if let Some(reply) = reply.borrow_mut().take() {
+                    let _ = reply.send(given.then(|| input.read(cx).value().to_string()));
+                }
+            }
+        };
+        let focused = std::rc::Rc::new(std::cell::Cell::new(false));
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (input, focused, prompt) = (input.clone(), focused.clone(), prompt.clone());
+            let (ok, cancel, close) = (answer.clone(), answer.clone(), answer.clone());
+            dialog
+                .title("ssh asks")
+                .w(px(480.))
+                .on_ok(move |_, _, cx| {
+                    ok(true, cx);
+                    true
+                })
+                .on_cancel(move |_, _, cx| {
+                    cancel(false, cx);
+                    true
+                })
+                .on_close(move |_, _, cx| close(false, cx))
+                .content(move |content, window, cx| {
+                    if !focused.replace(true) {
+                        let input = input.clone();
+                        window.defer(cx, move |window, cx| input.read(cx).focus_handle(cx).focus(window, cx));
+                    }
+                    content.child(v_flex().gap_2().child(div().text_sm().child(prompt.clone())).child(Input::new(&input)).child(
+                        div().text_xs().text_color(cx.theme().muted_foreground).child("Kept nowhere: asked again only when the link to it is made anew."),
+                    ))
+                })
+        });
+    }
+
     /// Whether `path` is a task of a host not connected yet. It is then
     /// being connected, and the task loads once it is; `show`: and comes
     /// into view, unless another was shown meanwhile.
@@ -140,8 +203,9 @@ impl Workspace {
         if let Some(entry) = self.entry_mut(path) {
             entry.busy.get_or_insert_with(|| "connecting…".into());
         }
+        // Being connected already (for a task, or for what waits on it).
+        let first = !self.host_waiting.contains_key(&host);
         let waiting = self.host_waiting.entry(host.clone()).or_default();
-        let first = waiting.is_empty();
         if !waiting.iter().any(|p| p == path) {
             waiting.push(path.to_path_buf());
         }
@@ -154,6 +218,7 @@ impl Workspace {
 
     #[cfg(not(unix))]
     fn connect_host(&mut self, host: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.host_then.remove(&host);
         let waiting = self.host_waiting.remove(&host).unwrap_or_default();
         for path in waiting {
             if let Some(entry) = self.entry_mut(&path) {
@@ -181,6 +246,7 @@ impl Workspace {
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 let waiting = this.host_waiting.remove(&host).unwrap_or_default();
+                let then = this.host_then.remove(&host).unwrap_or_default();
                 for path in &waiting {
                     if let Some(entry) = this.entry_mut(path) {
                         entry.busy = None;
@@ -197,6 +263,9 @@ impl Workspace {
                         // Its worktrees, as made there by anyone.
                         this.sync_worktrees(window, cx);
                         let shown = this.host_shown.take();
+                        for then in then {
+                            then(this, window, cx);
+                        }
                         for path in waiting {
                             if shown.as_deref() == Some(path.as_path()) {
                                 this.switch(&path, window, cx);
@@ -215,93 +284,6 @@ impl Workspace {
         .detach();
     }
 
-    /// A task of a project on another machine: its worktree made there
-    /// (`<project>.worktrees/<branch>`, from the remote's default branch, or
-    /// the project's base), then shown as a local one is.
-    pub(super) fn create_remote_task(&mut self, project: usize, title: String, prompt: String, agents: Vec<String>, given: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(p) = self.projects.get_mut(project) else { return };
-        let Some((host, repo)) = crate::hosts::split(&p.path) else { return };
-        let branch = naming::branch_name(&title);
-        // Named as a local task's folder is (`feat/x` in `feat-x`), beside the repository there.
-        let dir = PathBuf::from(format!("{}.worktrees", repo.display())).join(branch.replace('/', "-"));
-        let path = crate::hosts::join(&host, &dir);
-        if p.tasks.iter().any(|t| t.path == path) {
-            window.push_notification(Notification::error(format!("A task of this project is in {} already", dir.display())).title("Could not create the task"), cx);
-            return;
-        }
-        let base = p.base.clone();
-        p.collapsed = false;
-        p.tasks.push(TaskEntry {
-            path: path.clone(),
-            branch: branch.clone(),
-            title,
-            last_active: state::now(),
-            busy: Some("creating…".into()),
-            prompt: prompt.clone(),
-            created: state::now(),
-            agent: agents_ui::pick_profile(agents.first().map_or("", String::as_str)),
-            choices: agents_ui::pick_choices(agents.first().map_or("", String::as_str)),
-            fresh: true,
-            ..Default::default()
-        });
-        cx.notify();
-        let quote = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
-        let base = if base.is_empty() {
-            "\"$(git symbolic-ref -q --short refs/remotes/origin/HEAD || echo HEAD)\"".to_string()
-        } else {
-            quote(&base)
-        };
-        let line = format!(
-            "cd {repo} && {{ git fetch -q origin 2>/dev/null || true; }} && git worktree add -q -b {branch} {dir} {base}",
-            repo = quote(&repo.display().to_string()),
-            branch = quote(&branch),
-            dir = quote(&dir.display().to_string()),
-        );
-        cx.spawn_in(window, async move |this, cx| {
-            let made = cx
-                .background_spawn(async move {
-                    #[cfg(unix)]
-                    return crate::daemon::remote::run(&crate::daemon::remote::Remote::new(crate::hosts::ssh_for(&host)), &line, None).map(|_| ());
-                    #[cfg(not(unix))]
-                    {
-                        let _ = line;
-                        Err::<(), String>(format!("{host}: projects on other machines need ideae on Linux or macOS for now"))
-                    }
-                })
-                .await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                match made {
-                    Ok(()) => {
-                        if let Some(entry) = this.entry_mut(&path) {
-                            entry.busy = None;
-                        }
-                        this.switch(&path, window, cx);
-                        if !prompt.is_empty() {
-                            let send = state::settings().send_new_prompt || given || std::env::var_os("IDEAE_NEW_TASK").is_some();
-                            // Its view comes once its host is connected: the prompt waits for it there.
-                            match this.entry_mut(&path).and_then(|entry| entry.view.clone()) {
-                                Some(view) => view.update(cx, |t, cx| t.queue_prompt(prompt, send, window, cx)),
-                                None => {
-                                    if let Some(entry) = this.entry_mut(&path) {
-                                        entry.woke = Some(prompt);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        // The one being made, not another there before it.
-                        if let Some((pi, ti)) = this.find(&path).filter(|&(pi, ti)| this.projects[pi].tasks[ti].busy.is_some()) {
-                            this.projects[pi].tasks.remove(ti);
-                        }
-                        window.push_notification(Notification::error(e).title("Could not create the task"), cx);
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
 }
 
 /// A report from `host`: the paths it names (a worktree an agent makes,
@@ -410,7 +392,14 @@ mod tests {
         for d in [&home, &bins] {
             std::fs::create_dir_all(d).unwrap();
         }
-        let script = "git init -q -b main repo; cd repo; git config user.email t@t; git config user.name t; echo one > f.txt; git add f.txt; git commit -qm base";
+        // Its .ideae.toml sets its tasks up there, copies an ignored file into them and tears them down.
+        let torn = dir.join("torn");
+        let toml = format!("[task]\nsetup = [\"echo made > .made\"]\nteardown = [\"pwd > '{}'\"]\ncopy = [\".env.local\"]\n", torn.display());
+        std::fs::create_dir_all(dir.join("repo")).unwrap();
+        std::fs::write(dir.join("repo/.ideae.toml"), &toml).unwrap();
+        std::fs::write(dir.join("repo/.gitignore"), ".made\n.env.local\n").unwrap();
+        std::fs::write(dir.join("repo/.env.local"), "SECRET=1\n").unwrap();
+        let script = "git init -q -b main repo; cd repo; git config user.email t@t; git config user.name t; echo one > f.txt; git add f.txt .ideae.toml .gitignore; git commit -qm base";
         assert!(std::process::Command::new("sh").arg("-ec").arg(script).current_dir(&dir).status().unwrap().success());
         let repo = dir.join("repo").canonicalize().unwrap();
 
@@ -504,6 +493,11 @@ exec cat
             gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| Workspace::new(vec![PathBuf::from(&url)], Some(Some(agent.clone())), None, window, cx))).expect("a test window")
         });
         let main = crate::hosts::join("box", &repo);
+        // Its commands allowed, as the trust dialog would.
+        let key = crate::project_config::trust_key(&crate::project_config::parse(&toml).unwrap().task).unwrap();
+        workspace.update(cx, |w, _| {
+            w.projects[0].trusted.insert(key, true);
+        });
         let lines = || std::fs::read_to_string(&pwds).unwrap_or_default().lines().map(str::to_string).collect::<Vec<_>>();
         let until = |cx: &mut TestAppContext, what: &str, done: &dyn Fn(&mut TestAppContext) -> bool| {
             for _ in 0..600 {
@@ -544,6 +538,23 @@ exec cat
         cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx)).unwrap();
         cx.update_window(handle.into(), |_, window, cx| workspace.update(cx, |w, cx| w.create_task(0, "Fix it".into(), String::new(), Vec::new(), Vec::new(), window, cx))).unwrap();
         until(cx, "the task's agent ran in its worktree there", &|_| lines().len() == 2);
+        let made_in = PathBuf::from(&lines()[1]);
+        until(cx, "its setup ran there", &|_| made_in.join(".made").is_file());
+        assert_eq!(std::fs::read_to_string(made_in.join(".env.local")).unwrap(), "SECRET=1\n", "[task] copy, there");
+        // Its check's commands run there to their end: their code and output; a timeout ends them.
+        let in_task = crate::hosts::join("box", &made_in);
+        let never = std::sync::atomic::AtomicBool::new(false);
+        let ran = crate::project_config::run(&["echo hi there; exit 3".into()], &in_task, &[], Duration::from_secs(20), &never);
+        assert_eq!((ran.code, ran.output.trim()), (Some(3), "hi there"));
+        let pids = dir.join("slow.pid");
+        let ran = crate::project_config::run(&[format!("echo $$ > '{}'; sleep 30", pids.display())], &in_task, &[], Duration::from_millis(800), &never);
+        assert!(ran.timed_out && ran.code.is_none());
+        let pid = std::fs::read_to_string(&pids).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::process::Command::new("kill").args(["-0", pid.trim()]).status().unwrap().success() {
+            assert!(std::time::Instant::now() < deadline, "what ran out of time there ended");
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let worktree = PathBuf::from(&lines()[1]);
         assert_eq!(worktree.parent(), Some(repo.with_file_name("repo.worktrees").as_path()));
         let branch = String::from_utf8(std::process::Command::new("git").args(["branch", "--show-current"]).current_dir(&worktree).output().unwrap().stdout).unwrap();
@@ -578,6 +589,19 @@ exec cat
         until(cx, "the file came from there", &|cx| view.read_with(cx, |t, cx| t.open_text(&file, cx)).as_deref() == Some("two\n"));
         cx.update_window(handle.into(), |_, window, cx| view.update(cx, |t, cx| t.type_and_save(&file, "zero\n", window, cx))).unwrap();
         until(cx, "the file was saved there", &|_| std::fs::read_to_string(worktree.join("f.txt")).unwrap() == "zero\ntwo\n");
+
+        // A server it runs there: its port is told by its daemon, by the task's sessions.
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
+        let daemon = crate::daemon::client::for_path(&task).unwrap();
+        let serve = crate::daemon::proto::Spec { cwd: worktree.clone(), env: Vec::new(), input: None, program: vec!["python3".into(), "-m".into(), "http.server".into(), "--bind".into(), "127.0.0.1".into(), port.to_string()] };
+        let _served = daemon.pipe(format!("{}#serve", task.display()), serve);
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !crate::hostfs::listening(&task, None).iter().any(|l| l.port == port) {
+            assert!(std::time::Instant::now() < deadline, "its server's port is told");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(crate::hostfs::listening(&main, None).iter().all(|l| l.port != port), "another task's sessions are not its");
+        daemon.kill(&format!("{}#serve", task.display()));
 
         // Its language server runs there: found by the login shell there (the stand-in, and no
         // other), told and telling files by their names there, which here are its keys.
@@ -670,6 +694,7 @@ exec cat
         std::fs::write(worktree.join("h.txt"), "kept\n").unwrap();
         cx.update_window(handle.into(), |_, window, cx| workspace.update(cx, |w, cx| w.archive_now(&task, None, window, cx))).unwrap();
         until(cx, "archived", &|cx| workspace.update(cx, |w, _| w.entry_mut(&task).is_none()));
+        assert_eq!(std::fs::read_to_string(&torn).unwrap().trim(), worktree.display().to_string(), "torn down there, in it");
         assert!(!worktree.exists(), "its worktree is gone there");
         let root = workspace.update(cx, |w, _| w.archive_dir.clone());
         let listed = crate::archive::list(&root);

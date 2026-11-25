@@ -14,6 +14,8 @@ mod build_watch;
 #[cfg(unix)]
 mod daemon;
 mod hosts;
+#[cfg(unix)]
+mod askpass;
 mod hostfs;
 mod db;
 mod desktop;
@@ -617,6 +619,11 @@ fn main() {
         let _ = daemon::server::NOTIFY.set(daemon::notify);
         daemon::server::run(argv.get(2).map(String::as_str) == Some("--adopt"));
         return;
+    }
+    // Run by ssh as its SSH_ASKPASS: the question is the only argument.
+    #[cfg(unix)]
+    if std::env::var_os(askpass::MODE_ENV).is_some() && std::env::var_os(askpass::SOCK_ENV).is_some() {
+        std::process::exit(askpass::run(argv.get(1..).unwrap_or_default()));
     }
     if argv.get(1).map(String::as_str) == Some("--acp-host") {
         crash::install("acp-host");

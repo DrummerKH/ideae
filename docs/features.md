@@ -65,9 +65,21 @@ Variants are made there too, from one commit. Its language servers run
 there, those its login shell finds (rust-analyzer, gopls…, installed there),
 and answer for its files as for a local task's.
 
-Not there yet: its `.ideae.toml` (setup, check, teardown, copy; its .env
-files are copied as without one), the Run panel and Web tabs, chat agents,
-passwords (keys and the ssh agent only).
+Its `.ideae.toml` is read there: setup, check and teardown run there,
+`[task] copy` copies there.
+
+What ssh asks (a password, a key's passphrase, a host it has not met) is
+asked in the window, once a link: kept nowhere, it is asked again only when
+the link is made anew. Exit closes ssh's links too.
+
+The Run panel starts its services there and tells the ports its processes
+listen on there; a Web tab opens such an address (`localhost:3000` there)
+through ssh, forwarded to the same port here when that one is free. The
+host's sshd must allow forwarding (`AllowTcpForwarding`, on by default but
+on Alpine).
+
+Not there yet: chat agents, and agents driving its Web tabs (Playwright's
+IDEAE_BROWSER_CDP).
 
 ## Pause, archive, restore
 

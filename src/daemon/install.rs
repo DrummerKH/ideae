@@ -181,6 +181,29 @@ mod tests {
         daemon.unwatch("live");
         sh(format!("rm -rf {folder}"));
 
+        // A server of a task there: its port is told by the daemon, and reached here through ssh.
+        let port = 18000 + (std::process::id() % 1000) as u16;
+        let serve = crate::daemon::proto::Spec { cwd: "/".into(), env: Vec::new(), input: None, program: vec!["sh".into(), "-c".into(), format!("while :; do {{ echo hello; sleep 1; }} | nc -l -p {port}; done")] };
+        let _served = daemon.pipe("live-task#serve".into(), serve);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let (_, body) = daemon.call(&Call::Listening { task: "live-task".into() }, b"").unwrap();
+            let found: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap_or_default();
+            if found.iter().any(|l| l["port"] == port) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "its port is told: {found:?}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let here = daemon.forward(port).expect("forwarded");
+        let mut said = String::new();
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", here)).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let _ = std::io::Read::read_to_string(&mut stream, &mut said);
+        assert_eq!(said.trim(), "hello", "reached here at {here}");
+        eprintln!("forwarded {port} there to {here} here");
+        daemon.kill("live-task#serve");
+
         daemon.write(&id, b"one\n");
         let (got, _) = read("got:one");
         assert!(got.contains("got:one"), "{got}");
@@ -196,7 +219,7 @@ mod tests {
         assert!(read("got:two").0.contains("got:two"), "the session ran on after the link was cut");
         daemon.disconnect();
 
-        let (daemon, _) = super::super::remote::connect(remote, |_| {}).expect("connected again");
+        let (daemon, _) = super::super::remote::connect(remote.clone(), |_| {}).expect("connected again");
         let events = daemon.pipe(id.clone(), spec);
         daemon.write(&id, b"three\n");
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -212,6 +235,40 @@ mod tests {
         daemon.kill(&id);
         std::thread::sleep(Duration::from_millis(300));
         daemon.disconnect();
+        // ssh's link there goes with the test.
+        super::super::remote::close_master(&remote);
+    }
+
+    /// A host that wants a password: asked of the window once (the
+    /// app's own askpass), not again while ssh's master connection holds;
+    /// that connection ends when told to.
+    /// `cargo build && IDEAE_LIVE_PASSWORD_REMOTE="ssh -p 2222 -o PubkeyAuthentication=no me@host" IDEAE_LIVE_PASSWORD=… cargo test -- --ignored a_real_server_asks`
+    #[test]
+    #[ignore]
+    fn a_real_server_asks_for_a_password_once() {
+        let (Ok(ssh), Ok(password)) = (std::env::var("IDEAE_LIVE_PASSWORD_REMOTE"), std::env::var("IDEAE_LIVE_PASSWORD")) else { return };
+        let app = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/ideae");
+        assert!(app.is_file(), "cargo build first");
+        // SAFETY: set before any ssh is started.
+        unsafe { std::env::set_var("IDEAE_ASKPASS_PROGRAM", &app) };
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = asked.clone();
+        if crate::askpass::socket().is_none() {
+            crate::askpass::listen(move |ask| {
+                seen.lock().unwrap().push(ask.prompt.clone());
+                let _ = ask.reply.send(Some(password.clone()));
+            })
+            .unwrap();
+        }
+        let remote = super::Remote::new(ssh.split_whitespace().map(String::from).collect());
+        super::super::remote::close_master(&remote);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(super::run(&remote, "echo one", None).unwrap(), "one");
+        assert_eq!(super::run(&remote, "echo two", None).unwrap(), "two");
+        let asked = asked.lock().unwrap().clone();
+        assert_eq!(asked.len(), 1, "asked once: {asked:?}");
+        assert!(asked[0].to_lowercase().contains("password"), "{asked:?}");
+        super::super::remote::close_master(&remote);
     }
 
     #[test]

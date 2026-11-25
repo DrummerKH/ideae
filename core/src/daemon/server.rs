@@ -249,6 +249,7 @@ fn serve(shared: Shared, stream: UnixStream) {
                 // Its own thread: a slow git holds up nothing else.
                 std::thread::spawn(move || {
                     let reply = match proto::unpack::<proto::Call>(&bytes) {
+                        Some((proto::Call::Listening { task }, _)) => listening(&shared, &task),
                         Some((call, body)) => super::calls::answer(call, body),
                         None => (proto::Reply { error: Some("a call not understood".into()), ..Default::default() }, Vec::new()),
                     };
@@ -341,6 +342,26 @@ fn serve(shared: Shared, stream: UnixStream) {
     }
     drop(tx);
     let _ = writer_thread.join();
+}
+
+/// The ports the sessions of `task` listen on: their leaders' sessions,
+/// all they started in them.
+fn listening(shared: &Shared, task: &str) -> (proto::Reply, Vec<u8>) {
+    let prefix = format!("{task}#");
+    let leaders: Vec<i32> = {
+        let s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        s.sessions
+            .iter()
+            .filter(|(id, _)| id.starts_with(&prefix))
+            .filter_map(|(_, session)| match &session.pipe {
+                Some(pipe) => Some(pipe.pid() as i32),
+                None => session.handle.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pty().map(|(_, pid)| pid as i32),
+            })
+            .collect()
+    };
+    let found = crate::procs::listening(&crate::procs::in_sessions(&leaders));
+    let json: Vec<serde_json::Value> = found.iter().map(|l| serde_json::json!({ "port": l.port, "pid": l.pid, "name": l.name })).collect();
+    (proto::Reply::default(), serde_json::to_vec(&json).unwrap_or_default())
 }
 
 /// Watches `flat` and `deep` for window `client` as `id`, telling it of

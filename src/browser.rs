@@ -1624,6 +1624,22 @@ pub fn is_local(url: &str) -> bool {
     local_address(url).is_some()
 }
 
+/// The port of an address on this machine, and where it is written in
+/// `url`: its digits, or, not written (the scheme's), the empty place at
+/// the end of the host where `:port` would go (the flag false).
+#[cfg_attr(not(unix), allow(dead_code))]
+pub fn port_place(url: &str) -> Option<(u16, std::ops::Range<usize>, bool)> {
+    let port = local_address(url)?.rsplit_once(':')?.1.parse().ok()?;
+    let start = url.find("://")? + 3;
+    let rest = url.get(start..)?;
+    let authority_end = start + rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = url.get(start..authority_end)?;
+    match authority.rfind(':').filter(|&at| authority.get(at..).is_some_and(|tail| !tail.contains(']'))) {
+        Some(colon) => Some((port, start + colon + 1..authority_end, true)),
+        None => Some((port, authority_end..authority_end, false)),
+    }
+}
+
 /// `host:port` of an address on this machine, for waiting until something
 /// listens there.
 fn local_address(url: &str) -> Option<String> {
@@ -1937,7 +1953,7 @@ impl BrowserView {
                     .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
                         this.offering = false;
-                        this.go(&address);
+                        this.go_there(&address, cx);
                         this.focus.focus(window, cx);
                         cx.notify();
                     })),
@@ -1953,6 +1969,24 @@ impl BrowserView {
     /// To another address.
     pub fn go(&self, url: &str) {
         self.command("Page.navigate", json!({ "url": url }));
+    }
+
+    /// Goes to an address typed or picked: a remote task's own (`localhost:3000`
+    /// there) once its port is forwarded here ([`crate::hostfs::reach`]).
+    fn go_there(&self, url: &str, cx: &mut Context<Self>) {
+        let Owner::Task(root) = &self.owner else { return self.go(url) };
+        if !crate::hosts::is_remote(root) || !is_local(url) {
+            return self.go(url);
+        }
+        let (root, asked) = (root.clone(), url.to_string());
+        cx.spawn(async move |this, cx| {
+            let reached = cx.background_spawn(async move { crate::hostfs::reach(&root, &asked) }).await;
+            let _ = this.update(cx, |page, _| match reached {
+                Ok(url) => page.go(&url),
+                Err(e) => eprintln!("not reached through ssh: {e}"),
+            });
+        })
+        .detach();
     }
 
     /// A page's connection, and the task that takes what it tells.
@@ -2016,7 +2050,7 @@ impl BrowserView {
                 if !url.contains("://") && !url.is_empty() && !url.starts_with("about:") {
                     url = format!("http://{url}");
                 }
-                this.go(&url);
+                this.go_there(&url, cx);
                 this.focus.focus(window, cx);
             }
         })
@@ -3810,6 +3844,16 @@ mod tests {
             // running when the test is over, a gigabyte each time.
             chrome.close();
         }
+    }
+
+    #[core::prelude::v1::test]
+    fn the_port_of_an_address_and_where_it_is_written() {
+        let place = |url: &str| super::port_place(url).map(|(port, at, written)| (port, url.get(at).unwrap_or_default().to_string(), written));
+        assert_eq!(place("http://localhost:3000/a?b"), Some((3000, "3000".into(), true)));
+        assert_eq!(place("http://[::1]:8443"), Some((8443, "8443".into(), true)));
+        assert_eq!(place("http://localhost/x"), Some((80, String::new(), false)), "the scheme's own, where it would be written");
+        assert_eq!(super::port_place("http://localhost/x").unwrap().1, 16..16);
+        assert_eq!(place("https://example.com:3000/"), None, "not of this machine");
     }
 
     #[core::prelude::v1::test]

@@ -47,11 +47,37 @@ impl TaskView {
     }
 
     pub(super) fn start_service(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if crate::hosts::is_remote(&self.root) {
+            let name = name.to_string();
+            return self.with_services_there(window, cx, move |t, window, cx| t.start_service_now(&name, window, cx));
+        }
+        self.start_service_now(name, window, cx);
+    }
+
+    /// A remote task's .ideae.toml read afresh there, off the UI thread, then `then`; or what was wrong told.
+    fn with_services_there(&mut self, window: &mut Window, cx: &mut Context<Self>, then: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static) {
+        let root = self.root.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let loaded = cx.background_spawn(async move { crate::services::load(&root) }).await;
+            let _ = this.update_in(cx, |t, window, cx| match loaded {
+                Ok(services) => {
+                    t.services = services;
+                    then(t, window, cx);
+                }
+                Err(e) => window.push_notification(Notification::error(e).title("Services"), cx),
+            });
+        })
+        .detach();
+    }
+
+    fn start_service_now(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         if let Err(e) = self.reload_services() {
             window.push_notification(Notification::error(e).title("Services"), cx);
             return;
         }
         let port = self.services.iter().find(|s| s.name == name).and_then(|s| s.port(self.port_slot));
+        // A remote task's ports are its host's: not what listens here.
+        let port = port.filter(|_| !crate::hosts::is_remote(&self.root));
         if self.service_ix(name, cx).is_none() {
             if let Some(owner) = port.and_then(crate::services::port_taken) {
                 window.push_notification(
@@ -71,13 +97,24 @@ impl TaskView {
     /// whose port something listens on already is left: the agent may have
     /// started it itself. How many were started.
     pub fn start_services(&mut self, window: &mut Window, cx: &mut Context<Self>) -> usize {
+        // A remote task's: once its file is read there; none counted now.
+        if crate::hosts::is_remote(&self.root) {
+            self.with_services_there(window, cx, |t, window, cx| {
+                t.start_services_now(window, cx);
+            });
+            return 0;
+        }
+        self.start_services_now(window, cx)
+    }
+
+    fn start_services_now(&mut self, window: &mut Window, cx: &mut Context<Self>) -> usize {
         if self.reload_services().is_err() {
             return 0;
         }
         let waiting: Vec<String> = self
             .services
             .iter()
-            .filter(|s| self.service_ix(&s.name, cx).is_none() && s.port(self.port_slot).and_then(crate::services::port_taken).is_none())
+            .filter(|s| self.service_ix(&s.name, cx).is_none() && (crate::hosts::is_remote(&self.root) || s.port(self.port_slot).and_then(crate::services::port_taken).is_none()))
             .map(|s| s.name.clone())
             .collect();
         let started = waiting.into_iter().filter(|name| self.service_tab(name, window, cx).is_some()).count();
@@ -148,7 +185,33 @@ impl TaskView {
     }
 
     /// `url` in the Web tab that shows its site already, or a new one.
+    /// A remote task's address of its host's own (`localhost:3000` there) is
+    /// reached through ssh first, at the port here it is forwarded to.
     pub(super) fn show_url(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match self.reached(url, window, cx, |t, url, window, cx| t.show_url_here(&url, window, cx)) {
+            Some(url) => self.show_url_here(&url, window, cx),
+            None => {}
+        }
+    }
+
+    /// `url` as it is here now, or none: then `then` gets it once its port is forwarded.
+    pub(super) fn reached(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>, then: impl FnOnce(&mut Self, String, &mut Window, &mut Context<Self>) + 'static) -> Option<String> {
+        if !crate::hosts::is_remote(&self.root) || !crate::browser::is_local(url) {
+            return Some(url.to_string());
+        }
+        let (root, asked) = (self.root.clone(), url.to_string());
+        cx.spawn_in(window, async move |this, cx| {
+            let reached = cx.background_spawn(async move { crate::hostfs::reach(&root, &asked) }).await;
+            let _ = this.update_in(cx, |t, window, cx| match reached {
+                Ok(url) => then(t, url, window, cx),
+                Err(e) => window.push_notification(Notification::error(e).title("Not reached through ssh"), cx),
+            });
+        })
+        .detach();
+        None
+    }
+
+    fn show_url_here(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
         let open = self.tabs.iter().position(|t| match &t.kind {
             TabKind::Browser(view) => view.read(cx).url().starts_with(origin(url)),
             _ => false,
@@ -181,13 +244,49 @@ impl TaskView {
     }
 
     pub(super) fn reload_services(&mut self) -> Result<(), String> {
+        // A remote task's file is on its host: read in the background (load_services_there).
+        if crate::hosts::is_remote(&self.root) {
+            return Ok(());
+        }
         self.services = crate::services::load(&self.root)?;
         Ok(())
+    }
+
+    /// A remote task's services, read from its .ideae.toml there, off the UI thread.
+    pub(super) fn load_services_there(&mut self, cx: &mut Context<Self>) {
+        let root = self.root.clone();
+        cx.spawn(async move |this, cx| {
+            let loaded = cx.background_spawn(async move { crate::services::load(&root) }).await;
+            if let Ok(services) = loaded {
+                let _ = this.update(cx, |t, cx| {
+                    t.services = services;
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
 
     /// Writes a commented `.ideae.toml` to start from, and opens it.
     pub(super) fn create_services_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let path = self.root.join(crate::services::FILE);
+        // A remote task's, on its host, off the UI thread; then opened as any of its files.
+        if crate::hosts::is_remote(&self.root) {
+            let made = path.clone();
+            cx.spawn_in(window, async move |this, cx| {
+                let written = cx
+                    .background_spawn(async move {
+                        if crate::hostfs::stat(&made).is_ok() { Ok(()) } else { crate::hostfs::write(&made, crate::services::TEMPLATE.as_bytes()) }
+                    })
+                    .await;
+                let _ = this.update_in(cx, |t, window, cx| match written {
+                    Ok(()) => t.open_file_as(path, 0, 0, OpenAs::Kept, window, cx),
+                    Err(e) => window.push_notification(Notification::error(e.to_string()).title("Services"), cx),
+                });
+            })
+            .detach();
+            return;
+        }
         if !path.exists() {
             if let Err(e) = std::fs::write(&path, crate::services::TEMPLATE) {
                 window.push_notification(Notification::error(e.to_string()).title("Services"), cx);
@@ -204,7 +303,7 @@ impl TaskView {
     pub(super) fn own_places(&self) -> crate::browser::Places {
         let (root, socket, slot) = (self.root.clone(), self.hook_socket.clone(), self.port_slot);
         Arc::new(move || {
-            let listening = socket.as_ref().map(|socket| crate::services::listening(&crate::procs::task_processes(Some(&root.display().to_string()), socket))).unwrap_or_default();
+            let listening = crate::hostfs::listening(&root, socket.as_deref());
             let services = crate::project_config::resolve(&root).config.service;
             own_places(services.iter().filter_map(|service| Some((service.name.clone(), service.port(slot)?))).collect(), listening.into_iter().map(|l| (l.name, l.port)).collect())
         })
@@ -243,14 +342,18 @@ impl TaskView {
     /// Every few seconds while the Run panel is in view: the ports the
     /// task's processes listen on.
     pub(super) fn watch_listening(&mut self, cx: &mut Context<Self>) {
-        let Some(socket) = self.hook_socket.clone() else { return };
-        let root = self.root.display().to_string();
+        // A remote task's are asked of its daemon there: no socket here to go by.
+        let socket = self.hook_socket.clone();
+        if socket.is_none() && !crate::hosts::is_remote(&self.root) {
+            return;
+        }
+        let root = self.root.clone();
         self._listening_poll = Some(cx.spawn(async move |this, cx| {
             loop {
                 let (root, socket) = (root.clone(), socket.clone());
                 let ports = cx
                     .background_spawn(async move {
-                        crate::services::listening(&crate::procs::task_processes(Some(&root), &socket))
+                        crate::hostfs::listening(&root, socket.as_deref())
                     })
                     .await;
                 let shown = this.update(cx, |t, cx| {
@@ -293,6 +396,23 @@ impl TaskView {
 
     pub(super) fn add_found_service(&mut self, ix: usize, cx: &mut Context<Self>) {
         let Some(found) = self.services_found.get(ix).cloned() else { return };
+        // A remote task's file is on its host: written off the UI thread.
+        if crate::hosts::is_remote(&self.root) {
+            self.services_found.remove(ix);
+            let root = self.root.clone();
+            cx.spawn(async move |this, cx| {
+                let added = cx.background_spawn(async move { crate::services::add(&root, &found.service) }).await;
+                let _ = this.update(cx, |t, cx| {
+                    if let Err(e) = added {
+                        t.services_error = Some(e);
+                    }
+                    t.refresh_services(cx);
+                    cx.notify();
+                });
+            })
+            .detach();
+            return;
+        }
         if let Err(e) = crate::services::add(&self.root, &found.service) {
             self.services_error = Some(e);
         }

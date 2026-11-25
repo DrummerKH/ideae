@@ -167,11 +167,9 @@ impl Read for Reader {
 /// Starts `command` with `args` in `cwd` on the host of `root`: the pipes
 /// of the session there, and what ends it.
 pub fn start(program: &str, command: &Path, args: &[&str], root: &Path, cwd: &Path) -> io::Result<(Writer, Reader, Box<dyn FnOnce() + Send>)> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(1);
     let (host, _) = crate::hosts::split(root).ok_or_else(|| io::Error::other("not a remote task"))?;
     let daemon = crate::daemon::client::for_path(root).ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "its host is not connected"))?;
-    let id = format!("{}#lsp-{program}-{}", root.display(), NEXT.fetch_add(1, Ordering::Relaxed));
+    let id = format!("{}#lsp-{program}-{}", root.display(), crate::hostfs::unique());
     let mut line = vec![command.display().to_string()];
     line.extend(args.iter().map(|a| a.to_string()));
     // As a local one is started: jdtls with an index of the project's own,

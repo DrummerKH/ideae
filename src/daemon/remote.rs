@@ -5,6 +5,7 @@
 //! attaching anew.
 
 use std::io::{BufRead, BufReader, Read, Write};
+use std::path::PathBuf;
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -69,6 +70,22 @@ impl Wire {
     /// Whether the daemon there watches folders for the window.
     pub fn watches(&self) -> bool {
         self.watches.load(Ordering::Relaxed)
+    }
+
+    /// Waits, `most` at most, for the ssh of the link to end.
+    pub(super) fn wait_gone(&self, most: Duration) {
+        let until = Instant::now() + most;
+        while Instant::now() < until {
+            let gone = self.child.lock().unwrap().as_mut().is_none_or(|child| child.try_wait().ok().flatten().is_some());
+            if gone {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    pub(super) fn remote(&self) -> &Remote {
+        &self.remote
     }
 
     pub fn is_up(&self) -> bool {
@@ -281,9 +298,14 @@ fn dial(remote: &Remote) -> Result<Dialled, String> {
     let waiting = greeted.clone();
     std::thread::spawn(move || {
         let deadline = Instant::now() + HANDSHAKE;
+        let mut deadline = deadline;
         while Instant::now() < deadline {
             if waiting.load(Ordering::Relaxed) {
                 return;
+            }
+            // Someone is typing a password: their time is not the host's.
+            if crate::askpass::asking() {
+                deadline = Instant::now() + HANDSHAKE;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -340,18 +362,108 @@ pub fn run(remote: &Remote, line: &str, input: Option<&[u8]>) -> Result<String, 
 
 /// ssh to the host, running `line` in its shell there.
 pub(super) fn ssh(remote: &Remote, line: &str) -> Result<std::process::Command, String> {
+    let mut command = ssh_to(remote)?;
+    command.arg("--").arg(line);
+    Ok(command)
+}
+
+/// ssh to the host, its options and the host given, no command yet. What
+/// it asks (a password, a key's passphrase, a host not met) is asked in
+/// the window, once a link: later ones go through the first's master
+/// connection. With no window to ask, it asks nothing.
+fn ssh_to(remote: &Remote) -> Result<std::process::Command, String> {
+    ssh_with(remote, &[])
+}
+
+/// The same, with `extra` before the host (`-O forward …`).
+fn ssh_with(remote: &Remote, extra: &[&str]) -> Result<std::process::Command, String> {
     let (program, rest) = remote.ssh.split_first().ok_or("no ssh command")?;
     let (host, options) = rest.split_last().ok_or("no host")?;
     let mut command = crate::procs::command(program);
-    command
-        .args(options)
-        // No questions nobody can answer, and a link that hangs is told
-        // by ssh too.
-        .args(["-T", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3"])
-        .arg(host)
-        .arg("--")
-        .arg(line);
+    command.args(options).args(["-T", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3"]);
+    // IDEAE_ASKPASS_PROGRAM: the app's binary, for a test whose own is not.
+    let askpass = std::env::var_os("IDEAE_ASKPASS_PROGRAM").map(PathBuf::from).map_or_else(crate::desktop::exe, Ok);
+    match (crate::askpass::socket(), askpass) {
+        (Some(socket), Ok(exe)) => {
+            command.env("SSH_ASKPASS", exe).env("SSH_ASKPASS_REQUIRE", "force").env(crate::askpass::SOCK_ENV, socket).env(crate::askpass::MODE_ENV, "1");
+        }
+        _ => {
+            command.args(["-o", "BatchMode=yes"]);
+        }
+    }
+    if let Some(dir) = masters() {
+        command.args(["-o", "ControlMaster=auto", "-o"]).arg(format!("ControlPath={}/%C", dir.display())).args(["-o", "ControlPersist=600"]);
+    }
+    command.args(extra).arg(host);
     Ok(command)
+}
+
+/// Where ssh keeps this run's master connections: a short path (a
+/// socket's is 104 bytes at most on macOS), a folder of this user's alone,
+/// one of this process's in it, so that Exit in one window ends no link
+/// of another. Those of runs gone are cleared the first time.
+fn masters() -> Option<PathBuf> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    static MADE: std::sync::Once = std::sync::Once::new();
+    // SAFETY: getuid cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let dir = PathBuf::from(format!("/tmp/{}-ssh-{uid}", crate::state::APP_ID));
+    let _ = std::fs::create_dir(&dir);
+    let meta = std::fs::symlink_metadata(&dir).ok()?;
+    if !meta.is_dir() || meta.uid() != uid {
+        return None;
+    }
+    if meta.mode() & 0o077 != 0 {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok()?;
+    }
+    MADE.call_once(|| {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let pid = entry.file_name().to_str().and_then(|n| n.parse::<i32>().ok());
+            // SAFETY: kill with 0 only asks whether the process is there.
+            if pid.is_some_and(|pid| unsafe { libc::kill(pid, 0) } != 0) {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    });
+    let own = dir.join(std::process::id().to_string());
+    let _ = std::fs::create_dir(&own);
+    own.is_dir().then_some(own)
+}
+
+/// Ends ssh's master connection to the host: Exit leaves none behind.
+pub fn close_master(remote: &Remote) {
+    if masters().is_none() {
+        return;
+    }
+    if let Ok(mut exit) = ssh_with(remote, &["-O", "exit"]) {
+        let _ = exit.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+    }
+}
+
+/// Port `there` of the host, reached here through ssh's master connection:
+/// at the same port when it is free here, else at one that is. Kept while
+/// it answers; forwarded again when the master was made anew.
+pub fn forward(remote: &Remote, there: u16) -> Result<u16, String> {
+    use std::collections::HashMap;
+    static FORWARDS: Mutex<Option<HashMap<(String, u16), u16>>> = Mutex::new(None);
+    let key = (remote.ssh.join(" "), there);
+    let known = FORWARDS.lock().unwrap().get_or_insert_with(HashMap::new).get(&key).copied();
+    if let Some(here) = known.filter(|here| std::net::TcpStream::connect(("127.0.0.1", *here)).is_ok()) {
+        return Ok(here);
+    }
+    masters().ok_or("no folder for ssh's master connections")?;
+    let here = known
+        .filter(|here| std::net::TcpListener::bind(("127.0.0.1", *here)).is_ok())
+        .or_else(|| std::net::TcpListener::bind(("127.0.0.1", there)).ok().map(|_| there))
+        .or_else(|| std::net::TcpListener::bind(("127.0.0.1", 0)).ok().and_then(|l| l.local_addr().ok()).map(|a| a.port()))
+        .ok_or("no port free here")?;
+    let spec = format!("{here}:127.0.0.1:{there}");
+    let out = ssh_with(remote, &["-O", "forward", "-L", &spec])?.stdin(Stdio::null()).output().map_err(|e| format!("ssh: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    FORWARDS.lock().unwrap().get_or_insert_with(HashMap::new).insert(key, here);
+    Ok(here)
 }
 
 /// Reads up to the bridge's mark; what a login shell printed before it goes.

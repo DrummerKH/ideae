@@ -84,7 +84,8 @@ pub fn parse(text: &str) -> Result<Config, String> {
 
 /// The file in `dir`; none when there is no file.
 pub fn read_file(dir: &Path) -> Result<Option<Config>, String> {
-    match std::fs::read_to_string(dir.join(FILE)) {
+    // Where the folder's machine is (crate::hostfs).
+    match crate::hostfs::read_to_string(&dir.join(FILE)) {
         Ok(text) => parse(&text).map(Some),
         Err(_) => Ok(None),
     }
@@ -276,9 +277,9 @@ fn first_table(doc: &mut toml_edit::DocumentMut) -> Option<&mut toml_edit::Table
 /// Writes `config` into the `.ideae.toml` in `dir`.
 pub fn write_file(dir: &Path, config: &Config) -> Result<(), String> {
     let path = dir.join(FILE);
-    let text = std::fs::read_to_string(&path).ok();
+    let text = crate::hostfs::read_to_string(&path).ok();
     let out = render(text.as_deref(), config)?;
-    std::fs::write(&path, out).map_err(|e| format!("{FILE}: {e}"))
+    crate::hostfs::write(&path, out.as_bytes()).map_err(|e| format!("{FILE}: {e}"))
 }
 
 // ---------------------------------------------------------------- suggestions
@@ -300,9 +301,10 @@ impl Suggested {
 }
 
 pub fn suggest(root: &Path) -> Suggested {
-    let has = |name: &str| root.join(name).exists();
+    let remote = crate::hosts::is_remote(root);
+    let has = |name: &str| if remote { crate::hostfs::stat(&root.join(name)).is_ok() } else { root.join(name).exists() };
     let mut out = Suggested::default();
-    let scripts = std::fs::read_to_string(root.join("package.json"))
+    let scripts = crate::hostfs::read_to_string(&root.join("package.json"))
         .ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
         .map(|json| json["scripts"].clone());
@@ -376,7 +378,7 @@ pub fn suggest(root: &Path) -> Suggested {
 }
 
 fn ignored(root: &Path, file: &str) -> bool {
-    crate::procs::command("git").current_dir(root).args(["check-ignore", "-q", file]).status().is_ok_and(|s| s.success())
+    crate::hostfs::run(root, "git", &["check-ignore", "-q", file], &[], None).is_ok_and(|out| out.success())
 }
 
 /// Ignored files of the main checkout matching `patterns`, copied into the
@@ -387,8 +389,14 @@ pub fn copy_ignored(from: &Path, to: &Path, patterns: &[String]) {
     }
     let mut args = vec!["ls-files".to_string(), "--others".into(), "--ignored".into(), "--exclude-standard".into(), "-z".into(), "--".into()];
     args.extend(patterns.iter().map(|p| format!(":(glob){p}")));
-    let Ok(out) = crate::procs::command("git").current_dir(from).args(&args).output() else { return };
-    for rel in String::from_utf8_lossy(&out.stdout).split('\0').filter(|f| !f.is_empty()) {
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let Ok(out) = crate::hostfs::run(from, "git", &args, &[], None) else { return };
+    let listed = String::from_utf8_lossy(&out.stdout).into_owned();
+    if crate::hosts::is_remote(from) {
+        crate::git::copy_there(from, to, listed.split('\0').filter(|f| !f.is_empty()));
+        return;
+    }
+    for rel in listed.split('\0').filter(|f| !f.is_empty()) {
         let target = to.join(rel);
         if target.exists() {
             continue;
@@ -434,6 +442,10 @@ fn script(commands: &[String]) -> String {
 /// until `cancel` is set. They run in a session of their own, which is
 /// ended whole: what they start goes with them, and with the app.
 pub fn run(commands: &[String], cwd: &Path, env: &[(String, String)], timeout: Duration, cancel: &AtomicBool) -> Outcome {
+    #[cfg(unix)]
+    if crate::hosts::is_remote(cwd) {
+        return run_there(commands, cwd, env, timeout, cancel);
+    }
     let mut command = if cfg!(windows) {
         let mut c = crate::procs::command("cmd");
         c.arg("/C").arg(format!("({}) 2>&1", script(commands)));
@@ -507,6 +519,63 @@ pub fn run(commands: &[String], cwd: &Path, env: &[(String, String)], timeout: D
     let bytes = kept.lock().unwrap().clone();
     let start = bytes.len().saturating_sub(KEEP);
     Outcome { code, output: plain(&bytes[start..]), timed_out, cancelled }
+}
+
+/// The same on a remote task's host: in a pipe session of its daemon,
+/// which ends it (and all it started) on a timeout or when cancelled; its
+/// exit code told after its output, by a mark.
+#[cfg(unix)]
+fn run_there(commands: &[String], cwd: &Path, env: &[(String, String)], timeout: Duration, cancel: &AtomicBool) -> Outcome {
+    const MARK: &str = "\u{1e}ideae-exit ";
+    let Some(daemon) = crate::daemon::client::for_path(cwd) else {
+        return Outcome { output: "its host is not connected".into(), ..Default::default() };
+    };
+    let id = format!("{}#run-{}", cwd.display(), crate::hostfs::unique());
+    let line = format!("( exec 2>&1\n{} )\nprintf '\\n{MARK}%s\\n' \"$?\"", script(commands));
+    let spec = crate::daemon::proto::Spec {
+        cwd: crate::hosts::there(cwd),
+        env: env.to_vec(),
+        input: None,
+        // Below the agents there too, as here.
+        program: vec!["nice".into(), "-n".into(), "10".into(), "sh".into(), "-c".into(), line],
+    };
+    let events = daemon.pipe(id.clone(), spec);
+    let started = Instant::now();
+    let (mut kept, mut timed_out, mut cancelled) = (Vec::<u8>::new(), false, false);
+    loop {
+        let idle = match events.try_recv() {
+            Ok(crate::daemon::client::PipeEvent::Bytes(bytes)) => {
+                kept.extend_from_slice(&bytes);
+                if kept.len() > 2 * KEEP {
+                    let cut = kept.len() - KEEP;
+                    kept.drain(..cut);
+                }
+                false
+            }
+            Ok(crate::daemon::client::PipeEvent::Reattached) => false,
+            Ok(crate::daemon::client::PipeEvent::Exited) | Err(async_channel::TryRecvError::Closed) => break,
+            Err(async_channel::TryRecvError::Empty) => true,
+        };
+        // Each time, output coming or not: one that never stops printing ends too.
+        timed_out = started.elapsed() > timeout;
+        cancelled = cancel.load(Ordering::Relaxed);
+        if timed_out || cancelled {
+            daemon.kill(&id);
+            break;
+        }
+        if idle {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    let text = String::from_utf8_lossy(&kept).into_owned();
+    let (output, code) = match text.rfind(MARK) {
+        Some(at) => (text.get(..at).unwrap_or_default(), text.get(at + MARK.len()..).and_then(|c| c.trim().parse().ok())),
+        None => (text.as_str(), None),
+    };
+    // Its end, from a whole character on.
+    let start = output.len().saturating_sub(KEEP);
+    let end = (start..output.len()).find_map(|i| output.get(i..)).unwrap_or_default();
+    Outcome { code: code.filter(|_| !timed_out && !cancelled), output: plain(end.as_bytes()), timed_out, cancelled }
 }
 
 /// Ends the commands' whole session: a term first, then a kill.
@@ -585,7 +654,7 @@ pub fn tail(text: &str, n: usize) -> String {
 /// run again. None outside a repository.
 pub fn fingerprint(root: &Path) -> Option<String> {
     use sha2::Digest as _;
-    let git = |args: &[&str]| crate::procs::command("git").current_dir(root).args(args).output().ok().filter(|o| o.status.success()).map(|o| o.stdout);
+    let git = |args: &[&str]| crate::hostfs::run(root, "git", args, &[], None).ok().filter(|o| o.success()).map(|o| o.stdout);
     let mut hash = sha2::Sha256::new();
     hash.update(git(&["rev-parse", "HEAD"])?);
     let status = git(&["status", "--porcelain=v1", "-z", "--untracked-files=all"])?;
@@ -595,12 +664,10 @@ pub fn fingerprint(root: &Path) -> Option<String> {
     for entry in status.split(|&b| b == 0) {
         if let Some(rel) = entry.strip_prefix(b"?? ") {
             let path = root.join(String::from_utf8_lossy(rel).as_ref());
-            if let Ok(meta) = std::fs::metadata(&path) {
+            if let Ok(meta) = crate::hostfs::stat(&path) {
                 hash.update(rel);
-                hash.update(meta.len().to_le_bytes());
-                if let Ok(at) = meta.modified().map(|m| m.duration_since(std::time::UNIX_EPOCH).unwrap_or_default()) {
-                    hash.update(at.as_nanos().to_le_bytes());
-                }
+                hash.update(meta.len.to_le_bytes());
+                hash.update(meta.modified.to_le_bytes());
             }
         }
     }

@@ -411,23 +411,29 @@ impl Workspace {
     pub(super) fn teardown_at_quit(&mut self) {
         let mut runs = Vec::new();
         for p in &self.projects {
-            for t in p.tasks.iter().filter(|t| t.view.is_some() && !t.main && t.side.is_none() && !self.auto.tearing.contains_key(&t.path)) {
-                let resolved = project_config::resolve(&t.path);
-                let commands = resolved.config.task.teardown.clone();
-                let key = project_config::trust_key(&resolved.config.task);
-                let allowed = !resolved.from_file || key.and_then(|k| p.trusted.get(&k).copied()).unwrap_or(false);
-                if commands.is_empty() || !allowed {
-                    continue;
-                }
-                let env = crate::services::task_env(&resolved.config.service, t.port_slot);
-                let root = t.path.clone();
+            // A remote task whose host cannot be asked now is left: nobody waits on a dead link.
+            for t in p.tasks.iter().filter(|t| t.view.is_some() && !t.main && t.side.is_none() && !self.auto.tearing.contains_key(&t.path) && crate::hostfs::reachable(&t.path)) {
+                let (root, trusted, slot) = (t.path.clone(), p.trusted.clone(), t.port_slot);
+                // Read on its thread: a remote task's file is on its host.
                 runs.push(std::thread::spawn(move || {
+                    let resolved = project_config::resolve(&root);
+                    let commands = resolved.config.task.teardown.clone();
+                    let key = project_config::trust_key(&resolved.config.task);
+                    let allowed = !resolved.from_file || key.and_then(|k| trusted.get(&k).copied()).unwrap_or(false);
+                    if commands.is_empty() || !allowed {
+                        return;
+                    }
+                    let env = crate::services::task_env(&resolved.config.service, slot);
                     project_config::run(&commands, &root, &env, TEARDOWN_AT_QUIT, &std::sync::atomic::AtomicBool::new(false));
                 }));
             }
         }
+        // Their time and a little: a read of a file there that hangs holds no quit.
+        let until = std::time::Instant::now() + TEARDOWN_AT_QUIT + Duration::from_secs(2);
         for run in runs {
-            let _ = run.join();
+            while !run.is_finished() && std::time::Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
     }
 

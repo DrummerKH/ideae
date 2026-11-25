@@ -85,6 +85,10 @@ impl Pipe {
         Self { pid, child: Mutex::new(child), input: tx, fds }
     }
 
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
     /// The program's pid, and copies of its input and output for another daemon.
     pub fn handover(&self) -> Option<(u32, OwnedFd, OwnedFd)> {
         Some((self.pid, copy(self.fds.0)?, copy(self.fds.1)?))

@@ -99,14 +99,16 @@ fn port_in(command: &str) -> Option<u16> {
 }
 
 pub fn detect(root: &Path) -> Vec<Found> {
+    // Where the task's machine is (crate::hostfs).
+    let has = |name: &str| crate::hostfs::stat(&root.join(name)).is_ok();
     let mut out = Vec::new();
-    if let Ok(text) = std::fs::read_to_string(root.join("package.json")) {
+    if let Ok(text) = crate::hostfs::read_to_string(&root.join("package.json")) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-            let run = if root.join("pnpm-lock.yaml").exists() {
+            let run = if has("pnpm-lock.yaml") {
                 "pnpm"
-            } else if root.join("yarn.lock").exists() {
+            } else if has("yarn.lock") {
                 "yarn"
-            } else if root.join("bun.lockb").exists() || root.join("bun.lock").exists() {
+            } else if has("bun.lockb") || has("bun.lock") {
                 "bun run"
             } else {
                 "npm run"
@@ -131,7 +133,7 @@ pub fn detect(root: &Path) -> Vec<Found> {
         }
     }
     for makefile in ["Makefile", "makefile", "GNUmakefile"] {
-        let Ok(text) = std::fs::read_to_string(root.join(makefile)) else { continue };
+        let Ok(text) = crate::hostfs::read_to_string(&root.join(makefile)) else { continue };
         for line in text.lines() {
             let Some((target, _)) = line.split_once(':') else { continue };
             if matches!(target.trim(), "run" | "dev" | "serve" | "start" | "up" | "watch") && !line.starts_with(['\t', ' ']) {
@@ -140,7 +142,7 @@ pub fn detect(root: &Path) -> Vec<Found> {
         }
         break;
     }
-    if let Ok(text) = std::fs::read_to_string(root.join("Procfile")) {
+    if let Ok(text) = crate::hostfs::read_to_string(&root.join("Procfile")) {
         for line in text.lines() {
             let Some((name, command)) = line.split_once(':') else { continue };
             if !name.trim().is_empty() && !name.starts_with('#') {
@@ -148,7 +150,7 @@ pub fn detect(root: &Path) -> Vec<Found> {
             }
         }
     }
-    if ["compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml"].iter().any(|f| root.join(f).exists()) {
+    if ["compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml"].iter().any(|f| has(f)) {
         out.push(found("compose", "docker compose up".into(), None, "compose file"));
     }
     // A name once: the first source wins.
@@ -166,9 +168,10 @@ pub fn add(root: &Path, service: &Service) -> Result<(), String> {
         crate::project_config::set_own(&project, Some(own));
         return Ok(());
     }
-    let dir = if !root.join(FILE).exists() && project.join(FILE).exists() { project } else { root.to_path_buf() };
+    let has = |dir: &Path| crate::hostfs::stat(&dir.join(FILE)).is_ok();
+    let dir = if !has(root) && has(&project) { project } else { root.to_path_buf() };
     let path = dir.join(FILE);
-    let mut text = std::fs::read_to_string(&path).unwrap_or_else(|_| HEADER.to_string());
+    let mut text = crate::hostfs::read_to_string(&path).unwrap_or_else(|_| HEADER.to_string());
     let quote = |s: &str| toml::Value::String(s.to_string()).to_string();
     if !text.ends_with('\n') {
         text.push('\n');
@@ -180,7 +183,7 @@ pub fn add(root: &Path, service: &Service) -> Result<(), String> {
     if let Some(url) = &service.url {
         text.push_str(&format!("url = {}\n", quote(url)));
     }
-    std::fs::write(&path, text).map_err(|e| format!("{FILE}: {e}"))
+    crate::hostfs::write(&path, text.as_bytes()).map_err(|e| format!("{FILE}: {e}"))
 }
 
 /// The services of the task at `root`, or why they could not be read.
@@ -236,84 +239,7 @@ pub fn task_env(all: &[Service], slot: u32) -> Vec<(String, String)> {
 }
 
 /// A TCP port one of `pids` listens on, with that process.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Listening {
-    pub port: u16,
-    pub pid: i32,
-    pub name: String,
-}
-
-/// The ports `pids` listen on, lowest first.
-#[cfg(target_os = "linux")]
-pub fn listening(pids: &[i32]) -> Vec<Listening> {
-    // inode → port, from the listening sockets of the whole machine.
-    let mut ports: std::collections::HashMap<String, u16> = std::collections::HashMap::new();
-    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
-        let Ok(text) = std::fs::read_to_string(table) else { continue };
-        for line in text.lines().skip(1) {
-            let f: Vec<&str> = line.split_whitespace().collect();
-            if f.len() > 9 && f[3] == "0A" {
-                if let Some(port) = f[1].rsplit(':').next().and_then(|h| u16::from_str_radix(h, 16).ok()) {
-                    ports.insert(format!("socket:[{}]", f[9]), port);
-                }
-            }
-        }
-    }
-    let mut out: Vec<Listening> = Vec::new();
-    for &pid in pids {
-        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else { continue };
-        for fd in fds.flatten() {
-            let Ok(link) = std::fs::read_link(fd.path()) else { continue };
-            if let Some(&port) = ports.get(link.to_string_lossy().as_ref()) {
-                if !out.iter().any(|l| l.port == port) {
-                    let name = crate::procs::name(pid as u32).unwrap_or_default();
-                    out.push(Listening { port, pid, name });
-                }
-            }
-        }
-    }
-    out.sort_by_key(|l| l.port);
-    out
-}
-
-/// `lsof` for the ports of `pids`.
-#[cfg(target_os = "macos")]
-pub fn listening(pids: &[i32]) -> Vec<Listening> {
-    if pids.is_empty() {
-        return Vec::new();
-    }
-    let list: Vec<String> = pids.iter().map(i32::to_string).collect();
-    let Ok(out) = crate::procs::command("lsof")
-        .args(["-a", "-p", &list.join(","), "-iTCP", "-sTCP:LISTEN", "-P", "-n", "-Fpcn"])
-        .output()
-    else {
-        return Vec::new();
-    };
-    let mut found: Vec<Listening> = Vec::new();
-    let (mut pid, mut name) = (0, String::new());
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        match line.split_at_checked(1) {
-            Some(("p", v)) => pid = v.parse().unwrap_or(0),
-            Some(("c", v)) => name = v.to_string(),
-            // "n*:3000" or "n127.0.0.1:3000".
-            Some(("n", v)) => {
-                if let Some(port) = v.rsplit(':').next().and_then(|p| p.parse().ok()) {
-                    if !found.iter().any(|l| l.port == port) {
-                        found.push(Listening { port, pid, name: name.clone() });
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    found.sort_by_key(|l| l.port);
-    found
-}
-
-#[cfg(not(unix))]
-pub fn listening(_: &[i32]) -> Vec<Listening> {
-    Vec::new()
-}
+pub use ideae_core::procs::{Listening, listening};
 
 /// Something listens on `port` already: its process name when it can be
 /// told, else just that it is taken.

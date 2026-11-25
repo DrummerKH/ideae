@@ -156,6 +156,52 @@ pub fn reachable(path: &Path) -> bool {
     }
 }
 
+/// An id no other run of the app gives: for sessions a daemon keeps
+/// after this window has gone.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub fn unique() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    format!("{}-{at}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+/// The ports the task at `root` listens on: here, of its processes (by
+/// its terminals' variables); a remote task's, asked of its daemon there.
+pub fn listening(root: &Path, socket: Option<&str>) -> Vec<crate::services::Listening> {
+    #[cfg(unix)]
+    if let Some(remote) = remote(root) {
+        let Ok((daemon, _)) = remote else { return Vec::new() };
+        let asked = daemon.call(&crate::daemon::proto::Call::Listening { task: root.display().to_string() }, b"");
+        let Ok((reply, body)) = asked else { return Vec::new() };
+        if reply.error.is_some() {
+            return Vec::new();
+        }
+        let found: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap_or_default();
+        return found
+            .iter()
+            .filter_map(|l| Some(crate::services::Listening { port: l["port"].as_u64()? as u16, pid: l["pid"].as_i64()? as i32, name: l["name"].as_str()?.to_string() }))
+            .collect();
+    }
+    socket.map(|socket| crate::services::listening(&crate::procs::task_processes(Some(&root.display().to_string()), socket))).unwrap_or_default()
+}
+
+/// `url` as it is reached from here: a remote task's address of its host's
+/// own (`localhost:3000` there) at the port here its host's is forwarded
+/// to. Others as they are. Off the UI thread: it runs ssh.
+pub fn reach(root: &Path, url: &str) -> Result<String, String> {
+    #[cfg(unix)]
+    if crate::hosts::is_remote(root) {
+        let Some((port, at, written)) = crate::browser::port_place(url) else { return Ok(url.to_string()) };
+        let daemon = crate::daemon::client::for_path(root).ok_or("its host is not connected")?;
+        let here = daemon.forward(port)?;
+        let port = if written { here.to_string() } else { format!(":{here}") };
+        return Ok(format!("{}{port}{}", url.get(..at.start).unwrap_or_default(), url.get(at.end..).unwrap_or_default()));
+    }
+    let _ = root;
+    Ok(url.to_string())
+}
+
 /// Whether `path`'s host watches its folders for the window (its daemon said so).
 pub fn watched_there(path: &Path) -> bool {
     #[cfg(unix)]

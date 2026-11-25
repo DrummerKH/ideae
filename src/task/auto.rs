@@ -108,24 +108,42 @@ impl TaskView {
         self.auto.setup = Some(RunState::Running);
         cx.emit(TaskEvent::Changed);
         cx.notify();
-        let (job_script, job_status) = (script.clone(), status.clone());
+        let (job_script, job_status, job_root) = (script.clone(), status.clone(), self.root.clone());
         self.auto._setup_poll = Some(cx.spawn_in(window, async move |this, cx| {
-            let written = cx
+            let written: std::io::Result<(PathBuf, PathBuf)> = cx
                 .background_spawn(async move {
+                    // A remote task's on its host: beside its worktree's git files there.
+                    if crate::hosts::is_remote(&job_root) {
+                        let place = |name: &str| -> std::io::Result<PathBuf> {
+                            let there = crate::git::run(&job_root, "git", &["rev-parse", "--path-format=absolute", "--git-path", name]).map_err(std::io::Error::other)?;
+                            Ok(crate::hostfs::rekey(&job_root, PathBuf::from(there.trim())))
+                        };
+                        let (script, status) = (place("ideae-setup.sh")?, place("ideae-setup.status")?);
+                        let status_there = crate::hosts::there(&status).display().to_string();
+                        let _ = crate::hostfs::run(&job_root, "rm", &["-f", &status_there], &[], None);
+                        crate::hostfs::write(&script, crate::project_config::setup_script(&commands, Path::new(&status_there)).as_bytes())?;
+                        return Ok((script, status));
+                    }
                     std::fs::create_dir_all(&dir)?;
                     let _ = std::fs::remove_file(&job_status);
-                    std::fs::write(&job_script, crate::project_config::setup_script(&commands, &job_status))
+                    std::fs::write(&job_script, crate::project_config::setup_script(&commands, &job_status))?;
+                    Ok((job_script, job_status))
                 })
                 .await;
-            if let Err(e) = written {
-                let _ = this.update(cx, |t, cx| {
-                    t.auto.setup = Some(RunState::Failed(None));
-                    t.services_error = Some(format!("Setup: {e}"));
-                    cx.notify();
-                });
-                return;
-            }
+            let (script, status) = match written {
+                Ok(places) => places,
+                Err(e) => {
+                    let _ = this.update(cx, |t, cx| {
+                        t.auto.setup = Some(RunState::Failed(None));
+                        t.services_error = Some(format!("Setup: {e}"));
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
             let opened = this.update_in(cx, |t, window, cx| {
+                // By its path where the terminal runs: a remote task's on its host.
+                let script = crate::hosts::there(&script);
                 let line = if cfg!(windows) { format!("cmd /c \"{}\"", script.display()) } else { format!("sh {}", shell_quote(&script.display().to_string())) };
                 t.terminal_seq += 1;
                 let tab = Self::make_terminal(
@@ -148,7 +166,7 @@ impl TaskView {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 let read_status = status.clone();
-                let code = cx.background_spawn(async move { std::fs::read_to_string(&read_status).ok() }).await;
+                let code = cx.background_spawn(async move { crate::hostfs::read_to_string(&read_status).ok() }).await;
                 let ended = this.update_in(cx, |t, window, cx| {
                     let open = t.service_ix(SETUP_TAB, cx);
                     // An empty file is one being written.

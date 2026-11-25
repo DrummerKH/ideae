@@ -355,6 +355,8 @@ pub struct Workspace {
     /// Tasks of hosts being connected, by host ([`hosts_ui`]), and the one
     /// to show when its host is.
     host_waiting: std::collections::BTreeMap<String, Vec<PathBuf>>,
+    /// What waits for a host to be connected to be done ([`hosts_ui`]).
+    host_then: std::collections::BTreeMap<String, Vec<hosts_ui::Then>>,
     host_shown: Option<PathBuf>,
     /// Where agents' reports go, from this machine's daemon and others'.
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -461,6 +463,25 @@ impl Workspace {
                 None => eprintln!("daemon unavailable: terminals run in the window"),
             }
         }
+        // What ssh asks (a password, a passphrase) for a project on another machine.
+        #[cfg(unix)]
+        {
+            let (ask_tx, ask_rx) = async_channel::unbounded::<crate::askpass::Ask>();
+            if crate::askpass::socket().is_none() && !cfg!(test) {
+                let _ = crate::askpass::listen(move |ask| {
+                    let _ = ask_tx.send_blocking(ask);
+                })
+                .inspect_err(|e| eprintln!("ssh's questions not asked here: {e}"));
+            }
+            cx.spawn_in(window, async move |this, cx| {
+                while let Ok(ask) = ask_rx.recv().await {
+                    if this.update_in(cx, |this, window, cx| this.ask_for_ssh(ask, window, cx)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
         // Chat agents' questions through ideae's MCP server, each about its
         // own worktree. Tests leave the socket to the app.
         let (mcp_tx, mcp_rx) = async_channel::unbounded::<(crate::mcp::Request, async_channel::Sender<crate::mcp::Answer>)>();
@@ -541,10 +562,12 @@ impl Workspace {
                     if let Some(daemon) = crate::daemon::client::get() {
                         daemon.shutdown();
                     }
-                    // Exit ends the agents of other machines too; the window's × leaves them.
+                    // Exit ends the agents of other machines too, and ssh's links to
+                    // them; the window's × leaves them.
                     #[cfg(unix)]
                     for daemon in crate::daemon::client::remotes() {
                         daemon.shutdown();
+                        daemon.close_master();
                     }
                     // Here, not on the tasks' threads: the app exits next.
                     if let Some(socket) = this.hook_socket.clone() {
@@ -793,6 +816,7 @@ impl Workspace {
             waking: Default::default(),
             wake_failed: Default::default(),
             host_waiting: Default::default(),
+            host_then: Default::default(),
             host_shown: None,
             hook_tx: hook_tx.clone(),
         };
@@ -2047,12 +2071,16 @@ impl Workspace {
         // Taken now, for this task alone, whatever way it is made.
         let given = std::mem::take(&mut self.send_next_prompt);
         let Some(repo) = self.projects.get(project).map(|p| p.path.clone()) else { return };
+        // A remote project's: made there as here, once its host is connected (git, its
+        // files and its .ideae.toml are read and written there).
         if crate::hosts::is_remote(&repo) {
-            // Variants are made there as here (git::create_variant_worktrees).
-            if notes.len() > 1 {
-                return self.create_variants(project, title, prompt, notes, agents, window, cx);
-            }
-            return self.create_remote_task(project, title, prompt, agents, given, window, cx);
+            let key = repo.clone();
+            return self.with_host(&repo, window, cx, Box::new(move |this, window, cx| {
+                // By its path: the list may have changed while its host was connected.
+                if let Some(project) = this.projects.iter().position(|p| p.path == key) {
+                    this.create_worktree_task(project, title, prompt, notes, agents, given, window, cx)
+                }
+            }));
         }
         cx.spawn_in(window, async move |this, cx| {
             let folder = repo.clone();

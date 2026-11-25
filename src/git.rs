@@ -3415,10 +3415,7 @@ pub(crate) fn copy_env_files(from: &Path, to: &Path) {
     };
     // There: copied by its shell, in one go.
     if crate::hosts::is_remote(from) {
-        let (from_s, to_s) = (crate::hosts::there(from).display().to_string(), crate::hosts::there(to).display().to_string());
-        let mut args = vec!["-c", r#"f=$1; t=$2; shift 2; for r; do [ -e "$t/$r" ] || { mkdir -p "$(dirname "$t/$r")" && cp -p "$f/$r" "$t/$r"; }; done"#, "sh", &from_s, &to_s];
-        args.extend(out.split('\0').filter(|f| !f.is_empty()));
-        let _ = crate::hostfs::run(from, "sh", &args, &[], None);
+        copy_there(from, to, out.split('\0').filter(|f| !f.is_empty()));
         return;
     }
     for rel in out.split('\0').filter(|f| !f.is_empty()) {
@@ -3431,6 +3428,16 @@ pub(crate) fn copy_env_files(from: &Path, to: &Path) {
         }
         let _ = std::fs::copy(from.join(rel), &target);
     }
+}
+
+/// Files of `from` (relative paths) into `to`, where it has none of its own,
+/// on their machine, by its shell in one go: for a remote project's worktrees.
+pub(crate) fn copy_there<'a>(from: &Path, to: &Path, rels: impl Iterator<Item = &'a str>) {
+    let (from_s, to_s) = (crate::hosts::there(from).display().to_string(), crate::hosts::there(to).display().to_string());
+    let mut args: Vec<&str> = vec!["-c", r#"f=$1; t=$2; shift 2; for r; do [ -e "$t/$r" ] || { mkdir -p "$(dirname "$t/$r")" && cp -p "$f/$r" "$t/$r"; }; done"#, "sh", from_s.as_str(), to_s.as_str()];
+    let rels: Vec<&str> = rels.collect();
+    args.extend(rels.iter().copied());
+    let _ = crate::hostfs::run(from, "sh", &args, &[], None);
 }
 
 /// The file as the last commit has it, or with `since_fork` as the commit
