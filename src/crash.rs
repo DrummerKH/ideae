@@ -12,10 +12,29 @@ fn dir() -> PathBuf {
 const LOG: &str = "crashes.log";
 const LAST: &str = "last-crash.txt";
 
+thread_local! {
+    static CATCHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs code of a library that may panic on input it does not expect (a
+/// diagram's layout): its panic is an error of that input, not a crash, so
+/// it is neither logged nor ends the app.
+pub fn caught<R>(run: impl FnOnce() -> R) -> Result<R, String> {
+    let before = CATCHING.replace(true);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
+    CATCHING.set(before);
+    result.map_err(|payload| {
+        payload.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| payload.downcast_ref::<String>().cloned()).unwrap_or_else(|| "it failed".into())
+    })
+}
+
 /// `what` is the process: the window, or the daemon of the terminals.
 pub fn install(what: &'static str) {
     let before = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        if CATCHING.get() {
+            return;
+        }
         let said = info.payload().downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| info.payload().downcast_ref::<String>().cloned()).unwrap_or_default();
         let at = info.location().map(|at| format!("{}:{}", at.file(), at.line())).unwrap_or_default();
         let thread = std::thread::current();

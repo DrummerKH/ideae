@@ -764,7 +764,7 @@ pub(super) fn mermaid_svg(source: &str, colors: &DiagramColors) -> Result<String
         *slice = c.charts[ix % c.charts.len()].clone();
     }
     options.theme = theme;
-    mermaid_rs_renderer::render_with_options(source, options).map_err(|e| e.to_string())
+    crate::crash::caught(|| mermaid_rs_renderer::render_with_options(source, options).map_err(|e| e.to_string())).and_then(|drawn| drawn)
 }
 
 #[derive(Clone)]
@@ -1140,6 +1140,9 @@ mod tests {
         let picture = rasterize(&svg, std::path::Path::new(""), super::DIAGRAM_PIXELS, None).unwrap();
         assert!(picture.size.0 > 50. && picture.pixels.0 as f32 >= picture.size.0 * 1.9);
         assert!(super::mermaid_svg("flowchart LR\n  A -->", &colors).is_err());
+        // Subgraphs of unconnected nodes of two widths: the narrower ones of all groups once came first, the groups overlapped.
+        let groups = "graph TB\n  subgraph \"One Group\"\n    A1[First]\n    A2[Second]\n    A3[Third]\n    A4[Fourth]\n  end\n  subgraph \"Two Group\"\n    B1[First]\n    B2[Second]\n    B3[Third]\n    B4[Fourth]\n    B5[Fifth]\n  end\n  subgraph \"Three Group\"\n    C1[First]\n    C2[Second]\n    C3[Third]\n    C4[Fourth]\n  end\n  subgraph \"Four Group\"\n    D1[First]\n    D2[Second]\n    D3[Third]\n  end\n";
+        assert!(super::mermaid_svg(groups, &colors).unwrap().contains("Four Group"));
     }
 
     #[test]

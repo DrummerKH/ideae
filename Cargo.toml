@@ -144,6 +144,10 @@ gpui-fast-linux = { path = "vendor/gpui-fast-linux" }
 # tells each item's state, title and check mark when its menu opens (menuNeedsUpdate,
 # validateMenuItem), so the menus are made once, not again whenever what they show changes.
 gpui-fast-macos = { path = "vendor/gpui-fast-macos" }
+# layout/flowchart/manual_layout.rs patched: a rank's nodes start side by side in its order, not
+# sorted by their width, which tore subgraphs of unconnected nodes apart (overlapping groups,
+# and a panic of its debug_assert! in a debug build).
+mermaid-rs-renderer = { path = "vendor/mermaid-rs-renderer" }
 
 [dev-dependencies]
 gpui-kit = { version = "0.8.1", features = ["test-support"] }
