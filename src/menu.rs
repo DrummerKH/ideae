@@ -299,8 +299,15 @@ pub fn init(cx: &mut App) {
             });
         }
     });
+    // Context menus, and the menu bar where it is the app's own.
+    gpui_kit::component::menu::on_action_chosen(crate::learn::chosen);
     #[cfg(target_os = "macos")]
     {
+        let app = cx.to_async();
+        gpui_macos::on_menu_item_chosen(move |action| {
+            let action = action.boxed_clone();
+            let _ = app.update(|cx| in_window(cx, move |_, window, cx| crate::learn::chosen(&*action, window, cx)));
+        });
         let app = cx.to_async();
         gpui_macos::set_menu_hooks(
             move || app.update(refresh),
@@ -465,7 +472,7 @@ thread_local! {
 /// menus to this list.
 const REACHED: &[&str] = &[
     "agent", "changes", "shell", "history", "changes_panel", "files_panel", "structure_panel", "run_panel", "database_panel", "focus_mode", "close_tab",
-    "reopen_tab", "back", "forward", "branches", "go_to_file", "go_to_symbol", "find_in_files", "replace_in_files",
+    "reopen_tab", "back", "forward", "last_edit", "branches", "go_to_file", "go_to_symbol", "find_in_files", "replace_in_files",
 ];
 
 /// The item's action, sent again once the window is up and the task has
@@ -798,7 +805,7 @@ fn menus(shown: Shown) -> Vec<Menu> {
     let mut window = vec![act("Minimize", Minimize)];
     let mut help = vec![
         when(true, key("Command Palette…", "command_palette")),
-        when(true, act("Keyboard Shortcuts…", KeyboardShortcuts)),
+        when(true, key("Keyboard Shortcuts…", "keyboard_shortcuts")),
         sep(),
         act(format!("{app} Documentation"), Documentation),
     ];
@@ -874,6 +881,7 @@ fn menus(shown: Shown) -> Vec<Menu> {
             sep(),
             unkeyed("Back", "back", |t| t.back),
             unkeyed("Forward", "forward", |t| t.forward),
+            in_task("Last Edit Location", "last_edit"),
             sep(),
             when(true, key("Next Task Waiting for You", "next_waiting")),
             when(true, key("Recent Tasks and Files…", "recent")),

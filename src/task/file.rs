@@ -4,10 +4,10 @@ use super::*;
 
 actions!(ideae_git, [ShowBranches]);
 actions!(ideae_file, [SaveFile, ExpandSelection, ShrinkSelection, ToggleComment, ShowOutline, ShowUsages, SendToAgent, CompareFileWith, CopyReference, CopyFilePath, ShowFileInFiles]);
-actions!(ideae_edit, [DeleteLine, DuplicateLine, MoveLineUp, MoveLineDown, JoinLines, ToggleCase, NextOccurrence, GoToLine, RenameSymbol, FormatFile, Fold, Unfold, FoldAll, UnfoldAll, ParameterInfo, NextProblem, PrevProblem]);
+actions!(ideae_edit, [DeleteLine, DuplicateLine, MoveLineUp, MoveLineDown, JoinLines, ToggleCase, NextOccurrence, GoToLine, RenameSymbol, FormatFile, Fold, Unfold, FoldAll, UnfoldAll, ParameterInfo, NextProblem, PrevProblem, QuickDocumentation, OptimizeImports]);
 actions!(ideae_task, [ToggleZoom, SendDiffToAgent, CommentOnDiff, FindInTerminal]);
 
-actions!(ideae_task, [NextTab, PrevTab, NavigateBack, NavigateForward, CloseTab, ReopenClosedTab]);
+actions!(ideae_task, [NextTab, PrevTab, NavigateBack, NavigateForward, LastEditLocation, CloseTab, ReopenClosedTab]);
 
 /// Ctrl+1/2/3/`: the agent, Changes, History, a shell.
 #[derive(Clone, PartialEq, gpui_kit::Action)]
@@ -89,6 +89,8 @@ pub struct FileView {
     /// The changes the gutter marks, and the one opened from its mark.
     pub(super) change_runs: Rc<Vec<crate::edit::ChangeRun>>,
     pub(super) change_popup: Option<super::change_popup::ChangePopup>,
+    /// The name F1 showed the documentation of: the popover goes when the cursor leaves it.
+    pub(super) doc_shown: Option<std::ops::Range<usize>>,
     /// The count of the language server's reports when its problems were
     /// last put into the editor.
     pub(super) problems_seen: u64,
@@ -863,6 +865,55 @@ impl FileView {
         self.ask_server_or(window, cx, move |client, uri, _| client.formatting(uri, indent.size as u32, !indent.tabs), then, without);
     }
 
+    /// F1: what the language server says of the name at the cursor, in the
+    /// popover a resting pointer brings; gone once the cursor leaves the name.
+    pub(super) fn quick_documentation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ask_server(
+            window,
+            cx,
+            |client, uri, pos| client.hover(uri, pos),
+            |this, hover, window, cx| {
+                let Some(hover) = hover else {
+                    return window.push_notification(Notification::info("The language server says nothing of this."), cx);
+                };
+                let range = {
+                    let state = this.editor.read(cx);
+                    let (text, cursor) = (state.text(), state.cursor());
+                    match &hover.range {
+                        Some(range) => text.position_to_offset(&range.start)..text.position_to_offset(&range.end),
+                        None => text.word_range(cursor).unwrap_or(cursor..cursor),
+                    }
+                };
+                this.doc_shown = Some(range.clone());
+                this.editor.update(cx, |state, cx| state.present_hover(range, hover, cx));
+            },
+        );
+    }
+
+    /// Ctrl+Alt+O: the language server's `source.organizeImports`, over the whole file.
+    pub(super) fn optimize_imports(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let end = {
+            let text = self.editor.read(cx).text();
+            text.offset_to_position(text.len())
+        };
+        self.ask_server(
+            window,
+            cx,
+            move |client, uri, _| client.source_action(uri, "source.organizeImports", lsp_types::Range::new(lsp_types::Position::new(0, 0), end)),
+            |this, edits, window, cx| match edits {
+                None => window.push_notification(Notification::info("The language server does not optimize imports here."), cx),
+                Some(edits) if edits.iter().flat_map(lsp::edits_by_file).all(|(_, edits)| edits.is_empty()) => {
+                    window.push_notification(Notification::info("The imports are in order."), cx)
+                }
+                Some(edits) => {
+                    for edit in &edits {
+                        this.apply_workspace_edit(edit, window, cx, |_, _, _| {});
+                    }
+                }
+            },
+        );
+    }
+
     /// Asks for a new name of the symbol under the cursor and gives it that
     /// name everywhere the language server knows it.
     pub(super) fn rename_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1064,6 +1115,8 @@ impl Render for FileView {
                 this.format(window, cx)
             }))
             .on_action(cx.listener(|this, _: &ParameterInfo, _, cx| this.parameter_info(cx)))
+            .on_action(cx.listener(|this, _: &QuickDocumentation, window, cx| this.quick_documentation(window, cx)))
+            .on_action(cx.listener(|this, _: &OptimizeImports, window, cx| this.optimize_imports(window, cx)))
             .on_action(cx.listener(|this, _: &Fold, _, cx| this.fold(true, false, cx)))
             .on_action(cx.listener(|this, _: &Unfold, _, cx| this.fold(false, false, cx)))
             .on_action(cx.listener(|this, _: &FoldAll, _, cx| this.fold(true, true, cx)))

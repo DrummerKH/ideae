@@ -38,6 +38,9 @@ pub struct State {
     /// Agents tasks' agents started, by the ids they were given.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub crew: Vec<CrewRecord>,
+    /// How many times each shortcut was done without its keys (learn.rs).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub learn_counts: std::collections::BTreeMap<String, u32>,
 }
 
 /// One agent a task's agent started (workspace/crew.rs): a question
@@ -202,6 +205,8 @@ pub struct Settings {
     /// off, in the file's header.
     pub blame_at_line_end: bool,
     pub format_on_save: bool,
+    /// A command with keys, chosen with the pointer, says its keys (learn.rs).
+    pub learn_keys: bool,
     /// The worktrees agents make for themselves are listed, folded under
     /// the task they came from.
     pub show_side_worktrees: bool,
@@ -337,6 +342,7 @@ impl Default for Settings {
             blame_at_line_end: true,
             notices_at: "bottom-right".into(),
             format_on_save: false,
+            learn_keys: false,
             diff_unified: false,
             diff_ignore_whitespace: false,
             diff_files: false,

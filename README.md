@@ -105,11 +105,17 @@ More in [docs/features.md](docs/features.md); notes for each system in
 | F2 / Shift+F2 | Next / previous problem |
 | F11 / Shift+F11 | Bookmark the line / the task's bookmarks |
 | Alt+1 / 2 / 3 / 4 / 5 | Changes / Files / Structure / Run / Database panel |
+| F4 | In Changes, the diff or the list: open the file (at the line) |
+| F1 / Ctrl+Alt+O | Quick documentation / optimize imports |
+| Alt+F1 | Show the file in Files |
+| Ctrl+Shift+Backspace | Last edit location, again for the one before |
+| Ctrl+K / Ctrl+Shift+K | Commit / push |
+| Ctrl+Alt+K | Every key (Settings → Keys); there, Learn the keys tells the keys of a command chosen with the mouse |
 | Ctrl+F4 / Ctrl+Shift+F4 | Close tab / reopen the last closed |
 | Shift+Esc | Focus mode |
 
 On macOS, Cmd where this says Ctrl. Every key can be changed (Settings →
-Keys), and Ctrl+Shift+A lists every command.
+Keys, also Help → Keyboard Shortcuts…), and Ctrl+Shift+A lists every command.
 
 ## Building
 

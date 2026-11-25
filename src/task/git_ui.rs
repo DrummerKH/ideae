@@ -205,7 +205,10 @@ impl TaskView {
                             .disabled(!self.git_can(GitCommand::Push))
                             .label(push_label)
                             .tooltip(push_tip)
-                            .on_click(cx.listener(|this, _, window, cx| this.git_command(GitCommand::Push, window, cx))),
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.git_command(GitCommand::Push, window, cx);
+                                crate::learn::used("push", window, cx);
+                            })),
                     )
                     .child(
                         Button::new("pr")
@@ -637,7 +640,8 @@ impl TaskView {
             })
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.side_selected = ix;
-                this.show_changed_file(path.clone(), window, cx)
+                this.keyed = RightPane::Changes;
+                this.show_changed_file(path.clone(), window, cx);
             }))
             .context_menu(move |menu, window, cx| {
                 use gpui_kit::component::menu::PopupMenuItem;
