@@ -132,8 +132,9 @@ fn gh(repo: &Path, args: &[&str]) -> Option<String> {
 
 const FIELDS: &str = "number,title,headRefName,headRefOid,mergedAt,headRepository,headRepositoryOwner,isCrossRepository";
 
-/// The merged branches of the project at `repo`, `in_use` left out: the
-/// branches its tasks have checked out. Off the UI thread: asks GitHub.
+/// The branches of your own merged PRs in the project at `repo`, `in_use`
+/// left out: the branches its tasks have checked out. A colleague's branch
+/// is theirs to delete. Off the UI thread: asks GitHub.
 pub fn find(repo: &Path, in_use: &HashSet<String>) -> Vec<MergedBranch> {
     let git = |args: &[&str]| crate::git::git_status(repo, args).ok();
     let Some(default) = crate::git::remote_default(repo) else { return Vec::new() };
@@ -141,7 +142,7 @@ pub fn find(repo: &Path, in_use: &HashSet<String>) -> Vec<MergedBranch> {
     if refs.lines().all(|line| line.starts_with("HEAD\0") || line.starts_with(&format!("{default}\0"))) {
         return Vec::new();
     }
-    let Some(merged) = gh(repo, &["pr", "list", "--state", "merged", "--limit", "300", "--json", FIELDS]) else { return Vec::new() };
+    let Some(merged) = gh(repo, &["pr", "list", "--state", "merged", "--author", "@me", "--limit", "300", "--json", FIELDS]) else { return Vec::new() };
     let merged = parse_prs(&merged);
     if merged.is_empty() {
         return Vec::new();

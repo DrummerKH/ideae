@@ -966,7 +966,7 @@ impl Workspace {
                 }))
             })
             .when(stale > 0, |menu| {
-                menu.item(PopupMenuItem::new(format!("Delete remote branches of merged PRs ({stale})…")).icon(menu_icon("git-branch-minus")).on_click(move |_, window, cx| {
+                menu.item(PopupMenuItem::new(format!("Delete remote branches of my merged PRs ({stale})…")).icon(menu_icon("git-branch-minus")).on_click(move |_, window, cx| {
                     let _ = stale_w.update(cx, |w, cx| w.merged_branches_dialog(pi, window, cx));
                 }))
             })
