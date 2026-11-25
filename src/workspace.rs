@@ -3334,10 +3334,20 @@ fn yield_now() -> impl std::future::Future<Output = ()> {
     })
 }
 
+/// Names of standards and the like that look like a ticket's key: a title
+/// "SHA-256 for uploads" asks for no Jira issue.
+const NOT_TICKETS: [&str; 22] = [
+    "AES", "BASE", "COVID", "CP", "ECMA", "ES", "GPT", "HTTP", "IEC", "IEEE", "ISO", "MD", "PEP", "PSR", "RFC", "RSA", "SHA", "SSL", "TLS", "UCS",
+    "UTF", "WCAG",
+];
+
 fn jira_key(title: &str) -> Option<&str> {
     let first = title.split_whitespace().next()?;
     let (project, number) = first.split_once('-')?;
-    let ok = project.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+    // Jira's project keys have two characters at least.
+    let ok = project.len() >= 2
+        && !NOT_TICKETS.contains(&project)
+        && project.chars().next().is_some_and(|c| c.is_ascii_uppercase())
         && project.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
         && !number.is_empty()
         && number.chars().all(|c| c.is_ascii_digit());
@@ -3518,6 +3528,11 @@ mod ticket_tests {
         assert_eq!(super::jira_link("https://example.atlassian.net/browse/dev-5").map(|(key, _)| key), Some("DEV-5".into()));
         assert_eq!(super::jira_link("https://example.com/browse/notakey"), None);
         assert_eq!(super::jira_link("DEV-1 Fix login"), None, "a key typed is not a link");
+        assert_eq!(super::jira_key("DEV-1 Fix login"), Some("DEV-1"));
+        assert_eq!(super::jira_key("AB2-77"), Some("AB2-77"));
+        for title in ["SHA-256 for uploads", "UTF-8 file names", "ISO-8601 dates", "GPT-4 prompts", "A-1 grid", "dev-1"] {
+            assert_eq!(super::jira_key(title), None, "{title}");
+        }
         let linear = "https://linear.app/acme/issue/ENG-123/fix-the-login-form";
         assert_eq!(super::linear_link(linear), Some(("ENG-123".into(), "fix the login form".into(), linear.into())));
         assert_eq!(crate::naming::branch_name("ENG-123 fix the login form"), "ENG-123_fixTheLoginForm");

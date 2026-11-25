@@ -1342,7 +1342,10 @@ impl TaskView {
     /// The task's ports, and where its browser is, for what runs in it.
     fn terminal_env(&self) -> Vec<(String, String)> {
         let mut env = crate::services::task_env(&self.services, self.port_slot);
-        env.push(crate::browser::task_env(&self.root));
+        // Its Chrome is on this machine: a terminal elsewhere has no way to it.
+        if !crate::hosts::is_remote(&self.root) {
+            env.push(crate::browser::task_env(&self.root));
+        }
         env
     }
 

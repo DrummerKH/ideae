@@ -263,16 +263,43 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
-/// The task's profile, made when it has none; profiles of worktrees gone
-/// are removed on the way.
-fn task_profile(root: &Path) -> Result<PathBuf> {
+fn profiles_dir() -> PathBuf {
     // Tests keep theirs out of the state of the app that runs them.
-    let all = if cfg!(test) {
+    if cfg!(test) {
         std::env::temp_dir().join(format!("ideae-web-test-profiles-{}", std::process::id()))
     } else {
         crate::state::state_dir().join("web")
-    };
-    let dir = all.join(format!("{:016x}", fnv(&task_key(root))));
+    }
+}
+
+fn profile_of(root: &Path) -> PathBuf {
+    profiles_dir().join(format!("{:016x}", fnv(&task_key(root))))
+}
+
+/// A task gone (archived, deleted): its Chrome ends and its profile, the
+/// logins it held, goes at once, not when another task next makes one.
+pub fn forget(root: &Path) {
+    let owner = Owner::Task(root.to_path_buf());
+    let slot = SLOTS.get().and_then(|slots| slots.lock().ok()?.remove(&owner));
+    if let Some(slot) = slot {
+        if let Some(stop) = slot.waker.lock().unwrap().take() {
+            stop.store(true, Ordering::SeqCst);
+            // Out of its wait for a call, it lets go of the port.
+            let _ = TcpStream::connect_timeout(&([127, 0, 0, 1], task_port(root)).into(), Duration::from_millis(200));
+        }
+        let chrome = slot.chrome.lock().ok().and_then(|mut c| c.take());
+        if let Some(chrome) = chrome {
+            chrome.close();
+        }
+    }
+    let _ = std::fs::remove_dir_all(profile_of(root));
+}
+
+/// The task's profile, made when it has none; profiles of worktrees gone
+/// are removed on the way.
+fn task_profile(root: &Path) -> Result<PathBuf> {
+    let all = profiles_dir();
+    let dir = profile_of(root);
     let project = project_of(root);
     let mut seed: Option<(std::time::SystemTime, PathBuf)> = None;
     for entry in std::fs::read_dir(&all).into_iter().flatten().flatten() {

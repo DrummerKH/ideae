@@ -3542,6 +3542,8 @@ pub fn remove_task_worktree(repo: &Path, path: &Path, branch: &str, unlock: bool
     let _ = std::fs::remove_file(log);
     // Its chat's checkpoints: refs of the repository, not of the worktree.
     crate::acp::checkpoint::forget(repo, &crate::acp::checkpoint::thread_name(Some(&journal)));
+    // So do its browser's logins.
+    crate::browser::forget(path);
     let path_s = crate::hosts::there(path).to_string_lossy().into_owned();
     if exists {
         let mut args = vec!["worktree", "remove", "--force"];
