@@ -425,7 +425,8 @@ impl FileView {
                 if !target.is_empty() && !target.contains("://") && file.is_file() {
                     let _ = task.update(cx, |t, cx| t.open_file(file, 0, window, cx));
                 } else if link.contains("://") {
-                    cx.open_url(link);
+                    let link = link.to_string();
+                    let _ = task.update(cx, |t, cx| t.open_link(&link, window, cx));
                 }
             })
             .size_full()

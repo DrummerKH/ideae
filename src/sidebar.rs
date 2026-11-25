@@ -1693,9 +1693,12 @@ impl Workspace {
                                     .hover(|s| s.underline())
                                     .child(pr.label())
                                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                    .on_click(move |_, _, cx| {
-                                        cx.stop_propagation();
-                                        cx.open_url(&url);
+                                    .on_click({
+                                        let path = path.clone();
+                                        cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.open_link(&path, &url, window, cx);
+                                        })
                                     }),
                             )
                         })

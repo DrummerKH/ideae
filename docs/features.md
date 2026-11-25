@@ -449,9 +449,22 @@ components, the styles it is made of and a picture), drag over an area, or
 take the whole page; say what to do with them and send them all in one prompt.
 
 - Each task has a Chrome of its own: its profile is kept between runs, so
-  logins stay, and a new task starts with the cookies of the project's last
-  one; tasks share no cookies, so variants on other ports of localhost do not
-  log each other out.
+  logins stay; tasks share no cookies, so variants on other ports of
+  localhost do not log each other out.
+- A new task's Chrome starts signed in to the project's stands as its last
+  task's was, and to no other site: a Jira or a mail signed in to in a
+  task's tab never reaches the next task's Chrome, which its agent drives.
+  A stand is told by where it is, not by its name: localhost and its
+  subdomains, a host the task's pages were served from by this machine, its
+  containers or VMs (a site behind a proxy here is not), a host that
+  resolves to this machine as the new task starts, and the hosts named in
+  Settings → Tasks → Stand hosts (`*.app.test`), a space's or a project's;
+  not by a repository's `.ideae.toml`, which could name every site. Its
+  cookies and local storage come along; another site's, none.
+- To the sites it opens it is the Chrome it is, not a headless one: the
+  user agent of the same version with a window, no `navigator.webdriver`, the
+  graphics card where there is one. A dev stand's "Sign in with Google"
+  works; Google's sign-in refuses a browser that says it is headless.
 - The page's errors (exceptions, `console.error`, requests that failed) are
   counted in the toolbar: ⚠ lists them, and Send to agent puts them into its
   prompt.
@@ -466,7 +479,7 @@ take the whole page; say what to do with them and send them all in one prompt.
   (made smaller to fit, touches from the mouse on a phone), turned or not,
   and asks it for light or dark colors, or the IDE's.
 - Addresses of this machine Ctrl+clicked in a terminal open in a Web tab of
-  the task; others in the system's browser.
+  the task; others where the task's links open (below).
 - A task out of view as long as its language servers stay (Settings) closes
   its pages, unless its agent is at work: its Chrome ends, and each tab opens
   its page again when shown.
@@ -486,6 +499,53 @@ take the whole page; say what to do with them and send them all in one prompt.
   closes; a call at the task's port starts it again, so the agent finds it.
   Playwright drives the tab you see; a page it opens shows as a tab behind
   the one you look at.
+
+### Your own browser
+
+The task's Chrome is its agent's as much as yours: for its stands, not for
+the sites you sign in to. Those open in your own browser, in tabs of the
+task all the same (the globe in the tab bar, or New Tab of Your Own Browser
+in the palette): one Chrome for each space, its logins apart from the other
+spaces', and one for projects in no space. Its mark on the toolbar says
+whose it is.
+
+- No agent reaches it through ideae: it has no DevTools port at all (it is
+  spoken to over a pipe only ideae holds), nothing of it is in a task's
+  terminals or in what the MCP server tells, and its pages are never the
+  task's site to reload. It runs under your own user, as the agent does:
+  an agent could still read its files, and this is no wall against that.
+- Its cookies are encrypted with a key from the system's keyring (the
+  Secret Service on Linux, DPAPI on Windows); where there is none the mark
+  says they are kept unencrypted. On macOS, for now, they are not.
+- On Windows it needs Chrome 117 or later (or Edge), which take their pipe
+  as handles; this has not been tried on a live Windows yet.
+- A page it opens (`window.open`, a sign-in's window) comes up as a tab of
+  the task whose page opened it, and a download is told there.
+- Pick sends to the agent only what you choose of a page, and only what is
+  seen: an element's text and picture, an area, the whole page as a picture,
+  or the page's text (Page text: a ticket, an error). Its address goes
+  without what may be a sign-in's (tokens, codes, signatures).
+- Settings → Tasks → Links open in (a space or a project can say otherwise):
+  a tab of your own browser, as it is unless set so, or the system's
+  browser. A task's links open there, a tab in that task: its ticket, its pull request, an address
+  Ctrl+clicked in its terminal, a link in its chat or in a Markdown file. An
+  address of this machine opens in the task's own browser either way.
+- To sites it is the Chrome it is, not a headless one, as the task's.
+- ↗ opens the page in the system's browser, for a site it cannot sign you in
+  to: a passkey, a security key or a client certificate needs a browser's
+  own window, which this one has none of. A site that asks for a passkey or
+  a security key is told no at once, not left waiting, so it can offer
+  another way in, and a bar offers the system's browser. Always open … there keeps the
+  site's links in the system's browser (Settings → Sites for the system's
+  browser).
+- `</>` or F12 opens DevTools as in the task's tabs; with no port to serve
+  them from, they come from inside that Chrome and ideae carries what they
+  say to the page, and to that page alone.
+- While presenting its tabs are hidden, as files git ignores are, until you
+  ask to see them.
+- It ends five minutes after its last tab closes. Forget the Logins of Your
+  Own Browser (palette) signs you out of every site in it; removing a space
+  forgets its browser's logins too.
 
 ## Window
 

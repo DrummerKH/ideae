@@ -164,6 +164,15 @@ pub enum ChatEvent {
 impl EventEmitter<ChatEvent> for ChatView {}
 
 impl ChatView {
+    /// A link in the conversation opens as the task's links do.
+    fn link_opener(&self) -> impl Fn(&SharedString, &ClickEvent, &mut Window, &mut App) + 'static {
+        let task = self.task.clone();
+        move |url, _, window, cx| {
+            let url = url.to_string();
+            let _ = task.update(cx, |t, cx| t.open_link(&url, window, cx));
+        }
+    }
+
     pub(super) fn new(id: String, spec: HostSpec, task: WeakEntity<TaskView>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut this = Self::unlinked(id, spec, task, window, cx);
         this.connect(cx);
@@ -698,7 +707,7 @@ impl ChatView {
                     .line_height(px(TEXT_LINE))
                     .text_color(theme.foreground)
                     .when(self.found(entry), |d| d.border_l_2().border_color(theme.primary))
-                    .child(gpui_kit::component::text::TextView::markdown(SharedString::from(format!("chat-agent-{}-{}", row.entry, row.start)), text).selectable(true))
+                    .child(gpui_kit::component::text::TextView::markdown(SharedString::from(format!("chat-agent-{}-{}", row.entry, row.start)), text).selectable(true).on_link_click(self.link_opener()))
                     .when(last, |d| {
                         d.child(
                             div().absolute().right_2().bottom_0().opacity(0.).group_hover(group, |s| s.opacity(1.)).child(
@@ -861,7 +870,7 @@ impl ChatView {
                                     .bg(theme.muted)
                                     .text_size(px(TEXT))
                                     .line_height(px(TEXT_LINE))
-                                    .child(gpui_kit::component::text::TextView::markdown(SharedString::from(format!("chat-user-{ix}")), text.clone()).selectable(true)),
+                                    .child(gpui_kit::component::text::TextView::markdown(SharedString::from(format!("chat-user-{ix}")), text.clone()).selectable(true).on_link_click(self.link_opener())),
                             ),
                     )
                     .into_any_element()
@@ -869,7 +878,7 @@ impl ChatView {
             Entry::Agent { .. } => row
                 .text_size(px(TEXT))
                 .line_height(px(TEXT_LINE))
-                .child(gpui_kit::component::text::TextView::markdown(SharedString::from(format!("chat-agent-{ix}")), text.clone()).selectable(true))
+                .child(gpui_kit::component::text::TextView::markdown(SharedString::from(format!("chat-agent-{ix}")), text.clone()).selectable(true).on_link_click(self.link_opener()))
                 .into_any_element(),
             Entry::Thought { .. } => {
                 let open = self.expanded.contains(&ix);

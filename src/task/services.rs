@@ -168,7 +168,7 @@ impl TaskView {
             None => site.clone(),
         };
         let open = self.tabs.iter().position(|t| match &t.kind {
-            TabKind::Browser(view) => view.read(cx).url().starts_with(origin(&site)),
+            TabKind::Browser(view) => !view.read(cx).is_user() && view.read(cx).url().starts_with(origin(&site)),
             _ => false,
         });
         match open {
@@ -216,7 +216,7 @@ impl TaskView {
 
     fn show_url_here(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
         let open = self.tabs.iter().position(|t| match &t.kind {
-            TabKind::Browser(view) => view.read(cx).url().starts_with(origin(url)),
+            TabKind::Browser(view) => !view.read(cx).is_user() && view.read(cx).url().starts_with(origin(url)),
             _ => false,
         });
         match open {
@@ -323,7 +323,8 @@ impl TaskView {
             .tabs
             .iter()
             .filter_map(|tab| match &tab.kind {
-                TabKind::Browser(page) => Some((page.clone(), page.read(cx).own_port()?)),
+                // The user's own tabs are theirs to reload.
+                TabKind::Browser(page) if !page.read(cx).is_user() => Some((page.clone(), page.read(cx).own_port()?)),
                 _ => None,
             })
             .collect();

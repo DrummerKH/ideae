@@ -23,6 +23,8 @@ a setting a space or a project sets otherwise says who does.
 | Branch of a ticket's task (`{key}_{summary}`) | ✓ | ✓ | ✓ | ✓ |
 | Pull request's title (`{key} {title}`) | ✓ | ✓ | ✓ | ✓ |
 | Ticket in a pull request (fixes, refs, none) | ✓ | ✓ | ✓ | ✓ |
+| Links open in (a tab of your own browser, the system's browser) | ✓ | ✓ | | ✓ |
+| Stand hosts (`*.app.test`: a new task's browser signs in there) | ✓ | ✓ | | ✓ |
 | Integrations (a list, by id) | ✓ | ✓ | ✓ | ✓ |
 
 Whose agent runs, where worktrees go, whether another machine's agents
@@ -146,9 +148,10 @@ tools then answering an agent there as one here.
 A task keeps its tickets, its pull request and every address its title and
 prompt had (an error's page, a thread). The first ticket is its own:
 
-- its key is a mark on the task's row; a click opens it in the system's
-  browser (never the task's own Chrome, whose sessions are its agent's);
-  `DEV-1 +1` when it has more;
+- its key is a mark on the task's row; a click opens it where the task's
+  links open (Links open in: a tab of your own browser in the task, its
+  space's, or the system's browser; never the task's own Chrome, whose
+  sessions are its agent's); `DEV-1 +1` when it has more;
 - the task's menu and the palette: **Open DEV-1**, **Copy Ticket Link**,
   **Copy Ticket Key**, **Add a Link…**;
 - the task list's search finds a task by its ticket's key;

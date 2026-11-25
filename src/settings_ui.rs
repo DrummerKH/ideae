@@ -545,6 +545,35 @@ fn pages(
                     "remote_browser",
                     "A task of a project on another machine gives its agent IDEAE_BROWSER_CDP, and the task's Chrome here is reached at that port there for as long as the task is open. Every user of that machine can reach the port: turn it on only for machines that are yours alone, or on for a space or a project of them alone. Tasks opened after the change.",
                 ))
+            })
+            .item({
+                let (read, write) = (draft.clone(), draft.clone());
+                let options: Vec<(SharedString, SharedString)> = crate::layers_ui::LINKS_OPEN_IN.iter().map(|(k, v)| (SharedString::from(*k), SharedString::from(*v))).collect();
+                SettingItem::new(
+                    "Links open in",
+                    SettingField::dropdown(options, move |_| SharedString::from(Some(read.borrow().links_open_in.clone()).filter(|v| !v.is_empty()).unwrap_or_else(|| "tab".into())), move |v: SharedString, _| {
+                        write.borrow_mut().links_open_in = if v.as_ref() == "tab" { String::new() } else { v.to_string() }
+                    }),
+                )
+                .description(about_layered(layers, "links_open_in", "A task's links (its ticket, its pull request, an address in its terminal, its chat or a Markdown file) open in the system's browser, or in a tab of your own browser in the task: one for each space, your logins apart from other spaces' and out of agents' reach. This machine's addresses open in the task's own browser either way."))
+            })
+            .item({
+                let (read, write) = (draft.clone(), draft.clone());
+                SettingItem::new(
+                    "Sites for the system's browser",
+                    SettingField::input(move |_| read.borrow().system_hosts.join(" ").into(), move |value: SharedString, _| {
+                        write.borrow_mut().system_hosts = value.split([' ', ',']).map(str::trim).filter(|h| !h.is_empty()).map(str::to_string).collect()
+                    }),
+                )
+                .description("Hosts whose links open in the system's browser even when links open in tabs: sites your own browser cannot sign you in to (a passkey, a security key, a certificate). Space-parted; *.example.com for a domain and its subdomains. ↗ on a tab adds its site.")
+            })
+            .item({
+                let (read, write) = (draft.clone(), draft.clone());
+                SettingItem::new(
+                    "Stand hosts",
+                    SettingField::input(move |_| read.borrow().stand_hosts.clone().into(), move |value: SharedString, _| write.borrow_mut().stand_hosts = value.trim().to_string()),
+                )
+                .description(about_layered(layers, "stand_hosts", "A new task's browser starts signed in to the project's stands as its last task was, and to no other site. Found by themselves: localhost, hosts the task's pages were served from by this machine or its containers, hosts that resolve here. Name others here, space-parted: app.test, *.app.test for a domain and its subdomains. A space or a project can name its own; never a repository's .ideae.toml, which could name every site."))
             }),
         ),
         SettingPage::new("Editor").default_open(true).group(
@@ -708,7 +737,7 @@ fn pages(
                     .item(switch(
                         draft,
                         "Hide files git ignores",
-                        "Files git ignores (keys, local settings) are left out of the Files tree, and their contents are hidden behind a notice until you ask to see them.",
+                        "Files git ignores (keys, local settings) are left out of the Files tree, and their contents are hidden behind a notice until you ask to see them; so are the tabs of your own browser.",
                         |s| s.present_veil,
                         |s, v| s.present_veil = v,
                     ))

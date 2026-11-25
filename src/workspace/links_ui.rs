@@ -30,13 +30,23 @@ impl Workspace {
             window.push_notification(Notification::info(note).title("No link for this ticket"), cx);
             return;
         }
-        self.open_link(path, &ticket.url, cx);
+        self.open_link(path, &ticket.url, window, cx);
     }
 
-    /// Opens a link of a task's ticket or request: in the system's browser,
-    /// never the task's own Chrome, whose sessions are its agent's.
-    pub fn open_link(&mut self, _path: &Path, url: &str, cx: &mut Context<Self>) {
-        cx.open_url(url);
+    /// Opens a link of a task's ticket or request: never in the task's own
+    /// Chrome, whose sessions are its agent's; in a tab of the user's own
+    /// browser in that task where its settings say so (the task comes into
+    /// view), else in the system's browser.
+    pub fn open_link(&mut self, path: &Path, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !crate::browser::opens_in_tab(path, url) {
+            return cx.open_url(url);
+        }
+        self.switch(path, window, cx);
+        match self.find(path).and_then(|(pi, ti)| self.projects[pi].tasks[ti].view.clone()) {
+            Some(view) => view.update(cx, |t, cx| t.open_user_browser(url, window, cx)),
+            // Not open (its host away): the system's browser, not nothing.
+            None => cx.open_url(url),
+        }
     }
 
     /// Adds a link to a task: a ticket's address or key, or any address.
@@ -482,7 +492,7 @@ impl Workspace {
                             let _ = this.update(cx, |w, cx| w.archive_task(&at, window, cx));
                         }
                         Then::Open(url) => {
-                            let _ = this.update(cx, |w, cx| w.open_link(&at, url, cx));
+                            let _ = this.update(cx, |w, cx| w.open_link(&at, url, window, cx));
                         }
                         Then::Show => {
                             let _ = this.update(cx, |w, cx| w.switch(&at, window, cx));

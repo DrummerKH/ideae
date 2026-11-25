@@ -58,7 +58,8 @@ impl TaskView {
                     // Asked for once: the restart opens without it.
                     TabKind::Diff(_) => s.kind = "diff".into(),
                     TabKind::Browser(view) => {
-                        s.kind = "browser".into();
+                        // A tab of the user's browser: opened again in the browser of the project's space then.
+                        s.kind = if view.read(cx).is_user() { "user-browser" } else { "browser" }.into();
                         s.url = Some(view.read(cx).url());
                         s.web = view.read(cx).look();
                     }
@@ -121,8 +122,13 @@ impl TaskView {
                         }
                     }
                 }
-                "browser" => {
-                    self.open_browser(saved.url.as_deref().unwrap_or("about:blank"), window, cx);
+                "browser" | "user-browser" => {
+                    let url = saved.url.as_deref().unwrap_or("about:blank");
+                    if saved.kind == "user-browser" {
+                        self.open_user_browser(url, window, cx);
+                    } else {
+                        self.open_browser(url, window, cx);
+                    }
                     if let (Some(look), Some(TabKind::Browser(view))) = (&saved.web, self.tabs.last().map(|t| &t.kind)) {
                         view.update(cx, |v, cx| v.set_look(look, window, cx));
                     }

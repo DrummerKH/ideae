@@ -56,17 +56,29 @@ impl TaskView {
                                 this.new_terminal(window, cx)
                             })),
                     )
-                    .child(
+                    .child({
+                        let this = cx.entity().downgrade();
+                        let root = self.root.clone();
                         Button::new("new-browser")
                             .small()
                             .ghost()
                             .child(svg().path("side-icons/globe.svg").size(px(14.)).text_color(cx.theme().muted_foreground))
                             .tooltip("New browser tab here")
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.current = pane;
-                                this.new_browser(window, cx)
-                            })),
-                    )
+                            .dropdown_menu(move |menu, _, _| {
+                                let open = |user: bool| {
+                                    let this = this.clone();
+                                    move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                                        let _ = this.update(cx, |t, cx| {
+                                            t.current = pane;
+                                            if user { t.new_user_browser(window, cx) } else { t.new_browser(window, cx) }
+                                        });
+                                    }
+                                };
+                                let whose = crate::browser::user_mark(&root).name;
+                                menu.item(PopupMenuItem::new("The task's browser: for its stands, driven by its agent too").on_click(open(false)))
+                                    .item(PopupMenuItem::new(format!("Your own browser ({whose}): your logins, out of agents' reach")).on_click(open(true)))
+                            })
+                    })
                     .when(!right && !pane.below, |bar| {
                         bar.child(
                             Button::new("split")

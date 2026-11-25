@@ -13,6 +13,8 @@ pub enum TaskCommand {
     RestartAgent,
     NewTerminal,
     NewBrowserTab,
+    NewUserBrowserTab,
+    ForgetUserBrowser,
     StartServices,
     StopServices,
     Star,
@@ -36,6 +38,8 @@ impl TaskCommand {
             RestartAgent => "Restart Agent",
             NewTerminal => "New Terminal",
             NewBrowserTab => "New Browser Tab",
+            NewUserBrowserTab => "New Tab of Your Own Browser",
+            ForgetUserBrowser => "Forget the Logins of Your Own Browser",
             StartServices => "Start All in Run Panel",
             StopServices => "Stop All in Run Panel",
             Star if starred => "Unstar Task",
@@ -238,7 +242,7 @@ impl InHand {
     pub fn allows(&self, what: TaskCommand) -> bool {
         use TaskCommand::*;
         match what {
-            Star | CopyBranchName | CopyTitle => true,
+            Star | CopyBranchName | CopyTitle | ForgetUserBrowser => true,
             Rename => !self.main,
             Archive | Defer | AnotherVariant => !self.main && !self.side && self.ready,
             RemoveSide => self.side && self.ready,
@@ -249,7 +253,7 @@ impl InHand {
             StopServices => self.services_running,
             CompareThisFile => self.file,
             CompareWithBranch => self.open,
-            NewTerminal | NewBrowserTab | Pause => self.open,
+            NewTerminal | NewBrowserTab | NewUserBrowserTab | Pause => self.open,
         }
     }
 
@@ -301,6 +305,8 @@ impl Workspace {
             RestartAgent => in_view(crate::task::TaskView::restart_agent, window, cx),
             NewTerminal => in_view(crate::task::TaskView::new_terminal, window, cx),
             NewBrowserTab => in_view(crate::task::TaskView::new_browser, window, cx),
+            NewUserBrowserTab => in_view(crate::task::TaskView::new_user_browser, window, cx),
+            ForgetUserBrowser => in_view(crate::task::TaskView::forget_user_browser, window, cx),
             StartServices => in_view(
                 |t, window, cx| {
                     t.leave_focus_mode(window, cx);

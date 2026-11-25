@@ -259,6 +259,15 @@ fn item(field: &'static Field, draft: &Rc<RefCell<state::Settings>>, layers: &La
                 .on_reset(dirty, reset),
             )
         }
+        "links_open_in" => {
+            let (get, set) = (get.clone(), set.clone());
+            let options: Vec<(SharedString, SharedString)> = LINKS_OPEN_IN.iter().map(|(k, v)| (SharedString::from(*k), SharedString::from(*v))).collect();
+            SettingItem::new(
+                field.title,
+                SettingField::dropdown(options, move |_| get().links_open_in.unwrap_or_else(|| values.links_open_in.clone()).into(), move |v: SharedString, _| set(&|o| o.links_open_in = Some(v.to_string())))
+                    .on_reset(dirty, reset),
+            )
+        }
         "closes" => {
             let (get, set) = (get.clone(), set.clone());
             let options: Vec<(SharedString, SharedString)> = CLOSES.iter().map(|(k, v)| (SharedString::from(*k), SharedString::from(*v))).collect();
@@ -306,6 +315,7 @@ fn text_of(o: &Overrides, id: &str) -> Option<String> {
         "worktrees_dir" => o.worktrees_dir.clone(),
         "worktrees" => o.worktrees.clone(),
         "base" => o.base.clone(),
+        "stand_hosts" => o.stand_hosts.clone(),
         _ => None,
     }
 }
@@ -317,6 +327,7 @@ fn put_text(o: &mut Overrides, id: &str, value: Option<String>) {
         "worktrees_dir" => o.worktrees_dir = value,
         "worktrees" => o.worktrees = value,
         "base" => o.base = value,
+        "stand_hosts" => o.stand_hosts = value,
         _ => {}
     }
 }
@@ -325,6 +336,9 @@ fn put_text(o: &mut Overrides, id: &str, value: Option<String>) {
 
 use crate::integrations::Kind;
 use crate::layers::Entry;
+
+/// Where a task's links may open.
+pub const LINKS_OPEN_IN: [(&str, &str); 2] = [("tab", "A tab of your own browser"), ("system", "The system's browser")];
 
 /// What a request may say of its tickets.
 pub const CLOSES: [(&str, &str); 3] = [("fixes", "Fixes: closes them when merged"), ("refs", "Refs: mentions them"), ("none", "Nothing")];

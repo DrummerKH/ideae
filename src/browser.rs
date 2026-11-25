@@ -7,6 +7,12 @@
 //! terminals get it as IDEAE_BROWSER_CDP, so Playwright MCP
 //! (`--cdp-endpoint`) drives the pages you see; a page opened there, or by
 //! `window.open` and `target=_blank`, comes up as a tab of the task.
+//!
+//! The user's own browser (`Owner::User`), one per space, is spoken to over
+//! a pipe instead (`pipe.rs`): it has no port, nothing an agent could call.
+
+mod pipe;
+mod seed;
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -38,16 +44,58 @@ use tungstenite::{Message, WebSocket, protocol::Role, protocol::WebSocketConfig}
 
 // ---------------------------------------------------------------- chrome
 
-/// Whom a Chrome runs for: a task, by its worktree, or the pictures of
+/// Whom a Chrome runs for: a task, by its worktree; the user, for the
+/// sites they sign in to, out of agents' reach; or the pictures of
 /// variants' sites, which want no profile kept.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Owner {
     Task(PathBuf),
+    User(UserBrowser),
     Pictures,
 }
 
+/// The user's browsers: one for each space, its logins apart from the
+/// others', and one for projects in no space.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum UserBrowser {
+    Shared,
+    Space(String),
+}
+
+/// A project's own browser as its tabs show it: whose it is and the mark
+/// it is known by, its space's or that of projects in none.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UserMark {
+    pub browser: UserBrowser,
+    pub mark: String,
+    pub color: u8,
+    pub name: String,
+}
+
+impl Default for UserMark {
+    fn default() -> Self {
+        Self { browser: UserBrowser::Shared, mark: crate::workspace::spaces::ALL.into(), color: 7, name: "Shared".into() }
+    }
+}
+
+/// Each project's own browser, by the project's path: set as its space is
+/// known or changes, read by its tasks as they open one of its tabs.
+static USER_MARKS: std::sync::RwLock<Option<HashMap<PathBuf, UserMark>>> = std::sync::RwLock::new(None);
+
+pub fn set_user_mark(project: &Path, mark: UserMark) {
+    USER_MARKS.write().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(project.to_path_buf(), mark);
+}
+
+/// The browser of the project a task's root is of; the shared one when its project is not known.
+pub fn user_mark(root: &Path) -> UserMark {
+    let project = crate::project_config::project_of(root);
+    USER_MARKS.read().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|all| all.get(&project).or_else(|| all.get(root)).cloned()).unwrap_or_default()
+}
+
 struct Chrome {
+    /// 0 for the user's: spoken to over `pipe`.
     port: u16,
+    pipe: Option<Arc<pipe::Pipe>>,
     ws_path: String,
     child: Mutex<Child>,
     profile: PathBuf,
@@ -76,7 +124,7 @@ impl Chrome {
     /// when it takes too long.
     fn close(&self) {
         if !self.temporary && self.alive() {
-            if let Ok((mut socket, _)) = connect(self) {
+            if let Ok(mut socket) = connect(self) {
                 let _ = socket.send("Browser.close", json!({}));
             }
             let started = Instant::now();
@@ -111,6 +159,11 @@ struct Slot {
     /// Counts closings, so only the last one's idle time ends Chrome.
     closed: AtomicU64,
     adopt: Mutex<Option<async_channel::Sender<PageEvent>>>,
+    /// A user's Chrome serves the tabs of many tasks: whose each page is
+    /// (by its id, a tab's or one a tab's page opened), and where each
+    /// task is told of the pages its pages open and of their downloads.
+    page_tasks: Mutex<HashMap<String, PathBuf>>,
+    tasks: Mutex<HashMap<PathBuf, async_channel::Sender<PageEvent>>>,
     /// Listening at the task's port while its Chrome is ended: told to stop
     /// when a tab starts one.
     waker: Mutex<Option<Arc<AtomicBool>>>,
@@ -249,10 +302,6 @@ fn project_of(root: &Path) -> String {
     common.canonicalize().unwrap_or(common).display().to_string()
 }
 
-/// What of a profile holds who you are on a site: copied into a new task's
-/// from the project's last, so it starts logged in where that one was.
-const LOGINS: [&str; 4] = ["Local State", "Default/Network", "Default/Cookies", "Default/Local Storage"];
-
 fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
     if from.is_dir() {
         std::fs::create_dir_all(to)?;
@@ -301,6 +350,55 @@ pub fn forget(root: &Path) {
     let _ = std::fs::remove_dir_all(profile_of(root));
 }
 
+/// The user's browsers' profiles, in the state's folder: a run with a state
+/// of its own (IDEAE_STATE, a debug build's) sees none of the user's logins.
+fn user_profiles_dir() -> PathBuf {
+    if cfg!(test) {
+        std::env::temp_dir().join(format!("ideae-web-user-test-profiles-{}", std::process::id()))
+    } else {
+        crate::state::state_dir().join("web-user")
+    }
+}
+
+/// Where a user's browser's profile is, made or not.
+fn user_profile_path(browser: &UserBrowser) -> PathBuf {
+    let name = match browser {
+        UserBrowser::Shared => "shared".to_string(),
+        UserBrowser::Space(id) if !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') => format!("space-{id}"),
+        UserBrowser::Space(id) => format!("space-{:016x}", fnv(id)),
+    };
+    user_profiles_dir().join(name)
+}
+
+/// A user's browser's profile, made when it has none: no logins seeded
+/// from any other, and only the user may read it.
+fn user_profile(browser: &UserBrowser) -> Result<PathBuf> {
+    let all = user_profiles_dir();
+    let dir = user_profile_path(browser);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
+        for made in [&all, &dir] {
+            std::fs::set_permissions(made, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// A user's browser forgotten: its Chrome ended and its profile, every
+/// login in it, removed. Not for the UI thread: Chrome is given a moment to end.
+pub fn forget_user(browser: &UserBrowser) {
+    let owner = Owner::User(browser.clone());
+    let slot = SLOTS.get().and_then(|slots| slots.lock().ok()?.remove(&owner));
+    if let Some(chrome) = slot.and_then(|slot| slot.chrome.lock().ok().and_then(|mut c| c.take())) {
+        chrome.close();
+    }
+    let _ = std::fs::remove_dir_all(user_profile_path(browser));
+}
+
 /// The task's profile, made when it has none; profiles of worktrees gone
 /// are removed on the way.
 fn task_profile(root: &Path) -> Result<PathBuf> {
@@ -314,6 +412,11 @@ fn task_profile(root: &Path) -> Result<PathBuf> {
             continue;
         }
         let of = std::fs::read_to_string(other.join("root")).unwrap_or_default();
+        // One with no root yet may be another task's being made this moment: left a while.
+        let young = || std::fs::metadata(&other).and_then(|m| m.modified()).ok().and_then(|at| at.elapsed().ok()).is_some_and(|age| age < Duration::from_secs(60));
+        if of.is_empty() && young() {
+            continue;
+        }
         if of.is_empty() || !Path::new(&of).exists() {
             let _ = std::fs::remove_dir_all(&other);
             continue;
@@ -331,12 +434,9 @@ fn task_profile(root: &Path) -> Result<PathBuf> {
     }
     if !dir.join("root").exists() {
         std::fs::create_dir_all(&dir)?;
+        // Logged in to the project's stands as its last task was; to nothing else.
         if let Some((_, from)) = seed {
-            for part in LOGINS {
-                if from.join(part).exists() {
-                    let _ = copy_tree(&from.join(part), &dir.join(part));
-                }
-            }
+            seed::carry(&from, &dir, &seed::named_stands(root));
         }
         std::fs::write(dir.join("project"), &project)?;
         std::fs::write(dir.join("root"), root.display().to_string())?;
@@ -371,38 +471,59 @@ fn chrome(owner: &Owner) -> Result<Arc<Chrome>> {
     let program = program.as_path();
     let (profile, temporary, port) = match owner {
         Owner::Task(root) => (task_profile(root)?, false, task_port(root)),
+        Owner::User(browser) => (user_profile(browser)?, false, 0),
         Owner::Pictures => (crate::state::runtime_dir().join(format!("chrome-{}", std::process::id())), true, 0),
     };
     if temporary {
         let _ = std::fs::remove_dir_all(&profile);
     }
     std::fs::create_dir_all(&profile)?;
-    let port_file = profile.join("DevToolsActivePort");
-    let _ = std::fs::remove_file(&port_file);
-    // The task's port when it is free; else any, and its terminals' is wrong.
-    let port = if port != 0 && TcpListener::bind(("127.0.0.1", port)).is_ok() { port } else { 0 };
     let mut command = crate::procs::command(program);
     command
-        .args([
-            "--headless=new",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--hide-scrollbars",
-            "--password-store=basic",
-            "--use-mock-keychain",
-        ])
-        .arg(format!("--remote-debugging-port={port}"))
+        .args(["--headless=new", "--no-first-run", "--no-default-browser-check", "--hide-scrollbars"])
+        .args(cookie_key(owner))
+        .args(as_ordinary(program))
         // As many pixels to one as the window's screen has: the frames of a
         // page's stream are of the screen Chrome thinks it is on, whatever
         // the page is told, and on one of two to one they came with half.
         .args(Some(SCREEN_SCALE.load(std::sync::atomic::Ordering::Relaxed)).filter(|scale| *scale > 100).map(|scale| format!("--force-device-scale-factor={}", scale as f32 / 100.)))
-        // Its own DevTools, served from that port, connects back to it.
-        .args((port != 0).then(|| format!("--remote-allow-origins=http://127.0.0.1:{port}")))
         .arg(format!("--user-data-dir={}", profile.display()))
-        .arg("about:blank")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    let chrome = if matches!(owner, Owner::User(_)) {
+        over_pipe(command, program, profile)?
+    } else {
+        over_port(command, program, profile, port, temporary)?
+    };
+    // Taken now, under the lock a tab waits for: a tab's page made at the same time is not taken for one of them.
+    if let Ok(mut socket) = connect(&chrome) {
+        if let Ok(open) = socket.call("Target.getTargets", json!({}), &mut Vec::new()) {
+            for info in open["targetInfos"].as_array().into_iter().flatten().filter(|i| i["type"] == "page") {
+                let id = info["targetId"].as_str().unwrap_or_default().to_string();
+                chrome.claim(&id);
+                chrome.first.lock().unwrap().push(id);
+            }
+        }
+    }
+    if !matches!(owner, Owner::Pictures) {
+        watch(Arc::downgrade(&chrome), slot.clone(), matches!(owner, Owner::User(_)));
+    }
+    *held = Some(chrome.clone());
+    Ok(chrome)
+}
+
+/// A Chrome at a DevTools port: the task's, given to its agent, or any.
+fn over_port(mut command: std::process::Command, program: &Path, profile: PathBuf, port: u16, temporary: bool) -> Result<Arc<Chrome>> {
+    let port_file = profile.join("DevToolsActivePort");
+    let _ = std::fs::remove_file(&port_file);
+    // The task's port when it is free; else any, and its terminals' is wrong.
+    let port = if port != 0 && TcpListener::bind(("127.0.0.1", port)).is_ok() { port } else { 0 };
+    command
+        .arg(format!("--remote-debugging-port={port}"))
+        // Its own DevTools, served from that port, connects back to it.
+        .args((port != 0).then(|| format!("--remote-allow-origins=http://127.0.0.1:{port}")))
+        .arg("about:blank");
     let mut child = crate::procs::spawn_tied(&mut command).with_context(|| format!("starting {}", program.display()))?;
 
     // Chrome writes the port it took and the browser socket path here.
@@ -432,23 +553,141 @@ fn chrome(owner: &Owner) -> Result<Arc<Chrome>> {
         std::thread::sleep(Duration::from_millis(50));
     };
     let product = devtools_version(port).and_then(|v| v["Browser"].as_str().map(str::to_string)).unwrap_or_default();
-    let major = product.split_once('/').map(|(_, v)| v.split('.').next().unwrap_or_default().to_string()).unwrap_or_else(|| "130".into());
-    let chrome = Arc::new(Chrome { port, ws_path, child: Mutex::new(child), profile, temporary, claimed: Default::default(), major, first: Default::default() });
-    // Taken now, under the lock a tab waits for: a tab's page made at the same time is not taken for one of them.
-    if let Ok((mut socket, _)) = connect(&chrome) {
-        if let Ok(open) = socket.call("Target.getTargets", json!({}), &mut Vec::new()) {
-            for info in open["targetInfos"].as_array().into_iter().flatten().filter(|i| i["type"] == "page") {
-                let id = info["targetId"].as_str().unwrap_or_default().to_string();
-                chrome.claim(&id);
-                chrome.first.lock().unwrap().push(id);
+    let major = major_of_product(&product);
+    Ok(Arc::new(Chrome { port, pipe: None, ws_path, child: Mutex::new(child), profile, temporary, claimed: Default::default(), major, first: Default::default() }))
+}
+
+/// The user's Chrome: over a pipe only the app holds, with no port at all.
+#[cfg(any(unix, windows))]
+fn over_pipe(mut command: std::process::Command, program: &Path, profile: PathBuf) -> Result<Arc<Chrome>> {
+    let (ours, chromes) = pipe::make(&mut command)?;
+    command.arg("--remote-debugging-pipe").arg("about:blank");
+    let mut child = crate::procs::spawn_tied(&mut command).with_context(|| format!("starting {}", program.display()))?;
+    // Closed here, or Chrome's end would not tell when it is gone.
+    drop(chromes);
+    let pipe = pipe::Pipe::start(ours.0, ours.1);
+    let version = (|| {
+        let channel = pipe.channel()?;
+        let id = channel.send(&mut json!({ "method": "Browser.getVersion", "params": {} }))?;
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(15) {
+            if let Some(msg) = channel.recv(Some(Duration::from_millis(200)))? {
+                if msg["id"].as_u64() == Some(id) {
+                    return Ok(msg["result"]["product"].as_str().unwrap_or_default().to_string());
+                }
             }
         }
+        Err(anyhow!("Chrome did not answer over its pipe"))
+    })();
+    let product = match version {
+        Ok(product) => product,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e.context(format!("is another Chrome using {}?", profile.display())));
+        }
+    };
+    let major = major_of_product(&product);
+    Ok(Arc::new(Chrome { port: 0, pipe: Some(pipe), ws_path: String::new(), child: Mutex::new(child), profile, temporary: false, claimed: Default::default(), major, first: Default::default() }))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn over_pipe(_: std::process::Command, _: &Path, _: PathBuf) -> Result<Arc<Chrome>> {
+    Err(anyhow!("ideae's own browser is not on this system"))
+}
+
+/// What a Chrome's cookies are encrypted with. A task's: a key known to
+/// all, its logins are a dev stand's. The user's: the system's keyring
+/// (Secret Service on Linux, falling back to that same key where there is
+/// none; DPAPI on Windows), but never in tests or a run with a state of its
+/// own, which must not touch the user's keyring. macOS keeps the mock
+/// keychain until headless Chrome is seen to reach the real one without a
+/// dialog that would hang it.
+fn cookie_key(owner: &Owner) -> Vec<&'static str> {
+    let own_state = cfg!(test) || std::env::var_os("IDEAE_STATE").is_some();
+    match owner {
+        Owner::User(_) if !own_state && cfg!(target_os = "linux") => vec!["--password-store=gnome-libsecret"],
+        Owner::User(_) if !own_state && cfg!(windows) => vec![],
+        _ => vec!["--password-store=basic", "--use-mock-keychain"],
     }
-    if matches!(owner, Owner::Task(_)) {
-        watch(Arc::downgrade(&chrome), slot.clone());
+}
+
+/// Whether the logins of the user's browser are kept unencrypted here, to say so.
+fn user_logins_plain() -> bool {
+    cookie_key(&Owner::User(UserBrowser::Shared)).contains(&"--password-store=basic")
+        || (cfg!(target_os = "linux") && std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none())
+}
+
+/// `HeadlessChrome/158.0.8127.36` → `158`.
+fn major_of_product(product: &str) -> String {
+    product.split_once('/').map(|(_, v)| v.split('.').next().unwrap_or_default().to_string()).unwrap_or_else(|| "130".into())
+}
+
+/// What makes a headless Chrome the Chrome it is to a site: without it a
+/// site sees `HeadlessChrome` and `navigator.webdriver`, and Google's
+/// sign-in, among others, says the browser "may not be secure". The
+/// graphics card too, where there is one, for pages that draw with WebGL.
+fn as_ordinary(program: &Path) -> Vec<String> {
+    let mut args = vec!["--disable-blink-features=AutomationControlled".to_string(), "--enable-gpu".to_string()];
+    if let Some(major) = installed_major(program) {
+        let edge = program.file_name().is_some_and(|n| n.to_string_lossy().to_lowercase().contains("edge"));
+        args.push(format!("--user-agent={}", ordinary_agent(&major, edge)));
     }
-    *held = Some(chrome.clone());
-    Ok(chrome)
+    args
+}
+
+/// The user agent the same Chrome has with a window: its major version
+/// only and a fixed platform, as Chrome's own reduced one is.
+fn ordinary_agent(major: &str, edge: bool) -> String {
+    let platform = if cfg!(target_os = "macos") {
+        "Macintosh; Intel Mac OS X 10_15_7"
+    } else if cfg!(windows) {
+        "Windows NT 10.0; Win64; x64"
+    } else {
+        "X11; Linux x86_64"
+    };
+    let edge = if edge { format!(" Edg/{major}.0.0.0") } else { String::new() };
+    format!("Mozilla/5.0 ({platform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36{edge}")
+}
+
+/// The major version of the Chrome at `program`, asked once for each build
+/// of it: an update in place is a new one.
+fn installed_major(program: &Path) -> Option<String> {
+    static KNOWN: OnceLock<Mutex<HashMap<PathBuf, (Option<std::time::SystemTime>, Option<String>)>>> = OnceLock::new();
+    let built = std::fs::metadata(program).and_then(|m| m.modified()).ok();
+    let known = KNOWN.get_or_init(Default::default);
+    if let Some((at, major)) = known.lock().unwrap().get(program) {
+        if *at == built {
+            return major.clone();
+        }
+    }
+    let major = ask_major(program);
+    known.lock().unwrap().insert(program.to_path_buf(), (built, major.clone()));
+    major
+}
+
+/// `Google Chrome 158.0.8127.36`, `Chromium 158.0…`: its first number.
+fn major_in(text: &str) -> Option<String> {
+    text.split_whitespace().find(|w| w.contains('.') && w.starts_with(|c: char| c.is_ascii_digit()))?.split('.').next().map(str::to_string)
+}
+
+#[cfg(not(windows))]
+fn ask_major(program: &Path) -> Option<String> {
+    let out = crate::procs::command(program).arg("--version").stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+    major_in(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// `chrome.exe --version` opens a window instead of answering: the folder
+/// beside it is named after its version (`Application\158.0.8127.36`).
+#[cfg(windows)]
+fn ask_major(program: &Path) -> Option<String> {
+    std::fs::read_dir(program.parent()?)
+        .ok()?
+        .flatten()
+        .filter_map(|e| major_in(&e.file_name().to_string_lossy()))
+        .filter_map(|m| m.parse::<u32>().ok())
+        .max()
+        .map(|m| m.to_string())
 }
 
 /// The browser's socket path, from what its DevTools endpoint says of it.
@@ -525,6 +764,21 @@ pub fn quit() {
     }
 }
 
+/// What a user's Chrome has for a task: the pages its tabs' pages opened, their downloads.
+pub fn user_page_events(browser: &UserBrowser, root: &Path) -> async_channel::Receiver<PageEvent> {
+    let (tx, rx) = async_channel::unbounded();
+    slot(&Owner::User(browser.clone())).tasks.lock().unwrap().insert(root.to_path_buf(), tx);
+    rx
+}
+
+/// A page of a user's Chrome shown in a task's tab: what it opens and
+/// downloads goes to that task.
+fn note_task_page(owner: &Owner, target: &str, root: &Path) {
+    if matches!(owner, Owner::User(_)) {
+        slot(owner).page_tasks.lock().unwrap().insert(target.to_string(), root.to_path_buf());
+    }
+}
+
 /// What the task's Chrome has for the task: pages no tab opened, downloads.
 pub fn page_events(root: &Path) -> async_channel::Receiver<PageEvent> {
     let (tx, rx) = async_channel::unbounded();
@@ -537,24 +791,29 @@ fn ws_config() -> WebSocketConfig {
     WebSocketConfig::default().max_message_size(Some(512 << 20)).max_frame_size(Some(512 << 20))
 }
 
-/// A browser-level DevTools connection, and the stream under it for a
-/// writer of its own.
-fn connect(chrome: &Chrome) -> Result<(Socket, TcpStream)> {
+/// A browser-level DevTools connection: a WebSocket of its own to a port,
+/// or a channel of the user's Chrome's pipe.
+fn connect(chrome: &Chrome) -> Result<Socket> {
+    if let Some(pipe) = &chrome.pipe {
+        return Ok(Socket { wire: Wire::Pipe { channel: pipe.channel()?, timeout: None }, session: None });
+    }
     let stream = TcpStream::connect(("127.0.0.1", chrome.port))?;
     stream.set_nodelay(true)?;
-    let raw = stream.try_clone()?;
     let url = format!("ws://127.0.0.1:{}{}", chrome.port, chrome.ws_path);
     let (ws, _) =
         tungstenite::client::client_with_config(url.as_str(), stream, Some(ws_config())).map_err(|e| anyhow!("Unable to connect to {url}: {e}"))?;
-    Ok((Socket { ws, next_id: 0, session: None }, raw))
+    Ok(Socket { wire: Wire::Ws { ws, next_id: 0 }, session: None })
 }
 
 /// Offers the task the pages nobody claims: one is claimed by its tab
 /// within moments of being made, so a page is offered once that long
-/// unclaimed.
-fn watch(chrome: Weak<Chrome>, slot: Arc<Slot>) {
+/// unclaimed. A user's Chrome serves many tasks: a page goes to the task
+/// whose tab's page opened it, a download to the task whose page it came
+/// from; one of no task's (none should be: no agent reaches that Chrome)
+/// is closed.
+fn watch(chrome: Weak<Chrome>, slot: Arc<Slot>, user: bool) {
     let _ = std::thread::Builder::new().name("cdp-targets".into()).spawn(move || {
-        let Some((mut socket, _)) = chrome.upgrade().and_then(|c| connect(&c).ok()) else {
+        let Some(mut socket) = chrome.upgrade().and_then(|c| connect(&c).ok()) else {
             return;
         };
         let mut aside = Vec::new();
@@ -575,47 +834,58 @@ fn watch(chrome: Weak<Chrome>, slot: Arc<Slot>) {
             json!({ "behavior": "allowAndName", "downloadPath": folder.display().to_string(), "eventsEnabled": true }),
             &mut aside,
         );
-        let tell = |event: PageEvent| {
-            if let Some(tx) = slot.adopt.lock().unwrap().as_ref() {
-                let _ = tx.try_send(event);
+        // Where what a page did goes: the task's, or the task the page is of.
+        let task_of = |page: Option<&str>| page.and_then(|p| slot.page_tasks.lock().unwrap().get(p).cloned());
+        let to = |task: Option<&PathBuf>| -> Option<async_channel::Sender<PageEvent>> {
+            if !user {
+                return slot.adopt.lock().unwrap().clone();
             }
+            let tasks = slot.tasks.lock().unwrap();
+            task.and_then(|t| tasks.get(t).cloned())
         };
-        let _ = socket.ws.get_mut().set_read_timeout(Some(Duration::from_millis(200)));
-        let mut waiting: Vec<(String, bool, Instant)> = Vec::new();
-        let mut downloads: HashMap<String, String> = HashMap::new();
-        let mut handle = |msg: Value, waiting: &mut Vec<(String, bool, Instant)>| {
+        socket.set_timeout(Some(Duration::from_millis(200)));
+        type Waiting = Vec<(String, Option<String>, Instant)>;
+        let mut waiting: Waiting = Vec::new();
+        // A download's name and the page it came from, by its id.
+        let mut downloads: HashMap<String, (String, Option<String>)> = HashMap::new();
+        let mut handle = |msg: Value, waiting: &mut Waiting| {
             let params = &msg["params"];
             match msg["method"].as_str() {
                 Some("Target.targetCreated") if params["targetInfo"]["type"] == "page" => {
                     let info = &params["targetInfo"];
                     let id = info["targetId"].as_str().unwrap_or_default().to_string();
-                    waiting.push((id, info["openerId"].is_string(), Instant::now()));
+                    waiting.push((id, info["openerId"].as_str().map(str::to_string), Instant::now()));
                 }
                 Some("Target.targetDestroyed") => {
                     let id = params["targetId"].as_str().unwrap_or_default();
                     waiting.retain(|(w, _, _)| w != id);
+                    slot.page_tasks.lock().unwrap().remove(id);
                 }
                 Some("Browser.downloadWillBegin") => {
                     let name = params["suggestedFilename"].as_str().unwrap_or("download").to_string();
-                    downloads.insert(params["guid"].as_str().unwrap_or_default().to_string(), name);
+                    // A page's main frame has the page's id.
+                    downloads.insert(params["guid"].as_str().unwrap_or_default().to_string(), (name, params["frameId"].as_str().map(str::to_string)));
                 }
                 Some("Browser.downloadProgress") => {
                     let guid = params["guid"].as_str().unwrap_or_default();
-                    match params["state"].as_str() {
-                        Some("completed") => {
-                            let name = downloads.remove(guid).unwrap_or_else(|| "download".into());
-                            let to = free_name(&folder, &name);
-                            let from = params["filePath"].as_str().map(PathBuf::from).unwrap_or_else(|| folder.join(guid));
-                            tell(match std::fs::rename(&from, &to) {
-                                Ok(()) => PageEvent::Downloaded(to),
-                                Err(_) => PageEvent::Downloaded(from),
-                            });
+                    let done = params["state"].as_str();
+                    if !matches!(done, Some("completed" | "canceled")) {
+                        return;
+                    }
+                    let (name, frame) = downloads.remove(guid).unwrap_or_else(|| ("download".into(), None));
+                    let task = task_of(frame.as_deref()).or_else(|| slot.tasks.lock().unwrap().keys().next().cloned());
+                    let event = if done == Some("completed") {
+                        let to = free_name(&folder, &name);
+                        let from = params["filePath"].as_str().map(PathBuf::from).unwrap_or_else(|| folder.join(guid));
+                        match std::fs::rename(&from, &to) {
+                            Ok(()) => PageEvent::Downloaded(to),
+                            Err(_) => PageEvent::Downloaded(from),
                         }
-                        Some("canceled") => {
-                            let name = downloads.remove(guid).unwrap_or_default();
-                            tell(PageEvent::DownloadFailed(name));
-                        }
-                        _ => {}
+                    } else {
+                        PageEvent::DownloadFailed(name)
+                    };
+                    if let Some(tx) = to(task.as_ref()) {
+                        let _ = tx.try_send(event);
                     }
                 }
                 _ => {}
@@ -635,9 +905,11 @@ fn watch(chrome: Weak<Chrome>, slot: Arc<Slot>) {
             };
             if !first.is_empty() {
                 let tabs = chrome.claimed.lock().unwrap().len() > first.len();
-                if tabs {
-                    for target in first.drain(..) {
-                        let _ = socket.send("Target.closeTarget", json!({ "targetId": target }));
+                if tabs || user {
+                    if tabs {
+                        for target in first.drain(..) {
+                            let _ = socket.send("Target.closeTarget", json!({ "targetId": target }));
+                        }
                     }
                 } else if started.elapsed() > Duration::from_secs(3) {
                     for target in first.drain(..) {
@@ -650,12 +922,22 @@ fn watch(chrome: Weak<Chrome>, slot: Arc<Slot>) {
             }
             let due = Duration::from_millis(500);
             while let Some(ix) = waiting.iter().position(|(_, _, at)| at.elapsed() > due) {
-                let (target, by_page, _) = waiting.remove(ix);
+                let (target, opener, _) = waiting.remove(ix);
                 if chrome.claimed.lock().unwrap().contains(&target) {
                     continue;
                 }
-                if let Some(tx) = slot.adopt.lock().unwrap().as_ref() {
-                    let _ = tx.try_send(PageEvent::Opened { target, by_page });
+                let task = task_of(opener.as_deref());
+                match to(task.as_ref()) {
+                    Some(tx) => {
+                        if let Some(task) = task {
+                            slot.page_tasks.lock().unwrap().insert(target.clone(), task);
+                        }
+                        let _ = tx.try_send(PageEvent::Opened { target, by_page: opener.is_some() });
+                    }
+                    None if user => {
+                        let _ = socket.send("Target.closeTarget", json!({ "targetId": target }));
+                    }
+                    None => {}
                 }
             }
         }
@@ -688,10 +970,109 @@ fn free_name(folder: &Path, name: &str) -> PathBuf {
 
 // ---------------------------------------------------------------- page session
 
-/// What a tab shows: a page to open, or one open already.
+/// What a tab shows: a page to open, or one open already; or DevTools for
+/// a page of a Chrome with no port to serve them (the user's).
 pub enum Source {
     Url(String),
     Target(String),
+    DevTools(String),
+}
+
+/// Chrome's own DevTools, loaded from inside Chrome. Its WebSocket is made
+/// a stand-in: what it sends goes out through a binding, and ideae carries
+/// it to the page inspected over the pipe and brings back what it answers.
+const DEVTOOLS_BINDING: &str = "__ideaeDevtoolsSend";
+const DEVTOOLS_SHIM: &str = r##"(() => {
+  if (location.protocol !== "devtools:") return;
+  const socket = { readyState: 0, onopen: null, onmessage: null, onclose: null, onerror: null,
+    send: (m) => window.__ideaeDevtoolsSend(m), close() {},
+    addEventListener(type, f) { this["on" + type] = f; }, removeEventListener() {} };
+  window.__ideaeDevtools = { deliver(list) { for (const m of list) if (socket.onmessage) socket.onmessage({ data: JSON.stringify(m) }); } };
+  const Shim = function () { setTimeout(() => { socket.readyState = 1; if (socket.onopen) socket.onopen({}); }, 0); return socket; };
+  Shim.CONNECTING = 0; Shim.OPEN = 1; Shim.CLOSING = 2; Shim.CLOSED = 3;
+  window.WebSocket = Shim;
+})()"##;
+
+/// What DevTools may not ask of the page's Chrome: its other pages.
+const DEVTOOLS_DENIED: [&str; 8] = [
+    "Target.attachToTarget",
+    "Target.attachToBrowserTarget",
+    "Target.createTarget",
+    "Target.closeTarget",
+    "Target.exposeDevToolsProtocol",
+    "Target.createBrowserContext",
+    "Target.disposeBrowserContext",
+    "Target.setRemoteLocations",
+];
+
+/// The messages between DevTools (a page of the same Chrome) and the page it
+/// inspects, through a session of its own: its replies by the id DevTools
+/// gave, its events and those of the frames and workers under it.
+struct DevToolsBridge {
+    page: String,
+    inspected: String,
+    children: HashSet<String>,
+    outbox: Vec<Value>,
+}
+
+impl DevToolsBridge {
+    /// Takes the bridge's messages; gives back the page's own.
+    fn take(&mut self, mut msg: Value, socket: &mut Socket, replies: &Replies, ask: &mpsc::Sender<Out>) -> Option<Value> {
+        if let Some(id) = msg["id"].as_u64() {
+            let mine = matches!(replies.lock().unwrap().get(&id), Some(Reply::DevTools(_)));
+            if !mine {
+                return Some(msg);
+            }
+            if let Some(Reply::DevTools(front)) = replies.lock().unwrap().remove(&id) {
+                msg["id"] = json!(front);
+                if msg["sessionId"] == self.inspected.as_str() {
+                    msg.as_object_mut().map(|m| m.remove("sessionId"));
+                }
+                self.outbox.push(msg);
+            }
+            return None;
+        }
+        let session = msg["sessionId"].as_str().unwrap_or_default().to_string();
+        if session == self.inspected || self.children.contains(&session) {
+            if msg["method"] == "Target.attachedToTarget" {
+                if let Some(child) = msg["params"]["sessionId"].as_str() {
+                    self.children.insert(child.to_string());
+                    socket.listen(child);
+                }
+            }
+            if session == self.inspected {
+                msg.as_object_mut().map(|m| m.remove("sessionId"));
+            }
+            self.outbox.push(msg);
+            return None;
+        }
+        if session == self.page && msg["method"] == "Runtime.bindingCalled" && msg["params"]["name"] == DEVTOOLS_BINDING {
+            let Ok(mut asked) = serde_json::from_str::<Value>(msg["params"]["payload"].as_str().unwrap_or_default()) else { return None };
+            let front = asked["id"].as_u64().unwrap_or_default();
+            let to = asked["sessionId"].as_str().map(str::to_string);
+            let method = asked["method"].as_str().unwrap_or_default();
+            let allowed = to.as_ref().is_none_or(|s| self.children.contains(s)) && !DEVTOOLS_DENIED.contains(&method);
+            if !allowed {
+                self.outbox.push(json!({ "id": front, "error": { "code": -32601, "message": format!("{method} is not given to DevTools in ideae") } }));
+                return None;
+            }
+            if to.is_none() {
+                asked["sessionId"] = json!(self.inspected);
+            }
+            let _ = ask.send(Out::Raw(asked, Reply::DevTools(front)));
+            return None;
+        }
+        Some(msg)
+    }
+
+    /// What came for DevTools since, given to it at once.
+    fn flush(&mut self, ask: &mpsc::Sender<Out>) {
+        if self.outbox.is_empty() {
+            return;
+        }
+        let list = Value::Array(std::mem::take(&mut self.outbox));
+        let _ = ask.send(Out::Command("Runtime.evaluate", json!({ "expression": format!("window.__ideaeDevtools && window.__ideaeDevtools.deliver({list})") })));
+    }
 }
 
 enum Out {
@@ -712,6 +1093,8 @@ enum Out {
     Ack(i64),
     /// The tab came into view or left it.
     Visible(bool),
+    /// A message as DevTools made it, for the session it names; its reply goes back to it.
+    Raw(Value, Reply),
     Close,
 }
 
@@ -773,6 +1156,8 @@ enum In {
     Select(SelectMenu),
     Picker(Picker),
     Problem(String),
+    /// A page of the user's browser asked for a passkey or a security key, and was refused.
+    Passkey,
     Closed,
     Error(String),
 }
@@ -781,25 +1166,37 @@ enum In {
 enum Reply {
     Caller(mpsc::Sender<Value>),
     Title,
+    /// DevTools', by the id it gave.
+    DevTools(u64),
 }
 
 type Replies = Mutex<HashMap<u64, Reply>>;
 
+enum Wire {
+    Ws { ws: WebSocket<TcpStream>, next_id: u64 },
+    Pipe { channel: pipe::Channel, timeout: Option<Duration> },
+}
+
 struct Socket {
-    ws: WebSocket<TcpStream>,
-    next_id: u64,
+    wire: Wire,
     session: Option<String>,
 }
 
 impl Socket {
     fn send(&mut self, method: &str, params: Value) -> Result<u64> {
-        self.next_id += 1;
-        let mut msg = json!({ "id": self.next_id, "method": method, "params": params });
+        let mut msg = json!({ "method": method, "params": params });
         if let Some(session) = &self.session {
             msg["sessionId"] = json!(session);
         }
-        self.ws.send(Message::text(msg.to_string()))?;
-        Ok(self.next_id)
+        match &mut self.wire {
+            Wire::Ws { ws, next_id } => {
+                *next_id += 1;
+                msg["id"] = json!(*next_id);
+                ws.send(Message::text(msg.to_string()))?;
+                Ok(*next_id)
+            }
+            Wire::Pipe { channel, .. } => channel.send(&mut msg),
+        }
     }
 
     /// Sends and waits for the reply, setting other messages aside.
@@ -821,11 +1218,86 @@ impl Socket {
     }
 
     fn read(&mut self) -> Result<Option<Value>> {
-        match self.ws.read() {
-            Ok(Message::Text(text)) => Ok(serde_json::from_str(text.as_str()).ok()),
-            Ok(_) => Ok(None),
-            Err(tungstenite::Error::Io(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => Ok(None),
-            Err(e) => Err(e.into()),
+        match &mut self.wire {
+            Wire::Ws { ws, .. } => match ws.read() {
+                Ok(Message::Text(text)) => Ok(serde_json::from_str(text.as_str()).ok()),
+                Ok(_) => Ok(None),
+                Err(tungstenite::Error::Io(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => Ok(None),
+                Err(e) => Err(e.into()),
+            },
+            Wire::Pipe { channel, timeout } => channel.recv(*timeout),
+        }
+    }
+
+    /// How long a read waits; none: until a message comes.
+    fn set_timeout(&mut self, timeout: Option<Duration>) {
+        match &mut self.wire {
+            Wire::Ws { ws, .. } => {
+                let _ = ws.get_mut().set_read_timeout(timeout);
+            }
+            Wire::Pipe { timeout: t, .. } => *t = timeout,
+        }
+    }
+
+    /// Commands go to this page's session from now on, and over a pipe its
+    /// events come here.
+    fn set_session(&mut self, session: Option<String>) {
+        if let (Wire::Pipe { channel, .. }, Some(session)) = (&mut self.wire, &session) {
+            channel.listen(session);
+        }
+        self.session = session;
+    }
+
+    /// The events of another session come here too (over a WebSocket they come all the same).
+    fn listen(&mut self, session: &str) {
+        if let Wire::Pipe { channel, .. } = &mut self.wire {
+            channel.listen(session);
+        }
+    }
+
+    /// Writes for the page from another thread; what Chrome answers comes to
+    /// this socket's reads.
+    fn writer(&self) -> Result<Writer> {
+        Ok(match &self.wire {
+            Wire::Ws { ws, next_id } => {
+                let raw = ws.get_ref().try_clone()?;
+                Writer::Ws { ws: WebSocket::from_raw_socket(raw.try_clone()?, Role::Client, Some(ws_config())), raw, next_id: *next_id + 1 }
+            }
+            Wire::Pipe { channel, .. } => Writer::Pipe(channel.writer()),
+        })
+    }
+}
+
+enum Writer {
+    Ws { ws: WebSocket<TcpStream>, raw: TcpStream, next_id: u64 },
+    Pipe(pipe::Writer),
+}
+
+impl Writer {
+    fn next_id(&mut self) -> u64 {
+        match self {
+            Writer::Ws { next_id, .. } => {
+                *next_id += 1;
+                *next_id
+            }
+            Writer::Pipe(writer) => writer.next_id(),
+        }
+    }
+
+    fn write(&mut self, msg: &Value) -> bool {
+        match self {
+            Writer::Ws { ws, .. } => ws.send(Message::text(msg.to_string())).is_ok(),
+            Writer::Pipe(writer) => writer.write(msg),
+        }
+    }
+
+    /// Ends the reader's wait: the page is closed.
+    fn end(&mut self) {
+        match self {
+            Writer::Ws { raw, .. } => {
+                let _ = raw.shutdown(std::net::Shutdown::Both);
+            }
+            Writer::Pipe(writer) => writer.end(),
         }
     }
 }
@@ -834,6 +1306,9 @@ impl Socket {
 /// the last one closes: it is a browser's worth of processes kept for nothing.
 struct OpenPage(Arc<Slot>, Owner);
 const CHROME_IDLE: Duration = if cfg!(test) { Duration::from_millis(500) } else { Duration::from_secs(60) };
+/// The user's: a link clicked a while after the last tab closed should not
+/// wait for a Chrome to start.
+const USER_CHROME_IDLE: Duration = if cfg!(test) { Duration::from_millis(500) } else { Duration::from_secs(300) };
 
 impl OpenPage {
     fn new(owner: &Owner) -> Self {
@@ -852,7 +1327,7 @@ impl Drop for OpenPage {
         let this = slot.closed.fetch_add(1, Ordering::SeqCst) + 1;
         let owner = self.1.clone();
         std::thread::spawn(move || {
-            std::thread::sleep(CHROME_IDLE);
+            std::thread::sleep(if matches!(owner, Owner::User(_)) { USER_CHROME_IDLE } else { CHROME_IDLE });
             let mut held = slot.chrome.lock().unwrap();
             // Under the lock a new page waits for: it finds Chrome there, or starts one.
             if slot.pages.load(Ordering::SeqCst) == 0 && slot.closed.load(Ordering::SeqCst) == this {
@@ -1049,6 +1524,29 @@ const PAGE_SCRIPT: &str = r##"(() => {
 
 const BINDING: &str = "__ideae";
 
+/// In a page of the user's browser: a passkey or a security key asked for
+/// is refused at once, not left waiting for a dialog headless Chrome never
+/// shows, so the site offers its other ways in; the tab is told, to offer
+/// the system's browser. Not in a task's: an agent's Playwright tests
+/// passkeys there with virtual authenticators.
+const PASSKEY_SCRIPT: &str = r##"(() => {
+  const c = navigator.credentials;
+  if (!c || !window.PublicKeyCredential || c.__ideae) return;
+  c.__ideae = true;
+  const refuse = (options) => {
+    if (!options || !options.publicKey) return null;
+    if (options.mediation !== "conditional") {
+      try { window.__ideae(JSON.stringify({ passkey: true })); } catch (_) {}
+    }
+    return Promise.reject(new DOMException("No passkey or security key in this browser", "NotAllowedError"));
+  };
+  const get = c.get.bind(c), create = c.create.bind(c);
+  c.get = (o) => refuse(o) || get(o);
+  c.create = (o) => refuse(o) || create(o);
+  PublicKeyCredential.isConditionalMediationAvailable = () => Promise.resolve(false);
+  PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable = () => Promise.resolve(false);
+})()"##;
+
 /// The text selected, in a field too, where the page's selection has none;
 /// in the frame or shadow root that has the focus.
 const SELECTED: &str = r##"(() => {
@@ -1115,11 +1613,11 @@ fn problem(method: &str, params: &Value) -> Option<String> {
 fn run_page(owner: Owner, source: Source, in_tx: &async_channel::Sender<In>, out_rx: mpsc::Receiver<Out>, ask: mpsc::Sender<Out>) -> Result<()> {
     let open = OpenPage::new(&owner);
     let chrome = chrome(&owner)?;
-    let (mut socket, raw) = connect(&chrome)?;
+    let mut socket = connect(&chrome)?;
     let mut aside = Vec::new();
 
     let target_id = match &source {
-        Source::Url(_) => {
+        Source::Url(_) | Source::DevTools(_) => {
             // A window of its own: Chrome draws only the tab in front of a window,
             // and a page behind another sends no frames.
             let target = socket.call("Target.createTarget", json!({ "url": "about:blank", "newWindow": true }), &mut aside)?;
@@ -1132,17 +1630,38 @@ fn run_page(owner: Owner, source: Source, in_tx: &async_channel::Sender<In>, out
     // The page's closing is told to the browser's connection.
     socket.call("Target.setDiscoverTargets", json!({ "discover": true }), &mut aside)?;
     let attached = socket.call("Target.attachToTarget", json!({ "targetId": target_id, "flatten": true }), &mut aside)?;
-    socket.session = attached["sessionId"].as_str().map(str::to_string);
+    socket.set_session(attached["sessionId"].as_str().map(str::to_string));
     socket.call("Page.enable", json!({}), &mut aside)?;
     socket.call("Runtime.enable", json!({}), &mut aside)?;
     let _ = socket.call("Log.enable", json!({}), &mut aside);
+    // A task's page: which hosts are its stands is told by where they are served from.
+    let mut seen = matches!(owner, Owner::Task(_)).then(|| seed::Seen::load(&chrome.profile));
+    if seen.is_some() {
+        let _ = socket.call("Network.enable", json!({ "maxTotalBufferSize": 0, "maxResourceBufferSize": 0 }), &mut aside);
+    }
     // Focused as the tab in view is, wherever its window is.
     let _ = socket.call("Emulation.setFocusEmulationEnabled", json!({ "enabled": true }), &mut aside);
     let _ = socket.call("Page.setInterceptFileChooserDialog", json!({ "enabled": true }), &mut aside);
     socket.call("Runtime.addBinding", json!({ "name": BINDING }), &mut aside)?;
     socket.call("Page.addScriptToEvaluateOnNewDocument", json!({ "source": PAGE_SCRIPT }), &mut aside)?;
     let _ = socket.call("Runtime.evaluate", json!({ "expression": PAGE_SCRIPT }), &mut aside);
-    if let Source::Url(url) = &source {
+    if matches!(owner, Owner::User(_)) {
+        socket.call("Page.addScriptToEvaluateOnNewDocument", json!({ "source": PASSKEY_SCRIPT }), &mut aside)?;
+        let _ = socket.call("Runtime.evaluate", json!({ "expression": PASSKEY_SCRIPT }), &mut aside);
+    }
+    let mut bridge = None;
+    if let Source::DevTools(of) = &source {
+        socket.call("Runtime.addBinding", json!({ "name": DEVTOOLS_BINDING }), &mut aside)?;
+        socket.call("Page.addScriptToEvaluateOnNewDocument", json!({ "source": DEVTOOLS_SHIM }), &mut aside)?;
+        // A session of its own on the page inspected: what DevTools turns on there is not the tab's.
+        let page = socket.session.take().unwrap_or_default();
+        let inspected = socket.call("Target.attachToTarget", json!({ "targetId": of, "flatten": true }), &mut aside);
+        socket.session = Some(page.clone());
+        let inspected = inspected?["sessionId"].as_str().unwrap_or_default().to_string();
+        socket.listen(&inspected);
+        bridge = Some(DevToolsBridge { page, inspected, children: HashSet::new(), outbox: Vec::new() });
+        socket.send("Page.navigate", json!({ "url": format!("devtools://devtools/bundled/inspector.html?ws=ideae/page/{of}") }))?;
+    } else if let Source::Url(url) = &source {
         socket.send("Page.navigate", json!({ "url": url }))?;
     } else {
         // A page made elsewhere: what it shows now.
@@ -1156,26 +1675,50 @@ fn run_page(owner: Owner, source: Source, in_tx: &async_channel::Sender<In>, out
     let replies: Arc<Replies> = Default::default();
     let closing = Arc::new(AtomicBool::new(false));
     {
-        let writer = WebSocket::from_raw_socket(raw.try_clone()?, Role::Client, Some(ws_config()));
+        let writer = socket.writer()?;
         let (replies, closing, target_id) = (replies.clone(), closing.clone(), target_id.clone());
         let session = socket.session.clone().unwrap_or_default();
-        let first_id = socket.next_id + 1;
         std::thread::Builder::new().name("cdp-write".into()).spawn(move || {
             // Chrome stays while the page is written to.
             let _keep = (open, chrome);
-            write_page(writer, raw, first_id, session, &target_id, out_rx, &replies, &closing);
+            write_page(writer, session, &target_id, out_rx, &replies, &closing);
         })?;
     }
 
     let mut main_frame = target_id.clone();
     for msg in aside.drain(..) {
+        if let Some(seen) = &mut seen {
+            seen.note(&msg);
+        }
+        let Some(msg) = (match &mut bridge {
+            Some(bridge) => bridge.take(msg, &mut socket, &replies, &ask),
+            None => Some(msg),
+        }) else {
+            continue;
+        };
         read_message(msg, &target_id, &mut main_frame, in_tx, &replies, &ask);
     }
+    if let Some(bridge) = &mut bridge {
+        bridge.flush(&ask);
+    }
     // Blocking reads: the writer shuts the stream to end them.
-    let _ = socket.ws.get_mut().set_read_timeout(None);
+    socket.set_timeout(None);
     loop {
         match socket.read() {
             Ok(Some(msg)) => {
+                if let Some(seen) = &mut seen {
+                    seen.note(&msg);
+                }
+                let msg = match &mut bridge {
+                    Some(bridge) => match bridge.take(msg, &mut socket, &replies, &ask) {
+                        Some(msg) => msg,
+                        None => {
+                            bridge.flush(&ask);
+                            continue;
+                        }
+                    },
+                    None => msg,
+                };
                 if !read_message(msg, &target_id, &mut main_frame, in_tx, &replies, &ask) {
                     return Ok(());
                 }
@@ -1202,6 +1745,7 @@ fn read_message(mut msg: Value, target: &str, main_frame: &mut String, in_tx: &a
                 let title = msg["result"]["result"]["value"].as_str().unwrap_or_default().to_string();
                 in_tx.send_blocking(In::Title(title)).is_ok()
             }
+            Some(Reply::DevTools(_)) => true,
             None => true,
         };
     }
@@ -1245,6 +1789,8 @@ fn read_message(mut msg: Value, target: &str, main_frame: &mut String, in_tx: &a
             };
             if let Some(title) = payload["title"].as_str() {
                 In::Title(title.to_string())
+            } else if payload["passkey"] == true {
+                In::Passkey
             } else if payload["caret"].is_object() {
                 let c = &payload["caret"];
                 let n = |v: &Value| px(v.as_f64().unwrap_or(0.) as f32);
@@ -1294,26 +1840,25 @@ fn read_message(mut msg: Value, target: &str, main_frame: &mut String, in_tx: &a
 /// the last of them; a resize while frames come waits for the size to settle.
 #[allow(clippy::too_many_arguments)]
 fn write_page(
-    mut ws: WebSocket<TcpStream>,
-    raw: TcpStream,
-    first_id: u64,
+    writer: Writer,
     session: String,
     target: &str,
     out_rx: mpsc::Receiver<Out>,
     replies: &Replies,
     closing: &AtomicBool,
 ) {
-    let mut next_id = first_id;
-    let mut send = |method: &str, params: Value, in_page: bool, reply: Option<Reply>| -> bool {
-        next_id += 1;
-        let mut msg = json!({ "id": next_id, "method": method, "params": params });
+    // Shared by `send` and the close below.
+    let writer = std::cell::RefCell::new(writer);
+    let send = |method: &str, params: Value, in_page: bool, reply: Option<Reply>| -> bool {
+        let id = writer.borrow_mut().next_id();
+        let mut msg = json!({ "id": id, "method": method, "params": params });
         if in_page {
             msg["sessionId"] = json!(session);
         }
         if let Some(reply) = reply {
-            replies.lock().unwrap().insert(next_id, reply);
+            replies.lock().unwrap().insert(id, reply);
         }
-        ws.send(Message::text(msg.to_string())).is_ok()
+        writer.borrow_mut().write(&msg)
     };
     let mut waiting: VecDeque<Out> = VecDeque::new();
     let mut resize: Option<((u32, u32, f32, bool, Option<Value>, String), Instant)> = None;
@@ -1370,6 +1915,12 @@ fn write_page(
                 )
             }
             Some(Out::Command(method, params)) => send(method, params, true, None),
+            Some(Out::Raw(mut msg, reply)) => {
+                let id = writer.borrow_mut().next_id();
+                msg["id"] = json!(id);
+                replies.lock().unwrap().insert(id, reply);
+                writer.borrow_mut().write(&msg)
+            }
             Some(Out::Call(method, params, reply)) => send(method, params, true, Some(Reply::Caller(reply))),
             Some(Out::AskTitle) => {
                 send("Runtime.evaluate", json!({ "expression": "document.title", "returnByValue": true }), true, Some(Reply::Title))
@@ -1408,13 +1959,13 @@ fn write_page(
             Some(Out::Close) => {
                 closing.store(true, Ordering::SeqCst);
                 send("Target.closeTarget", json!({ "targetId": target }), false, None);
-                let _ = raw.shutdown(std::net::Shutdown::Both);
+                writer.borrow_mut().end();
                 return;
             }
         };
         if !ok {
             closing.store(true, Ordering::SeqCst);
-            let _ = raw.shutdown(std::net::Shutdown::Both);
+            writer.borrow_mut().end();
             return;
         }
     }
@@ -1429,20 +1980,20 @@ fn write_page(
 pub fn shot(url: &str, width: u32, height: u32, out: &std::path::Path) -> Result<()> {
     let _open = OpenPage::new(&Owner::Pictures);
     let chrome = chrome(&Owner::Pictures)?;
-    let (mut socket, _) = connect(&chrome)?;
+    let mut socket = connect(&chrome)?;
     let mut aside = Vec::new();
     let target = socket.call("Target.createTarget", json!({ "url": "about:blank" }), &mut aside)?;
     let target_id = target["targetId"].as_str().unwrap_or_default().to_string();
     let taken = (|| -> Result<Vec<u8>> {
         let attached = socket.call("Target.attachToTarget", json!({ "targetId": target_id, "flatten": true }), &mut aside)?;
-        socket.session = attached["sessionId"].as_str().map(str::to_string);
+        socket.set_session(attached["sessionId"].as_str().map(str::to_string));
         socket.call("Page.enable", json!({}), &mut aside)?;
         socket.call(
             "Emulation.setDeviceMetricsOverride",
             json!({ "width": width, "height": height, "deviceScaleFactor": 1, "mobile": false }),
             &mut aside,
         )?;
-        socket.ws.get_mut().set_read_timeout(Some(Duration::from_millis(100)))?;
+        socket.set_timeout(Some(Duration::from_millis(100)));
         aside.clear();
         let gone = socket.call("Page.navigate", json!({ "url": url }), &mut aside)?;
         if let Some(error) = gone["errorText"].as_str().filter(|e| !e.is_empty()) {
@@ -1460,7 +2011,7 @@ pub fn shot(url: &str, width: u32, height: u32, out: &std::path::Path) -> Result
         let picture = socket.call("Page.captureScreenshot", json!({ "format": "png" }), &mut aside)?;
         Ok(base64::engine::general_purpose::STANDARD.decode(picture["data"].as_str().unwrap_or_default())?)
     })();
-    socket.session = None;
+    socket.set_session(None);
     let _ = socket.send("Target.closeTarget", json!({ "targetId": target_id }));
     let png = taken?;
     if let Some(folder) = out.parent() {
@@ -1652,6 +2203,129 @@ fn pick_page(out: &mpsc::Sender<Out>, dir: &Path) -> Option<Picked> {
     Some(Picked { label: "whole page".into(), text: format!("the whole page, {}×{} CSS pixels:\npicture: {}\n", w.round(), h.round(), path.display()) })
 }
 
+/// An element of a page of the user's, as it is seen: its text and picture,
+/// none of its markup.
+fn pick_seen(out: &mpsc::Sender<Out>, x: f32, y: f32, dir: &Path) -> Option<Picked> {
+    let element = element_at(out, x, y, true)?;
+    let number = |value: &Value| value.as_f64().unwrap_or(0.);
+    let (bounds, scroll) = (&element["box"], &element["scroll"]);
+    let clip = json!({
+        "x": number(&bounds["x"]) + number(&scroll["x"]),
+        "y": number(&bounds["y"]) + number(&scroll["y"]),
+        "width": number(&bounds["width"]).max(1.),
+        "height": number(&bounds["height"]).max(1.),
+        "scale": 1,
+    });
+    let picture = save_picture(call(out, "Page.captureScreenshot", json!({ "format": "png", "clip": clip })), dir, "element");
+    let text = element["text"].as_str().unwrap_or_default();
+    let mut message = "a part of the page".to_string();
+    if !text.is_empty() {
+        message.push_str(&format!(", reading {text:?}"));
+    }
+    message.push('\n');
+    if let Some(path) = picture {
+        message.push_str(&format!("picture: {}\n", path.display()));
+    }
+    let label: String = if text.is_empty() { "element".into() } else { text.chars().take(30).collect() };
+    Some(Picked { label, text: message })
+}
+
+/// How much of a page's text goes to an agent.
+const PAGE_TEXT: usize = 20_000;
+
+/// The page's text as it reads, up to `PAGE_TEXT` characters.
+fn page_text(out: &mpsc::Sender<Out>) -> Option<Picked> {
+    let said = call(out, "Runtime.evaluate", json!({ "expression": "document.body ? document.body.innerText : ''", "returnByValue": true }))?;
+    let text = said["result"]["value"].as_str().unwrap_or_default().trim();
+    let count = text.chars().count();
+    let kept: String = text.chars().take(PAGE_TEXT).collect();
+    let cut = if count > PAGE_TEXT { format!(" (its first {PAGE_TEXT} characters of {count})") } else { String::new() };
+    Some(Picked { label: "page text".into(), text: format!("the page's text{cut}:\n```\n{kept}\n```\n") })
+}
+
+/// An address without what may be a sign-in's in it: query parameters
+/// named as tokens, codes and signatures are, and a fragment with values
+/// (OAuth's `#access_token=`).
+pub fn without_secrets(url: &str) -> String {
+    let secret = |key: &str| {
+        let key = key.to_ascii_lowercase();
+        ["token", "access_token", "id_token", "refresh_token", "code", "state", "sig", "signature", "key", "apikey", "api_key", "password", "secret", "session", "auth"]
+            .contains(&key.as_str())
+            || key.starts_with("x-amz-")
+            || key.starts_with("x-goog-")
+            || key.ends_with("_token")
+    };
+    let (rest, fragment) = match url.split_once('#') {
+        Some((rest, fragment)) => (rest, Some(fragment)),
+        None => (url, None),
+    };
+    let mut out = match rest.split_once('?') {
+        Some((base, query)) => {
+            let kept: Vec<&str> = query.split('&').filter(|p| !p.is_empty() && !secret(p.split_once('=').map_or(*p, |(k, _)| k))).collect();
+            if kept.is_empty() { base.to_string() } else { format!("{base}?{}", kept.join("&")) }
+        }
+        None => rest.to_string(),
+    };
+    if let Some(fragment) = fragment.filter(|f| !f.contains('=')) {
+        out.push('#');
+        out.push_str(fragment);
+    }
+    out
+}
+
+/// Whether a task's link opens in a tab of the user's own browser: as the
+/// settings of its project say, where that browser can run, and never one
+/// of this machine (a stand's: the task's own browser has it) or of a site
+/// set for the system's browser.
+pub fn opens_in_tab(root: &Path, url: &str) -> bool {
+    let web = url.starts_with("https://") || url.starts_with("http://");
+    web && !is_local(url)
+        && crate::layers::of_root(root).values.links_open_in == "tab"
+        && user_browser_here()
+        && !crate::state::with_settings(|s| s.system_hosts.iter().any(|h| host_named(h, url)))
+}
+
+/// Whether the user's own browser can run here: a Chrome to speak to over
+/// a pipe. Looked for once, off the UI thread; until found out, as if it can.
+fn user_browser_here() -> bool {
+    static FOUND: OnceLock<Arc<std::sync::atomic::AtomicU8>> = OnceLock::new();
+    if !cfg!(any(unix, windows)) {
+        return false;
+    }
+    let found = FOUND.get_or_init(|| {
+        let found = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let told = found.clone();
+        std::thread::spawn(move || {
+            let here = std::env::var_os("IDEAE_CHROME").is_some() || find_chrome().is_some();
+            told.store(if here { 1 } else { 2 }, Ordering::Relaxed);
+        });
+        found
+    });
+    found.load(Ordering::Relaxed) != 2
+}
+
+/// The host of an address, in lower case.
+fn host_of(url: &str) -> Option<String> {
+    let rest = url.split_once("://")?.1;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, a)| a);
+    let host = match authority.rsplit_once(':') {
+        Some((host, port)) if !port.contains(']') => host,
+        _ => authority,
+    };
+    Some(host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase())
+}
+
+/// Whether `pattern` (`example.com`, `*.example.com`) names the host of `url`.
+fn host_named(pattern: &str, url: &str) -> bool {
+    let Some(host) = host_of(url) else { return false };
+    let pattern = pattern.trim().to_ascii_lowercase();
+    match pattern.strip_prefix("*.") {
+        Some(domain) => host == domain || host.ends_with(&format!(".{domain}")),
+        None => host == pattern,
+    }
+}
+
 /// Whether `url` is of this machine: a dev server's, for a Web tab.
 pub fn is_local(url: &str) -> bool {
     local_address(url).is_some()
@@ -1825,6 +2499,16 @@ impl EventEmitter<BrowserEvent> for BrowserView {}
 
 pub struct BrowserView {
     owner: Owner,
+    /// A tab of the user's own browser: whose, as its toolbar shows it, and
+    /// the task it is a tab of, which gets the pages it opens.
+    user: Option<UserMark>,
+    task_root: Option<PathBuf>,
+    /// What its mark tells of it.
+    whose: SharedString,
+    /// The page asked for a passkey or a security key: the system's browser is offered.
+    passkey: bool,
+    /// Shown while presenting all the same, as asked.
+    unveiled: bool,
     /// The page alone, no toolbar: DevTools in its panel.
     bare: bool,
     /// The page's id in Chrome and Chrome's major version, once connected.
@@ -1999,6 +2683,31 @@ impl BrowserView {
         self.url.to_string()
     }
 
+    /// A tab of the user's browser, in the task at `root`.
+    pub fn for_user(&mut self, mark: UserMark, root: &Path) {
+        let plain = if user_logins_plain() { " Its logins are kept unencrypted here, as no keyring can be asked for a key." } else { "" };
+        self.whose = format!(
+            "{}'s browser: your own, its logins kept apart from other spaces' and out of agents' reach. No agent drives it; Pick sends only what you choose.{plain}",
+            mark.name
+        )
+        .into();
+        self.user = Some(mark);
+        self.task_root = Some(root.to_path_buf());
+        if let Some(target) = &self.target {
+            note_task_page(&self.owner, target, root);
+        }
+    }
+
+    pub fn is_user(&self) -> bool {
+        self.user.is_some()
+    }
+
+    /// The address as it goes to the agent: of the user's browser, without
+    /// what in it may be a sign-in's (a token, a code, a signature).
+    fn told_url(&self) -> String {
+        if self.user.is_some() { without_secrets(&self.url) } else { self.url.to_string() }
+    }
+
     /// To another address.
     pub fn go(&self, url: &str) {
         self.command("Page.navigate", json!({ "url": url }));
@@ -2059,7 +2768,7 @@ impl BrowserView {
     pub fn new(source: Source, owner: Owner, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (url, loading) = match &source {
             Source::Url(url) => (url.clone(), true),
-            Source::Target(_) => (String::new(), false),
+            Source::Target(_) | Source::DevTools(_) => (String::new(), false),
         };
         let (out, frames) = Self::attach(source, owner.clone(), window, cx);
         // The last frame's pixels go with the tab.
@@ -2124,6 +2833,11 @@ impl BrowserView {
 
         Self {
             owner,
+            user: None,
+            task_root: None,
+            whose: SharedString::default(),
+            passkey: false,
+            unveiled: false,
             bare: false,
             target: None,
             major: String::new(),
@@ -2241,7 +2955,11 @@ impl BrowserView {
         match message {
             In::Frame(..) => {}
             In::Ready { port, target, major } => {
-                (self.port, self.target, self.major) = (Some(port), Some(target), major);
+                // The user's Chrome has none: no DevTools served from one.
+                if let Some(root) = &self.task_root {
+                    note_task_page(&self.owner, &target, root);
+                }
+                (self.port, self.target, self.major) = ((port != 0).then_some(port), Some(target), major);
                 // A device's user agent is told with the size.
                 self.sent_size.set((0, 0, 0, 0));
                 if self.devtools_wanted {
@@ -2251,6 +2969,7 @@ impl BrowserView {
             In::Caret(at) => self.caret = Some(at),
             In::Navigated { url, failed } => {
                 self.problems.clear();
+                self.passkey = false;
                 (self.select, self.picker) = (None, None);
                 self.error = None;
                 self.failed = failed.then(|| url.clone());
@@ -2302,6 +3021,7 @@ impl BrowserView {
                 });
                 self.picker = Some(picker);
             }
+            In::Passkey => self.passkey = true,
             In::Problem(text) => {
                 // The latest hundred: a page that throws on every frame says nothing new after.
                 if self.problems.len() >= 100 {
@@ -2464,6 +3184,10 @@ impl BrowserView {
 
     fn pick_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         let (x, y) = self.pointer(position);
+        // A page of the user's: what is seen of it, not its markup, where a token may be.
+        if self.user.is_some() {
+            return self.run_pick(cx, move |out, dir| pick_seen(&out, x, y, &dir));
+        }
         self.run_pick(cx, move |out, dir| pick(&out, x, y, &dir));
     }
 
@@ -2497,7 +3221,7 @@ impl BrowserView {
             message.push_str(&note);
             message.push_str("\n\n");
         }
-        message.push_str(&format!("On {}:\n", self.url));
+        message.push_str(&format!("On {}:\n", self.told_url()));
         let many = self.picked.len() > 1;
         for (i, picked) in self.picked.drain(..).enumerate() {
             if many {
@@ -2582,15 +3306,20 @@ impl BrowserView {
     /// Chrome's own DevTools for the page, served by the task's Chrome and
     /// shown in a panel of the tab; the page gives it room.
     fn open_devtools(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(port), Some(target)) = (self.port, self.target.clone()) else { return };
+        let Some(target) = self.target.clone() else { return };
         if self.devtools.is_some() {
             return;
         }
-        let url = format!("http://127.0.0.1:{port}/devtools/inspector.html?ws=127.0.0.1:{port}/devtools/page/{target}");
+        // The task's Chrome serves DevTools at its port; the user's has none, and they come from inside it.
+        let source = match self.port {
+            Some(port) => Source::Url(format!("http://127.0.0.1:{port}/devtools/inspector.html?ws=127.0.0.1:{port}/devtools/page/{target}")),
+            None if self.user.is_some() => Source::DevTools(target),
+            None => return,
+        };
         let owner = self.owner.clone();
         let scheme = self.scheme;
         let view = cx.new(|cx| {
-            let mut view = BrowserView::new(Source::Url(url), owner, window, cx);
+            let mut view = BrowserView::new(source, owner, window, cx);
             view.bare = true;
             view.scheme = scheme;
             view
@@ -2989,6 +3718,16 @@ impl BrowserView {
             .py_1()
             .border_b_1()
             .border_color(cx.theme().border)
+            .when_some(self.user.as_ref(), |bar, mark| {
+                let told = self.whose.clone();
+                bar.child(
+                    div()
+                        .id("whose-browser")
+                        .flex_none()
+                        .child(crate::workspace::spaces::chip(&mark.mark, mark.color))
+                        .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(told.clone()).build(window, cx)),
+                )
+            })
             .child(Button::new("back").xsmall().ghost().child(drawn("arrow-left", muted)).tooltip("Back").on_click(cx.listener(|this, _, _, _| this.back())))
             .child(Button::new("forward").xsmall().ghost().child(drawn("arrow-right", muted)).tooltip("Forward").on_click(cx.listener(|this, _, _, _| this.forward())))
             .child(if self.loading {
@@ -3056,7 +3795,11 @@ impl BrowserView {
                     .ghost()
                     .child(drawn("square-dashed-mouse-pointer", if self.picking { lit } else { muted }))
                     .selected(self.picking)
-                    .tooltip("Pick an element for the agent: its selector, markup and picture go into the prompt")
+                    .tooltip(if self.user.is_some() {
+                        "Pick for the agent what you choose of the page: an element's text and picture, an area, the page's text"
+                    } else {
+                        "Pick an element for the agent: its selector, markup and picture go into the prompt"
+                    })
                     .on_click(cx.listener(|this, _, window, cx| {
                         // Focused, so Esc gets here to leave picking.
                         this.focus.focus(window, cx);
@@ -3072,6 +3815,31 @@ impl BrowserView {
                     .tooltip("DevTools (F12): in a panel of the tab, the page beside it")
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_devtools(window, cx))),
             )
+            .when(self.user.is_some(), |bar| {
+                let url = self.url.to_string();
+                let host = host_of(&url).filter(|h| !h.is_empty() && url.starts_with("http"));
+                bar.child(
+                    Button::new("system-browser")
+                        .xsmall()
+                        .ghost()
+                        .child(drawn("external-link", muted))
+                        .tooltip("Open in the system's browser: for a site this one cannot sign you in to (a passkey, a security key, a certificate)")
+                        .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                            let once = url.clone();
+                            let menu = menu.item(PopupMenuItem::new("Open in the system's browser").on_click(move |_, _, cx| cx.open_url(&once)));
+                            let Some(host) = host.clone() else { return menu };
+                            let always = url.clone();
+                            menu.item(PopupMenuItem::new(format!("Always open {host} there")).on_click(move |_, _, cx| {
+                                let mut settings = crate::state::settings();
+                                if !settings.system_hosts.contains(&host) {
+                                    settings.system_hosts.push(host.clone());
+                                }
+                                crate::state::set_settings(settings);
+                                cx.open_url(&always);
+                            }))
+                        }),
+                )
+            })
             .when_some(self.port, |this, port| {
                 let endpoint = format!("http://127.0.0.1:{port}");
                 this.child(
@@ -3222,6 +3990,16 @@ impl BrowserView {
                     .tooltip("A picture of the whole page, what is scrolled out of view too")
                     .on_click(cx.listener(|this, _, _, cx| this.run_pick(cx, |out, dir| pick_page(&out, &dir)))),
             )
+            .when(self.user.is_some(), |bar| {
+                bar.child(
+                    Button::new("pick-text")
+                        .xsmall()
+                        .ghost()
+                        .label("Page text")
+                        .tooltip("The page's text as it reads: a ticket, an error, a page of documentation")
+                        .on_click(cx.listener(|this, _, _, cx| this.run_pick(cx, |out, _| page_text(&out)))),
+                )
+            })
             .child(div().flex_1().min_w(px(180.)).child(Input::new(&self.pick_note).small()))
             .child(
                 Button::new("pick-send")
@@ -3554,6 +4332,21 @@ fn decode(bytes: &[u8], format: image::ImageFormat) -> Option<Arc<RenderImage>> 
 
 impl Render for BrowserView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The user's own pages (mail, tickets) are not shown while presenting, as files git ignores are not.
+        if self.user.is_some() && !self.unveiled && crate::workspace::present::on() && crate::state::with_settings(|s| s.present_veil) {
+            return v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .text_color(cx.theme().muted_foreground)
+                .child("A tab of your own browser: it is not shown while presenting.")
+                .child(Button::new("unveil").small().outline().label("Show it anyway").on_click(cx.listener(|this, _, _, cx| {
+                    this.unveiled = true;
+                    cx.notify();
+                })))
+                .into_any_element();
+        }
         if self.asleep && self.visible {
             self.wake(window, cx);
         }
@@ -3772,6 +4565,36 @@ impl Render for BrowserView {
             .when(self.finding, |this| this.child(self.render_find(cx)))
             .when(self.problems_open && !self.problems.is_empty(), |this| this.child(self.render_problems(cx)))
             .when(self.picking || !self.picked.is_empty(), |this| this.child(self.render_picked(cx)))
+            .when(self.passkey, |this| {
+                let url = self.url.to_string();
+                let always = url.clone();
+                let host = host_of(&url).filter(|h| !h.is_empty());
+                this.child(
+                    h_flex()
+                        .px_3()
+                        .py_1()
+                        .gap_2()
+                        .bg(cx.theme().secondary)
+                        .child(div().flex_1().text_xs().child(
+                            "The site asked for a passkey or a security key: this browser has no window for them, so it said no, and the site may offer another way in. Or sign in in the system's browser.",
+                        ))
+                        .child(Button::new("passkey-system").xsmall().outline().label("Open in the system's browser").on_click(move |_, _, cx| cx.open_url(&url)))
+                        .when_some(host, |bar, host| {
+                            bar.child(Button::new("passkey-always").xsmall().ghost().label(format!("Always for {host}")).on_click(move |_, _, cx| {
+                                let mut settings = crate::state::settings();
+                                if !settings.system_hosts.contains(&host) {
+                                    settings.system_hosts.push(host.clone());
+                                }
+                                crate::state::set_settings(settings);
+                                cx.open_url(&always);
+                            }))
+                        })
+                        .child(Button::new("passkey-close").xsmall().ghost().label("×").on_click(cx.listener(|this, _, _, cx| {
+                            this.passkey = false;
+                            cx.notify();
+                        }))),
+                )
+            })
             .when_some(self.error.clone(), |this, error| {
                 this.child(
                     h_flex()
@@ -3863,25 +4686,52 @@ mod tests {
     use super::*;
 
     /// Ends the pictures' Chrome however a test ends: on macOS nothing else does.
+    /// Ends the owner's Chrome as a test ends, failed or not, and only then
+    /// removes its profile: a Chrome ending writes its profile out, and one
+    /// removed before it would be made again.
     struct Quit(Owner);
     impl Drop for Quit {
         fn drop(&mut self) {
-            let Some(mut chrome) = slot(&self.0).chrome.lock().ok().and_then(|mut c| c.take()) else {
-                return;
-            };
-            let started = Instant::now();
-            // A page's writer lets go of it once the page is closed.
-            while started.elapsed() < Duration::from_secs(3) {
-                match Arc::try_unwrap(chrome) {
-                    Ok(owned) => return drop(owned),
-                    Err(shared) => chrome = shared,
-                }
-                std::thread::sleep(Duration::from_millis(20));
+            if let Some(chrome) = slot(&self.0).chrome.lock().ok().and_then(|mut c| c.take()) {
+                end(chrome);
             }
-            // Still held by a page's thread: ended all the same, or it is left
-            // running when the test is over, a gigabyte each time.
-            chrome.close();
+            let (profile, all) = match &self.0 {
+                // Its waker too, which a call at its port would start it again by.
+                Owner::Task(root) => {
+                    forget(root);
+                    (profile_of(root), profiles_dir())
+                }
+                Owner::User(browser) => (user_profile_path(browser), user_profiles_dir()),
+                Owner::Pictures => return,
+            };
+            // What Chrome still writes as it ends makes it again: removed until it stays gone half a second.
+            let (started, mut gone) = (Instant::now(), None::<Instant>);
+            while started.elapsed() < Duration::from_secs(4) && gone.is_none_or(|at| at.elapsed() < Duration::from_millis(500)) {
+                if profile.exists() {
+                    let _ = std::fs::remove_dir_all(&profile);
+                    gone = None;
+                } else if gone.is_none() {
+                    gone = Some(Instant::now());
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let _ = std::fs::remove_dir(all);
         }
+    }
+
+    fn end(mut chrome: Arc<Chrome>) {
+        let started = Instant::now();
+        // A page's writer lets go of it once the page is closed.
+        while started.elapsed() < Duration::from_secs(3) {
+            match Arc::try_unwrap(chrome) {
+                Ok(owned) => return drop(owned),
+                Err(shared) => chrome = shared,
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Still held by a page's thread: ended all the same, or it is left
+        // running when the test is over, a gigabyte each time.
+        chrome.close();
     }
 
     #[core::prelude::v1::test]
@@ -3901,6 +4751,51 @@ mod tests {
         assert_eq!(local_address("http://app.localhost/").as_deref(), Some("localhost:80"));
         assert_eq!(local_address("https://[::1]:8443/").as_deref(), Some("[::1]:8443"));
         assert_eq!(local_address("https://example.com/"), None);
+    }
+
+    #[core::prelude::v1::test]
+    fn a_task_s_link_opens_where_its_settings_say() {
+        let (tab, system) = (Path::new("/tasks/links-in-tabs"), Path::new("/tasks/links-in-system"));
+        // A tab of the user's browser unless set otherwise.
+        let mut own = crate::layers::Overrides::default();
+        own.links_open_in = Some("system".into());
+        crate::layers::set_project(system, Arc::new(crate::layers::resolve(&Default::default(), None, None, &own)));
+        assert!(opens_in_tab(tab, "https://jira.example.com/browse/DEV-1") || !cfg!(unix));
+        assert!(!opens_in_tab(tab, "http://localhost:3000/"), "a stand's: the task's own browser");
+        assert!(!opens_in_tab(tab, "http://127.0.0.1:8080/x"));
+        assert!(!opens_in_tab(tab, "mailto:someone@example.com"));
+        assert!(!opens_in_tab(system, "https://jira.example.com/browse/DEV-1"), "the system's browser where set so");
+    }
+
+    #[core::prelude::v1::test]
+    fn a_site_named_for_the_system_s_browser() {
+        assert!(host_named("example.com", "https://example.com/x"));
+        assert!(host_named("*.example.com", "https://sso.EXAMPLE.com:8443/login"));
+        assert!(host_named("*.example.com", "https://example.com/"));
+        assert!(!host_named("example.com", "https://sso.example.com/"));
+        assert!(!host_named("*.example.com", "https://notexample.com/"));
+        assert_eq!(host_of("https://u:p@[::1]:8080/x"), Some("::1".into()));
+    }
+
+    #[core::prelude::v1::test]
+    fn an_address_without_its_secrets() {
+        assert_eq!(without_secrets("https://jira.example.com/browse/DEV-1?focusedId=5#comment-1"), "https://jira.example.com/browse/DEV-1?focusedId=5#comment-1");
+        assert_eq!(without_secrets("https://app.example/cb?code=abc&state=x&tab=2"), "https://app.example/cb?tab=2");
+        assert_eq!(without_secrets("https://b.s3.example/f?X-Amz-Signature=1&X-Amz-Credential=2"), "https://b.s3.example/f");
+        assert_eq!(without_secrets("https://app.example/#access_token=xyz&type=bearer"), "https://app.example/");
+        assert_eq!(without_secrets("https://пример.example/путь?токен=1&csrf_token=2"), "https://пример.example/путь?токен=1");
+    }
+
+    #[core::prelude::v1::test]
+    fn an_ordinary_chrome_s_version_and_agent() {
+        assert_eq!(major_in("Google Chrome 158.0.8127.36 "), Some("158".into()));
+        assert_eq!(major_in("Chromium 158.0.8127.36 snap"), Some("158".into()));
+        assert_eq!(major_in("158.0.8127.36"), Some("158".into()));
+        assert_eq!(major_in("Chromium"), None);
+        assert_eq!(major_of_product("HeadlessChrome/158.0.8127.36"), "158");
+        let agent = ordinary_agent("158", false);
+        assert!(agent.starts_with("Mozilla/5.0 (") && agent.ends_with(") AppleWebKit/537.36 (KHTML, like Gecko) Chrome/158.0.0.0 Safari/537.36"), "{agent}");
+        assert!(ordinary_agent("158", true).ends_with(" Safari/537.36 Edg/158.0.0.0"));
     }
 
     #[core::prelude::v1::test]
@@ -4102,6 +4997,10 @@ mod tests {
             }
         };
         wait("the title", &mut |m| matches!(m, In::Title(t) if t == "Shop"));
+        // To its sites an ordinary Chrome: Google's sign-in, on a stand's "Sign in with Google", refuses a headless one.
+        let said = call(&out, "Runtime.evaluate", json!({ "expression": "navigator.userAgent + ' ' + navigator.webdriver", "returnByValue": true })).unwrap();
+        let said = said["result"]["value"].as_str().unwrap().to_string();
+        assert!(said.contains(" Chrome/") && !said.contains("Headless") && said.ends_with(" false"), "{said}");
         // A size of its own, as a tab gives its page: the window Chrome starts with is as many
         // pixels whatever its screen, and on one of two to one too low for the date field below.
         let _ = out.send(Out::Resize(800, 600, 1., false, None, String::new()));
@@ -4249,8 +5148,6 @@ mod tests {
         let _ = other.send(Out::Command("Runtime.evaluate", json!({ "expression": "window.close()" })));
         wait2("the opened page to close itself", &|m| matches!(m, In::Closed));
         drop((out, other));
-        let profile = task_profile(&root).unwrap();
-        let _ = std::fs::remove_dir_all(&profile);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4286,8 +5183,348 @@ mod tests {
         assert!(version["webSocketDebuggerUrl"].is_string(), "{version}");
         let second = slot(&owner).chrome.lock().unwrap().as_ref().map(|c| c.child.lock().unwrap().id()).expect("a Chrome again");
         assert_ne!(first, second);
-        let _ = std::fs::remove_dir_all(task_profile(&root).unwrap());
         let _ = std::fs::remove_dir_all(&root);
     }
 
+
+    /// The sockets of `pid` and its children's that listen for a TCP connection.
+    #[cfg(target_os = "linux")]
+    fn listening(pid: u32) -> Vec<String> {
+        let mut pids = vec![pid];
+        let mut i = 0;
+        while i < pids.len() {
+            let parent = pids[i];
+            for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+                let stat = std::fs::read_to_string(entry.path().join("stat")).unwrap_or_default();
+                // `pid (name) state ppid`: the name may hold spaces and parentheses.
+                let ppid = stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().nth(1)?.parse::<u32>().ok());
+                if let (Some(ppid), Ok(child)) = (ppid, entry.file_name().to_string_lossy().parse::<u32>()) {
+                    if ppid == parent && !pids.contains(&child) {
+                        pids.push(child);
+                    }
+                }
+            }
+            i += 1;
+        }
+        let mut inodes = HashSet::new();
+        for pid in &pids {
+            for fd in std::fs::read_dir(format!("/proc/{pid}/fd")).into_iter().flatten().flatten() {
+                let link = std::fs::read_link(fd.path()).unwrap_or_default().display().to_string();
+                if let Some(inode) = link.strip_prefix("socket:[").and_then(|l| l.strip_suffix(']')) {
+                    inodes.insert(inode.to_string());
+                }
+            }
+        }
+        assert!(pids.len() > 1, "Chrome's processes found: {pids:?}");
+        let mut found = Vec::new();
+        for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+            for line in std::fs::read_to_string(table).unwrap_or_default().lines().skip(1) {
+                let cols: Vec<&str> = line.split_whitespace().collect();
+                // State 0A is LISTEN; the inode is the tenth column.
+                if cols.get(3) == Some(&"0A") && cols.get(9).is_some_and(|inode| inodes.contains(*inode)) {
+                    found.push(line.to_string());
+                }
+            }
+        }
+        found
+    }
+
+    #[cfg(target_os = "macos")]
+    fn listening(pid: u32) -> Vec<String> {
+        let tree = std::process::Command::new("pgrep").args(["-P", &pid.to_string()]).output().unwrap();
+        let mut pids = vec![pid.to_string()];
+        pids.extend(String::from_utf8_lossy(&tree.stdout).lines().map(str::to_string));
+        let out = std::process::Command::new("lsof").args(["-a", "-p", &pids.join(","), "-iTCP", "-sTCP:LISTEN", "-Fn"]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).lines().filter(|l| l.starts_with('n')).map(str::to_string).collect()
+    }
+
+    /// The user's Chrome, over its pipe: pages shown and driven as a task's
+    /// are, two at once on the one connection; no port of it listens, no
+    /// DevToolsActivePort says where one is, and a site sees an ordinary
+    /// Chrome. Needs Chrome: `cargo test -- --ignored a_user_browser_has_no_port`.
+    #[core::prelude::v1::test]
+    #[ignore]
+    fn a_user_browser_has_no_port() {
+        if no_chrome() {
+            return;
+        }
+        let _one = ONE_CHROME.lock().unwrap_or_else(|e| e.into_inner());
+        let owner = Owner::User(UserBrowser::Space(format!("test-{}", std::process::id())));
+        let _quit = Quit(owner.clone());
+        // A page of this machine is a secure context, as a site's is: navigator.credentials is there.
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let site = format!("http://127.0.0.1:{}/", server.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let html = "<title>One</title><h1 style='font-size:60px'>One</h1>";
+            for mut stream in server.incoming().flatten() {
+                let mut asked = [0u8; 2048];
+                let _ = stream.read(&mut asked);
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}", html.len());
+            }
+        });
+        let open = |title: &str| {
+            let (tx, rx) = async_channel::bounded(256);
+            let url = if title == "One" { site.clone() } else { format!("data:text/html,<title>{title}</title><h1 style='font-size:60px'>{title}</h1>") };
+            let out = spawn_page(owner.clone(), Source::Url(url), tx);
+            (out, rx)
+        };
+        let wait = |rx: &async_channel::Receiver<In>, what: &str, found: &mut dyn FnMut(&In) -> bool| {
+            let started = Instant::now();
+            loop {
+                assert!(started.elapsed() < Duration::from_secs(30), "waited for {what}");
+                match rx.try_recv() {
+                    Ok(message) if found(&message) => return message,
+                    Ok(In::Error(e)) => panic!("waiting for {what}: {e}"),
+                    Ok(_) => {}
+                    Err(async_channel::TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(10)),
+                    Err(_) => panic!("the page ended waiting for {what}"),
+                }
+            }
+        };
+        let (one, one_rx) = open("One");
+        let (two, two_rx) = open("Two");
+        let In::Ready { port, .. } = wait(&one_rx, "the page", &mut |m| matches!(m, In::Ready { .. })) else { unreachable!() };
+        assert_eq!(port, 0);
+        wait(&one_rx, "the first title", &mut |m| matches!(m, In::Title(t) if t == "One"));
+        wait(&two_rx, "the second title", &mut |m| matches!(m, In::Title(t) if t == "Two"));
+        let _ = two.send(Out::Resize(640, 480, 1., false, None, String::new()));
+        let In::Frame(frame, _) = wait(&two_rx, "a frame", &mut |m| matches!(m, In::Frame(bytes, _) if !bytes.is_empty())) else { unreachable!() };
+        assert!(image::load_from_memory(&frame).is_ok());
+
+        let said = call(&one, "Runtime.evaluate", json!({ "expression": "navigator.userAgent + ' ' + navigator.webdriver", "returnByValue": true })).unwrap();
+        let said = said["result"]["value"].as_str().unwrap().to_string();
+        assert!(said.contains(" Chrome/") && !said.contains("Headless") && said.ends_with(" false"), "{said}");
+        // A passkey asked for is refused at once, not left waiting for a dialog nobody sees, and the tab is told.
+        let refused = call(
+            &one,
+            "Runtime.evaluate",
+            json!({ "expression": "navigator.credentials.get({ publicKey: { challenge: new Uint8Array(32) } }).then(() => 'given', (e) => e.name)", "awaitPromise": true, "returnByValue": true }),
+        )
+        .unwrap();
+        assert_eq!(refused["result"]["value"], "NotAllowedError");
+        wait(&one_rx, "the tab told of the passkey", &mut |m| matches!(m, In::Passkey));
+
+        let chrome = slot(&owner).chrome.lock().unwrap().clone().unwrap();
+        assert!(chrome.pipe.is_some() && chrome.port == 0);
+        assert!(!chrome.profile.join("DevToolsActivePort").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(std::fs::metadata(&chrome.profile).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let pid = chrome.child.lock().unwrap().id();
+            assert_eq!(listening(pid), Vec::<String>::new());
+        }
+        drop(chrome);
+
+        // A page closed ends its reader, and the other goes on.
+        let _ = one.send(Out::Close);
+        let ended = Instant::now();
+        while !one_rx.is_closed() {
+            assert!(ended.elapsed() < Duration::from_secs(10), "the closed page's reader ended");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let title = call(&two, "Runtime.evaluate", json!({ "expression": "document.title", "returnByValue": true })).unwrap();
+        assert_eq!(title["result"]["value"], "Two");
+        let _ = two.send(Out::Close);
+    }
+
+    /// A new task's Chrome starts signed in to the project's stands as its
+    /// last task's was, and to no other site: a stand's cookies and local
+    /// storage carried, a company's left. Needs Chrome:
+    /// `cargo test -- --ignored a_new_task_is_signed_in_to_its_stands_only`.
+    #[core::prelude::v1::test]
+    #[ignore]
+    fn a_new_task_is_signed_in_to_its_stands_only() {
+        if no_chrome() {
+            return;
+        }
+        let _one = ONE_CHROME.lock().unwrap_or_else(|e| e.into_inner());
+        let base = std::env::temp_dir().join(format!("ideae-seed-test-{}", std::process::id()));
+        let repo = base.join("repo");
+        let root = |name: &str| {
+            let dir = base.join(name);
+            std::fs::create_dir_all(repo.join(".git/worktrees").join(name)).unwrap();
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(".git"), format!("gitdir: {}", repo.join(".git/worktrees").join(name).display())).unwrap();
+            dir
+        };
+        let (a, b) = (root("a"), root("b"));
+        // The stand: a site of this machine that signs you in.
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let site = format!("http://127.0.0.1:{}/", server.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let html = "<title>Stand</title><script>if (!localStorage.getItem('token')) localStorage.setItem('token', 'stand-token')</script>";
+            for mut stream in server.incoming().flatten() {
+                let mut asked = [0u8; 2048];
+                let _ = stream.read(&mut asked);
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nSet-Cookie: session=stand; Max-Age=3600\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}", html.len());
+            }
+        });
+        let open = |owner: &Owner| {
+            let (tx, rx) = async_channel::bounded(256);
+            let out = spawn_page(owner.clone(), Source::Url(site.clone()), tx);
+            let started = Instant::now();
+            loop {
+                assert!(started.elapsed() < Duration::from_secs(30), "the stand's page");
+                match rx.try_recv() {
+                    Ok(In::Title(t)) if t == "Stand" => break,
+                    Ok(In::Error(e)) => panic!("{e}"),
+                    Ok(_) => {}
+                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+            (out, rx)
+        };
+        let set_cookie = |out: &mpsc::Sender<Out>, name: &str, domain: &str| {
+            let set = call(out, "Network.setCookie", json!({ "name": name, "value": "1", "domain": domain, "path": "/", "expires": 4102444800i64 })).unwrap();
+            assert_eq!(set["success"], true, "{name} on {domain}");
+        };
+
+        let task_a = Owner::Task(a.clone());
+        let quit_a = Quit(task_a.clone());
+        let (out, rx) = open(&task_a);
+        set_cookie(&out, "jira", "jira.example.com");
+        set_cookie(&out, "seen", "app.stand.test");
+        set_cookie(&out, "named", "api.corp-dev.test");
+        set_cookie(&out, "parent", ".stand.test");
+        // A host its pages were served from by this machine, as its tabs note them.
+        let profile_a = profile_of(&a);
+        std::fs::write(profile_a.join(seed::STAND_HOSTS), "app.stand.test\n").unwrap();
+        let _ = out.send(Out::Close);
+        while !rx.is_closed() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Ended as a task's Chrome ends, its profile written out.
+        if let Some(chrome) = slot(&task_a).chrome.lock().unwrap().take() {
+            end(chrome);
+        }
+        assert!(profile_a.join("Default/Cookies").is_file() || profile_a.join("Default/Network/Cookies").is_file());
+
+        let mut own = crate::layers::Overrides::default();
+        own.stand_hosts = Some("*.corp-dev.test".into());
+        crate::layers::set_project(&b, Arc::new(crate::layers::resolve(&Default::default(), None, None, &own)));
+        let task_b = Owner::Task(b.clone());
+        let _quit_b = Quit(task_b.clone());
+        let (out, _rx) = open(&task_b);
+        let all = call(&out, "Network.getAllCookies", json!({})).unwrap();
+        let mut names: Vec<String> = all["cookies"].as_array().unwrap().iter().map(|c| format!("{}@{}", c["name"].as_str().unwrap(), c["domain"].as_str().unwrap())).collect();
+        names.sort();
+        assert_eq!(names, ["named@api.corp-dev.test", "parent@.stand.test", "seen@app.stand.test", "session@127.0.0.1"]);
+        let token = call(&out, "Runtime.evaluate", json!({ "expression": "localStorage.getItem('token')", "returnByValue": true })).unwrap();
+        assert_eq!(token["result"]["value"], "stand-token", "the stand's local storage came along");
+        assert_eq!(std::fs::read_to_string(profile_of(&b).join(seed::STAND_HOSTS)).unwrap(), "app.stand.test\n");
+        let _ = out.send(Out::Close);
+        drop(quit_a);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A user's Chrome serves the tabs of many tasks: a page one of them
+    /// opens comes up in that task, not in another with a tab of the same
+    /// Chrome. Needs Chrome: `cargo test -- --ignored a_page_opened_by_a_user_tab_goes_to_its_task`.
+    #[core::prelude::v1::test]
+    #[ignore]
+    fn a_page_opened_by_a_user_tab_goes_to_its_task() {
+        if no_chrome() {
+            return;
+        }
+        let _one = ONE_CHROME.lock().unwrap_or_else(|e| e.into_inner());
+        let browser = UserBrowser::Space(format!("route-{}", std::process::id()));
+        let owner = Owner::User(browser.clone());
+        let _quit = Quit(owner.clone());
+        let (a, b) = (PathBuf::from("/tasks/a"), PathBuf::from("/tasks/b"));
+        let (to_a, to_b) = (user_page_events(&browser, &a), user_page_events(&browser, &b));
+        let open = |root: &Path, title: &str| {
+            let (tx, rx) = async_channel::bounded(256);
+            let out = spawn_page(owner.clone(), Source::Url(format!("data:text/html,<title>{title}</title>")), tx);
+            let started = Instant::now();
+            loop {
+                assert!(started.elapsed() < Duration::from_secs(30), "the page {title}");
+                match rx.try_recv() {
+                    // As a tab of the task tells its page's id.
+                    Ok(In::Ready { target, .. }) => note_task_page(&owner, &target, root),
+                    Ok(In::Title(t)) if t == title => break,
+                    Ok(In::Error(e)) => panic!("{e}"),
+                    Ok(_) => {}
+                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+            (out, rx)
+        };
+        let (in_a, _rx_a) = open(&a, "A");
+        let (_in_b, _rx_b) = open(&b, "B");
+        let _ = in_a.send(Out::Command("Runtime.evaluate", json!({ "expression": "window.open('about:blank#from-a')", "userGesture": true })));
+        let started = Instant::now();
+        let opened = loop {
+            assert!(started.elapsed() < Duration::from_secs(10), "the page A opened came to A");
+            if let Ok(PageEvent::Opened { target, by_page }) = to_a.try_recv() {
+                assert!(by_page);
+                break target;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(to_b.try_recv().is_err(), "nothing of A's went to B");
+        // Whatever the opened page opens is A's too.
+        assert_eq!(slot(&owner).page_tasks.lock().unwrap().get(&opened), Some(&a));
+    }
+
+    /// DevTools for a page of the user's Chrome, which has no port to serve
+    /// them: loaded from inside Chrome, carried over its pipe to the page
+    /// inspected, and kept from its other pages. Needs Chrome:
+    /// `cargo test -- --ignored devtools_without_a_port`.
+    #[core::prelude::v1::test]
+    #[ignore]
+    fn devtools_without_a_port() {
+        if no_chrome() {
+            return;
+        }
+        let _one = ONE_CHROME.lock().unwrap_or_else(|e| e.into_inner());
+        let owner = Owner::User(UserBrowser::Space(format!("devtools-{}", std::process::id())));
+        let _quit = Quit(owner.clone());
+        let ready = |rx: &async_channel::Receiver<In>, what: &str| {
+            let started = Instant::now();
+            loop {
+                assert!(started.elapsed() < Duration::from_secs(30), "{what}");
+                match rx.try_recv() {
+                    Ok(In::Ready { target, .. }) => return target,
+                    Ok(In::Error(e)) => panic!("{e}"),
+                    Ok(_) => {}
+                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+        };
+        let (tx, rx) = async_channel::bounded(256);
+        let _page = spawn_page(owner.clone(), Source::Url("data:text/html,<title>Inspected</title>".into()), tx);
+        let inspected = ready(&rx, "the page");
+        let (tx, dev_rx) = async_channel::bounded(256);
+        let devtools = spawn_page(owner.clone(), Source::DevTools(inspected), tx);
+        ready(&dev_rx, "DevTools' page");
+        // As DevTools does: a command through its WebSocket, its answer back by its id.
+        let ask = |message: &str| {
+            let expression = format!(
+                "new Promise((done) => {{ const wait = () => {{ if (!window.__ideaeDevtools) return setTimeout(wait, 50); \
+                 const deliver = window.__ideaeDevtools.deliver; \
+                 window.__ideaeDevtools.deliver = (list) => {{ for (const m of list) if (m.id === 999999) done(JSON.stringify(m)); deliver(list); }}; \
+                 window.__ideaeDevtoolsSend(JSON.stringify({message})); }}; wait(); }})"
+            );
+            let started = Instant::now();
+            loop {
+                if let Some(said) = call(&devtools, "Runtime.evaluate", json!({ "expression": expression, "awaitPromise": true, "returnByValue": true })) {
+                    if let Some(text) = said["result"]["value"].as_str() {
+                        return serde_json::from_str::<Value>(text).unwrap();
+                    }
+                }
+                assert!(started.elapsed() < Duration::from_secs(20), "DevTools answered: {message}");
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        };
+        let title = ask(r#"{ id: 999999, method: "Runtime.evaluate", params: { expression: "document.title", returnByValue: true } }"#);
+        assert_eq!(title["result"]["result"]["value"], "Inspected", "{title}");
+        let denied = ask(r#"{ id: 999999, method: "Target.createTarget", params: { url: "about:blank" } }"#);
+        assert!(denied["error"]["message"].as_str().is_some_and(|m| m.contains("not given")), "{denied}");
+    }
 }

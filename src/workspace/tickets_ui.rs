@@ -111,7 +111,8 @@ impl Workspace {
         let Some(link) = self.find(path).and_then(|(pi, ti)| self.projects[pi].tasks[ti].ticket().cloned()) else { return };
         let Some(integration) = self.reader_of(path, &link) else { return };
         let read = self.read_ticket(integration, link.key.clone(), window, cx);
-        cx.spawn_in(window, async move |_, cx| {
+        let at = path.to_path_buf();
+        cx.spawn_in(window, async move |this, cx| {
             let Ok(body) = read.await else { return };
             if body.done {
                 return;
@@ -119,14 +120,14 @@ impl Workspace {
             let url = link.url.clone();
             let _ = cx.update(|window, cx| {
                 let note = Notification::info(format!("{} is still {}: its tracker did not move it on the merge.", body.key, body.status)).title("A ticket still open").content(move |_, _, cx| {
-                    let (url, me) = (url.clone(), cx.entity().downgrade());
+                    let (url, me, this, at) = (url.clone(), cx.entity().downgrade(), this.clone(), at.clone());
                     gpui_kit::component::h_flex()
                         .child(
                             gpui_kit::component::button::Button::new("still-open")
                                 .xsmall()
                                 .label("Open ticket")
                                 .on_click(move |_, window, cx| {
-                                    cx.open_url(&url);
+                                    let _ = this.update(cx, |w, cx| w.open_link(&at, &url, window, cx));
                                     let _ = me.update(cx, |note, cx| note.dismiss(window, cx));
                                 }),
                         )

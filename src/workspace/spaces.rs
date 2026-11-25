@@ -201,6 +201,11 @@ impl Workspace {
         for project in &mut self.projects {
             follow(&mut project.space);
         }
+        // A space gone: its browser's logins with it, not into another's.
+        for gone in self.spaces.iter().filter(|old| !spaces.iter().any(|s| s.id == old.id)) {
+            let browser = crate::browser::UserBrowser::Space(gone.id.clone());
+            cx.background_spawn(async move { crate::browser::forget_user(&browser) }).detach();
+        }
         let mut shown = self.space.clone();
         follow(&mut shown);
         // The menu's list of spaces, made again once typing a name pauses.
@@ -352,7 +357,7 @@ impl Workspace {
                             )
                             .child(div().w(px(64.)).child(Input::new(icon).small()))
                             .child(div().flex_1().child(Input::new(name).small()))
-                            .child(Button::new(("space-remove", ix)).xsmall().ghost().label("×").tooltip("Remove: its projects are then in no space, and in every one").on_click(
+                            .child(Button::new(("space-remove", ix)).xsmall().ghost().label("×").tooltip("Remove: its projects are then in no space, and in every one; the logins of its own browser are forgotten").on_click(
                                 move |_, window, cx| {
                                     let Some(id) = rows.borrow().get(ix).map(|row| row.0.clone()) else { return };
                                     let (rows, keep, gone) = (rows.clone(), keep.clone(), id.clone());

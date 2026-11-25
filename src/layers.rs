@@ -239,6 +239,12 @@ layered! {
     pr_title: String = DEFAULT_PR_TITLE.to_string(),
         "Pull request's title", "The title of a pull or merge request of a task with a ticket: {key} and {title}, the commit's subject or the task's title. Its ticket's tracker finds it by the key.",
         [Global, Space, Team, Project];
+    links_open_in: String = "tab".to_string(),
+        "Links open in", "Where a task's links open (its ticket, its pull request, an address in its terminal, its chat or a Markdown file): a tab of your own browser in the task, its space's, or the system's browser. This machine's addresses open in the task's own browser either way.",
+        [Global, Space, Project];
+    stand_hosts: String = String::new(),
+        "Stand hosts", "Hosts of your dev stands besides those found: a new task's browser starts signed in to them as the project's last task was, and to no other site. Found are localhost, hosts its pages were served from by this machine or its containers, and hosts that resolve here. Space-parted; *.app.test for a domain and its subdomains.",
+        [Global, Space, Project];
     closes: String = "refs".to_string(),
         "Ticket in a pull request", "What a request's description says of its tickets: fixes (the tracker may close them when it is merged), refs, or none. Asked each time; this is the first choice.",
         [Global, Space, Team, Project];
@@ -304,6 +310,8 @@ pub fn global_layer(settings: &crate::state::Settings) -> Overrides {
         branch: Some(settings.branch_template.clone()).filter(|t| !t.trim().is_empty()),
         pr_title: Some(settings.pr_title.clone()).filter(|t| !t.trim().is_empty()),
         closes: Some(settings.pr_closes.clone()).filter(|t| !t.trim().is_empty()),
+        stand_hosts: Some(settings.stand_hosts.clone()).filter(|t| !t.trim().is_empty()),
+        links_open_in: Some(settings.links_open_in.clone()).filter(|t| !t.trim().is_empty()),
         ..Default::default()
     }
 }
@@ -331,6 +339,12 @@ pub fn into_global(overrides: &Overrides, settings: &mut crate::state::Settings)
     }
     if let Some(t) = &overrides.closes {
         settings.pr_closes = t.clone();
+    }
+    if let Some(t) = &overrides.stand_hosts {
+        settings.stand_hosts = t.clone();
+    }
+    if let Some(t) = &overrides.links_open_in {
+        settings.links_open_in = t.clone();
     }
     for entry in &overrides.integrations {
         match settings.integrations.iter_mut().find(|e| e.id == entry.id) {
@@ -573,6 +587,7 @@ check = "cargo test"
 [project]
 base = "develop"
 agent = "codex"
+stand_hosts = "*.example.com"
 
 [integrations.acme]
 kind = "jira"
@@ -582,6 +597,7 @@ keys = ["DEV"]
         let layer = team_layer(text).unwrap();
         assert_eq!(layer.base.as_deref(), Some("develop"));
         assert_eq!(layer.agent, None, "whose agent runs is not the team's to say");
+        assert_eq!(layer.stand_hosts, None, "a repository's file names no site a new task's browser is signed in to");
         assert_eq!(layer.integrations, vec![Entry { keys: Some(vec!["DEV".into()]), ..entry("acme", Some("jira"), Some("https://example.atlassian.net")) }]);
         assert_eq!(team_layer("[task]\ncheck = \"x\"\n").unwrap(), Overrides::default());
         assert!(team_layer("[project\n").is_err());

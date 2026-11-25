@@ -1244,7 +1244,7 @@ impl TaskView {
                 match result {
                     Ok(out) => {
                         if open_url {
-                            cx.open_url(&out);
+                            this.open_link(&out, window, cx);
                         }
                         if label == "Commit" || label == "Amend" {
                             let start = this.commit_start();

@@ -41,6 +41,10 @@ cargo test -- --ignored \
   an_archived_task \
   a_page_tells_the_tab \
   a_task_s_browser_wakes_when_called \
+  a_user_browser_has_no_port \
+  a_new_task_is_signed_in_to_its_stands_only \
+  a_page_opened_by_a_user_tab_goes_to_its_task \
+  devtools_without_a_port \
   a_stream_has_the_screen_s_pixels \
   a_local_model_predicts_at_the_cursor \
   a_local_model_predicts_the_next_edits \

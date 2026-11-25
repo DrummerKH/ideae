@@ -1113,6 +1113,7 @@ impl Workspace {
                 .collect();
             self.projects.push(project);
         }
+        self.tell_user_browsers();
         let open: Vec<PathBuf> = saved
             .projects
             .iter()

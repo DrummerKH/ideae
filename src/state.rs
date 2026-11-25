@@ -137,6 +137,17 @@ pub struct Settings {
     pub pr_title: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub pr_closes: String,
+    /// Hosts of dev stands a new task's browser is signed in to besides
+    /// those found (browser/seed.rs): Global's layer of `stand_hosts`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stand_hosts: String,
+    /// Global's layer of `links_open_in`: system, tab; empty for the default.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub links_open_in: String,
+    /// Sites a task's links always open in the system's browser, whatever
+    /// `links_open_in` says: ones the user's own browser cannot sign in to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub system_hosts: Vec<String>,
     /// The agents to choose from (agents/mod.rs); none, and tasks get a
     /// plain shell. `--agent` and `--no-agent` on the command line win.
     #[serde(default)]
@@ -353,6 +364,9 @@ impl Default for Settings {
             branch_template: String::new(),
             pr_title: String::new(),
             pr_closes: String::new(),
+            stand_hosts: String::new(),
+            links_open_in: String::new(),
+            system_hosts: Vec::new(),
             agents: vec![crate::agents::Profile::claude_code()],
             default_agent: crate::agents::DEFAULT_ID.into(),
             quick_agent: String::new(),

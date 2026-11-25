@@ -16,6 +16,8 @@ impl Workspace {
     /// layers changed, and passes on what changed to what follows it.
     pub fn resolve_projects(&mut self, cx: &mut Context<Self>) {
         let global = crate::state::with_settings(layers::global_layer);
+        // Told before the settings, which may be as they were when only a space changed.
+        self.tell_user_browsers();
         for pi in 0..self.projects.len() {
             let p = &self.projects[pi];
             let space = p.space.as_ref().and_then(|id| self.spaces.iter().find(|s| &s.id == id)).map(|s| &s.settings);
@@ -50,6 +52,18 @@ impl Workspace {
             }
         }
         cx.notify();
+    }
+
+    /// Each project's own browser: its space's, else the one of projects in
+    /// none. Before its tasks open, so a tab of it restored is of the right one.
+    pub fn tell_user_browsers(&self) {
+        for p in &self.projects {
+            let mark = match p.space.as_ref().and_then(|id| self.spaces.iter().find(|s| &s.id == id)) {
+                Some(space) => crate::browser::UserMark { browser: crate::browser::UserBrowser::Space(space.id.clone()), mark: space.mark(), color: space.color, name: space.name.clone() },
+                None => crate::browser::UserMark::default(),
+            };
+            crate::browser::set_user_mark(&p.path, mark);
+        }
     }
 
     /// A project's own layer, as Settings or a menu left it.
@@ -157,6 +171,8 @@ impl Workspace {
             "branch" => v.branch.clone(),
             "pr_title" => v.pr_title.clone(),
             "closes" => v.closes.clone(),
+            "stand_hosts" => text(&v.stand_hosts),
+            "links_open_in" => crate::layers_ui::LINKS_OPEN_IN.iter().find(|(k, _)| *k == v.links_open_in).map_or_else(|| v.links_open_in.clone(), |(_, label)| label.to_string()),
             _ => String::new(),
         }
     }

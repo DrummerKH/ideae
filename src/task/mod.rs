@@ -741,6 +741,8 @@ pub struct TaskView {
     visible: bool,
     /// Pages of the task's Chrome no tab opened, to show as tabs.
     _new_pages: Option<Task<()>>,
+    /// The same of each user's browser it has tabs of.
+    _user_pages: HashMap<crate::browser::UserBrowser, Task<()>>,
     _poll: Task<()>,
 }
 
@@ -1108,6 +1110,7 @@ impl TaskView {
             edits_back: 0,
             visible: false,
             _new_pages: None,
+            _user_pages: HashMap::new(),
             _poll: poll,
         };
         // Debug aid for headless screenshots: start on a given tab.
@@ -1273,9 +1276,9 @@ impl TaskView {
                 let cwd = state.read(cx).cwd().map(|p| p.to_path_buf());
                 this.open_terminal_path(target, cwd, window, cx);
             }
-            // A dev server's address opens in the task's Web tab, the rest in the system's browser.
+            // A dev server's address opens in the task's Web tab, the rest as its links do.
             TerminalEvent::OpenUrl(url) if crate::browser::is_local(url) => this.show_url(url, window, cx),
-            TerminalEvent::OpenUrl(url) => cx.open_url(url),
+            TerminalEvent::OpenUrl(url) => this.open_link(url, window, cx),
             _ => {}
         })
         .detach();
@@ -1394,37 +1397,130 @@ impl TaskView {
         }
     }
 
+    /// A tab of the user's own browser, its project's space's: for the
+    /// sites they sign in to, which no agent reaches.
+    pub fn new_user_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_user_browser("about:blank", window, cx);
+    }
+
+    pub fn open_user_browser(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let mark = crate::browser::user_mark(&self.root);
+        self.add_page(crate::browser::Source::Url(url.to_string()), true, Some(mark), window, cx);
+    }
+
+    /// Asks, then forgets the logins of the user's browser of this task's
+    /// project: its tabs here close, its Chrome ends, its profile goes.
+    pub fn forget_user_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mark = crate::browser::user_mark(&self.root);
+        let this = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (this, mark) = (this.clone(), mark.clone());
+            dialog
+                .title(format!("Forget the logins of {}'s browser?", mark.name))
+                .w(px(440.))
+                .child(div().text_sm().child("Every site signed in to in it signs you out; its tabs close, in every task of its projects. Other spaces' browsers and the tasks' own keep theirs."))
+                .footer(
+                    h_flex()
+                        .w_full()
+                        .gap_2()
+                        .child(div().flex_1())
+                        .child(Button::new("forget-keep").ghost().label("Keep them").on_click(|_, window, cx| window.close_dialog(cx)))
+                        .child(Button::new("forget-logins").primary().label("Forget them").on_click(move |_, window, cx| {
+                            window.close_dialog(cx);
+                            let browser = mark.browser.clone();
+                            let _ = this.update(cx, |t, cx| {
+                                let mine: Vec<usize> = t.tabs.iter().enumerate().filter(|(_, tab)| matches!(&tab.kind, TabKind::Browser(v) if v.read(cx).is_user())).map(|(i, _)| i).collect();
+                                for ix in mine.into_iter().rev() {
+                                    t.remove_tab(ix, window, cx);
+                                }
+                                t._user_pages.remove(&browser);
+                                cx.background_spawn(async move { crate::browser::forget_user(&browser) }).detach();
+                                cx.notify();
+                            });
+                        })),
+                )
+        });
+    }
+
+    /// A link of the task's: in a tab of the user's own browser where its
+    /// settings say so, else the system's browser.
+    pub fn open_link(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if crate::browser::opens_in_tab(&self.root, url) {
+            self.open_user_browser(url, window, cx);
+        } else {
+            cx.open_url(url);
+        }
+    }
+
+    /// What a page tells its task beside its tab: a page it opened, a download.
+    fn take_page_event(&mut self, event: crate::browser::PageEvent, user: Option<&crate::browser::UserMark>, window: &mut Window, cx: &mut Context<Self>) {
+        match event {
+            crate::browser::PageEvent::Opened { target, by_page } => self.add_page(crate::browser::Source::Target(target), by_page, user.cloned(), window, cx),
+            crate::browser::PageEvent::Downloaded(path) => {
+                let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                let told = format!("{name} is in {}", path.parent().map(|p| p.display().to_string()).unwrap_or_default());
+                window.push_notification(gpui_kit::component::notification::Notification::success(told).title("Downloaded"), cx);
+            }
+            crate::browser::PageEvent::DownloadFailed(name) => {
+                let told = format!("{name} did not download");
+                window.push_notification(gpui_kit::component::notification::Notification::warning(told).title("Download"), cx);
+            }
+        }
+    }
+
     /// A tab for a page of the task's Chrome, opened in it or not: one a
     /// page opened comes up as a tab in front, one an agent's Playwright
     /// opened as a tab behind, not to take the user's eyes from their work.
     fn add_browser(&mut self, source: crate::browser::Source, activate: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self._new_pages.is_none() {
-            let events = crate::browser::page_events(&self.root);
-            self._new_pages = Some(cx.spawn_in(window, async move |this, cx| {
-                while let Ok(event) = events.recv().await {
-                    let done = this.update_in(cx, |t, window, cx| match event {
-                        crate::browser::PageEvent::Opened { target, by_page } => {
-                            t.add_browser(crate::browser::Source::Target(target), by_page, window, cx)
+        self.add_page(source, activate, None, window, cx);
+    }
+
+    /// A page's tab: of the task's Chrome, or of the user's (`user`).
+    fn add_page(&mut self, source: crate::browser::Source, activate: bool, user: Option<crate::browser::UserMark>, window: &mut Window, cx: &mut Context<Self>) {
+        match &user {
+            None if self._new_pages.is_none() => {
+                let events = crate::browser::page_events(&self.root);
+                self._new_pages = Some(cx.spawn_in(window, async move |this, cx| {
+                    while let Ok(event) = events.recv().await {
+                        if this.update_in(cx, |t, window, cx| t.take_page_event(event, None, window, cx)).is_err() {
+                            break;
                         }
-                        crate::browser::PageEvent::Downloaded(path) => {
-                            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                            let told = format!("{name} is in {}", path.parent().map(|p| p.display().to_string()).unwrap_or_default());
-                            window.push_notification(gpui_kit::component::notification::Notification::success(told).title("Downloaded"), cx);
-                        }
-                        crate::browser::PageEvent::DownloadFailed(name) => {
-                            let told = format!("{name} did not download");
-                            window.push_notification(gpui_kit::component::notification::Notification::warning(told).title("Download"), cx);
-                        }
-                    });
-                    if done.is_err() {
-                        break;
                     }
-                }
-            }));
+                }));
+            }
+            Some(mark) if !self._user_pages.contains_key(&mark.browser) => {
+                let events = crate::browser::user_page_events(&mark.browser, &self.root);
+                let mark = mark.clone();
+                let listening = cx.spawn_in(window, {
+                    let mark = mark.clone();
+                    async move |this, cx| {
+                        while let Ok(event) = events.recv().await {
+                            if this.update_in(cx, |t, window, cx| t.take_page_event(event, Some(&mark), window, cx)).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                });
+                self._user_pages.insert(mark.browser, listening);
+            }
+            _ => {}
         }
-        let owner = crate::browser::Owner::Task(self.root.clone());
-        let view = cx.new(|cx| crate::browser::BrowserView::new(source, owner, window, cx));
-        view.update(cx, |page, _| page.set_places(self.own_places()));
+        let owner = match &user {
+            Some(mark) => crate::browser::Owner::User(mark.browser.clone()),
+            None => crate::browser::Owner::Task(self.root.clone()),
+        };
+        let root = self.root.clone();
+        let view = cx.new(|cx| {
+            let mut page = crate::browser::BrowserView::new(source, owner, window, cx);
+            if let Some(mark) = user {
+                page.for_user(mark, &root);
+            }
+            page
+        });
+        // The task's own addresses are offered in its own Chrome's address bar.
+        if !view.read(cx).is_user() {
+            view.update(cx, |page, _| page.set_places(self.own_places()));
+        }
         cx.subscribe_in(&view, window, |this, view, event: &crate::browser::BrowserEvent, window, cx| match event {
             crate::browser::BrowserEvent::Navigated => {
                 let title = view.read(cx).title();
