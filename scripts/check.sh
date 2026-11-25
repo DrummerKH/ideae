@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Before a push: the tests, the end-to-end ones (real repositories, real
-# terminals, a real daemon; under a minute together), and the Windows side.
+# terminals, a real daemon; under two minutes together), and the Windows side.
 # Edit prediction's runs a real model only when IDEAE_PREDICT_SERVER and
 # IDEAE_PREDICT_MODEL name one.
 set -euo pipefail
@@ -20,6 +20,10 @@ done
 cargo build
 scripts/string-slices.sh
 cargo test
+# Each run's count of tests passed is the count it began with: a run that
+# ends early with success (a test's process gone) is no pass.
+ran=$(mktemp)
+trap 'rm -f "$ran"' EXIT
 cargo test -- --ignored \
   an_acp_agent \
   a_sql_file_runs \
@@ -41,7 +45,10 @@ cargo test -- --ignored \
   a_local_model_predicts_at_the_cursor \
   a_local_model_predicts_the_next_edits \
   two_tasks_share_one_rust_analyzer \
-  an_agent_asks_the_language_server
+  an_agent_asks_the_language_server 2>&1 | tee "$ran"
+awk '/^running [0-9]+ tests?$/ { if (want != "") bad = 1; want = $2 }
+     /^test result: ok\. [0-9]+ passed/ { if ($4 != want) bad = 1; want = "" }
+     END { if (want != "" || bad) { print "an end-to-end run ended before its tests did" > "/dev/stderr"; exit 1 } }' "$ran"
 
 if rustup target list --installed 2>/dev/null | grep -q x86_64-pc-windows-gnu; then
   # With the tests: CI builds them there too, and code only they have was once left for Unix alone.

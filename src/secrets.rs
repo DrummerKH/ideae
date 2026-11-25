@@ -236,9 +236,7 @@ pub fn secret_name(name: &str) -> bool {
 }
 
 /// A value the shell makes when the agent starts: `$(op read …)`.
-pub fn command_value(value: &str) -> Option<&str> {
-    value.trim().strip_prefix("$(")?.strip_suffix(')').map(str::trim).filter(|c| !c.is_empty())
-}
+pub use ideae_core::env::command_value;
 
 #[cfg(test)]
 mod tests {

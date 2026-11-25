@@ -4,9 +4,11 @@
 //! this and re-exports it where it was; `ideae-server` is built from it
 //! alone, with no gpui, for a server to run.
 
+pub mod acp;
 pub mod build;
 #[cfg(unix)]
 pub mod daemon;
+pub mod env;
 pub mod hook;
 pub mod paths;
 pub mod procs;
@@ -17,5 +19,6 @@ pub mod watch;
 #[cfg(test)]
 pub(crate) mod tests {
     /// Tests that set IDEAE_STATE run one at a time.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }

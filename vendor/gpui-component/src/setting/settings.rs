@@ -391,7 +391,8 @@ impl RenderOnce for Settings {
             SettingsState {
                 search_input,
                 selected_index: self.default_selected_index,
-                deferred_scroll_group_ix: None,
+                // ideae patch: a group selected at first is scrolled to, as one clicked is.
+                deferred_scroll_group_ix: self.default_selected_index.group_ix,
             }
         });
 

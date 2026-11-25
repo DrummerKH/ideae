@@ -46,9 +46,7 @@ pub fn preload() {
 }
 
 /// A cost as the host shows it ("$0.42"), in USD; None for another currency.
-pub fn usd(cost: &str) -> Option<f64> {
-    cost.trim().strip_prefix('$')?.parse().ok()
-}
+pub use ideae_core::acp::usd;
 
 /// A session of `profile` now costs `cost` (USD, all of it so far): its
 /// growth is added to today's. Returns today's total for the profile.

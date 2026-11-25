@@ -20,9 +20,11 @@ impl Workspace {
             let p = &self.projects[pi];
             let space = p.space.as_ref().and_then(|id| self.spaces.iter().find(|s| &s.id == id)).map(|s| &s.settings);
             let resolved = layers::resolve(&global, space, Some(&p.team), &p.settings);
-            if *p.resolved == resolved {
+            // The first time always: what tasks read of it (layers::of_root) is set then.
+            if *p.resolved == resolved && p.resolved_once {
                 continue;
             }
+            self.projects[pi].resolved_once = true;
             let before = std::mem::replace(&mut self.projects[pi].resolved, Arc::new(resolved));
             let p = &self.projects[pi];
             let now = p.values();
@@ -73,10 +75,19 @@ impl Workspace {
 
     /// As `read_team_layers`; `remote`: those on other machines too, each read a call over ssh.
     pub fn read_team_layers_of(&mut self, remote: bool, cx: &mut Context<Self>) {
+        self.read_team_layers_where(&|p| remote || !crate::hosts::is_remote(&p.path), cx)
+    }
+
+    /// The team's layer of the project at `path` alone, now: its file changed there.
+    pub fn read_team_layer_of(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        self.read_team_layers_where(&|p| p.path == path, cx)
+    }
+
+    fn read_team_layers_where(&mut self, which: &dyn Fn(&crate::workspace::Project) -> bool, cx: &mut Context<Self>) {
         let projects: Vec<(PathBuf, Option<u64>)> = self
             .projects
             .iter()
-            .filter(|p| (remote || !crate::hosts::is_remote(&p.path)) && crate::hostfs::reachable(&p.path))
+            .filter(|p| which(p) && crate::hostfs::reachable(&p.path))
             .map(|p| (p.path.clone(), p.team_read))
             .collect();
         if projects.is_empty() {
@@ -140,6 +151,7 @@ impl Workspace {
             "worktrees" => text(&v.worktrees),
             "base" => if v.base.trim().is_empty() { "the remote's default branch".into() } else { v.base.trim().to_string() },
             "pull_requests" => flag(v.pull_requests),
+            "remote_browser" => flag(v.remote_browser),
             "language_servers" => flag(v.language_servers),
             "check_to_agent" => v.check_to_agent.to_string(),
             "branch" => v.branch.clone(),

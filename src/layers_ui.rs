@@ -229,17 +229,32 @@ fn item(field: &'static Field, draft: &Rc<RefCell<state::Settings>>, layers: &La
                     .on_reset(dirty, reset),
             )
         }
-        "pull_requests" | "language_servers" => {
+        "pull_requests" | "language_servers" | "remote_browser" => {
             let (get, set) = (get.clone(), set.clone());
-            let fallback = if id == "pull_requests" { values.pull_requests } else { values.language_servers };
+            let fallback = match id {
+                "pull_requests" => values.pull_requests,
+                "language_servers" => values.language_servers,
+                _ => values.remote_browser,
+            };
             SettingItem::new(
                 field.title,
                 SettingField::switch(
                     move |_| {
                         let o = get();
-                        (if id == "pull_requests" { o.pull_requests } else { o.language_servers }).unwrap_or(fallback)
+                        match id {
+                            "pull_requests" => o.pull_requests,
+                            "language_servers" => o.language_servers,
+                            _ => o.remote_browser,
+                        }
+                        .unwrap_or(fallback)
                     },
-                    move |on, _| set(&|o| if id == "pull_requests" { o.pull_requests = Some(on) } else { o.language_servers = Some(on) }),
+                    move |on, _| {
+                        set(&|o| match id {
+                            "pull_requests" => o.pull_requests = Some(on),
+                            "language_servers" => o.language_servers = Some(on),
+                            _ => o.remote_browser = Some(on),
+                        })
+                    },
                 )
                 .on_reset(dirty, reset),
             )

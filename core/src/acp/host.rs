@@ -21,6 +21,10 @@ use serde_json::{Value, json};
 use super::thread::{AuthMethod, ConfigOption, Diff, Entry, Location, Op, OptionValue, Permission, PermissionOption, PlanItem, SlashCommand, Status, Thread, Tool, Usage};
 use super::wire::{self, HostSpec, ToHost, ToWindow};
 
+/// What tells the user of a question no window sees (the app's desktop
+/// notification); a host on a server has none.
+pub static NOTIFY: std::sync::OnceLock<fn(&str, &str)> = std::sync::OnceLock::new();
+
 pub const SPEC_ENV: &str = "IDEAE_ACP_SPEC";
 
 /// Text a tool gave back, kept from its end.
@@ -130,6 +134,9 @@ pub struct Host {
 
 impl Host {
     pub fn new(spec: HostSpec, out: Box<dyn FnMut(ToWindow) + Send>) -> Self {
+        if let (Some(journal), Some(before)) = (&spec.journal, &spec.journal_before) {
+            super::carry_journal(before, journal, &spec.cwd);
+        }
         let (thread, journal, snapshot_bytes) = open_journal(spec.journal.as_deref());
         let mut host = Self {
             spec,
@@ -164,7 +171,7 @@ impl Host {
             npx_mended: false,
             over_budget: false,
         };
-        host.cost_base = host.thread.usage.as_ref().and_then(|u| u.cost.as_deref()).and_then(super::spend::usd).unwrap_or(0.0);
+        host.cost_base = host.thread.usage.as_ref().and_then(|u| u.cost.as_deref()).and_then(super::usd).unwrap_or(0.0);
         // Spent before it starts: nothing goes.
         host.over_budget = host.spec.budget.is_some_and(|b| b <= 0.0);
         host.reindex_tools();
@@ -365,7 +372,9 @@ impl Host {
         if cfg!(test) {
             return;
         }
-        crate::desktop::notify(&format!("{name} needs your answer"), body);
+        if let Some(notify) = NOTIFY.get() {
+            notify(&format!("{name} needs your answer"), body);
+        }
     }
 
     /// Questions nobody answered in the time set: declined with the
@@ -751,7 +760,7 @@ impl Host {
                 let Some(tx) = self.tx.clone() else { return self.respond_error(rpc, -32603, "no host loop") };
                 let command = params.get("command").and_then(Value::as_str).unwrap_or_default();
                 let args = strings(params.get("args"));
-                let mut env = crate::agents::run_made(self.spec.env.clone());
+                let mut env = crate::env::run_made(self.spec.env.clone());
                 env.extend(params.get("env").and_then(Value::as_array).into_iter().flatten().filter_map(|v| {
                     Some((v.get("name")?.as_str()?.to_string(), v.get("value")?.as_str()?.to_string()))
                 }));
@@ -954,7 +963,7 @@ impl Host {
                     size: update.get("size").and_then(Value::as_u64).unwrap_or_default(),
                     cost,
                 };
-                let spent = usage.cost.as_deref().and_then(super::spend::usd).map(|c| c - self.cost_base);
+                let spent = usage.cost.as_deref().and_then(super::usd).map(|c| c - self.cost_base);
                 if self.thread.usage.as_ref() != Some(&usage) {
                     self.emit(Op::Usage { usage });
                 }
@@ -1312,7 +1321,7 @@ impl Host {
 }
 
 fn spawn_agent(spec: &HostSpec, tx: mpsc::Sender<Event>) -> std::io::Result<Agent> {
-    let env = crate::agents::run_made(spec.env.clone());
+    let env = crate::env::run_made(spec.env.clone());
     let mut command = if cfg!(windows) {
         // Quoted words whole: a program under `C:\Users\Jane Doe\…`.
         let words = command_words(&spec.command);
@@ -1321,13 +1330,18 @@ fn spawn_agent(spec: &HostSpec, tx: mpsc::Sender<Event>) -> std::io::Result<Agen
         command
     } else {
         let mut command = std::process::Command::new("sh");
-        command.arg("-c").arg(format!("exec {}", spec.command));
+        let line = format!("exec {}", spec.command);
+        if spec.login_shell {
+            command.arg("-c").arg(r#"exec "${SHELL:-/bin/sh}" -lc "$1""#).arg("sh").arg(line);
+        } else {
+            command.arg("-c").arg(line);
+        }
         command
     };
     command
         .current_dir(&spec.cwd)
         .envs(env.iter().map(|(k, v)| (k, v)))
-        .env_remove(crate::agent::SOCK_ENV)
+        .env_remove(crate::hook::SOCK_ENV)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

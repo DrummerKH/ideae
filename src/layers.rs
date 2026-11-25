@@ -224,6 +224,9 @@ layered! {
     pull_requests: bool = true,
         "Pull request status", "Tasks' pull requests are asked of gh: their state, CI and review on each task.",
         [Global, Space, Project];
+    remote_browser: bool = false,
+        "Agents there drive Chrome here", "A project on another machine: its agents are given IDEAE_BROWSER_CDP, and the task's Chrome here is reached at that port there. Every user of that machine can reach the port: on only for machines that are yours alone. Never a team's file's to say.",
+        [Global, Space, Project];
     language_servers: bool = true,
         "Language servers", "Completion, types and go to definition from a server. Which servers run is in Settings → Language servers.",
         [Space, Project];
@@ -295,6 +298,7 @@ pub fn global_layer(settings: &crate::state::Settings) -> Overrides {
         agent: Some(settings.default_agent.clone()),
         worktrees_dir: Some(settings.worktrees_dir.clone()),
         pull_requests: Some(settings.pr_status),
+        remote_browser: Some(settings.remote_browser),
         integrations: settings.integrations.clone(),
         // Empty: the default, not set here.
         branch: Some(settings.branch_template.clone()).filter(|t| !t.trim().is_empty()),
@@ -315,6 +319,9 @@ pub fn into_global(overrides: &Overrides, settings: &mut crate::state::Settings)
     }
     if let Some(on) = overrides.pull_requests {
         settings.pr_status = on;
+    }
+    if let Some(on) = overrides.remote_browser {
+        settings.remote_browser = on;
     }
     if let Some(t) = &overrides.branch {
         settings.branch_template = t.clone();
@@ -480,6 +487,23 @@ mod tests {
 
     fn entry(id: &str, kind: Option<&str>, url: Option<&str>) -> Entry {
         Entry { id: id.into(), kind: kind.map(Into::into), url: url.map(Into::into), ..Default::default() }
+    }
+
+    /// Chrome reached from another machine is yours to allow, for a space
+    /// or a project of yours alone: a team's file can neither allow nor forbid it.
+    #[test]
+    fn a_team_never_says_whether_its_agents_drive_chrome_here() {
+        let global = Overrides { remote_browser: Some(false), ..Default::default() };
+        let team = Overrides { remote_browser: Some(true), ..Default::default() }.allowed_in(Layer::Team);
+        assert_eq!(team.remote_browser, None, "a team's file cannot hold it");
+        let mine = Overrides { remote_browser: Some(true), ..Default::default() };
+        let resolved = resolve(&global, None, Some(&team), &mine);
+        assert!(resolved.values.remote_browser);
+        assert_eq!(resolved.from.remote_browser, Layer::Project);
+        let space = Overrides { remote_browser: Some(true), ..Default::default() };
+        let by_space = resolve(&global, Some(&space), None, &Overrides::default());
+        assert!(by_space.values.remote_browser && by_space.from.remote_browser == Layer::Space);
+        assert!(!resolve(&global, None, None, &Overrides::default()).values.remote_browser, "off unless allowed");
     }
 
     #[test]

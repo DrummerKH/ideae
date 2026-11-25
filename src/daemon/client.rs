@@ -42,12 +42,24 @@ struct Peer {
     /// The daemon was asked for the session, and when the size last changed.
     opened: bool,
     sized: Instant,
+    /// Started again when its daemon has it no longer (died, or it ended
+    /// while the link was down): a chat's host, which finds its thread in
+    /// its journal. Others are told they ended.
+    again: bool,
+    /// The link it was opened on ([`Daemon::epoch`]): one opened on a link
+    /// since dropped had its Open lost, and is opened again, not ended.
+    epoch: u64,
+    /// The daemon said it took the Open (`Opened`).
+    acked: bool,
 }
 
 /// How long a terminal's size holds before it attaches to a session that
 /// runs: a window that maximizes right after it opens would show the
 /// program a size for a moment, and its output replayed into that one.
 const SIZE_SETTLES: Duration = Duration::from_millis(300);
+
+/// How many ended sessions are remembered for a link that comes back.
+const KILLED_KEPT: usize = 256;
 
 pub struct Daemon {
     /// The daemon process, as the socket's peer: changes with a handover.
@@ -70,6 +82,21 @@ pub struct Daemon {
     /// and whom a change of each is told to.
     watches: Mutex<HashMap<String, (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>)>>,
     changes: Mutex<HashMap<String, async_channel::Sender<()>>>,
+    /// Which link to the daemon this is: one more each time it drops.
+    epoch: std::sync::atomic::AtomicU64,
+    /// Sessions of another machine ended, till the daemon is known to have
+    /// taken their Kill (a Pong to a Ping sent after it: it answers in
+    /// order): one sent on a link that had died unnoticed is lost, and is
+    /// sent again once a link is back (for one still running there and not
+    /// opened again here). By the number of the Kill. Never one it took: by
+    /// then another machine's window may run a session of that name.
+    killed: Mutex<std::collections::VecDeque<(String, u64)>>,
+    kills: std::sync::atomic::AtomicU64,
+    /// The Pings on their way, by the number of the last Kill before each.
+    pings: Mutex<std::collections::VecDeque<u64>>,
+    /// It says `Opened` (one of an earlier build there may not): what it
+    /// took is known, not guessed from the link it was sent on.
+    acks: std::sync::atomic::AtomicBool,
 }
 
 static DAEMON: OnceLock<Option<Arc<Daemon>>> = OnceLock::new();
@@ -120,6 +147,11 @@ pub fn connect(on_hook: impl Fn(Hook) + Send + Sync + 'static) -> Option<(Arc<Da
         calls: Mutex::default(),
         watches: Mutex::default(),
         changes: Mutex::default(),
+        epoch: Default::default(),
+        killed: Mutex::default(),
+        kills: Default::default(),
+        pings: Mutex::default(),
+        acks: true.into(),
     });
     let reading = daemon.clone();
     std::thread::Builder::new()
@@ -137,12 +169,13 @@ pub fn connect(on_hook: impl Fn(Hook) + Send + Sync + 'static) -> Option<(Arc<Da
                 }
                 // The daemon went away: handed over to a newer one, or died.
                 // Attach again where it serves now.
+                reading.link_lost();
                 match dial(false) {
-                    Some((writer, next, kept, _)) => {
+                    Some((writer, next, kept, running)) => {
                         reading.pid.store(peer_pid(&writer), std::sync::atomic::Ordering::Relaxed);
                         *reading.writer.lock().unwrap() = Box::new(writer);
                         reader = next;
-                        reading.reopen();
+                        reading.reopen(&running);
                         // What was reported while nobody listened: a turn's
                         // end among them, or the task stays "working".
                         for hook in kept {
@@ -275,13 +308,53 @@ impl Daemon {
         Some(self.pid.load(std::sync::atomic::Ordering::Relaxed)).filter(|&p| p > 0)
     }
 
+    fn epoch(&self) -> u64 {
+        self.epoch.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Whether the daemon there, as dialled again, says `Opened`.
+    pub(super) fn set_acks(&self, acks: bool) {
+        self.acks.store(acks, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The link to the daemon dropped: what is opened from now on is opened on the next.
+    pub(super) fn link_lost(&self) {
+        self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Their Pongs do not come.
+        self.pings.lock().unwrap().clear();
+    }
+
+    /// Kills not yet known to be taken.
+    #[cfg(test)]
+    pub(super) fn kills_unconfirmed(&self) -> usize {
+        self.killed.lock().unwrap().len()
+    }
+
+    /// Asks whether the daemon is there, and so whether it took what was sent before.
+    pub(super) fn ping(&self) {
+        let mut pings = self.pings.lock().unwrap();
+        pings.push_back(self.kills.load(std::sync::atomic::Ordering::SeqCst));
+        self.send(proto::encode_msg(&Msg::Ping));
+    }
+
     pub(super) fn send(&self, frame: Vec<u8>) {
         let _ = self.writer.lock().unwrap().write_all(&frame);
     }
 
     /// After a reconnect: every terminal attaches again, its screen cleared
     /// for the replay that follows.
-    pub(super) fn reopen(&self) {
+    /// `running`: the sessions the daemon has (its welcome's). One of this
+    /// window's not among them ended while nobody listened: it is told so,
+    /// not started again (a check run twice, a shell that exited back).
+    pub(super) fn reopen(&self, running: &[String]) {
+        // Ended while the link was down: ended there too, unless opened again since.
+        let killed: Vec<String> = self.killed.lock().unwrap().iter().map(|(id, _)| id.clone()).collect();
+        for id in killed {
+            if running.contains(&id) && !self.peers.lock().unwrap().contains_key(&id) {
+                self.send(proto::encode_msg(&Msg::Kill { id }));
+            }
+        }
+        let now = self.epoch();
         // What was watched there: watched again, and looked at once, as what changed meanwhile was not told.
         // One of an earlier build may not (the bridge could not hand it over).
         let watches = self.watches_folders();
@@ -291,9 +364,23 @@ impl Daemon {
                 let _ = tx.try_send(());
             }
         }
-        let peers = self.peers.lock().unwrap();
-        for (id, p) in peers.iter() {
+        let mut peers = self.peers.lock().unwrap();
+        // Not there, though opened on a link before: it ended meanwhile. One opened
+        // since the link dropped is opened now (if the daemon has it after all, it attaches).
+        let acks = self.acks.load(std::sync::atomic::Ordering::SeqCst);
+        let ended: Vec<String> = peers.iter().filter(|(id, p)| p.opened && !p.again && (if acks { p.acked } else { p.epoch < now }) && !running.contains(id)).map(|(id, _)| id.clone()).collect();
+        for id in ended {
+            match peers.remove(&id).map(|p| p.link) {
+                Some(Link::Term { peer, .. }) => peer.exit(ExitStatus::new(None, None::<String>)),
+                Some(Link::Pipe(tx)) => {
+                    let _ = tx.try_send(PipeEvent::Exited);
+                }
+                None => {}
+            }
+        }
+        for (id, p) in peers.iter_mut() {
             let Some(size) = p.size.filter(|_| p.opened) else { continue };
+            p.acked = false;
             if let Link::Term { peer, .. } = &p.link {
                 peer.output(b"\x1b[H\x1b[2J\x1b[3J\x1bc");
             }
@@ -340,6 +427,11 @@ impl Daemon {
                     peer.output(&bytes);
                 }
             }
+            Frame::Msg(Msg::Opened { id }) => {
+                if let Some(p) = self.peers.lock().unwrap().get_mut(&id) {
+                    p.acked = true;
+                }
+            }
             Frame::Msg(Msg::Exited { id, code, signal }) => {
                 if let Some(p) = self.peers.lock().unwrap().remove(&id) {
                     match p.link {
@@ -371,6 +463,10 @@ impl Daemon {
                 if let Some(wire) = &self.wire {
                     wire.heard();
                 }
+                // Every Kill sent before its Ping was taken.
+                if let Some(before) = self.pings.lock().unwrap().pop_front() {
+                    self.killed.lock().unwrap().retain(|(_, n)| *n > before);
+                }
             }
             Frame::Msg(_) => {}
         }
@@ -388,7 +484,7 @@ impl Daemon {
     ) -> TerminalState {
         let (source, peer) = StreamSource::new();
         let events = peer.clone();
-        self.peers.lock().unwrap().insert(id.clone(), Peer { link: Link::Term { peer, mute_until: None }, spec: spec.clone(), size: None, opened: false, sized: Instant::now() });
+        self.peers.lock().unwrap().insert(id.clone(), Peer { link: Link::Term { peer, mute_until: None }, spec: spec.clone(), size: None, opened: false, sized: Instant::now(), again: false, epoch: self.epoch(), acked: false });
         let attach = self.running.lock().unwrap().remove(&id);
         let daemon = self.clone();
         cx.background_spawn(async move {
@@ -420,6 +516,9 @@ impl Daemon {
                             daemon.send(proto::encode_msg(&Msg::Resize { id: id.clone(), size }));
                         } else if !attach {
                             p.opened = true;
+                            // Sent now, on the link of now.
+                            p.epoch = daemon.epoch();
+                            p.acked = false;
                             daemon.send(proto::encode_msg(&Msg::Open { id: id.clone(), spec: spec.clone(), size }));
                         } else if !waiting {
                             waiting = true;
@@ -451,6 +550,9 @@ impl Daemon {
             let Some(size) = p.size else { return };
             if p.sized.elapsed() >= SIZE_SETTLES || since.elapsed() >= SIZE_SETTLES * 10 {
                 p.opened = true;
+                // Sent now, on the link of now.
+                p.epoch = self.epoch();
+                p.acked = false;
                 self.send(proto::encode_msg(&Msg::Open { id: id.to_string(), spec: spec.clone(), size }));
                 return;
             }
@@ -461,10 +563,20 @@ impl Daemon {
     /// started from `spec`. What it prints comes as events; [`Self::write`]
     /// gives it input.
     pub fn pipe(&self, id: String, spec: Spec) -> async_channel::Receiver<PipeEvent> {
+        self.open_pipe(id, spec, false)
+    }
+
+    /// A pipe session started again whenever its daemon has it no longer
+    /// (see [`Peer::again`]): it tells `Reattached` then, as when found.
+    pub fn pipe_again(&self, id: String, spec: Spec) -> async_channel::Receiver<PipeEvent> {
+        self.open_pipe(id, spec, true)
+    }
+
+    fn open_pipe(&self, id: String, spec: Spec, again: bool) -> async_channel::Receiver<PipeEvent> {
         let (tx, rx) = async_channel::unbounded();
         // Pipes have no grid; the size only marks the session as opened.
         let size = Size { cols: 80, rows: 24, cell_w: 8, cell_h: 16 };
-        self.peers.lock().unwrap().insert(id.clone(), Peer { link: Link::Pipe(tx), spec: spec.clone(), size: Some(size), opened: true, sized: Instant::now() });
+        self.peers.lock().unwrap().insert(id.clone(), Peer { link: Link::Pipe(tx), spec: spec.clone(), size: Some(size), opened: true, sized: Instant::now(), again, epoch: self.epoch(), acked: false });
         self.send(proto::encode_msg(&Msg::Open { id, spec, size }));
         rx
     }
@@ -473,8 +585,30 @@ impl Daemon {
         self.send(proto::encode_bytes(KIND_BYTES, id, bytes));
     }
 
+    /// Ends session `id`. It is forgotten here at once: a link made anew
+    /// opens again only what is still meant to run.
     pub fn kill(&self, id: &str) {
+        let peer = self.peers.lock().unwrap().remove(id);
+        // Numbered and sent under the lock Pings are sent under: in the order they go.
+        let pings = self.pings.lock().unwrap();
+        if self.wire.is_some() {
+            let n = self.kills.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let mut killed = self.killed.lock().unwrap();
+            killed.retain(|(k, _)| k != id);
+            if killed.len() >= KILLED_KEPT {
+                killed.pop_front();
+            }
+            killed.push_back((id.to_string(), n));
+        }
         self.send(proto::encode_msg(&Msg::Kill { id: id.to_string() }));
+        drop(pings);
+        match peer.map(|p| p.link) {
+            Some(Link::Term { peer, .. }) => peer.exit(ExitStatus::new(None, None::<String>)),
+            Some(Link::Pipe(tx)) => {
+                let _ = tx.try_send(PipeEvent::Exited);
+            }
+            None => {}
+        }
     }
 
     pub fn prune(&self, keep: Vec<String>) {
@@ -483,7 +617,7 @@ impl Daemon {
 
     /// Builds one for a daemon on another machine; [`super::remote`] keeps
     /// its link.
-    pub(super) fn remote(wire: super::remote::Wire, writer: Box<dyn Write + Send>, sessions: Vec<String>) -> Self {
+    pub(super) fn remote(wire: super::remote::Wire, writer: Box<dyn Write + Send>, sessions: Vec<String>, acks: bool) -> Self {
         Daemon {
             pid: 0.into(),
             writer: Mutex::new(writer),
@@ -495,6 +629,11 @@ impl Daemon {
             calls: Mutex::default(),
             watches: Mutex::default(),
             changes: Mutex::default(),
+            epoch: Default::default(),
+            killed: Mutex::default(),
+            kills: Default::default(),
+            pings: Mutex::default(),
+            acks: acks.into(),
         }
     }
 
@@ -572,6 +711,12 @@ impl Daemon {
         }
     }
 
+    /// The ideae-server and the home folder of a daemon's machine, another one.
+    pub fn there(&self) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        let remote = self.wire.as_ref()?.remote();
+        Some((remote.exe.clone()?, remote.home.clone()?))
+    }
+
     /// Port `there` of a daemon's machine, reached at the port here this gives.
     pub fn forward(&self, there: u16) -> Result<u16, String> {
         match &self.wire {
@@ -584,6 +729,13 @@ impl Daemon {
     pub fn close_master(&self) {
         if let Some(wire) = &self.wire {
             super::remote::close_master(wire.remote());
+        }
+    }
+
+    /// What a link through another host left on that host, ended: before any close_master.
+    pub fn close_beyond(&self) {
+        if let Some(wire) = &self.wire {
+            super::remote::close_beyond(wire.remote());
         }
     }
 

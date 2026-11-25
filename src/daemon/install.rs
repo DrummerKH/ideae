@@ -54,6 +54,7 @@ impl Target {
 /// there); returns `remote` set to run it, and those hooks. Off the UI
 /// thread: it runs ssh, and may download a release.
 pub fn ensure(mut remote: Remote) -> Result<(Remote, crate::agents::Hooks), String> {
+    super::remote::clear_first_host(&remote);
     // The last lines: a login shell may greet before them.
     let probe = run(&remote, "uname -sm; printf '%s\\n' \"$HOME\"", None)?;
     let mut last = probe.lines().rev();
@@ -87,6 +88,7 @@ pub fn ensure(mut remote: Remote) -> Result<(Remote, crate::agents::Hooks), Stri
     // A daemon of its own there, apart from one an ideae of that machine
     // runs for its own window (`<app>-remote`): neither hands the other over.
     remote.ideae = format!("IDEAE_APP={app}-remote {}", q(&exe));
+    (remote.exe, remote.home) = (Some(exe.clone()), Some(PathBuf::from(&home)));
     let hooks = crate::agents::Hooks { claude_settings: Some(settings), exe: Some(exe), opencode_plugin: Some(plugin), claude_mcp: None };
     Ok((remote, hooks))
 }
@@ -117,7 +119,8 @@ mod tests {
     use crate::daemon::proto::Spec;
     use std::time::{Duration, Instant};
 
-    /// Against a real server: `IDEAE_LIVE_REMOTE="ssh -p 2222 -i key me@host"`.
+    /// Against a real server: `IDEAE_LIVE_REMOTE="ssh -p 2222 -i key me@host"`,
+    /// and `IDEAE_LIVE_HOP="me@other"` for one that server reaches.
     /// Its ideae-server is put there (or found), a session runs, the link
     /// is cut and comes back, the window goes and another finds the session.
     ///
@@ -127,12 +130,23 @@ mod tests {
     fn a_real_server_gets_its_ideae_and_keeps_a_session() {
         let Ok(ssh) = std::env::var("IDEAE_LIVE_REMOTE") else { return };
         let ssh: Vec<String> = ssh.split_whitespace().map(String::from).collect();
+        // IDEAE_LIVE_HOP: a host that one reaches with its own key (`dev@10.0.0.3`), reached through it.
+        let at = |ssh: Vec<String>| super::Remote { hop: std::env::var("IDEAE_LIVE_HOP").ok().filter(|h| !h.trim().is_empty()).map(|h| h.split_whitespace().map(String::from).collect()), ..super::Remote::new(ssh) };
         let started = Instant::now();
-        let (remote, _) = super::ensure(super::Remote::new(ssh.clone())).expect("installed");
+        let (remote, _) = super::ensure(at(ssh.clone())).expect("installed");
+        // Through a first host: what a run killed there left is cleared, what this live one keeps stays.
+        if remote.hop.is_some() {
+            let (first, mine) = (remote.first(), super::super::remote::run_token());
+            let plant = format!("touch ~/.ssh/ideae-1x1-9-0.sock ~/.ssh/ideae-{mine}-9-0.sock");
+            super::super::remote::run(&first, &plant, None).unwrap();
+            super::super::remote::clear_first_host(&remote);
+            let left = super::super::remote::run(&first, &format!("cd ~/.ssh && ls ideae-*-9-0.sock 2>/dev/null; rm -f ideae-{mine}-9-0.sock"), None).unwrap();
+            assert_eq!(left.trim(), format!("ideae-{mine}-9-0.sock"), "a killed run's socket is cleared, a live one's kept");
+        }
         let first = started.elapsed();
         // Found the second time, not sent again.
         let started = Instant::now();
-        let (again, _) = super::ensure(super::Remote::new(ssh)).expect("found");
+        let (again, _) = super::ensure(at(ssh)).expect("found");
         assert_eq!(again.ideae, remote.ideae);
         eprintln!("installed in {first:?}, found in {:?}: {}", started.elapsed(), remote.ideae);
 
@@ -204,6 +218,42 @@ mod tests {
         eprintln!("forwarded {port} there to {here} here");
         daemon.kill("live-task#serve");
 
+        // A port of here (a task's Chrome) reached there at the same port: an agent there asks it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mine = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut client, _)) = listener.accept() {
+                let _ = std::io::Write::write_all(&mut client, b"from here\n");
+            }
+        });
+        daemon.wire().unwrap().reach_here(mine).expect("reached from there");
+        let asked = Call::Exec { cwd: "/".into(), program: "sh".into(), args: vec!["-c".into(), format!("nc 127.0.0.1 {mine} </dev/null")], env: Vec::new() };
+        let (_, out) = daemon.call(&asked, b"").unwrap();
+        assert_eq!(String::from_utf8_lossy(&out).trim(), "from here", "port {mine} of here, asked there");
+        // Let go of with its task: no longer there.
+        daemon.wire().unwrap().release_here(mine);
+        let (_, out) = daemon.call(&asked, b"").unwrap();
+        assert!(String::from_utf8_lossy(&out).trim().is_empty(), "port {mine} let go of there too");
+        eprintln!("port {mine} of here reached there");
+
+        // A chat agent's host there, its own ideae-server's: it answers a window.
+        let (exe, home) = daemon.there().expect("its ideae-server and home");
+        let host = crate::acp::wire::HostSpec { command: "no-such-agent".into(), cwd: "/tmp".into(), journal: Some(home.join(".local/share/ideae-live/acp/x.jsonl")), ..Default::default() };
+        let hosted = Spec { cwd: "/tmp".into(), env: Vec::new(), input: Some(String::from_utf8(crate::acp::wire::line(&host)).unwrap()), program: vec![exe.display().to_string(), "--acp-host".into()] };
+        let told = daemon.pipe("live-task#acp".into(), hosted);
+        daemon.write("live-task#acp", &crate::acp::wire::line(&crate::acp::wire::ToHost::Attach { version: crate::acp::wire::VERSION }));
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut heard = String::new();
+        while !heard.contains("\"Hello\"") {
+            assert!(Instant::now() < deadline, "the host there answered: {heard}");
+            match told.try_recv() {
+                Ok(PipeEvent::Bytes(b)) => heard.push_str(&String::from_utf8_lossy(&b)),
+                _ => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        daemon.kill("live-task#acp");
+        eprintln!("an agent's host ran there");
+
         daemon.write(&id, b"one\n");
         let (got, _) = read("got:one");
         assert!(got.contains("got:one"), "{got}");
@@ -217,6 +267,10 @@ mod tests {
         }
         daemon.write(&id, b"two\n");
         assert!(read("got:two").0.contains("got:two"), "the session ran on after the link was cut");
+        // What was ended before the link was cut is not started again with it.
+        std::thread::sleep(Duration::from_millis(500));
+        let (_, body) = daemon.call(&Call::Listening { task: "live-task".into() }, b"").unwrap();
+        assert_eq!(String::from_utf8_lossy(&body).trim(), "[]", "the ended server is not opened again");
         daemon.disconnect();
 
         let (daemon, _) = super::super::remote::connect(remote.clone(), |_| {}).expect("connected again");
@@ -236,6 +290,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(300));
         daemon.disconnect();
         // ssh's link there goes with the test.
+        super::super::remote::close_beyond(&remote);
         super::super::remote::close_master(&remote);
     }
 
@@ -261,6 +316,7 @@ mod tests {
             .unwrap();
         }
         let remote = super::Remote::new(ssh.split_whitespace().map(String::from).collect());
+        super::super::remote::close_beyond(&remote);
         super::super::remote::close_master(&remote);
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(super::run(&remote, "echo one", None).unwrap(), "one");
@@ -268,6 +324,7 @@ mod tests {
         let asked = asked.lock().unwrap().clone();
         assert_eq!(asked.len(), 1, "asked once: {asked:?}");
         assert!(asked[0].to_lowercase().contains("password"), "{asked:?}");
+        super::super::remote::close_beyond(&remote);
         super::super::remote::close_master(&remote);
     }
 

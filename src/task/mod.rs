@@ -42,8 +42,18 @@ use panes::Pane;
 mod git_ui;
 mod helpers;
 /// What a test outside the task looks at and does.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl TaskView {
+    /// A remote project's main thread has seen its team's file there.
+    pub(crate) fn team_file_seen(&self) -> bool {
+        self.team_stamp.is_some()
+    }
+
+    /// The titles of its tabs.
+    pub(crate) fn tab_titles(&self) -> Vec<String> {
+        self.tabs.iter().map(|t| t.title.to_string()).collect()
+    }
+
     /// The changed files shown, by name.
     pub(crate) fn changed_names(&self) -> Vec<String> {
         self.files.iter().map(|f| f.path.to_string()).collect()
@@ -52,10 +62,6 @@ impl TaskView {
     /// A refresh has read its files: what it watches is known.
     pub(crate) fn refreshed_once(&self) -> bool {
         !self.tree_files.is_empty()
-    }
-
-    pub(crate) fn refresh_now(&self) {
-        let _ = self.refresh_tx.try_send(());
     }
 
     /// The text of the open file at `path`.
@@ -479,15 +485,51 @@ pub enum TaskEvent {
     OwnBranch(String),
     /// A worktree was added, or this one put on another branch.
     Worktrees,
+    /// A remote project's `.ideae.toml` changed there (its main thread saw
+    /// it): its team's layer is read again now, not at the next round.
+    TeamFile,
     /// Of a question asked aside (agent_tab.rs).
     Asked(Asked),
 }
 
 impl EventEmitter<TaskEvent> for TaskView {}
 
+/// A port of here reached from a remote task's host; let go of with the task.
+#[cfg(unix)]
+struct ReachedHere {
+    daemon: std::sync::Arc<crate::daemon::client::Daemon>,
+    port: u16,
+}
+
+#[cfg(unix)]
+impl Drop for ReachedHere {
+    fn drop(&mut self) {
+        let (daemon, port) = (self.daemon.clone(), self.port);
+        // It runs ssh: not on the thread that drops the task.
+        std::thread::spawn(move || {
+            if let Some(wire) = daemon.wire() {
+                wire.release_here(port);
+            }
+        });
+    }
+}
+
+/// What is done with a task once something it waited for is there.
+pub type Then = Box<dyn FnOnce(&mut TaskView, &mut Window, &mut Context<TaskView>)>;
+
 pub struct TaskView {
     /// The project's own checkout, not a worktree of a task.
     pub main_thread: bool,
+    /// A remote task's Chrome, reached from its host while the task is open.
+    #[cfg(unix)]
+    _reached: Option<ReachedHere>,
+    /// A remote task's Chrome was reached from its host: its terminals are told of it.
+    cdp_reached: bool,
+    /// When a remote project's team file there was last changed, as its main thread last saw.
+    /// None: not seen yet; Some(None): there is no such file there.
+    team_stamp: Option<Option<u128>>,
+    /// Its agent waits for that, to be told of it: its tab says so.
+    agent_waits_for_chrome: bool,
     /// A remote task's files, read in the background before they open.
     remote_texts: HashMap<PathBuf, (Result<String, String>, Option<std::time::SystemTime>)>,
     /// The branches the main thread was asked to stay on, not the default.
@@ -710,6 +752,7 @@ impl TaskView {
         start_agent: bool,
         hook_socket: Option<String>,
         port_slot: u32,
+        links: Vec<crate::state::TaskLink>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -718,9 +761,47 @@ impl TaskView {
         let remote = crate::hosts::is_remote(&root);
         let services = if remote { Default::default() } else { crate::services::load(&root).unwrap_or_default() };
         let mut task_env = crate::services::task_env(&services, port_slot);
+        // A remote task's agent reaches its Chrome here at the same port there, when you
+        // allow it, and is told of it only once it is reached: that port there may be
+        // another's. Its agent waits for that (its tab holds its place); on its own it starts.
+        #[cfg(unix)]
+        let reached = crate::daemon::client::for_path(&root).filter(|_| remote && crate::layers::of_root(&root).values.remote_browser).map(|daemon| {
+            let port = crate::browser::cdp_port(&root);
+            let asked = daemon.clone();
+            cx.spawn_in(window, async move |this, cx| {
+                let ok = cx
+                    .background_spawn(async move {
+                        let reached = asked.wire().map(|wire| wire.reach_here(port));
+                        if let Some(Err(e)) = &reached {
+                            eprintln!("the task's Chrome not reached from its host: {e}");
+                        }
+                        matches!(reached, Some(Ok(())))
+                    })
+                    .await;
+                let _ = this.update_in(cx, |t, window, cx| {
+                    t.cdp_reached = ok;
+                    if t.agent_waits_for_chrome {
+                        t.agent_waits_for_chrome = false;
+                        t.start_main_agent(window, cx);
+                        // A prompt given while it waited (a new task's): its delivery found no agent then.
+                        if let Some((text, send)) = t.agent.pending_prompt.take() {
+                            t.queue_prompt_to(Who::Main, text, send, window, cx);
+                        }
+                    }
+                });
+            })
+            .detach();
+            ReachedHere { daemon, port }
+        });
+        #[cfg(unix)]
+        let deferred = reached.is_some() && start_agent && launch.is_some();
+        #[cfg(not(unix))]
+        let deferred = false;
         if !remote {
             task_env.push(crate::browser::task_env(&root));
         }
+        // Its tickets, for the first agent and shell as for those started later (terminal_env).
+        task_env.extend(ticket_env(&links));
         let weak = cx.weak_entity();
         let changes = cx.new(|cx| ChangesView::new(root.clone(), weak.clone(), cx));
         let history = cx.new(|cx| HistoryView::new(root.clone(), weak, cx));
@@ -737,7 +818,7 @@ impl TaskView {
         // Not started (a question opened in a task not running): its tab
         // holds its place, first, until it is (`start_main_agent`).
         match &launch {
-            Some(launch) if start_agent => tabs.push(Self::make_agent_tab(&root, hook_socket.as_ref(), Who::Main, launch, task_env.clone(), window, cx)),
+            Some(launch) if start_agent && !deferred => tabs.push(Self::make_agent_tab(&root, hook_socket.as_ref(), Who::Main, launch, task_env.clone(), window, cx)),
             Some(launch) => tabs.push(TabItem { agent: Some(Who::Main), ..TabItem::new(launch.profile.name.clone(), TabKind::Asleep) }),
             _ => tabs.push(Self::make_terminal(&root, hook_socket.as_ref(), Term::Shell { title: "shell".into(), seq: 1 }, None, task_env.clone(), None, window, cx)),
         }
@@ -801,8 +882,10 @@ impl TaskView {
                 let picked = poll_base.lock().unwrap().clone();
                 let Ok((open, open_known)) = this.update(cx, |this, cx| this.open_files_known(cx)) else { break };
                 let Ok(light) = this.read_with(cx, |this, _| !this.visible) else { break };
+                // A remote project's main thread: when its team's file there was last changed.
+                let Ok(team_file) = this.read_with(cx, |this, _| (this.main_thread && crate::hosts::is_remote(&this.root)).then(|| this.root.join(crate::services::FILE))) else { break };
                 let watching = poll_watching.clone();
-                let (read, patch, branch, shared, staged, on_disk, now_seen, now_known) = cx
+                let (read, patch, branch, shared, staged, on_disk, now_seen, now_known, team_stamp) = cx
                     .background_spawn(async move {
                         let mut read = git::refresh(&root, picked, light, &mut known);
                         // Here, not on the UI thread: a call for every directory that came or went.
@@ -826,13 +909,26 @@ impl TaskView {
                             }
                             None => (None, None, false, None),
                         };
-                        (read, patch, branch, shared, staged, changed_on_disk(open_known), seen, known)
+                        // Made or gone counts as a change; a host that did not answer, as nothing seen.
+                        let team_stamp = team_file.and_then(|file| match crate::hostfs::stat(&file) {
+                            Ok(stat) => Some(Some(stat.modified)),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(None),
+                            Err(_) => None,
+                        });
+                        (read, patch, branch, shared, staged, changed_on_disk(open_known), seen, known, team_stamp)
                     })
                     .await;
                 let git::Refreshed { files, ignored, info, states, base, stashes, failed, .. } = read;
                 known = now_known;
                 seen = now_seen;
                 let applied = this.update_in(cx, |this, window, cx| {
+                    // Known before and changed since: read again (the first is read with the project).
+                    if team_stamp.is_some() && this.team_stamp.is_some() && this.team_stamp != team_stamp {
+                        cx.emit(TaskEvent::TeamFile);
+                    }
+                    if team_stamp.is_some() {
+                        this.team_stamp = team_stamp;
+                    }
                     for (file, change) in open.iter().zip(on_disk) {
                         if let Some(change) = change {
                             let _ = file.update(cx, |f, cx| f.apply_disk(change, window, cx));
@@ -894,6 +990,11 @@ impl TaskView {
         });
 
         let mut this = Self {
+            #[cfg(unix)]
+            _reached: reached,
+            cdp_reached: false,
+            team_stamp: None,
+            agent_waits_for_chrome: deferred,
             remote_texts: HashMap::new(),
             main_thread: false,
             kept_branches: Vec::new(),
@@ -910,7 +1011,7 @@ impl TaskView {
             changed_paths: Rc::default(),
             recent: Vec::new(),
             pr: None,
-            links: Vec::new(),
+            links,
             commit_key: None,
             viewed: BTreeMap::new(),
             bookmarks: BTreeMap::new(),
@@ -1013,7 +1114,7 @@ impl TaskView {
         let first = std::env::var("IDEAE_TAB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
         this.active[0] = this.tabs.get(first).or(this.tabs.first()).map(|t| t.id);
         this.sync_visibility(cx);
-        if start_agent {
+        if start_agent && !deferred {
             this.watch_activity(Who::Main, cx);
         }
         if remote {
@@ -1356,8 +1457,9 @@ impl TaskView {
     /// The task's ports, and where its browser is, for what runs in it.
     fn terminal_env(&self) -> Vec<(String, String)> {
         let mut env = crate::services::task_env(&self.services, self.port_slot);
-        // Its Chrome is on this machine: a terminal elsewhere has no way to it.
-        if !crate::hosts::is_remote(&self.root) {
+        // Its Chrome is on this machine: a terminal elsewhere has a way to it
+        // only once it is reached from there (Settings allow it).
+        if !crate::hosts::is_remote(&self.root) || self.cdp_reached {
             env.push(crate::browser::task_env(&self.root));
         }
         env.extend(ticket_env(&self.links));
@@ -1725,7 +1827,7 @@ impl TaskView {
     }
 
     /// Whether the keyboard is with the tab in front, for tests.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn front_tab_has_focus(&self, window: &Window, cx: &App) -> bool {
         match self.focused_ix().and_then(|ix| self.tabs.get(ix)).map(|t| &t.kind) {
             Some(TabKind::Terminal(view)) => view.read(cx).state.read(cx).focus_handle().is_focused(window),
@@ -3152,7 +3254,7 @@ mod open_file_scenario {
         assert_eq!(typed(cx).trim(), "DEV-1 First\n\nIts body", "Amend: the last message, not the key");
         cx.update_window(handle.into(), |_, window, cx| task.update(cx, |t, cx| t.toggle_amend(window, cx))).unwrap();
         assert_eq!(typed(cx), "DEV-1 ", "Amend off: the key again");
-        cx.update_window(handle.into(), |_, window, cx| window.remove_window()).unwrap();
+        cx.update_window(handle.into(), |_, window, _| window.remove_window()).unwrap();
         cx.run_until_parked();
         let _ = std::fs::remove_dir_all(&dir);
     }

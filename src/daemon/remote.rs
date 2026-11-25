@@ -4,6 +4,7 @@
 //! there, and the window dials again until it is back, its terminals
 //! attaching anew.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Stdio};
@@ -24,16 +25,50 @@ pub struct Remote {
     /// How often the daemon is asked whether it is there; three times this
     /// without a word, and the link is dropped and dialled again.
     pub ping: Duration,
+    /// Once put there ([`super::install::ensure`]): the ideae-server there
+    /// and the home folder there, for what runs it (an agent's host).
+    pub exe: Option<PathBuf>,
+    pub home: Option<PathBuf>,
+    /// A host reached through this one: as this one's ssh names it
+    /// (`-p 2222 me@mac`). It ssh's there with its own keys, config and
+    /// known hosts; nothing of here but this one's port need reach it.
+    pub hop: Option<Vec<String>>,
 }
 
 impl Remote {
     pub fn new(ssh: Vec<String>) -> Self {
-        Remote { ssh, ideae: "ideae".into(), ping: Duration::from_secs(5) }
+        Remote { ssh, ideae: "ideae".into(), ping: Duration::from_secs(5), exe: None, home: None, hop: None }
+    }
+
+    /// The host of a key ([`crate::hosts`]), through another one when it names two.
+    pub fn for_host(host: &str) -> Self {
+        let mut remote = Remote::new(crate::hosts::ssh_for(host));
+        remote.hop = crate::hosts::hop(host).1.map(crate::hosts::destination);
+        remote
     }
 
     /// The host, for messages.
-    pub fn name(&self) -> &str {
-        self.ssh.last().map_or("", String::as_str)
+    pub fn name(&self) -> String {
+        let first = self.ssh.last().map_or("", String::as_str);
+        match self.hop.as_ref().and_then(|h| h.last()) {
+            Some(then) => format!("{then} (through {first})"),
+            None => first.to_string(),
+        }
+    }
+
+    /// The host this one's ssh reaches, alone.
+    pub(super) fn first(&self) -> Remote {
+        Remote { hop: None, ..self.clone() }
+    }
+
+    /// What tells this one apart from another of the same first host.
+    fn label(&self) -> String {
+        let mut label = self.ssh.join(" ");
+        if let Some(hop) = &self.hop {
+            label.push_str(" > ");
+            label.push_str(&hop.join(" "));
+        }
+        label
     }
 }
 
@@ -50,6 +85,8 @@ pub struct Wire {
     up: AtomicBool,
     /// Where `ideae --hook` reports on that machine.
     socket: Mutex<Option<String>>,
+    /// Ports of here reached from there (`-R`): asked again of a master made anew.
+    reverses: Mutex<HashMap<u16, i64>>,
 }
 
 impl Wire {
@@ -81,6 +118,43 @@ impl Wire {
                 return;
             }
             std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Port `port` of here reached at the same port there (a task's Chrome,
+    /// for its agent there), now and after the link is made anew.
+    pub fn reach_here(&self, port: u16) -> Result<(), String> {
+        // Counted, and asked of ssh under the same lock: a task's view let go of
+        // while a new one of it takes the port again leaves the port reached;
+        // one let go of before its taking was done (below zero) leaves it not.
+        let mut reverses = self.reverses.lock().unwrap();
+        let holders = reverses.entry(port).or_insert(0);
+        *holders += 1;
+        match *holders {
+            1 => {
+                let made = reverse(&self.remote, port, "forward");
+                // Not reached: the next to ask tries again.
+                if made.is_err() {
+                    reverses.remove(&port);
+                }
+                made
+            }
+            0 => {
+                reverses.remove(&port);
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// No longer, once its last holder has gone.
+    pub fn release_here(&self, port: u16) {
+        let mut reverses = self.reverses.lock().unwrap();
+        let holders = reverses.entry(port).or_insert(0);
+        *holders -= 1;
+        if *holders == 0 {
+            reverses.remove(&port);
+            let _ = reverse(&self.remote, port, "cancel");
         }
     }
 
@@ -119,6 +193,7 @@ struct Dialled {
     sessions: Vec<String>,
     ping: bool,
     watches: bool,
+    opened: bool,
     socket: Option<String>,
 }
 
@@ -140,8 +215,9 @@ pub fn connect(remote: Remote, on_hook: impl Fn(Hook) + Send + Sync + 'static) -
         watches: AtomicBool::new(first.watches),
         up: AtomicBool::new(true),
         socket: Mutex::new(first.socket),
+        reverses: Mutex::default(),
     };
-    let daemon = Arc::new(Daemon::remote(wire, queued(first.writer), first.sessions));
+    let daemon = Arc::new(Daemon::remote(wire, queued(first.writer), first.sessions, first.opened));
     let reading = daemon.clone();
     let mut reader = first.reader;
     std::thread::Builder::new()
@@ -154,6 +230,7 @@ pub fn connect(remote: Remote, on_hook: impl Fn(Hook) + Send + Sync + 'static) -
                     reading.on_frame(frame, &on_hook);
                 }
                 wire.drop_link();
+                reading.link_lost();
                 reading.drop_calls();
                 if reading.quitting() {
                     return;
@@ -186,7 +263,19 @@ pub fn connect(remote: Remote, on_hook: impl Fn(Hook) + Send + Sync + 'static) -
                     wire.drop_link();
                     return;
                 }
-                reading.reopen();
+                reading.set_acks(next.opened);
+                reading.reopen(&next.sessions);
+                // A master made anew has none of the old one's forwards.
+                let reverses = wire.reverses.lock().unwrap();
+                for (&port, _) in reverses.iter().filter(|(_, held)| **held > 0) {
+                    let _ = reverse(&wire.remote, port, "forward");
+                }
+                drop(reverses);
+                // Beyond a first host, its own link may have been made anew, its forwards gone with it.
+                if wire.remote.hop.is_some() {
+                    let label = wire.remote.label();
+                    FORWARDS.lock().unwrap().get_or_insert_with(HashMap::new).retain(|(of, _), _| *of != label);
+                }
                 for hook in next.hooks {
                     on_hook(hook);
                 }
@@ -211,7 +300,7 @@ pub fn connect(remote: Remote, on_hook: impl Fn(Hook) + Send + Sync + 'static) -
                     if wire.heard.lock().unwrap().elapsed() > every * 3 {
                         wire.drop_link();
                     } else {
-                        daemon.send(proto::encode_msg(&Msg::Ping));
+                        daemon.ping();
                     }
                 }
                 drop(daemon);
@@ -317,10 +406,20 @@ fn dial(remote: &Remote) -> Result<Dialled, String> {
     });
     let fail = |child: &mut Child, what: &str| {
         greeted.store(true, Ordering::Relaxed);
+        // Ended by now when it was ssh that failed (its output closed with it).
+        let until = Instant::now() + Duration::from_millis(300);
+        let mut code = None;
+        while Instant::now() < until {
+            if let Ok(Some(status)) = child.try_wait() {
+                code = status.code();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let _ = child.kill();
         let _ = child.wait();
         let said = String::from_utf8_lossy(&said.lock().unwrap()).trim().to_string();
-        if said.is_empty() { what.to_string() } else { format!("{what}: {said}") }
+        ssh_said(code, if said.is_empty() { what.to_string() } else { format!("{what}: {said}") })
     };
 
     let mut reader = BufReader::new(stdout);
@@ -332,9 +431,9 @@ fn dial(remote: &Remote) -> Result<Dialled, String> {
         return Err(fail(&mut child, "the link closed"));
     }
     match proto::read_frame(&mut reader) {
-        Ok(Frame::Msg(Msg::Welcome { protocol, hooks, sessions, ping, socket, watches, .. })) if protocol == proto::PROTOCOL => {
+        Ok(Frame::Msg(Msg::Welcome { protocol, hooks, sessions, ping, socket, watches, opened, .. })) if protocol == proto::PROTOCOL => {
             greeted.store(true, Ordering::Relaxed);
-            Ok(Dialled { child, writer: Box::new(writer), reader: Box::new(reader), hooks, sessions, ping, socket, watches })
+            Ok(Dialled { child, writer: Box::new(writer), reader: Box::new(reader), hooks, sessions, ping, socket, watches, opened })
         }
         Ok(Frame::Msg(Msg::Welcome { protocol, .. })) => {
             Err(fail(&mut child, &format!("the daemon there speaks protocol {protocol}, this window {}", proto::PROTOCOL)))
@@ -355,7 +454,8 @@ pub fn run(remote: &Remote, line: &str, input: Option<&[u8]>) -> Result<String, 
     let out = child.wait_with_output().map_err(|e| format!("ssh: {e}"))?;
     if !out.status.success() {
         let said = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        return Err(if said.is_empty() { format!("ssh {} failed", remote.name()) } else { said });
+        let said = if said.is_empty() { format!("ssh {} failed", remote.name()) } else { said };
+        return Err(ssh_said(out.status.code(), said));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
@@ -363,8 +463,77 @@ pub fn run(remote: &Remote, line: &str, input: Option<&[u8]>) -> Result<String, 
 /// ssh to the host, running `line` in its shell there.
 pub(super) fn ssh(remote: &Remote, line: &str) -> Result<std::process::Command, String> {
     let mut command = ssh_to(remote)?;
-    command.arg("--").arg(line);
+    match &remote.hop {
+        Some(hop) => command.arg("--").arg(hop_line(hop, &[], Some(line))),
+        None => command.arg("--").arg(line),
+    };
     Ok(command)
+}
+
+/// What names this run's files on a first host: its process and when it
+/// began, as another machine's window could have the same process id.
+pub(super) fn run_token() -> &'static str {
+    static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TOKEN.get_or_init(|| {
+        let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros());
+        format!("{}x{:x}", std::process::id(), at % 0x1000_0000)
+    })
+}
+
+/// What ssh said, marked as ssh's own failure when it was (its 255),
+/// not a failure of a command it ran ([`crate::hosts::explain_ssh`]).
+fn ssh_said(code: Option<i32>, said: String) -> String {
+    if code == Some(255) { format!("{said}\n{}", crate::hosts::SSH_FAILED) } else { said }
+}
+
+fn quote(word: &str) -> String {
+    format!("'{}'", word.replace('\'', r"'\''"))
+}
+
+/// The line the first host runs to reach the one beyond it: its own ssh,
+/// asking nothing (no one is there to answer), with a master connection
+/// of its own that forwards are added to. `extra` before the host, then
+/// `line` for the host beyond.
+fn hop_line(hop: &[String], extra: &[&str], line: Option<&str>) -> String {
+    // This run's alone: Exit here ends no link of another window's through the same host.
+    let control = format!("ControlPath=~/.ssh/ideae-{}-%C", run_token());
+    let mut words: Vec<String> = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3", "-o", "ControlMaster=auto", "-o", &control, "-o", "ControlPersist=600", "-o", "StreamLocalBindUnlink=yes"]
+        .iter()
+        .map(|w| w.to_string())
+        .collect();
+    words.extend(extra.iter().map(|w| w.to_string()));
+    words.extend(hop.iter().cloned());
+    let mut ssh = words.iter().map(|w| quote(w)).collect::<Vec<_>>().join(" ");
+    if let Some(line) = line {
+        ssh.push_str(" -- ");
+        ssh.push_str(&quote(line));
+    }
+    // ssh's own failure (255), not the command's: told as the leg beyond failing.
+    format!("mkdir -p ~/.ssh; {ssh}; c=$?; [ $c -eq 255 ] && printf '\\n%s\\n' {} >&2; exit $c", quote(crate::hosts::BEYOND_FAILED))
+}
+
+/// What runs of the app that did not Exit (killed, the machine gone) left on
+/// a first host: the sockets of their forwards beyond it, once the link
+/// they were made on is gone (its ssh removes its control socket as it ends).
+pub(super) fn clear_first_host(remote: &Remote) {
+    const CLEAR: &str = r#"cd ~/.ssh 2>/dev/null || exit 0
+for s in ideae-*-*.sock; do
+  [ -e "$s" ] || continue
+  t=${s#ideae-}; t=${t%%-*}; live=
+  for m in ideae-"$t"-*; do
+    case $m in *.sock) ;; *) [ -S "$m" ] && live=1 ;; esac
+  done
+  [ -n "$live" ] || rm -f "$s"
+done"#;
+    if remote.hop.is_some() {
+        let _ = run(&remote.first(), CLEAR, None);
+    }
+}
+
+/// Runs `extra` (`-O forward …`) on the first host's master connection to
+/// the one beyond it.
+fn on_hop(remote: &Remote, hop: &[String], extra: &[&str]) -> Result<(), String> {
+    run(&remote.first(), &hop_line(hop, extra, None), None).map(|_| ())
 }
 
 /// ssh to the host, its options and the host given, no command yet. What
@@ -440,13 +609,88 @@ pub fn close_master(remote: &Remote) {
     }
 }
 
+/// Beyond a first host: the first host's sockets of this run's forwards
+/// beyond it, and its link beyond, ended through the link to it (so before
+/// [`close_master`] of any project through it), asking nothing, waited for
+/// a moment at most (this is a quit).
+pub fn close_beyond(remote: &Remote) {
+    if masters().is_none() {
+        return;
+    }
+    if let Some(hop) = &remote.hop {
+        let line = format!("rm -f ~/.ssh/ideae-{}-*.sock; {}", run_token(), hop_line(hop, &["-O", "exit"], None));
+        if let Ok(mut command) = ssh_with(&remote.first(), &["-o", "BatchMode=yes"]) {
+            if let Ok(mut child) = command.arg("--").arg(line).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+                let until = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < until && matches!(child.try_wait(), Ok(None)) {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+}
+
+/// Port `port` of here, reached at the same port on the host through ssh's
+/// master connection (`-R`).
+/// `how`: "forward", or "cancel" to end it.
+/// Beyond a first host, through a socket of this run's on it (its user's
+/// alone, as sshd makes it): no port of that host is taken, or reached by
+/// its other users.
+fn reverse(remote: &Remote, port: u16, how: &str) -> Result<(), String> {
+    masters().ok_or("no folder for ssh's master connections")?;
+    let (here, beyond) = match &remote.hop {
+        Some(_) => {
+            let socket = format!("{}/.ssh/ideae-{}-r{port}.sock", first_home(remote)?, run_token());
+            // A socket a link before left there takes the path (sshd leaves it): what of it is still asked is let go of first.
+            if how == "forward" {
+                let _ = ssh_with(remote, &["-O", "cancel", "-R", &format!("{socket}:127.0.0.1:{port}")]).and_then(|mut c| c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().map_err(|e| e.to_string()));
+                let _ = run(&remote.first(), &format!("rm -f '{socket}'"), None);
+            }
+            (format!("{socket}:127.0.0.1:{port}"), Some(format!("{port}:{socket}")))
+        }
+        None => (format!("{port}:127.0.0.1:{port}"), None),
+    };
+    let out = ssh_with(remote, &["-O", how, "-R", &here])?.stdin(Stdio::null()).output().map_err(|e| format!("ssh: {e}"))?;
+    if !out.status.success() {
+        return Err(ssh_said(Some(255), String::from_utf8_lossy(&out.stderr).trim().to_string()));
+    }
+    match (&remote.hop, beyond) {
+        (Some(hop), Some(beyond)) => {
+            let done = on_hop(remote, hop, &["-O", how, "-R", &beyond]);
+            if how == "cancel" {
+                let _ = run(&remote.first(), &format!("rm -f ~/.ssh/ideae-{}-r{port}.sock", run_token()), None);
+            }
+            done
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The home folder of a first host, asked once.
+fn first_home(remote: &Remote) -> Result<String, String> {
+    static HOMES: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+    let key = remote.first().label();
+    if let Some(home) = HOMES.lock().unwrap().get_or_insert_with(HashMap::new).get(&key) {
+        return Ok(home.clone());
+    }
+    let home = run(&remote.first(), r#"printf %s "$HOME""#, None)?;
+    if !home.starts_with('/') {
+        return Err(format!("{}: no home folder there", remote.first().name()));
+    }
+    HOMES.lock().unwrap().get_or_insert_with(HashMap::new).insert(key, home.clone());
+    Ok(home)
+}
+
 /// Port `there` of the host, reached here through ssh's master connection:
 /// at the same port when it is free here, else at one that is. Kept while
 /// it answers; forwarded again when the master was made anew.
+/// Ports of hosts forwarded here: by the host's label and the port there.
+static FORWARDS: Mutex<Option<HashMap<(String, u16), u16>>> = Mutex::new(None);
+
 pub fn forward(remote: &Remote, there: u16) -> Result<u16, String> {
-    use std::collections::HashMap;
-    static FORWARDS: Mutex<Option<HashMap<(String, u16), u16>>> = Mutex::new(None);
-    let key = (remote.ssh.join(" "), there);
+    let key = (remote.label(), there);
     let known = FORWARDS.lock().unwrap().get_or_insert_with(HashMap::new).get(&key).copied();
     if let Some(here) = known.filter(|here| std::net::TcpStream::connect(("127.0.0.1", *here)).is_ok()) {
         return Ok(here);
@@ -457,10 +701,24 @@ pub fn forward(remote: &Remote, there: u16) -> Result<u16, String> {
         .or_else(|| std::net::TcpListener::bind(("127.0.0.1", there)).ok().map(|_| there))
         .or_else(|| std::net::TcpListener::bind(("127.0.0.1", 0)).ok().and_then(|l| l.local_addr().ok()).map(|a| a.port()))
         .ok_or("no port free here")?;
-    let spec = format!("{here}:127.0.0.1:{there}");
+    // Beyond the first host: a socket of its own reaches the port there, and here reaches that socket.
+    let spec = match &remote.hop {
+        Some(hop) => {
+            let home = first_home(remote)?;
+            let socket = format!("{home}/.ssh/ideae-{}-{there}-{:08x}.sock", run_token(), {
+                use std::hash::{Hash as _, Hasher as _};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                hop.hash(&mut h);
+                h.finish() as u32
+            });
+            on_hop(remote, hop, &["-O", "forward", "-L", &format!("{socket}:127.0.0.1:{there}")])?;
+            format!("{here}:{socket}")
+        }
+        None => format!("{here}:127.0.0.1:{there}"),
+    };
     let out = ssh_with(remote, &["-O", "forward", "-L", &spec])?.stdin(Stdio::null()).output().map_err(|e| format!("ssh: {e}"))?;
     if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        return Err(ssh_said(Some(255), String::from_utf8_lossy(&out.stderr).trim().to_string()));
     }
     FORWARDS.lock().unwrap().get_or_insert_with(HashMap::new).insert(key, here);
     Ok(here)
@@ -507,6 +765,12 @@ mod tests {
 
     /// Text a pipe session printed, until `want` shows (with no `want`,
     /// until it is attached again) or time is up.
+    /// Once what was written to the daemon on `stream` is taken: a Ping after it answered.
+    fn settle(stream: &mut std::os::unix::net::UnixStream) {
+        proto::write_msg(stream, &Msg::Ping).unwrap();
+        while !matches!(proto::read_frame(stream), Ok(Frame::Msg(Msg::Pong)) | Err(_)) {}
+    }
+
     fn until(events: &async_channel::Receiver<PipeEvent>, want: &str, reattached: &mut bool) -> String {
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut got = String::new();
@@ -536,7 +800,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         // SAFETY: set before anything of the daemon reads it.
         unsafe { std::env::set_var("IDEAE_STATE", dir.join("state.json")) };
-        std::thread::spawn(|| crate::daemon::server::run(false));
+        let _daemon = crate::daemon::tests::start();
 
         // ssh to "box": a greeting, as a login shell may print, then the bridge.
         let ssh = dir.join("ssh");
@@ -544,7 +808,7 @@ mod tests {
         std::fs::write(
             &ssh,
             format!(
-                "#!/bin/sh\necho \"$*\" >> '{args}'\necho 'Welcome to box'\nexec env IDEAE_TEST_BRIDGE=1 '{exe}' --exact daemon::remote::tests::bridge_process --ignored --nocapture --test-threads=1\n",
+                "#!/bin/sh\ncase \" $* \" in *\" -O \"*) exit 0;; esac\necho \"$*\" >> '{args}'\necho 'Welcome to box'\nexec env IDEAE_TEST_BRIDGE=1 '{exe}' --exact daemon::remote::tests::bridge_process --ignored --nocapture --test-threads=1\n",
                 args = dir.join("args").display(),
                 exe = exe.display()
             ),
@@ -552,7 +816,7 @@ mod tests {
         .unwrap();
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let remote = Remote { ssh: vec![ssh.display().to_string(), "box".into()], ideae: "ideae".into(), ping: Duration::from_millis(300) };
+        let remote = Remote { ssh: vec![ssh.display().to_string(), "box".into()], ideae: "ideae".into(), ping: Duration::from_millis(300), exe: None, home: None, hop: None };
         let (daemon, _) = connect(remote, |_| {}).expect("connected");
         let args = std::fs::read_to_string(dir.join("args")).unwrap();
         assert!(args.contains("BatchMode=yes") && args.ends_with("box -- ideae --daemon --stdio\n"), "{args}");
@@ -575,11 +839,87 @@ mod tests {
         assert!(until(&events, "got:two", &mut reattached).contains("got:two"), "the session ran on");
 
         // Hangs: the bridge stops, the link stays open and says nothing.
+        // Meanwhile a session ends there: told so once the link is back, not run again.
+        let once = Spec { cwd: dir.clone(), env: Vec::new(), input: None, program: vec!["sh".into(), "-c".into(), "if [ -f once.log ]; then exec sleep 60; fi; echo up; while [ ! -f gate ]; do sleep 0.02; done; echo ran >> once.log".into()] };
+        let once_events = daemon.pipe("task#once".into(), once);
+        let mut once_back = false;
+        assert!(until(&once_events, "up", &mut once_back).contains("up"));
+        // One that finds what it was doing on its own (a chat's host) is started again instead.
+        let again = Spec { cwd: dir.clone(), env: Vec::new(), input: None, program: vec!["sh".into(), "-c".into(), "echo up; while [ ! -f gate ]; do sleep 0.02; done; echo ran >> again.log".into()] };
+        let again_events = daemon.pipe_again("task#again".into(), again);
+        assert!(until(&again_events, "up", &mut once_back).contains("up"));
+        let doomed = Spec { cwd: dir.clone(), env: Vec::new(), input: None, program: vec!["sh".into(), "-c".into(), "echo up; exec sleep 60".into()] };
+        let doomed_events = daemon.pipe("task#doomed".into(), doomed);
+        assert!(until(&doomed_events, "up", &mut once_back).contains("up"));
         reattached = false;
         let second = wire.pid().unwrap();
         unsafe { libc::kill(second, libc::SIGSTOP) };
+        // Those two end now, while the link is dead and before it is found to be.
+        std::fs::write(dir.join("gate"), "").unwrap();
+        // The link is dead and not yet known to be: what is opened and ended now is lost on the way.
+        let late = Spec { cwd: dir.clone(), env: Vec::new(), input: None, program: vec!["sh".into(), "-c".into(), "echo late-up; exec sleep 60".into()] };
+        let late_events = daemon.pipe("task#late".into(), late);
+        daemon.kill("task#doomed");
         let _ = until(&events, "", &mut reattached);
         assert!(reattached, "a link that went quiet was dropped and dialled again");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let ended = loop {
+            match once_events.try_recv() {
+                Ok(PipeEvent::Exited) => break true,
+                Ok(PipeEvent::Reattached) => break false,
+                _ if Instant::now() > deadline => break false,
+                _ => std::thread::sleep(Duration::from_millis(20)),
+            }
+        };
+        assert!(ended, "a session that ended while the link was down is told as ended");
+        // Opened on the dead link: opened on the new one, not taken as ended.
+        let mut late_back = false;
+        assert!(until(&late_events, "late-up", &mut late_back).contains("late-up"), "a session opened as the link died runs");
+        daemon.kill("task#late");
+
+        // Ended here with the link up: its Kill is taken (a Pong says so), and not sent
+        // again later, when another machine's window may run a session of that name.
+        let shared = Spec { cwd: dir.clone(), env: Vec::new(), input: None, program: vec!["sh".into(), "-c".into(), "echo up; exec sleep 60".into()] };
+        let shared_events = daemon.pipe("task#shared".into(), shared.clone());
+        assert!(until(&shared_events, "up", &mut once_back).contains("up"));
+        daemon.kill("task#shared");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while daemon.kills_unconfirmed() > 0 {
+            assert!(Instant::now() < deadline, "the Kill taken, as a Pong says");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let mut other = std::os::unix::net::UnixStream::connect(proto::socket_path()).unwrap();
+        proto::write_msg(&mut other, &Msg::Hello { protocol: proto::PROTOCOL, version: crate::build_watch::build_id() }).unwrap();
+        assert!(matches!(proto::read_frame(&mut other), Ok(Frame::Msg(Msg::Welcome { .. }))));
+        let size = proto::Size { cols: 80, rows: 24, cell_w: 8, cell_h: 16 };
+        proto::write_msg(&mut other, &Msg::Open { id: "task#shared".into(), spec: shared, size }).unwrap();
+        while !matches!(proto::read_frame(&mut other), Ok(Frame::Msg(Msg::Opened { .. }))) {}
+        reattached = false;
+        let third = wire.pid().unwrap();
+        unsafe { libc::kill(third, libc::SIGKILL) };
+        let _ = until(&events, "", &mut reattached);
+        assert!(reattached);
+        // What the window sent as the link came back (an Open, a Kill) is taken once a call
+        // after it is answered: the daemon takes a window's messages in order.
+        daemon.call(&proto::Call::Listening { task: "none".into() }, b"").unwrap();
+        let mut look = std::os::unix::net::UnixStream::connect(proto::socket_path()).unwrap();
+        proto::write_msg(&mut look, &Msg::Hello { protocol: proto::PROTOCOL, version: crate::build_watch::build_id() }).unwrap();
+        let Ok(Frame::Msg(Msg::Welcome { sessions: now, .. })) = proto::read_frame(&mut look) else { panic!("no welcome") };
+        assert!(now.iter().any(|s| s == "task#shared"), "another window's session of that name runs on: {now:?}");
+        // Started again, it would run on (its log there): not among them.
+        assert!(!now.iter().any(|s| s == "task#once"), "an ended session is not started again: {now:?}");
+        assert_eq!(std::fs::read_to_string(dir.join("once.log")).unwrap(), "ran\n");
+        proto::write_msg(&mut other, &Msg::Kill { id: "task#shared".into() }).unwrap();
+        settle(&mut other);
+        let mut again_back = false;
+        let _ = until(&again_events, "", &mut again_back);
+        assert!(again_back, "one to start again is told it is attached again");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while std::fs::read_to_string(dir.join("again.log")).unwrap_or_default() != "ran\nran\n" {
+            assert!(Instant::now() < deadline, "and runs again");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        daemon.kill("task#again");
         daemon.write(&id, b"three\n");
         assert!(until(&events, "got:three", &mut reattached).contains("got:three"));
 
@@ -589,11 +929,25 @@ mod tests {
         proto::write_msg(&mut stream, &Msg::Hello { protocol: proto::PROTOCOL, version: crate::build_watch::build_id() }).unwrap();
         let Ok(Frame::Msg(Msg::Welcome { sessions, ping, .. })) = proto::read_frame(&mut stream) else { panic!("no welcome") };
         assert!(ping);
-        assert_eq!(sessions, [id.clone()]);
+        assert_eq!(sessions, [id.clone()], "the one ended as the link died ended there too");
         proto::write_msg(&mut stream, &Msg::Kill { id }).unwrap();
-        std::thread::sleep(Duration::from_millis(200));
+        settle(&mut stream);
+        // Shut down while its socket is there to be asked on.
+        drop(_daemon);
         let _ = std::fs::remove_file(proto::socket_path());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The first host's own ssh failing to reach the next is told apart
+    /// from the command failing there: run here, against no such machine.
+    #[test]
+    fn a_failure_beyond_the_first_host_is_marked() {
+        let line = hop_line(&["-o".into(), "ConnectTimeout=2".into(), "no-such-machine.invalid".into()], &[], Some("true"));
+        let out = std::process::Command::new("sh").arg("-c").arg(&line).output().unwrap();
+        assert_eq!(out.status.code(), Some(255));
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert!(said.contains(crate::hosts::BEYOND_FAILED), "{said}");
+        assert!(crate::hosts::explain_ssh("hub>no-such-machine.invalid", &said).starts_with("no machine named no-such-machine.invalid is known"), "{}", crate::hosts::explain_ssh("hub>no-such-machine.invalid", &said));
     }
 
     #[test]

@@ -210,6 +210,12 @@ fn task_key(root: &Path) -> String {
     format!("{}\0{}", crate::state::state_dir().display(), root.display())
 }
 
+/// The task's DevTools port, for an agent of it on another machine.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub fn cdp_port(root: &Path) -> u16 {
+    task_port(root)
+}
+
 /// The task's DevTools port: below the ephemeral range, where the system
 /// gives no program one of its own choosing.
 fn task_port(root: &Path) -> u16 {
@@ -2006,11 +2012,16 @@ impl BrowserView {
             return self.go(url);
         }
         let (root, asked) = (root.clone(), url.to_string());
+        let host = crate::hosts::split(&root).map(|(host, _)| host).unwrap_or_default();
         cx.spawn(async move |this, cx| {
             let reached = cx.background_spawn(async move { crate::hostfs::reach(&root, &asked) }).await;
-            let _ = this.update(cx, |page, _| match reached {
+            let _ = this.update(cx, |page, cx| match reached {
                 Ok(url) => page.go(&url),
-                Err(e) => eprintln!("not reached through ssh: {e}"),
+                // Said on the page, where the address was typed.
+                Err(e) => {
+                    page.error = Some(format!("Not reached through ssh on {}: {}", crate::hosts::label(&host), crate::hosts::explain_ssh(&host, &e)));
+                    cx.notify();
+                }
             });
         })
         .detach();

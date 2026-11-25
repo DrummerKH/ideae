@@ -2,29 +2,17 @@
 //! a terminal ends its session on a background thread, which a quitting app
 //! does not wait for.
 
-use std::{
-    ffi::OsStr,
-    path::PathBuf,
-    process::{Child, Command},
-};
+#[cfg(unix)]
+use std::process::Command;
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
-/// A command for a helper program (git, gh, curl…). On Windows it opens no
-/// console window, and a bare name is looked up on PATH with its extension,
-/// so `npm` finds `npm.cmd`, which `Command` alone does not.
-pub fn command(program: impl AsRef<OsStr>) -> Command {
+pub use ideae_core::procs::{command, spawn_tied, which};
+
+/// What ideae-core asks of the app: the job its children go in on Windows.
+pub fn tie_children() {
     #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt as _;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let program = program.as_ref();
-        let mut command = Command::new(which(program).map_or_else(|| program.to_os_string(), PathBuf::into_os_string));
-        command.creation_flags(CREATE_NO_WINDOW);
-        command
-    }
-    #[cfg(not(windows))]
-    Command::new(program)
+    let _ = ideae_core::procs::TIE.set(win::tie);
 }
 
 /// Runs `job` on a thread of its own and gives what it returns. For what
@@ -39,40 +27,6 @@ pub fn on_thread<T: Send + 'static>(job: impl FnOnce() -> T + Send + 'static) ->
     async move { rx.recv().await.expect("the job's thread ended without a result") }
 }
 
-/// Where `program` is on PATH; with an extension from PATHEXT on Windows.
-pub fn which(program: impl AsRef<OsStr>) -> Option<PathBuf> {
-    let program = std::path::Path::new(program.as_ref());
-    if program.components().count() > 1 {
-        return program.is_file().then(|| program.to_path_buf());
-    }
-    let path = std::env::var_os("PATH")?;
-    #[cfg(windows)]
-    let extensions: Vec<String> = {
-        let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
-        std::iter::once(String::new()).chain(pathext.split(';').filter(|e| !e.is_empty()).map(str::to_lowercase)).collect()
-    };
-    std::env::split_paths(&path).find_map(|dir| {
-        #[cfg(windows)]
-        {
-            extensions.iter().find_map(|ext| {
-                let mut name = program.as_os_str().to_os_string();
-                name.push(ext);
-                let candidate = dir.join(name);
-                // A bare name with no extension is no Windows executable (npm's sh script).
-                (!ext.is_empty() || program.extension().is_some()).then_some(())?;
-                candidate.is_file().then_some(candidate)
-            })
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let candidate = dir.join(program);
-            std::fs::metadata(&candidate)
-                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-                .then_some(candidate)
-        }
-    })
-}
 
 /// Started from the Dock or a launcher, the app has the session's bare
 /// environment: none of what the user's shell profile sets (PATH with go,
@@ -159,57 +113,6 @@ mod shell_env_tests {
         let expected = [("PATH", "/opt/bin:/usr/bin:/bin"), ("ANDROID_HOME", "/sdk"), ("MULTI", "a\nb")];
         assert_eq!(changes, expected.map(|(n, v)| (n.to_string(), v.to_string())));
         assert!(super::shell_env_changes("no marks", "MARK", current).is_empty());
-    }
-}
-
-/// Starts a program that must not outlive the app, even when the app is
-/// killed: a language server, the headless browser.
-pub fn spawn_tied(command: &mut Command) -> std::io::Result<Child> {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::process::CommandExt as _;
-        // SAFETY: prctl only sets a flag of the child.
-        unsafe {
-            command.pre_exec(|| {
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
-                Ok(())
-            });
-        }
-        // The signal comes when the thread that started the child ends, not
-        // the app: started from a page's or a picture's thread, Chrome died
-        // with it. A thread that lasts as long as the app starts them all.
-        struct Job(*mut Command, std::sync::mpsc::Sender<std::io::Result<Child>>);
-        // SAFETY: the command is used only while its owner waits for the reply.
-        unsafe impl Send for Job {}
-        static SPAWNER: std::sync::OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<Job>>> = std::sync::OnceLock::new();
-        let spawner = SPAWNER.get_or_init(|| {
-            let (tx, rx) = std::sync::mpsc::channel::<Job>();
-            std::thread::Builder::new()
-                .name("spawner".into())
-                .spawn(move || {
-                    for Job(command, reply) in rx {
-                        // SAFETY: see `Job`.
-                        let _ = reply.send(unsafe { (*command).spawn() });
-                    }
-                })
-                .expect("spawn the spawner thread");
-            std::sync::Mutex::new(tx)
-        });
-        let (reply, child) = std::sync::mpsc::channel();
-        spawner.lock().unwrap_or_else(|e| e.into_inner()).send(Job(command, reply)).map_err(|_| std::io::Error::other("the spawner thread ended"))?;
-        child.recv().map_err(std::io::Error::other)?
-    }
-    // macOS has no parent-death signal: these end with their task or on
-    // quit, not when the app is killed.
-    #[cfg(all(unix, not(target_os = "linux")))]
-    {
-        command.spawn()
-    }
-    #[cfg(windows)]
-    {
-        let child = command.spawn()?;
-        win::tie(&child);
-        Ok(child)
     }
 }
 
@@ -703,9 +606,12 @@ mod stray_tests {
     /// another app's, and left alone.
     fn agent(task: &str, socket: &str) -> Child {
         let stand_in = std::env::temp_dir().join(format!("stray-agent-{}", std::process::id()));
-        // A link of its own, or a copy: a symlink keeps the program's name.
+        // A copy (a clone on APFS: no time, no room), not a link: a symlink
+        // keeps the program's name, and a hard link is the build's own file,
+        // whose start waits on whatever watches the build's folder (seen at
+        // half a minute on a Mac, with every process the tests started after it).
         let this = std::env::current_exe().unwrap();
-        if !stand_in.exists() && std::fs::hard_link(&this, &stand_in).is_err() {
+        if !stand_in.exists() {
             std::fs::copy(&this, &stand_in).unwrap();
         }
         Command::new(stand_in)

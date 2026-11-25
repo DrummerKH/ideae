@@ -122,6 +122,18 @@ pub fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     }
 }
 
+/// Removes the file at `path`; one not there is no error.
+pub fn remove(path: &Path) -> io::Result<()> {
+    if let Some((host, there)) = crate::hosts::split(path) {
+        let out = run(&crate::hosts::join(&host, Path::new("/")), "rm", &["-f", &there.to_string_lossy()], &[], None)?;
+        return if out.success() { Ok(()) } else { Err(io::Error::other(out.stderr)) };
+    }
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        done => done,
+    }
+}
+
 pub fn stat(path: &Path) -> io::Result<Stat> {
     match remote(path) {
         #[cfg(unix)]

@@ -72,14 +72,14 @@ src/integrations/  trackers and code hosts, set up as layered entries: `Tracker`
   http.rs read.rs  a tracker's API with your token (ureq, a stand-in server in the tests); a ticket read: Jira Cloud/DC, Linear, YouTrack
   secret_store.rs  tokens by host and account in the keyring, asked on first use; sealed here where there is none
 src/archive.rs     an archived task's .tar.gz (task.json, sessions, unpushed bundle, patch): write, list, restore, clean up
-src/acp/           agents that speak ACP, shown as a chat (docs/agents.md)
-  host.rs          the host process (`ideae --acp-host`): speaks ACP with the agent, keeps the thread and its journal, answers its file reads and writes
-  link.rs wire.rs  the window's end of a host (in the daemon, or a thread), and the messages between them
-  thread.rs        the conversation and its ops, the same on both sides
-  checkpoint.rs    the files before a prompt as a git tree, put back on request
-  policy.rs        who answers an agent's permission questions: you, the app's rules, or nobody
-  terminal.rs      commands an agent runs through the app (`terminal/*`)
+src/acp/           agents that speak ACP, shown as a chat (docs/agents.md); their host is ideae-core's (core/src/acp), re-exported here
+  link.rs          the window's end of a host (in the daemon, here or on a remote task's host, or a thread), paths keyed each way for a remote one
+  spend.rs         what agents cost today, against a profile's daily limit
   fake.rs          a stand-in agent for the tests: the test binary run again
+core/src/acp/      the host process (`ideae --acp-host`, `ideae-server --acp-host` on another machine): speaks ACP with the agent, keeps the
+                   thread and its journal (carried over from a name of before), answers its file reads and writes; wire.rs the messages
+                   with the window, thread.rs the conversation, checkpoint.rs the files before a prompt as a git tree, policy.rs who answers
+                   its permission questions, terminal.rs commands it runs through the app (`terminal/*`)
 src/mcp.rs         ideae as an MCP server for a chat agent (`ideae --mcp`): its task's open files, problems, check; asked of the window with a worktree's token
 src/db/            databases, no UI: connections (connections.json), passwords in the system's keyring, bastions shared by connections, a tunnel by the system's ssh, a session on its own thread (docs/databases.md)
   backend.rs       what a session asks of a server; mysql_backend.rs postgres_backend.rs redis_backend.rs
@@ -110,7 +110,9 @@ src/daemon/        the window's side of daemons (`ideae --daemon`, unix): this m
 core/              ideae-core, no gpui: the daemon itself (daemon/: server, pipes, bridge for `--daemon --stdio`, calls: a program run, a file read or written
                    for a window elsewhere), hook reports (`--hook`), what an agent said, paths. `ideae-server` is built from it alone for servers
                    (scripts/server.sh: static Linux x86_64/aarch64, macOS); a window of another build makes the daemon hand its ptys to a new one (SCM_RIGHTS)
-src/hosts.rs       projects on another machine: their key `ssh:/<host>/<path there>`, never a path here; ssh_for (IDEAE_SSH)
+src/hosts.rs       projects on another machine: their key `ssh:/<host>/<path there>` (`hub>mac` for one reached through another), never a
+                   path here; ssh_for (IDEAE_SSH); what ssh said, told in words (explain_ssh)
+src/askpass.rs     what ssh asks (a password, a passphrase, a host not met), asked in the window: ideae run as ssh's SSH_ASKPASS
 src/hostfs.rs      a task's programs and files there or here by its path: git, reads and writes of a remote task go through it
 src/workspace/hosts_ui.rs  a remote project: added (checked there), its host connected before its tasks open, a task's worktree made there
 src/deep_link.rs   `ideae ticket KEY` and `ideae://ticket/KEY`: handed to the running window (a socket per state), or taken at start
@@ -125,7 +127,7 @@ vendor/            patched gpui-component, gpui-base, gpui-cn, gpui-fast-linux, 
                    cn-pty: gpui-cn's pty, shell setup and process table without a window (gpui-cn re-exports it), for the daemon
 assets/side-icons/ the marks of the side's strip (Lucide's drawings, served by `task::Assets` over the kit's)
 assets/icon/       the app icon: ideae.svg, and the .icns and .ico made from it by scripts/icons.py
-scripts/           Xvfb driver for UI checks, wayland.sh (the same in a headless GNOME Shell), check.sh (the tests to run before a push), icons.py, macos-app.sh (a .app around a binary)
+scripts/           Xvfb driver for UI checks, wayland.sh (the same in a headless GNOME Shell), check.sh (the tests to run before a push), remote-live.sh (projects on another machine against real sshd, in Docker), icons.py, macos-app.sh (a .app around a binary)
 ```
 
 ## Build and test
@@ -142,12 +144,12 @@ scripts/           Xvfb driver for UI checks, wayland.sh (the same in a headless
 - So has archiving and restoring: `cargo test -- --ignored an_archived_task` after changing either.
 - And chat agents (ACP): `cargo build && cargo test -- --ignored an_acp_agent` after changing the host, the chat's link or the daemon's pipes (a stand-in agent, the real daemon, an upgrade of it).
 - And the daemon's terminals: `cargo test -- --ignored a_window_that_does_not_read` after changing how output goes from a session to a window (it floods one that reads nothing).
-- And projects on another machine: `cargo build && cargo test -- --ignored a_remote_daemon a_remote_project` after changing the bridge, the remote link, calls, hostfs or hosts_ui (a stand-in ssh to this machine, ideae-server from target/debug). Against a real host: `scripts/server.sh && IDEAE_LIVE_REMOTE="ssh -i key -p 2222 me@host" cargo test -- --ignored a_real_server`.
+- And projects on another machine: `cargo build && cargo test -- --ignored a_remote_daemon a_remote_project` after changing the bridge, the remote link, calls, hostfs or hosts_ui (a stand-in ssh to this machine, ideae-server from target/debug). Against real sshd: `scripts/remote-live.sh` (Docker: two throwaway containers, each reached directly and one through the other, a password asked once; `IDEAE_LIVE_PLATFORM=linux/amd64` for the other architecture) after changing the remote link, ssh's master connections, forwards or the install. Against a host of your own: `scripts/server.sh && IDEAE_LIVE_REMOTE="ssh -i key -p 2222 me@host" cargo test -- --ignored a_real_server`.
 - And a project's setup, check and teardown: `cargo test -- --ignored a_task_is_set_up_checked_and_torn_down` after changing them.
 - And Web tabs (needs Chrome): `cargo test -- --ignored a_page_tells_the_tab a_task_s_browser_wakes_when_called` after changing browser.rs: a page's dialog, select, pickers, cursor, errors, title, user agent, DevTools and the pages it opens; a task's Chrome started again by a call at its port.
 - And tasks sharing a language server: `cargo test -- --ignored two_tasks_share_one_rust_analyzer` after changing lsp_share.rs or how a task holds its servers; `an_agent_asks_the_language_server` after changing the MCP server's code questions (tell.rs). Both need rust-analyzer.
 - And databases: `cargo test -- --ignored a_sql_file_runs` after changing `src/db` (a stand-in MySQL and ssh). Against real servers: `a_real_` with `IDEAE_LIVE_SSH_PORT`, `IDEAE_LIVE_SSH_KEY`, `IDEAE_LIVE_SSH_PROGRAM` (see `src/db/live.rs`).
-- `scripts/check.sh` runs all of these and the Windows check: before every push, and again after merging main. A new end-to-end test goes into it; none of them waits on real time except for a timeout it is about, and together they stay under a minute.
+- `scripts/check.sh` runs all of these and the Windows check: before every push, and again after merging main. A new end-to-end test goes into it; none of them waits on real time except for a timeout it is about, and together they stay under two minutes (an agent runs it before every push).
 - UI can be tested without a display: `#[gpui_kit::test]` with `gpui_kit::test` (find, click, scroll by element id; mark elements with `.test_support()`), as `settings_ui.rs` does.
 - A debug build is the separate app `ideae-dev`: own state, sockets, window class, launcher. Keep that split for anything new that has an identity on the system.
 

@@ -4,35 +4,119 @@
 //! talks with the host ([`wire`]) through the daemon, or runs it on a thread
 //! when there is none ([`link`]).
 
-pub mod checkpoint;
-pub mod host;
+pub use ideae_core::acp::{checkpoint, host, policy, thread, wire};
 pub mod link;
-pub mod policy;
 pub mod spend;
-pub mod terminal;
-pub mod thread;
-pub mod wire;
 
-/// Where a task's conversation is kept, next to the app's state.
+/// Where a task's conversation is kept, next to the app's state; a
+/// remote task's on its host ([`crate::hosts`]), where its agent's host
+/// keeps it, in the home there.
 pub fn journal_path(root: &std::path::Path) -> std::path::PathBuf {
+    use sha2::Digest as _;
+    // A hash that stays: the name is found again by every later build.
+    let hash: String = sha2::Sha256::digest(root.as_os_str().as_encoded_bytes()).iter().take(8).map(|b| format!("{b:02x}")).collect();
+    placed(root, format!("{}-{hash}.jsonl", folder_name(root)))
+}
+
+/// The name it had before ([`journal_path`] took std's hasher, which a
+/// newer Rust may change): its host moves it ([`HostSpec::journal_before`]).
+pub fn journal_before(root: &std::path::Path) -> std::path::PathBuf {
     use std::hash::{Hash as _, Hasher as _};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     root.hash(&mut h);
-    let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    crate::state::state_dir().join("acp").join(format!("{name}-{:016x}.jsonl", h.finish()))
+    placed(root, format!("{}-{:016x}.jsonl", folder_name(root), h.finish()))
 }
 
-/// The conversation of one of a task's agents: a question's beside the
-/// task's own.
-pub fn journal_of(root: &std::path::Path, tag: Option<&str>) -> std::path::PathBuf {
-    let journal = journal_path(root);
+fn folder_name(root: &std::path::Path) -> String {
+    root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+fn placed(root: &std::path::Path, file: String) -> std::path::PathBuf {
+    if let Some((host, _)) = crate::hosts::split(root) {
+        return crate::hosts::join(&host, &journals_there(root).join(file));
+    }
+    crate::state::state_dir().join("acp").join(file)
+}
+
+/// The conversation of one of a task's agents as it is found: under its
+/// name, else under the one before. Not for the UI thread (it looks, there
+/// for a remote task).
+pub fn journal_found(root: &std::path::Path, tag: Option<&str>) -> std::path::PathBuf {
+    let now = journal_of(root, tag);
+    let before = tagged(journal_before(root), tag);
+    let is_file = |p: &std::path::Path| crate::hostfs::stat(p).is_ok_and(|s| s.file);
+    if !is_file(&now) && is_file(&before) { before } else { now }
+}
+
+/// Every file a task's conversation may have (journal and logs, under
+/// either name), and its checkpoints' thread names: what goes with it.
+pub fn journal_files(root: &std::path::Path) -> (Vec<std::path::PathBuf>, Vec<String>) {
+    let mut files = Vec::new();
+    let mut threads = Vec::new();
+    for journal in [journal_path(root), journal_before(root)] {
+        let log = host::log_path(&journal);
+        threads.push(checkpoint::thread_name(Some(&journal)));
+        files.extend([log.with_extension("log.old"), log, journal]);
+    }
+    (files, threads)
+}
+
+/// Forgets a thread's checkpoints in `repo`, on its host for a remote one.
+pub fn forget_checkpoints(repo: &std::path::Path, thread: &str) {
+    if crate::hosts::is_remote(repo) {
+        let line = r#"git for-each-ref --format='delete %(refname)' "refs/ideae/checkpoints/$1/" | git update-ref --stdin"#;
+        let _ = crate::hostfs::run(repo, "sh", &["-c", line, "sh", thread], &[], None);
+        return;
+    }
+    checkpoint::forget(repo, thread);
+}
+
+fn tagged(journal: std::path::PathBuf, tag: Option<&str>) -> std::path::PathBuf {
     match tag {
         Some(tag) => journal.with_extension(format!("{tag}.jsonl")),
         None => journal,
     }
 }
+
+/// The folder of a remote task's conversations on its host. Its home
+/// there is known once its host is connected, as it is wherever an agent
+/// runs; before, a folder that is no one's, where nothing is found.
+fn journals_there(root: &std::path::Path) -> std::path::PathBuf {
+    #[cfg(unix)]
+    let home = crate::daemon::client::for_path(root).and_then(|d| d.there()).map(|(_, home)| home);
+    #[cfg(not(unix))]
+    let home: Option<std::path::PathBuf> = {
+        let _ = root;
+        None
+    };
+    home.unwrap_or_else(|| "/nonexistent".into()).join(".local/share").join(crate::state::APP_ID).join("acp")
+}
+
+/// The conversation of one of a task's agents: a question's beside the
+/// task's own.
+pub fn journal_of(root: &std::path::Path, tag: Option<&str>) -> std::path::PathBuf {
+    tagged(journal_path(root), tag)
+}
+
+/// The same under the name before.
+pub fn journal_of_before(root: &std::path::Path, tag: Option<&str>) -> std::path::PathBuf {
+    tagged(journal_before(root), tag)
+}
 #[cfg(test)]
 pub mod fake;
+
+#[cfg(test)]
+mod name_tests {
+    /// The name a task's conversation is found by is the same for every build: a fixed hash.
+    #[test]
+    fn a_journal_s_name_stays_from_build_to_build() {
+        let root = std::path::Path::new("/home/me/proj.worktrees/fix-login");
+        let name = super::journal_path(root).file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(name, "fix-login-475fa1d3edf0771a.jsonl");
+        assert_ne!(super::journal_before(root).file_name(), super::journal_path(root).file_name());
+        assert_eq!(super::journal_of(root, Some("q-1")).file_name().unwrap().to_string_lossy(), "fix-login-475fa1d3edf0771a.q-1.jsonl");
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -548,7 +632,7 @@ mod tests {
         std::fs::write(dir.join("f.txt"), "one\n").unwrap();
         // SAFETY: set before anything of the daemon reads it.
         unsafe { std::env::set_var("IDEAE_STATE", dir.join("state.json")) };
-        std::thread::spawn(|| crate::daemon::server::run(false));
+        let _daemon = crate::daemon::tests::start();
         let path = proto::socket_path();
         let spec = HostSpec {
             command: super::fake::command(),
@@ -629,6 +713,8 @@ mod tests {
         proto::write_msg(&mut check, &Msg::Hello { protocol: proto::PROTOCOL, version: crate::build_watch::build_id() }).unwrap();
         let Ok(Frame::Msg(Msg::Welcome { sessions, .. })) = proto::read_frame(&mut check) else { panic!("no welcome") };
         assert!(sessions.is_empty(), "the host ended with its session: {sessions:?}");
+        // Shut down while its socket is there to be asked on.
+        drop(_daemon);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(&dir);
     }

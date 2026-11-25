@@ -412,7 +412,7 @@ impl ChatView {
         self.input.read(cx).focus_handle(cx)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn is_focused(&self, window: &Window, cx: &App) -> bool {
         self.input.read(cx).focus_handle(cx).is_focused(window)
     }
@@ -801,7 +801,7 @@ impl ChatView {
         cx.spawn_in(window, async move |_, cx| {
             let there = cx.background_spawn({
                 let path = path.clone();
-                async move { path.is_file() }
+                async move { crate::hostfs::stat(&path).is_ok_and(|s| s.file) }
             })
             .await;
             let _ = cx.update(|window, cx| {

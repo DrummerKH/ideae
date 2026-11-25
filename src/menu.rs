@@ -1088,6 +1088,7 @@ mod bar {
 
     use gpui_kit::component::menu::AppMenuBar;
     use gpui_kit::test::{TestEventExt as _, TestQueryExt as _, TestWindowExt as _};
+    #[cfg_attr(not(unix), allow(unused_imports))]
     use gpui_kit::{
         AppContext as _, Bounds, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement, KeyBinding, Menu, Modifiers, MouseButton, ParentElement as _,
         Point, Render, Styled as _, TestAppContext, Window, WindowBounds, WindowOptions, div, px, size,

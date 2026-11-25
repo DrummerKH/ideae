@@ -248,7 +248,7 @@ impl InHand {
             StartServices => self.open && (!self.services || self.services_waiting),
             StopServices => self.services_running,
             CompareThisFile => self.file,
-            CompareWithBranch => self.open && !self.remote,
+            CompareWithBranch => self.open,
             NewTerminal | NewBrowserTab | Pause => self.open,
         }
     }

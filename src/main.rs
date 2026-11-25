@@ -619,6 +619,8 @@ fn main() {
     let argv: Vec<String> = std::env::args().collect();
     // Before the file can change under a running process.
     let _ = build_watch::build_id();
+    procs::tie_children();
+    let _ = acp::host::NOTIFY.set(desktop::notify);
     #[cfg(unix)]
     if argv.get(1).map(String::as_str) == Some("--daemon") {
         if argv.get(2).map(String::as_str) == Some("--stdio") {

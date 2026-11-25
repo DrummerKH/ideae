@@ -228,18 +228,19 @@ impl Workspace {
                     }
                 };
                 let fresh = view.read(cx).agent.launch.as_ref() != Some(&launch);
-                view.update(cx, |t, cx| {
-                    if fresh {
-                        t.switch_agent(launch, window, cx);
-                    }
-                    match resume.is_some() {
-                        // Its own session: it knows; a chat that cannot load it is told.
-                        true => t.otherwise_tell(text, cx),
-                        false => t.queue_prompt(text, true, window, cx),
-                    }
+                // Told once it is there: a new agent starts after the old one's conversation is gone.
+                let resumed = resume.is_some();
+                let tell: crate::task::Then = Box::new(move |t, window, cx| match resumed {
+                    // Its own session: it knows; a chat that cannot load it is told.
+                    true => t.otherwise_tell(text, cx),
+                    false => t.queue_prompt(text, true, window, cx),
+                });
+                view.update(cx, |t, cx| match fresh {
+                    true => t.switch_agent(launch, tell, window, cx),
+                    false => tell(t, window, cx),
                 });
                 this.switch(&root, window, cx);
-                let how = if resume.is_some() { " in the same session" } else { "" };
+                let how = if resumed { " in the same session" } else { "" };
                 window.push_notification(Notification::info(format!("{} carries the task on{how}.", profile.name)), cx);
                 cx.notify();
             });
@@ -250,7 +251,9 @@ impl Workspace {
 
 #[cfg(test)]
 mod tests {
+    #[cfg_attr(not(unix), allow(unused_imports))]
     use super::Workspace;
+    #[cfg_attr(not(unix), allow(unused_imports))]
     use crate::state::{ProjectState, State};
     #[test]
     fn the_next_agent_is_told_where_the_work_stands() {
@@ -298,7 +301,9 @@ mod tests {
         // Claude Code's stand-in: how it was started, then it waits.
         let claude = script("claude", "echo \"$@\" > \"$PWD/.claude-args\"\nexec sleep 60");
         // Another agent: its account, then a few lines of work, the bell, and what it is told.
-        let other = script("other", "echo \"$OTHER_ACCOUNT\" > \"$PWD/.other-env\"\nfor i in 1 2 3 4 5 6; do echo working $i; sleep 0.5; done\nprintf 'done\\a\\n'\nexec cat > \"$PWD/.other-told\"");
+        // It writes till the test lets it finish (a file), then rings: done at the bell, not after a quiet while.
+        let finish = dir.join("finish");
+        let other = script("other", &format!("echo \"$OTHER_ACCOUNT\" > \"$PWD/.other-env\"\nwhile [ ! -f '{}' ]; do echo working; sleep 0.2; done\nprintf 'done\\a\\n'\nexec cat > \"$PWD/.other-told\"", finish.display()));
 
         // SAFETY: set before anything of the app reads them.
         unsafe {
@@ -428,6 +433,7 @@ mod tests {
 
         // B tells nothing: it is seen to work while it writes, and to be done at the bell.
         wait(cx, "B guessed at work", &mut |cx| workspace.update(cx, |w, cx| w.projects[0].work()[1].view.as_ref().unwrap().read(cx).agent.status == AgentStatus::Working));
+        std::fs::write(&finish, "").unwrap();
         wait(cx, "B guessed done", &mut |cx| {
             workspace.update(cx, |w, cx| {
                 let v = w.projects[0].work()[1].view.as_ref().unwrap().read(cx);

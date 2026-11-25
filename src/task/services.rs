@@ -204,7 +204,10 @@ impl TaskView {
             let reached = cx.background_spawn(async move { crate::hostfs::reach(&root, &asked) }).await;
             let _ = this.update_in(cx, |t, window, cx| match reached {
                 Ok(url) => then(t, url, window, cx),
-                Err(e) => window.push_notification(Notification::error(e).title("Not reached through ssh"), cx),
+                Err(e) => {
+                    let host = crate::hosts::split(&t.root).map(|(host, _)| host).unwrap_or_default();
+                    window.push_notification(Notification::error(crate::hosts::explain_ssh(&host, &e)).title(format!("Not reached through ssh on {}", crate::hosts::label(&host))), cx)
+                }
             });
         })
         .detach();

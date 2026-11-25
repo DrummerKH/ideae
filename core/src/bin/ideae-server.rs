@@ -12,6 +12,8 @@ fn main() {
         ["--daemon"] => ideae_core::daemon::server::run(false),
         #[cfg(unix)]
         ["--daemon", "--adopt"] => ideae_core::daemon::server::run(true),
+        #[cfg(unix)]
+        ["--acp-host"] => ideae_core::acp::host::run_process(),
         ["--hook", ..] => {
             let _ = ideae_core::hook::run(&args[1..].iter().map(|a| a.to_string()).collect::<Vec<_>>(), None);
         }

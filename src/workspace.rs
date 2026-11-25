@@ -122,6 +122,7 @@ impl TaskEntry {
 pub mod agents_ui;
 pub mod archive_ui;
 mod hosts_ui;
+pub(crate) use hosts_ui::HostState;
 mod merged_ui;
 pub mod automation;
 pub mod layered;
@@ -187,6 +188,9 @@ pub struct Project {
     /// What applies, all layers put together: worked out when one changes
     /// (`Workspace::resolve_projects`), never while drawing.
     pub resolved: std::sync::Arc<crate::layers::Resolved>,
+    /// `resolved` was worked out at least once: a project added since the
+    /// last time is not, and has only the defaults until it is.
+    pub resolved_once: bool,
     /// Branches of origin whose PR was merged, and when they were looked for.
     pub merged_branches: Vec<crate::merged_branches::MergedBranch>,
     pub merged_checked: Option<std::time::Instant>,
@@ -195,7 +199,7 @@ pub struct Project {
     pub made_by_agents: std::collections::BTreeMap<PathBuf, PathBuf>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl Project {
     /// Its tasks but the main thread, which every project has.
     pub fn work(&self) -> Vec<&TaskEntry> {
@@ -226,6 +230,7 @@ impl Project {
             team_read: None,
             keys_in_history: None,
             resolved: Default::default(),
+            resolved_once: false,
             merged_branches: Vec::new(),
             merged_checked: None,
             made_by_agents: Default::default(),
@@ -389,6 +394,11 @@ pub struct Workspace {
     host_waiting: std::collections::BTreeMap<String, Vec<PathBuf>>,
     /// What waits for a host to be connected to be done ([`hosts_ui`]).
     host_then: std::collections::BTreeMap<String, Vec<hosts_ui::Then>>,
+    /// Hosts the last try to connect failed, and why (in words): told by
+    /// their projects until tried again.
+    host_failed: std::collections::BTreeMap<String, String>,
+    /// Settings asked for and being opened (the language servers looked for first): asked again, nothing more.
+    pub(crate) settings_opening: bool,
     host_shown: Option<PathBuf>,
     /// Where agents' reports go, from this machine's daemon and others'.
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -598,10 +608,27 @@ impl Workspace {
                     }
                     // Exit ends the agents of other machines too, and ssh's links to
                     // them; the window's × leaves them.
+                    // Each host at once (each waits a moment at most), what lies beyond a
+                    // first host before any link to one is closed.
                     #[cfg(unix)]
-                    for daemon in crate::daemon::client::remotes() {
-                        daemon.shutdown();
-                        daemon.close_master();
+                    {
+                        let remotes = crate::daemon::client::remotes();
+                        let ending: Vec<_> = remotes
+                            .iter()
+                            .cloned()
+                            .map(|daemon| {
+                                std::thread::spawn(move || {
+                                    daemon.shutdown();
+                                    daemon.close_beyond();
+                                })
+                            })
+                            .collect();
+                        for done in ending {
+                            let _ = done.join();
+                        }
+                        for daemon in remotes {
+                            daemon.close_master();
+                        }
                     }
                     // Here, not on the tasks' threads: the app exits next.
                     if let Some(socket) = this.hook_socket.clone() {
@@ -873,6 +900,8 @@ impl Workspace {
             wake_failed: Default::default(),
             host_waiting: Default::default(),
             host_then: Default::default(),
+            host_failed: Default::default(),
+            settings_opening: false,
             host_shown: None,
             hook_tx: hook_tx.clone(),
         };
@@ -1270,6 +1299,10 @@ impl Workspace {
         let slot = self.port_slot_for(path);
         if let Some((pi, _)) = self.find(path) {
             crate::project_config::register(path, &self.projects[pi].path);
+            // Added since the layers were last put together: what applies to it, before its task reads it.
+            if !self.projects[pi].resolved_once {
+                self.resolve_projects(cx);
+            }
         }
         let entry = self.entry_mut(path)?;
         let (root, branch, session, pr, links) = (entry.path.clone(), entry.branch.clone(), entry.session.clone(), entry.pr.clone(), entry.links.clone());
@@ -1282,7 +1315,7 @@ impl Workspace {
         let slept = session.tabs.iter().any(|tab| tab.kind == "slept-agent");
         let quiet = slept || self.quiet_start.contains(path) || (self.last_run.remove(path) && session.tabs.iter().any(|tab| tab.kind == "paused-agent"));
         let view = cx.new(|cx| {
-            let mut t = TaskView::new(root, branch, launch, !quiet, socket, slot, window, cx);
+            let mut t = TaskView::new(root, branch, launch, !quiet, socket, slot, links, window, cx);
             // Put to sleep in the last run: it resumes when the task is shown.
             t.set_agent_slept(slept);
             t.context_fill = fill;
@@ -1292,7 +1325,6 @@ impl Workspace {
             if let Some(entry) = self.find(path).map(|(pi, ti)| &self.projects[pi].tasks[ti]) {
                 self.give_questions(entry, &mut t);
             }
-            t.links = links;
             t.set_commit_key(commit_key, window, cx);
             t.restore(&session, window, cx);
             t.pr = pr;
@@ -3615,6 +3647,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 
 #[cfg(test)]
 mod ticket_tests {
+    #[cfg_attr(not(unix), allow(unused_imports))]
     use super::{ProjectState, State, Workspace, state};
 
     /// A task titled by a ticket's key alone is named after its agent's

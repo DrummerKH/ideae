@@ -109,7 +109,7 @@ pub fn restore(cwd: &Path, tree: &str, changed: &[(char, String)]) -> Result<(),
     for path in made.into_iter().filter(|p| !ignored.contains(*p)) {
         let path = cwd.join(path);
         // A folder of it made a link out of the worktree since: not followed.
-        if !crate::acp::policy::inside(cwd, path.parent().unwrap_or(cwd)) && path.parent() != Some(cwd) {
+        if !super::policy::inside(cwd, path.parent().unwrap_or(cwd)) && path.parent() != Some(cwd) {
             continue;
         }
         let _ = std::fs::remove_file(&path);
@@ -143,6 +143,27 @@ fn ignored(cwd: &Path, paths: &[&str]) -> std::collections::HashSet<String> {
 pub fn forget(repo: &Path, thread: &str) {
     let Some(refs) = output(git(repo).args(["for-each-ref", "--format=%(refname)", &format!("{REFS}/{thread}/")])) else { return };
     let input: String = refs.lines().filter(|l| !l.is_empty()).map(|r| format!("delete {r}\n")).collect();
+    if input.is_empty() {
+        return;
+    }
+    if let Ok(mut child) = git(repo).args(["update-ref", "--stdin"]).stdin(Stdio::piped()).spawn() {
+        use std::io::Write as _;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(input.as_bytes());
+        }
+        let _ = child.wait();
+    }
+}
+
+/// The checkpoints of thread `old`, kept under `new` instead.
+pub fn rename_thread(repo: &Path, old: &str, new: &str) {
+    let Some(refs) = output(git(repo).args(["for-each-ref", "--format=%(refname) %(objectname)", &format!("{REFS}/{old}/")])) else { return };
+    let from = format!("{REFS}/{old}/");
+    let input: String = refs
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .filter_map(|(name, id)| Some(format!("create {REFS}/{new}/{} {id}\ndelete {name}\n", name.strip_prefix(&from)?)))
+        .collect();
     if input.is_empty() {
         return;
     }

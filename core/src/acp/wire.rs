@@ -43,6 +43,14 @@ pub struct HostSpec {
     /// What this run may still cost (USD), its profile's daily limit less
     /// what it has cost today; None: no limit.
     pub budget: Option<f64>,
+    /// Started by the login shell (`$SHELL -lc`), for its PATH: an agent
+    /// on another machine, where no window's environment is.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub login_shell: bool,
+    /// Where the thread was kept under the name of an earlier build: moved
+    /// to `journal` when that has none ([`super::carry_journal`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_before: Option<PathBuf>,
 }
 
 /// Window to host.

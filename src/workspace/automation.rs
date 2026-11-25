@@ -299,6 +299,10 @@ impl Workspace {
         if let TaskEvent::Worktrees = event {
             return self.sync_worktrees(window, cx);
         }
+        if let TaskEvent::TeamFile = event {
+            let root = view.read(cx).root.clone();
+            return self.read_team_layer_of(&root, cx);
+        }
         if let TaskEvent::OwnBranch(branch) = event {
             let root = view.read(cx).root.clone();
             if let Some(entry) = self.entry_mut(&root) {

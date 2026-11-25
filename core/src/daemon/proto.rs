@@ -215,11 +215,17 @@ pub enum Msg {
         /// It watches folders for a window (`Watch`).
         #[serde(default)]
         watches: bool,
+        /// It says `Opened` for each `Open` it took.
+        #[serde(default)]
+        opened: bool,
     },
     /// The answer to an `Upgrade` that did not happen: this daemon goes on
     /// serving its sessions.
     Stays,
     Exited { id: String, code: Option<i32>, signal: Option<String> },
+    /// Daemon: an `Open` was taken (started, or attached to): a session the
+    /// window opened, not among the running when a link comes back, ended.
+    Opened { id: String },
     Foreground { id: String, fg: Option<Fg> },
     /// Window: watch these folders, each on its own (`flat`) or with all
     /// in them (`deep`), in place of what `id` watched; the daemon says

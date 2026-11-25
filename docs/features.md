@@ -50,8 +50,19 @@ own: [integrations](integrations.md).
 
 A repository on a server or another computer, reached by ssh as a terminal
 reaches it (keys, `~/.ssh/config`): **Add project → On another machine…**
-(`me@box:/home/me/project`, or `ssh://me@box:2222/home/me/project`), or
-`ideae ssh://me@box/home/me/project`. ideae puts a small `ideae-server` of
+(the machine, its port, the repository there, and a machine on the way if
+there is one; or a whole address in the first field, `me@box:/home/me/project`
+or `ssh://me@box:2222/home/me/project`), or
+`ideae ssh://me@box/home/me/project`. The dialog says how it reads what is
+typed, and stays open saying what went wrong, in words, until the project
+is added. A host not reached says so beside its projects; a click tries
+again. A machine this one cannot reach, or
+has no key for, is reached through one that can, with that one's keys,
+`~/.ssh/config` and known hosts: `me@hub>me@mac:/Users/me/project` (a
+server at home: only its port need be open to the outside, the other is
+reached from it). That one asks nothing on the way: the other takes its
+key, not a password, and is a host it has met (`ssh me@mac` from it once).
+ideae puts a small `ideae-server` of
 its own version there (static, for Linux x86_64 and aarch64 and macOS; no
 network needed there) and its tasks run there: their worktrees, agents and
 terminals, git, the changes and the files you open and save. The agents
@@ -82,8 +93,16 @@ through ssh, forwarded to the same port here when that one is free. The
 host's sshd must allow forwarding (`AllowTcpForwarding`, on by default but
 on Alpine).
 
-Not there yet: chat agents, and agents driving its Web tabs (Playwright's
-IDEAE_BROWSER_CDP).
+Chat agents (ACP) run there too: their host is the ideae-server there, the
+agent started by the login shell there, its conversation kept there.
+
+With **Agents on other machines drive Chrome here** on (Settings → Web
+tabs, or a space or a project of machines that are yours alone; off at
+first, never a team's file's to say), its agents there drive its Web tabs
+as a local task's do: IDEAE_BROWSER_CDP names the same port there, which
+ssh carries back to the task's Chrome here while the task is open. Any user
+of that machine can reach that port: only for machines that are yours
+alone.
 
 ## Pause, archive, restore
 

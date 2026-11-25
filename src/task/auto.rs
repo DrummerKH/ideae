@@ -293,7 +293,7 @@ impl TaskView {
 
     /// Failed checks the agent was sent by themselves in a row, and past
     /// the most when you were told.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn check_fixes(&self) -> u32 {
         self.auto.fixes
     }

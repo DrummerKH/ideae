@@ -17,6 +17,7 @@ a setting a space or a project sets otherwise says who does.
 | Worktrees in (this project's own folder) | | | | ✓ |
 | New tasks from (base branch) | | | ✓ | ✓ |
 | Pull request status | ✓ | ✓ | | ✓ |
+| Agents on other machines drive Chrome here | ✓ | ✓ | | ✓ |
 | Language servers | | ✓ | | ✓ |
 | Failed check back to the agent | | ✓ | | ✓ |
 | Branch of a ticket's task (`{key}_{summary}`) | ✓ | ✓ | ✓ | ✓ |
@@ -24,8 +25,13 @@ a setting a space or a project sets otherwise says who does.
 | Ticket in a pull request (fixes, refs, none) | ✓ | ✓ | ✓ | ✓ |
 | Integrations (a list, by id) | ✓ | ✓ | ✓ | ✓ |
 
-Whose agent runs, where worktrees go and anything secret are never the
-team's: a `.ideae.toml` that sets them is not listened to there.
+Whose agent runs, where worktrees go, whether another machine's agents
+reach your Chrome, and anything secret are never the team's: a
+`.ideae.toml` that sets them is not listened to there.
+
+A project on another machine has its team's layer read there: again as
+soon as its main checkout's `.ideae.toml` changes there (its main thread
+sees it), else every five minutes.
 
 A list of integrations is put together from all the layers: a layer adds an
 entry by a new id (with its kind and address), changes one by its id, or
@@ -131,7 +137,9 @@ token by the window (the token never reaches the agent or a remote host),
 its text framed as the ticket's and not instructions, bounded, without
 attachments. Nothing written to the tracker: no transitions, no comments.
 Agents of tasks on another machine have no ideae MCP server, so no `ticket`
-there; their terminals still get `IDEAE_TICKET*`.
+there; their terminals still get `IDEAE_TICKET*`. Planned: the window's MCP
+server reached from the host through ssh (as a task's Chrome is), its
+tools then answering an agent there as one here.
 
 ## A task's links
 

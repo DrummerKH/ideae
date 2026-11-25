@@ -182,7 +182,7 @@ fn commit_lines(root: &Path, args: &[&str]) -> Vec<CommitLine> {
 
 /// The commits of `root`'s HEAD that are on no remote and no other local
 /// branch: what deleting its branch would lose. Merges are left out.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub fn unpushed(root: &Path) -> Vec<CommitLine> {
     unpushed_of(root, "")
 }
@@ -297,7 +297,7 @@ pub fn write(job: Job) -> Result<Meta, String> {
     if !meta.uncommitted.is_empty() {
         work.push((patch, PATCH));
     }
-    let chat = crate::acp::journal_path(&root);
+    let chat = crate::acp::journal_found(&root, None);
     if chat.is_file() {
         work.push((chat, CHAT));
     }
@@ -418,8 +418,9 @@ fn sh(root: &Path, line: &str, args: &[&str], input: Option<&[u8]>) -> Result<St
 
 /// A remote task's archive, made and kept on its host: there the work
 /// nowhere else (unpushed commits, the uncommitted changes) is packed
-/// with its facts; here only a stub at `job.dest` tells of it. Its agents'
-/// conversations stay where their agents keep them there.
+/// with its facts; here only a stub at `job.dest` tells of it. Its chat's
+/// conversation goes in it too (its task's goes with it); a terminal
+/// agent's stays where the agent keeps it there.
 fn write_remote(job: Job) -> Result<Meta, String> {
     let Job { mut meta, dest, .. } = job;
     let root = meta.worktree.clone();
@@ -459,6 +460,11 @@ rm -f "$s/index""#;
     }
     if !meta.uncommitted.is_empty() {
         entries.push(PATCH);
+    }
+    let chat_there = crate::hosts::there(&crate::acp::journal_found(&root, None)).display().to_string();
+    let kept_chat = sh(&root, r#"if [ -f "$1" ]; then cp "$1" "$2/$3" && echo kept; fi"#, &[&chat_there, &scratch_s, CHAT], None).map_err(|e| cleanup(format!("the chat: {e}")))?;
+    if kept_chat.trim() == "kept" {
+        entries.push(CHAT);
     }
     let json = serde_json::to_vec_pretty(&meta).map_err(|e| e.to_string())?;
     let mut args = vec![scratch_s.as_str(), file_s.as_str()];
@@ -913,8 +919,8 @@ pub fn restore(repo: &Path, archive: &Path, meta: &Meta, plan: &Plan) -> Result<
 
 /// A remote task back on its host, from its archive there: its worktree
 /// made there (beside the repository, named as a local task's folder), the
-/// work taken out of the archive there and brought in as here. Its agents'
-/// conversations are where they were.
+/// work taken out of the archive there and brought in as here, its chat's
+/// conversation put back. A terminal agent's is where it was.
 fn restore_remote(repo: &Path, archive: &Path, meta: &Meta, plan: &Plan) -> Result<Restored, String> {
     let stub = read_stub(archive)?;
     let (host, repo_there) = crate::hosts::split(repo).ok_or("not a remote project")?;
@@ -951,6 +957,9 @@ fn restore_remote(repo: &Path, archive: &Path, meta: &Meta, plan: &Plan) -> Resu
         if plan.changes && !meta.uncommitted.is_empty() {
             sh(&path, take, &[&there, PATCH, &patch], None).map_err(|e| format!("the uncommitted changes from the archive there: {e}"))?;
         }
+        // Its chat, if the archive has one: where the new worktree's agent finds it.
+        let chat = crate::hosts::there(&crate::acp::journal_path(&path)).display().to_string();
+        let _ = sh(&path, r#"tar tzf "$1" "$2" >/dev/null 2>&1 || exit 0; mkdir -p "$(dirname "$3")"; tar xzf "$1" -O "$2" > "$3""#, &[&there, CHAT, &chat], None);
         let (commits, changes) = bring_back(&path, meta, plan, &key_of(archive), &bundle, &patch, &|file| {
             let _ = sh(&path, r#"rm -f "$1""#, &[file], None);
         });

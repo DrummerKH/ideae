@@ -323,12 +323,8 @@ fn pages(
         .default_value(SharedString::from(Appearance::Auto.label()))
     };
     let now = if dark_now { "dark" } else { "light" };
-    // Looked for on disk once while the dialog is open: this runs with every frame of it.
-    let there = |program: &'static str| {
-        INSTALLED.with(|known| {
-            *known.borrow_mut().entry(program).or_insert_with(|| lsp::SERVERS.iter().any(|d| d.program == program && d.available()))
-        })
-    };
+    // Looked for before the dialog opened ([`installed_servers`]): this runs with every frame of it.
+    let there = |program: &'static str| INSTALLED.with(|known| known.borrow().get(program).copied().unwrap_or(false));
     let servers = lsp::SERVERS.iter().flat_map(|def| {
         let program = def.program;
         if let Some(&(key, language, programs)) = lsp::ALTERNATIVES.iter().find(|(_, _, programs)| programs.contains(&program)) {
@@ -542,7 +538,14 @@ fn pages(
                 "A Web tab showing the task's own site (a port of its services, or one its processes listen on) reloads when the agent finishes a turn. Other pages are left alone. Turn it off if the site reloads by itself and should keep its state.",
                 |s| s.web_reload_after_turn,
                 |s, v| s.web_reload_after_turn = v,
-            )),
+            )).item({
+                let row = switch(draft, "Agents on other machines drive Chrome here", "", |s| s.remote_browser, |s, v| s.remote_browser = v);
+                row.description(about_layered(
+                    layers,
+                    "remote_browser",
+                    "A task of a project on another machine gives its agent IDEAE_BROWSER_CDP, and the task's Chrome here is reached at that port there for as long as the task is open. Every user of that machine can reach the port: turn it on only for machines that are yours alone, or on for a space or a project of them alone. Tasks opened after the change.",
+                ))
+            }),
         ),
         SettingPage::new("Editor").default_open(true).group(
             SettingGroup::new().title("Typing")
@@ -1399,7 +1402,7 @@ fn profile_dialog(draft: Draft, at: Option<usize>, template: Option<crate::agent
 }
 
 thread_local! {
-    /// Which language servers are there, as found when the dialog asked first.
+    /// Which language servers are there, as found before the dialog opened.
     static INSTALLED: RefCell<std::collections::HashMap<&'static str, bool>> = RefCell::default();
     /// What opens the list of spaces, for the page that has a button for it.
     static EDIT_SPACES: RefCell<Option<Rc<dyn Fn(&mut Window, &mut App)>>> = const { RefCell::new(None) };
@@ -1425,19 +1428,41 @@ impl Workspace {
             }))
         });
         let layers = self.layer_drafts();
-        open_layered(state::settings(), self.appearance, page, layers, scope, window, cx, move |settings, appearance, layers, window, cx| {
-            let _ = this.update(cx, |w, cx| {
-                w.apply_layer_drafts(layers, cx);
-                w.apply_settings(settings, cx);
-                if appearance != w.appearance {
-                    w.set_appearance(appearance, window, cx);
-                }
+        // Which language servers are there takes a look on disk, and rust-analyzer a run of
+        // it (rustup's stand-in may be slow to answer): asked first, off this thread.
+        if std::mem::replace(&mut self.settings_opening, true) {
+            return;
+        }
+        let installed = cx.background_spawn(async { installed_servers() });
+        let appearance = self.appearance;
+        let opening = cx.weak_entity();
+        cx.spawn_in(window, async move |_, cx| {
+            let installed = installed.await;
+            let _ = opening.update(cx, |w, _| w.settings_opening = false);
+            let _ = cx.update(|window, cx| {
+                let at = SelectIndex { page_ix: page, group_ix: None };
+                open_layered(state::settings(), appearance, at, layers, scope, installed, window, cx, move |settings, appearance, layers, window, cx| {
+                    let _ = this.update(cx, |w, cx| {
+                        w.apply_layer_drafts(layers, cx);
+                        w.apply_settings(settings, cx);
+                        if appearance != w.appearance {
+                            w.set_appearance(appearance, window, cx);
+                        }
+                    });
+                });
             });
-        });
+        })
+        .detach();
     }
 }
 
+/// Which language servers are there. Not for the UI thread.
+fn installed_servers() -> std::collections::HashMap<&'static str, bool> {
+    lsp::SERVERS.iter().map(|def| (def.program, def.available())).collect()
+}
+
 /// The dialog over `current`, at the page `first`; Save hands `save` the result.
+/// No language server counts as there (the tests' own).
 #[cfg(test)]
 fn open(
     current: state::Settings,
@@ -1447,18 +1472,20 @@ fn open(
     cx: &mut App,
     save: impl Fn(state::Settings, Appearance, &mut Window, &mut App) + 'static,
 ) {
-    open_layered(current, appearance, first, Layers::default(), Scope::Global, window, cx, move |settings, look, _, window, cx| save(settings, look, window, cx));
+    open_layered(current, appearance, SelectIndex { page_ix: first, group_ix: None }, Layers::default(), Scope::Global, Default::default(), window, cx, move |settings, look, _, window, cx| save(settings, look, window, cx));
 }
 
 /// The dialog over `current` and the layers under it, on `scope` at the
-/// page `first`; Save hands `save` the result.
+/// page and group `first` (scrolled to it), the language servers there as
+/// `installed` says; Save hands `save` the result.
 #[allow(clippy::too_many_arguments)]
 fn open_layered(
     current: state::Settings,
     appearance: Appearance,
-    first: usize,
+    first: SelectIndex,
     layers: Layers,
     scope: Scope,
+    installed: std::collections::HashMap<&'static str, bool>,
     window: &mut Window,
     cx: &mut App,
     save: impl Fn(state::Settings, Appearance, Layers, &mut Window, &mut App) + 'static,
@@ -1468,7 +1495,7 @@ fn open_layered(
     let scope = Rc::new(Cell::new(scope));
     let look = Rc::new(Cell::new(appearance));
     let sizes: Sizes = Rc::new(Cell::new(crate::zoom::current(cx)));
-    INSTALLED.with(|known| known.borrow_mut().clear());
+    INSTALLED.with(|known| *known.borrow_mut() = installed);
     crate::workspace::welcome::forget_find();
     crate::theme::forget_code_fonts(cx);
     // The shortcut waiting for keys, and what catches them before any
@@ -1509,7 +1536,7 @@ fn open_layered(
                     Scope::Space(si) => (format!("settings-space-{si}").into(), vec![crate::layers_ui::page(&draft, &layers, now)]),
                     Scope::Project(pi) => (format!("settings-project-{pi}").into(), vec![crate::layers_ui::page(&draft, &layers, now)]),
                 };
-                let first = if now == Scope::Global { first } else { 0 };
+                let first = if now == Scope::Global { first } else { SelectIndex { page_ix: 0, group_ix: None } };
                 content
                     .when(layered, |content| {
                         content.child(
@@ -1535,7 +1562,7 @@ fn open_layered(
                             .child(
                                 Settings::new(id)
                                     .sidebar_width(px(240.))
-                                    .default_selected_index(SelectIndex { page_ix: first, group_ix: None })
+                                    .default_selected_index(first)
                                     .pages(pages),
                             ),
                     )
@@ -1729,6 +1756,40 @@ mod tests {
         assert_eq!(saved.borrow().as_ref().map(|s| s.agent.as_str()), Some("mine"), "the older field follows the default profile");
     }
 
+    /// Agents on other machines reach Chrome here only when asked: the switch
+    /// is on the Tasks page, off at first, and on once turned on and saved.
+    #[gpui_kit::test]
+    fn chrome_for_remote_agents_is_off_until_turned_on(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = window(cx);
+        let saved: Rc<RefCell<Option<state::Settings>>> = Rc::default();
+        cx.update_window(handle, |_, window, cx| {
+            let saved = saved.clone();
+            // The Tasks page at its Web tabs: only the groups in view are drawn.
+            let at = super::SelectIndex { page_ix: 2, group_ix: Some(3) };
+            super::open_layered(state::Settings::default(), Appearance::Auto, at, Default::default(), super::Scope::Global, Default::default(), window, cx, move |settings, _, _, _, _| *saved.borrow_mut() = Some(settings));
+            window.render_frame(cx);
+            window.render_frame(cx);
+            let title = "Agents on other machines drive Chrome here";
+            let switch = window.find_all("check").into_iter().find(|s| s.label() == Some(title) && s.visible()).unwrap_or_else(|| panic!("{:?}", window.find_all("check").iter().map(|s| (s.label().map(str::to_string), s.visible(), s.bounds().origin.y)).collect::<Vec<_>>()));
+            assert_eq!(switch.checked(), Some(false), "off at first");
+            // Every switch of the page is "check": this one by its whole path.
+            fn click_path(scoped: &mut gpui_kit::test::ScopedWindow, path: &[gpui_kit::ElementId], cx: &mut gpui_kit::App) {
+                match path {
+                    [last] => scoped.click(last.clone(), cx),
+                    [first, rest @ ..] => click_path(&mut scoped.within(first.clone()), rest, cx),
+                    [] => {}
+                }
+            }
+            let path = switch.path().to_vec();
+            click_path(&mut window.within(path[0].clone()), &path[1..], cx);
+            window.render_frame(cx);
+            window.click("settings-save", cx);
+        })
+        .unwrap();
+        assert_eq!(saved.borrow().as_ref().map(|s| s.remote_browser), Some(true));
+    }
+
     /// The Agents page lists the profiles; one removed is gone on Save,
     /// and the default moves to one still there.
     #[gpui_kit::test]
@@ -1799,7 +1860,7 @@ mod tests {
         };
         cx.update_window(handle, |_, window, cx| {
             let saved = saved.clone();
-            super::open_layered(state::Settings::default(), Appearance::Auto, 0, layers, Scope::Project(0), window, cx, move |_, _, layers, _, _| *saved.borrow_mut() = Some(layers));
+            super::open_layered(state::Settings::default(), Appearance::Auto, super::SelectIndex { page_ix: 0, group_ix: None }, layers, Scope::Project(0), Default::default(), window, cx, move |_, _, layers, _, _| *saved.borrow_mut() = Some(layers));
             window.render_frame(cx);
             assert!(window.find("settings-layer").visible(), "the layer switch");
             assert!(window.try_find("key-row-quit").is_none(), "Global's pages are not over a project");

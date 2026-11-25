@@ -2,7 +2,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use std::sync::Arc;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::process::Command;
 
 pub struct Worktree {
@@ -631,7 +631,7 @@ pub fn is_junk(path: &str) -> bool {
 }
 
 /// Tracked and untracked-but-not-ignored files, relative to `root`.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub fn files(root: &Path) -> Vec<String> {
     let out = git(root, &["ls-files", "--cached", "--others", "--exclude-standard", "-z"]).unwrap_or_default();
     let mut files: Vec<String> = out.split('\0').filter(|f| !f.is_empty()).map(str::to_string).collect();
@@ -3581,7 +3581,12 @@ pub fn remove_side_worktree(repo: &Path, path: &Path, branch: &str) -> Result<Op
 pub fn remove_task_worktree(repo: &Path, path: &Path, branch: &str, unlock: bool) -> Result<Option<String>, String> {
     let named = !branch.is_empty() && !branch.starts_with('(');
     // Where the worktree's machine is (crate::hostfs), and by its path there.
-    let exists = crate::hostfs::stat(path).is_ok();
+    // A host that cannot be asked keeps the task: gone here, it would be left there, its branch and all.
+    let exists = match crate::hostfs::stat(path) {
+        Ok(_) => true,
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotConnected | std::io::ErrorKind::TimedOut) => return Err(format!("{e}: the task stays until it is")),
+        Err(_) => false,
+    };
     let only_there: u32 = if named && exists && branch_exists(repo, branch) {
         let exclude = format!("--exclude={branch}");
         git(path, &["rev-list", "--count", &format!("refs/heads/{branch}"), "--not", "HEAD", "--remotes", &exclude, "--branches"])
@@ -3591,13 +3596,15 @@ pub fn remove_task_worktree(repo: &Path, path: &Path, branch: &str, unlock: bool
         0
     };
     // A chat agent's conversation goes with its task (an archive keeps its copy).
-    let journal = crate::acp::journal_path(path);
-    let _ = std::fs::remove_file(&journal);
-    let log = crate::acp::host::log_path(&journal);
-    let _ = std::fs::remove_file(log.with_extension("log.old"));
-    let _ = std::fs::remove_file(log);
+    // A remote task's on its host; under its name of before too.
+    let (files, threads) = crate::acp::journal_files(path);
+    for file in files {
+        let _ = crate::hostfs::remove(&file);
+    }
     // Its chat's checkpoints: refs of the repository, not of the worktree.
-    crate::acp::checkpoint::forget(repo, &crate::acp::checkpoint::thread_name(Some(&journal)));
+    for thread in threads {
+        crate::acp::forget_checkpoints(repo, &thread);
+    }
     // So do its browser's logins.
     crate::browser::forget(path);
     let path_s = crate::hosts::there(path).to_string_lossy().into_owned();

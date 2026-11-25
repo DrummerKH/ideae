@@ -194,7 +194,8 @@ fn housekeeping(shared: Shared) {
             let s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             s.alone_since.is_some_and(|since| s.sessions.is_empty() && since.elapsed() > EMPTY)
         };
-        if unattended {
+        // Its tests run it on a thread of theirs: its exit would end them all, with success.
+        if unattended && !cfg!(test) {
             shutdown(&shared);
         }
         let handles: Vec<(String, Arc<Mutex<Box<dyn ByteHandle>>>)> = {
@@ -273,10 +274,14 @@ fn serve(shared: Shared, stream: UnixStream) {
                     socket: Some(proto::socket_path().display().to_string()),
                     calls: true,
                     watches: true,
+                    opened: true,
                 };
                 s.send(client, proto::encode_msg(&welcome));
             }
-            Frame::Msg(Msg::Open { id, spec, size }) => open(&shared, client, id, spec, size),
+            Frame::Msg(Msg::Open { id, spec, size }) => {
+                shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).send(client, proto::encode_msg(&Msg::Opened { id: id.clone() }));
+                open(&shared, client, id, spec, size)
+            }
             Frame::Msg(Msg::Resize { id, size }) => {
                 let mut s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(session) = s.sessions.get_mut(&id) {

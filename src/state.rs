@@ -286,6 +286,10 @@ pub struct Settings {
     pub changes_flat: bool,
     /// A page of the task's own site is loaded again when its agent's turn ends.
     pub web_reload_after_turn: bool,
+    /// An agent on another machine drives the task's Chrome here: its
+    /// DevTools port is reached there, where that machine's other users
+    /// reach it too. Off unless asked for.
+    pub remote_browser: bool,
     /// Said once as the battery runs low: there is a power save mode.
     pub battery_hint: bool,
     /// The system does not go to sleep while an agent works, a setup or a
@@ -404,6 +408,7 @@ impl Default for Settings {
             diff_files: false,
             changes_flat: false,
             web_reload_after_turn: true,
+            remote_browser: false,
             battery_hint: true,
             keep_awake: true,
             keep_awake_on_battery: true,

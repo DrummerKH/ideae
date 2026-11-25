@@ -608,7 +608,7 @@ impl Workspace {
         if let Some(files) = self.fork_copies.remove(&(event.task.clone(), n)) {
             cx.background_spawn(async move {
                 for file in files {
-                    let _ = std::fs::remove_file(file);
+                    let _ = crate::hostfs::remove(&file);
                 }
             })
             .detach();
@@ -720,7 +720,15 @@ fn carry_session(profile: &crate::agents::Profile, from: &Path, to: &Path, sessi
         }
     };
     if profile.acp {
-        copy(&crate::acp::journal_of(from, tag), &crate::acp::journal_path(to));
+        let (from, to) = (crate::acp::journal_found(from, tag), crate::acp::journal_path(to));
+        // A remote task's: on its host.
+        if crate::hosts::is_remote(&to) {
+            if crate::hostfs::stat(&to).is_err() && crate::hostfs::read(&from).and_then(|bytes| crate::hostfs::write(&to, &bytes)).is_ok() {
+                made.push(to);
+            }
+            return made;
+        }
+        copy(&from, &to);
         return made;
     }
     let adapter = profile.adapter();

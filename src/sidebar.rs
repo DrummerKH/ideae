@@ -1123,17 +1123,36 @@ impl Workspace {
             .child(div().flex_1().min_w_0().truncate().child(name.clone()))
             // On another machine: which, and how its link is.
             .when_some(self.host_state(&p.path), |s, (host, state)| {
+                use crate::workspace::HostState;
+                let label = crate::hosts::label(&host);
+                let text = match &state {
+                    HostState::Up => label,
+                    HostState::Connecting => format!("{label} · connecting…"),
+                    HostState::Reconnecting => format!("{label} · reconnecting…"),
+                    HostState::Failed(_) => format!("{label} · not reached"),
+                };
+                let why = match &state {
+                    HostState::Failed(why) => Some(format!("{why}\n\nClick to try again.")),
+                    HostState::Reconnecting => Some("The link is being made again; its agents go on there meanwhile.".to_string()),
+                    _ => None,
+                };
+                let failed = matches!(state, HostState::Failed(_));
                 s.child(
                     div()
+                        .id(SharedString::from(format!("host-state-{}", p.path.display())))
                         .flex_shrink_0()
-                        .max_w(px(120.))
+                        .max_w(px(160.))
                         .truncate()
                         .text_xs()
-                        .when(state == Some("no link"), |s| s.text_color(cx.theme().warning))
-                        .child(match state {
-                            Some(state) => format!("{host} · {state}"),
-                            None => host,
-                        }),
+                        .when(state != HostState::Up && state != HostState::Connecting, |s| s.text_color(cx.theme().warning))
+                        .when_some(why, |s, why| s.tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(why.clone()).build(window, cx)))
+                        .when(failed, |s| {
+                            s.cursor_pointer().on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.retry_host(host.clone(), window, cx);
+                            }))
+                        })
+                        .child(text),
                 )
             })
             .when(p.collapsed, |s| {

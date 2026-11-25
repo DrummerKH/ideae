@@ -14,10 +14,13 @@ use gpui_kit::{App, Task};
 pub enum Kept {
     /// In the keyring, under this name.
     As(String),
+    /// Told by the Secret Service alone (Linux); elsewhere it is not asked.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Nothing,
     /// This system's keyring is not asked without need.
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     Unknown,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Unavailable(String),
 }
 

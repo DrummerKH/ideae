@@ -42,7 +42,7 @@ pub struct AgentState {
     pub(super) watch: activity::Watch,
     /// Text for its prompt once it is ready to take it, and whether it is
     /// sent too.
-    pending_prompt: Option<(String, bool)>,
+    pub(super) pending_prompt: Option<(String, bool)>,
     /// A message for it while busy: sent when its turn ends.
     queued: Option<String>,
     /// What a chat agent was last reported doing, not to report it twice.
@@ -362,18 +362,18 @@ impl TaskView {
         }).collect()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn question_wrote(&self, path: &str) -> bool {
         self.question_touched.contains_key(path)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn tab_id(&self, ix: usize) -> usize {
         self.tabs[ix].id
     }
 
     /// Who each tab is the agent of, and whether it is only its place.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn agent_tabs(&self) -> Vec<(Who, bool)> {
         self.tabs.iter().filter_map(|t| t.agent.map(|who| (who, matches!(t.kind, TabKind::Asleep)))).collect()
     }
@@ -430,6 +430,16 @@ impl TaskView {
     /// What stands in a tab whose agent is not running.
     pub(super) fn render_asleep(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
         let who = self.tabs[ix].agent;
+        if who == Some(Who::Main) && self.agent_waits_for_chrome {
+            return v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child("The agent starts once its host reaches Chrome here (Settings → Web tabs)…")
+                .into_any_element();
+        }
         let (text, label) = match who {
             Some(Who::Question(_)) => ("This question's agent is asleep. Its conversation goes on when it starts.", "Continue"),
             _ if self.agent_slept => ("The agent was stopped after it had nothing to do for a while. Its conversation goes on when it starts.", "Continue"),
@@ -795,22 +805,37 @@ impl TaskView {
     /// Another agent in the agent's tab: the one running ends with its
     /// terminal, the new one starts in a terminal of its own, with its
     /// own environment.
-    pub fn switch_agent(&mut self, launch: crate::agents::Launch, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn switch_agent(&mut self, launch: crate::agents::Launch, then: Then, window: &mut Window, cx: &mut Context<Self>) {
         let task_env = self.terminal_env();
         // The conversation before was another agent's: not the new one's to go on with.
         if let Some(chat) = self.agent_chat(Who::Main) {
             chat.update(cx, |c, _| c.end());
         }
-        // A new conversation: the old one's journal, log and checkpoints go.
-        // The files now, before the new host opens them (an unlink each);
-        // the refs, which take git, off this thread.
-        let journal = crate::acp::journal_path(&self.root);
-        let log = crate::acp::host::log_path(&journal);
-        for old in [journal.clone(), log.with_extension("log.old"), log] {
-            let _ = std::fs::remove_file(old);
-        }
+        // A new conversation: the old one's journal, log and checkpoints go,
+        // (a remote task's on its host) before the new agent starts: its host
+        // would find the old journal, and its first checkpoint could go with the old ones.
+        let (old, threads) = crate::acp::journal_files(&self.root);
         let root = self.root.clone();
-        std::thread::spawn(move || crate::acp::checkpoint::forget(&root, &crate::acp::checkpoint::thread_name(Some(&journal))));
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_spawn(async move {
+                for file in old {
+                    let _ = crate::hostfs::remove(&file);
+                }
+                for thread in threads {
+                    crate::acp::forget_checkpoints(&root, &thread);
+                }
+            })
+            .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.put_agent(launch, task_env, window, cx);
+                then(this, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// The new agent of [`Self::switch_agent`] in the agent's tab.
+    fn put_agent(&mut self, launch: crate::agents::Launch, task_env: Vec<(String, String)>, window: &mut Window, cx: &mut Context<Self>) {
         let tab = self.agent_tab(Who::Main, &launch, task_env, window, cx);
         let ix = match self.agent_ix(Who::Main) {
             Some(ix) => {
@@ -1067,6 +1092,9 @@ impl TaskView {
             unanswered_secs: crate::state::with_settings(|s| u64::from(s.agent_unanswered_minutes) * 60),
             notify_as: crate::state::with_settings(|s| s.notifications).then(|| launch.profile.name.clone()),
             budget: launch.profile.daily_limit.map(|limit| (limit - crate::acp::spend::spent_today(&launch.profile.id)).max(0.0)),
+            // Set where it runs ([`crate::acp::link`]).
+            login_shell: false,
+            journal_before: Some(crate::acp::journal_of_before(root, who.tag().as_deref())),
         }
     }
 
