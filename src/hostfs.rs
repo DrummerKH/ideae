@@ -156,6 +156,17 @@ pub fn reachable(path: &Path) -> bool {
     }
 }
 
+/// Whether `path`'s host watches its folders for the window (its daemon said so).
+pub fn watched_there(path: &Path) -> bool {
+    #[cfg(unix)]
+    return crate::daemon::client::for_path(path).is_some_and(|daemon| daemon.watches_folders());
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 /// A path git or a program on `root`'s machine printed, as the window
 /// keys it: on a remote task's host, its key.
 pub fn rekey(root: &Path, printed: PathBuf) -> PathBuf {

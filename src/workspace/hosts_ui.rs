@@ -321,6 +321,67 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
+    /// A language server, as the stand-in `gopls` of the test below runs it
+    /// there: it answers hover with the file as it was named to it, tells a
+    /// problem of each file opened by the name it knows, and its pid.
+    #[test]
+    #[ignore]
+    fn stand_in_language_server() {
+        use std::io::{BufRead as _, Read as _, Write as _};
+        use std::os::fd::FromRawFd as _;
+        if std::env::var_os("IDEAE_TEST_LSP").is_none() {
+            return;
+        }
+        // SAFETY: descriptors 0 and 1 are this process's, used by nothing else here.
+        let (input, mut output) = unsafe { (std::fs::File::from_raw_fd(0), std::fs::File::from_raw_fd(1)) };
+        if let Ok(file) = std::env::var("IDEAE_TEST_LSP_PID") {
+            let _ = std::fs::write(file, std::process::id().to_string());
+        }
+        let mut input = std::io::BufReader::new(input);
+        let mut send = |message: serde_json::Value| {
+            let body = message.to_string();
+            let _ = write!(output, "Content-Length: {}\r\n\r\n{body}", body.len());
+            let _ = output.flush();
+        };
+        loop {
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                if input.read_line(&mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                let line = line.trim_end();
+                if line.is_empty() {
+                    break;
+                }
+                if let Some(n) = line.strip_prefix("Content-Length:") {
+                    length = n.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0; length];
+            if input.read_exact(&mut body).is_err() {
+                return;
+            }
+            let message: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            let id = message["id"].clone();
+            match message["method"].as_str().unwrap_or_default() {
+                "initialize" => send(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"capabilities": {"hoverProvider": true, "textDocumentSync": 1}, "processId": message["params"]["processId"]}})),
+                "textDocument/didOpen" => {
+                    let uri = message["params"]["textDocument"]["uri"].clone();
+                    send(serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {"uri": uri, "diagnostics": [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "message": "seen there"}]}}));
+                }
+                "textDocument/hover" => {
+                    let named = format!("named {}", message["params"]["textDocument"]["uri"].as_str().unwrap_or_default());
+                    send(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"contents": {"kind": "plaintext", "value": named}}}));
+                }
+                "shutdown" => send(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": null})),
+                "exit" => return,
+                _ if !id.is_null() => send(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": null})),
+                _ => {}
+            }
+        }
+    }
+
     /// A project on "another machine": this one, behind a stand-in ssh with
     /// a home and a state of its own, its ideae-server put there from
     /// target/debug. Its main thread's agent runs there, in the folder
@@ -378,6 +439,17 @@ exec cat
             pwds = dir.join("pwds").display()
         );
         std::fs::write(bins.join("claude"), claude).unwrap();
+        // gopls as far as the test goes: the test binary run again (none is here, to be found first).
+        let gopls_pid = dir.join("gopls.pid");
+        std::fs::write(
+            bins.join("gopls"),
+            format!(
+                "#!/bin/sh\nexec env IDEAE_TEST_LSP=1 IDEAE_TEST_LSP_PID='{}' '{}' --exact workspace::hosts_ui::tests::stand_in_language_server --ignored --nocapture --test-threads=1\n",
+                gopls_pid.display(),
+                std::env::current_exe().unwrap().display()
+            ),
+        )
+        .unwrap();
         let ssh = dir.join("ssh");
         std::fs::write(
             &ssh,
@@ -390,7 +462,7 @@ exec cat
         )
         .unwrap();
         use std::os::unix::fs::PermissionsExt as _;
-        for program in [&ssh, &bins.join("claude")] {
+        for program in [&ssh, &bins.join("claude"), &bins.join("gopls")] {
             std::fs::set_permissions(program, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let pwds = dir.join("pwds");
@@ -421,6 +493,7 @@ exec cat
             .env("HOME", &home)
             .env("IDEAE_STATE", dir.join("box-state.json"))
             .env("IDEAE_APP", format!("{}-remote", crate::state::APP_ID))
+            .env("PATH", format!("{}:{}", bins.display(), std::env::var("PATH").unwrap_or_default()))
             .env_remove("XDG_RUNTIME_DIR")
             .spawn()
             .unwrap();
@@ -480,15 +553,25 @@ exec cat
             assert_eq!(w.entry_mut(&task).unwrap().branch, branch.trim());
         });
 
+        // Its first refresh done, which tells the daemon what to watch there.
+        let view = workspace.update(cx, |w, _| w.entry_mut(&task).unwrap().view.clone().unwrap());
+        until(cx, "the task's first refresh", &|cx| view.read_with(cx, |t, _| t.refreshed_once()));
         // Its changes, read there: a file changed and one new.
         std::fs::write(worktree.join("f.txt"), "two\n").unwrap();
         std::fs::write(worktree.join("g.txt"), "new\n").unwrap();
-        let view = workspace.update(cx, |w, _| w.entry_mut(&task).unwrap().view.clone().unwrap());
-        view.update(cx, |t, _| t.refresh_now());
-        until(cx, "its changes were read there", &|cx| {
+        // Told by its daemon's watcher there, well before the poll of a minute.
+        let seen = |cx: &mut TestAppContext| {
             let names = view.read_with(cx, |t, _| t.changed_names());
             names.contains(&"f.txt".to_string()) && names.contains(&"g.txt".to_string())
-        });
+        };
+        let mut waited = Duration::ZERO;
+        while !seen(cx) {
+            assert!(waited < Duration::from_secs(20), "its changes were told by the watcher there");
+            cx.run_until_parked();
+            cx.executor().advance_clock(Duration::from_millis(250));
+            waited += Duration::from_millis(250);
+            std::thread::sleep(Duration::from_millis(20));
+        }
         // A file of it opens from there, and is saved there.
         let file = task.join("f.txt");
         cx.update_window(handle.into(), |_, window, cx| view.update(cx, |t, cx| t.open_file(file.clone(), 0, window, cx))).unwrap();
@@ -496,14 +579,54 @@ exec cat
         cx.update_window(handle.into(), |_, window, cx| view.update(cx, |t, cx| t.type_and_save(&file, "zero\n", window, cx))).unwrap();
         until(cx, "the file was saved there", &|_| std::fs::read_to_string(worktree.join("f.txt")).unwrap() == "zero\ntwo\n");
 
+        // Its language server runs there: found by the login shell there (the stand-in, and no
+        // other), told and telling files by their names there, which here are its keys.
+        let go = task.join("main.go");
+        std::fs::write(worktree.join("main.go"), "package main\n").unwrap();
+        assert_eq!(crate::lsp_remote::locate(&go, "gopls"), Some(bins.join("gopls")), "the stand-in, not a gopls of this machine");
+        let servers = crate::lsp_share::TaskServers::default();
+        let found = servers.server_for(&task, &go).expect("its server there");
+        found.client.did_open(&go, "go", "package main\n").unwrap();
+        let hover = found.client.hover(&crate::lsp::path_to_uri(&go), lsp_types::Position { line: 0, character: 0 }).unwrap().expect("hover");
+        let named = serde_json::to_value(&hover.contents).unwrap()["value"].as_str().unwrap_or_default().to_string();
+        assert_eq!(named, format!("named {}", crate::lsp::path_to_uri(&worktree.join("main.go"))), "named as it is there");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while found.client.problems(&crate::lsp::path_to_uri(&go)).1.is_empty() {
+            assert!(std::time::Instant::now() < deadline, "its problems are told of the file here");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let pid = std::fs::read_to_string(&gopls_pid).unwrap();
+        drop(found);
+        servers.clear();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::process::Command::new("kill").args(["-0", pid.trim()]).status().unwrap().success() {
+            assert!(std::time::Instant::now() < deadline, "its server there ended with it");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
         // Committed there, by the commit box.
         cx.update_window(handle.into(), |_, window, cx| view.update(cx, |t, cx| t.commit_for_test("Saved there", window, cx))).unwrap();
         let subject = || String::from_utf8(std::process::Command::new("git").args(["log", "-1", "--format=%s"]).current_dir(&worktree).output().unwrap().stdout).unwrap();
         until(cx, "committed there", &|_| subject().trim() == "Saved there");
-        workspace.update(cx, |w, cx| {
-            let commands = crate::commands::InHand::of(w.entry_mut(&task).unwrap(), cx);
-            assert!(commands.remote && !commands.git(crate::task::GitCommand::PullRequest), "gh is here, not there");
-        });
+        // gh, here with the user's sign-in, is told the repository its origin there names.
+        let origin = std::process::Command::new("git").args(["remote", "add", "origin", "git@github.com:owner/repo.git"]).current_dir(&repo).status().unwrap();
+        assert!(origin.success());
+        let gh = crate::pr::gh_for(&task).expect("a GitHub repository");
+        let named = gh.get_envs().find(|(k, _)| *k == "GH_REPO").and_then(|(_, v)| v).map(|v| v.to_string_lossy().into_owned());
+        assert_eq!(named.as_deref(), Some("github.com/owner/repo"));
+        workspace.update(cx, |w, cx| assert!(crate::commands::InHand::of(w.entry_mut(&task).unwrap(), cx).remote));
+
+        // Two tries at one task: their worktrees made there, from one commit, each with its agent.
+        cx.update_window(handle.into(), |_, window, cx| {
+            workspace.update(cx, |w, cx| w.create_task(0, "Try both".into(), String::new(), vec!["one way".into(), "another".into()], Vec::new(), window, cx))
+        })
+        .unwrap();
+        let variants = |cx: &mut TestAppContext| workspace.update(cx, |w, _| w.projects[0].tasks.iter().filter(|t| !t.group.is_empty() && t.busy.is_none() && t.view.is_some()).map(|t| t.path.clone()).collect::<Vec<_>>());
+        until(cx, "both variants made there and open", &|cx| variants(cx).len() == 2);
+        for variant in variants(cx) {
+            assert!(crate::hosts::is_remote(&variant) && crate::hosts::there(&variant).is_dir(), "{} there", variant.display());
+        }
+        until(cx, "their agents ran there", &|_| lines().len() == 4);
 
         // A worktree made there by hand is a task here.
         let by_hand = repo.with_file_name("repo.worktrees").join("by-hand");
@@ -522,6 +645,7 @@ exec cat
         std::fs::create_dir_all(dir.join("plain")).unwrap();
         cx.update_window(handle.into(), |_, window, cx| {
             workspace.update(cx, |w, cx| {
+                w.switch(&task, window, cx);
                 assert_eq!(w.active.as_deref(), Some(task.as_path()));
                 w.check_remote_project("box".into(), dir.join("link").display().to_string(), window, cx);
                 w.check_remote_project("box".into(), dir.join("plain").display().to_string(), window, cx);
@@ -540,6 +664,33 @@ exec cat
         cx.update_window(handle.into(), |_, window, cx| workspace.update(cx, |w, cx| w.close_task(&task, window, cx))).unwrap();
         let gone = || !std::process::Command::new("kill").args(["-0", &pid]).status().unwrap().success();
         until(cx, "the paused task's agent ended", &|_| gone());
+
+        // Archived: packed on its host with what is nowhere else (a commit there, a change not
+        // committed), a stub here; its worktree goes there.
+        std::fs::write(worktree.join("h.txt"), "kept\n").unwrap();
+        cx.update_window(handle.into(), |_, window, cx| workspace.update(cx, |w, cx| w.archive_now(&task, None, window, cx))).unwrap();
+        until(cx, "archived", &|cx| workspace.update(cx, |w, _| w.entry_mut(&task).is_none()));
+        assert!(!worktree.exists(), "its worktree is gone there");
+        let root = workspace.update(cx, |w, _| w.archive_dir.clone());
+        let listed = crate::archive::list(&root);
+        let item = listed.iter().find(|a| a.meta.worktree == task).expect("listed here");
+        assert!(crate::archive::is_stub(&item.file) && item.size > 0);
+        assert_eq!(item.meta.uncommitted, ["h.txt"]);
+        assert!(item.meta.unpushed.iter().any(|c| c.subject == "Saved there"));
+        let kept = std::fs::read_dir(home.join(".local/share").join(crate::state::APP_ID).join("archive")).unwrap().flatten().flat_map(|d| std::fs::read_dir(d.path()).unwrap().flatten()).filter(|f| f.file_name().to_string_lossy().ends_with(".tar.gz")).count();
+        assert_eq!(kept, 1, "the archive is there, not here");
+        assert!(std::fs::read_dir(&root).unwrap().flatten().flat_map(|d| std::fs::read_dir(d.path()).unwrap().flatten()).all(|f| !f.file_name().to_string_lossy().ends_with(".tar.gz")));
+
+        // Restored there, with its commit and its change.
+        let plan = crate::archive::Plan { start: crate::archive::Start::Origin, branch: "fix-again".into(), commits: true, changes: true, profiles: Vec::new(), copy_env: false };
+        let restored = crate::archive::restore(&main, &item.file, &item.meta, &plan).expect("restored there");
+        let back = crate::hosts::there(&restored.path);
+        assert_eq!((restored.commits.clone(), restored.changes.clone()), (crate::archive::Applied::Done, crate::archive::Applied::Done));
+        assert_eq!(std::fs::read_to_string(back.join("h.txt")).unwrap(), "kept\n");
+        let log = String::from_utf8(std::process::Command::new("git").args(["log", "-1", "--format=%s"]).current_dir(&back).output().unwrap().stdout).unwrap();
+        assert_eq!(log.trim(), "Saved there");
+        crate::archive::delete(&item.file).unwrap();
+        assert!(!item.file.exists());
 
         drop(_end);
         let _ = std::fs::remove_dir_all(&dir);

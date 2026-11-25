@@ -66,6 +66,10 @@ pub struct Daemon {
     wire: Option<super::remote::Wire>,
     /// Calls waiting for their reply, by id.
     calls: Mutex<HashMap<String, std::sync::mpsc::Sender<(proto::Reply, Vec<u8>)>>>,
+    /// What tasks have watched there, sent again when the link is back,
+    /// and whom a change of each is told to.
+    watches: Mutex<HashMap<String, (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>)>>,
+    changes: Mutex<HashMap<String, async_channel::Sender<()>>>,
 }
 
 static DAEMON: OnceLock<Option<Arc<Daemon>>> = OnceLock::new();
@@ -114,6 +118,8 @@ pub fn connect(on_hook: impl Fn(Hook) + Send + Sync + 'static) -> Option<(Arc<Da
         running: Mutex::new(sessions.into_iter().collect()),
         wire: None,
         calls: Mutex::default(),
+        watches: Mutex::default(),
+        changes: Mutex::default(),
     });
     let reading = daemon.clone();
     std::thread::Builder::new()
@@ -276,6 +282,15 @@ impl Daemon {
     /// After a reconnect: every terminal attaches again, its screen cleared
     /// for the replay that follows.
     pub(super) fn reopen(&self) {
+        // What was watched there: watched again, and looked at once, as what changed meanwhile was not told.
+        // One of an earlier build may not (the bridge could not hand it over).
+        let watches = self.watches_folders();
+        for (id, (flat, deep)) in self.watches.lock().unwrap().iter().filter(|_| watches) {
+            self.send(proto::encode_msg(&Msg::Watch { id: id.clone(), flat: flat.clone(), deep: deep.clone() }));
+            if let Some(tx) = self.changes.lock().unwrap().get(id) {
+                let _ = tx.try_send(());
+            }
+        }
         let peers = self.peers.lock().unwrap();
         for (id, p) in peers.iter() {
             let Some(size) = p.size.filter(|_| p.opened) else { continue };
@@ -347,6 +362,11 @@ impl Daemon {
                 }
             }
             Frame::Msg(Msg::Hook(hook)) => on_hook(hook),
+            Frame::Msg(Msg::Changed { id }) => {
+                if let Some(tx) = self.changes.lock().unwrap().get(&id) {
+                    let _ = tx.try_send(());
+                }
+            }
             Frame::Msg(Msg::Pong) => {
                 if let Some(wire) = &self.wire {
                     wire.heard();
@@ -473,6 +493,8 @@ impl Daemon {
             running: Mutex::new(sessions.into_iter().collect()),
             wire: Some(wire),
             calls: Mutex::default(),
+            watches: Mutex::default(),
+            changes: Mutex::default(),
         }
     }
 
@@ -506,6 +528,35 @@ impl Daemon {
         let answer = rx.recv_timeout(Duration::from_secs(120));
         self.calls.lock().unwrap().remove(&id);
         answer.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "no answer from the host"))
+    }
+
+    /// Whom a change of what `id` watches is told to.
+    pub fn on_change(&self, id: &str, tx: async_channel::Sender<()>) {
+        self.changes.lock().unwrap().insert(id.to_string(), tx);
+    }
+
+    /// Watches `flat` (each on its own) and `deep` (with all in them) on
+    /// the daemon's machine as `id`, in place of what it watched.
+    pub fn watch(&self, id: &str, flat: Vec<std::path::PathBuf>, deep: Vec<std::path::PathBuf>) {
+        if !self.watches_folders() {
+            return;
+        }
+        self.watches.lock().unwrap().insert(id.to_string(), (flat.clone(), deep.clone()));
+        self.send(proto::encode_msg(&Msg::Watch { id: id.to_string(), flat, deep }));
+    }
+
+    pub fn unwatch(&self, id: &str) {
+        let watched = self.watches.lock().unwrap().remove(id).is_some();
+        self.changes.lock().unwrap().remove(id);
+        if watched {
+            self.send(proto::encode_msg(&Msg::Unwatch { id: id.to_string() }));
+        }
+    }
+
+    /// Whether it watches folders for this window: this machine's, which
+    /// the window watches itself, never asked; another's, when it said so.
+    pub fn watches_folders(&self) -> bool {
+        self.wire.as_ref().is_some_and(|wire| wire.watches())
     }
 
     /// The link dropped: what waits for a reply is told now.

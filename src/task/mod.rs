@@ -24,7 +24,6 @@ use gpui_kit::component::{
 };
 use gpui_kit::{prelude::FluentBuilder as _, *};
 
-use notify::{RecursiveMode, Watcher as _};
 
 use crate::{git, history::HistoryView, lsp};
 use gpui_kit::component::notification::Notification;
@@ -48,6 +47,11 @@ impl TaskView {
     /// The changed files shown, by name.
     pub(crate) fn changed_names(&self) -> Vec<String> {
         self.files.iter().map(|f| f.path.to_string()).collect()
+    }
+
+    /// A refresh has read its files: what it watches is known.
+    pub(crate) fn refreshed_once(&self) -> bool {
+        !self.tree_files.is_empty()
     }
 
     pub(crate) fn refresh_now(&self) {
@@ -732,22 +736,20 @@ impl TaskView {
 
         let (refresh_tx, refresh_rx) = async_channel::unbounded::<()>();
         let watch_tx = refresh_tx.clone();
-        let filter: Arc<std::sync::RwLock<WatchFilter>> = Arc::default();
-        let event_filter = filter.clone();
-        let watcher = (!remote).then(|| notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-            if let Ok(event) = event {
-                let wanted = !whole_trees() || event.paths.is_empty() || {
-                    let filter = event_filter.read().unwrap();
-                    event.paths.iter().any(|path| filter.lets_through(path))
-                };
-                if wanted && !matches!(event.kind, notify::EventKind::Access(_)) {
-                    let _ = watch_tx.try_send(());
-                }
-            }
-        })
-        .inspect_err(|e| eprintln!("file watcher off, polling only: {e}"))
-        .ok()).flatten();
-        let watching = Arc::new(std::sync::Mutex::new(Watching::new(watcher, filter)));
+        // A remote task's files are watched there, by its daemon, which tells of their changes.
+        #[cfg(unix)]
+        let watching = if remote {
+            Watching::there(&root, watch_tx)
+        } else {
+            Watching::Here(ideae_core::watch::Watch::new(move || {
+                let _ = watch_tx.try_send(());
+            }))
+        };
+        #[cfg(not(unix))]
+        let watching = Watching::Here(ideae_core::watch::Watch::new(move || {
+            let _ = watch_tx.try_send(());
+        }));
+        let watching = Arc::new(std::sync::Mutex::new(watching));
         let poll_watching = watching.clone();
         // Fallback for anything the watcher misses (new directories, remotes).
         // Out of view a task is looked at once a minute: every open task pays
@@ -758,13 +760,19 @@ impl TaskView {
             let _ = ws_tx.try_send(());
         })
         .detach();
+        let root_tick = root.clone();
         cx.spawn(async move |this, cx| {
             let mut n = 0u32;
             loop {
                 cx.background_executor().timer(Duration::from_secs(10)).await;
                 n += 1;
                 let Ok(visible) = this.read_with(cx, |t, _| t.visible) else { break };
-                if (visible || n % 6 == 0) && tick_tx.send(()).await.is_err() {
+                // A remote task's daemon tells of its changes: in view, looked at again every half
+                // minute alone, should its watching there fail (too many folders for the system);
+                // every ten seconds where the daemon there watches nothing.
+                let watched = remote && crate::hostfs::watched_there(&root_tick);
+                let due = if watched { n % 3 == 0 } else { true };
+                if ((visible && due) || n % 6 == 0) && tick_tx.send(()).await.is_err() {
                     break;
                 }
             }

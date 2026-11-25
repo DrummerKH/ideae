@@ -33,6 +33,8 @@ mod keymap;
 mod keys;
 mod local_time;
 mod lsp;
+#[cfg(unix)]
+mod lsp_remote;
 mod lsp_columns;
 #[cfg(target_os = "macos")]
 mod mac_notify;

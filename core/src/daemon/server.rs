@@ -41,6 +41,8 @@ struct Server {
     hooks: HashMap<String, Hook>,
     next_client: u64,
     alone_since: Option<Instant>,
+    /// Folders watched for windows, by window and what they call them.
+    watches: HashMap<(u64, String), crate::watch::Watch>,
 }
 
 /// Locked with `unwrap_or_else(PoisonError::into_inner)` everywhere, here
@@ -269,6 +271,7 @@ fn serve(shared: Shared, stream: UnixStream) {
                     ping: true,
                     socket: Some(proto::socket_path().display().to_string()),
                     calls: true,
+                    watches: true,
                 };
                 s.send(client, proto::encode_msg(&welcome));
             }
@@ -288,6 +291,10 @@ fn serve(shared: Shared, stream: UnixStream) {
                 }
             }
             Frame::Msg(Msg::Shutdown) => shutdown(&shared),
+            Frame::Msg(Msg::Watch { id, flat, deep }) => watch(&shared, client, id, flat, deep),
+            Frame::Msg(Msg::Unwatch { id }) => {
+                shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).watches.remove(&(client, id));
+            }
             Frame::Msg(Msg::Ping) => shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).send(client, proto::encode_msg(&Msg::Pong)),
             Frame::Msg(Msg::Upgrade { exe }) => {
                 // It returns only when the sessions stayed here.
@@ -315,6 +322,7 @@ fn serve(shared: Shared, stream: UnixStream) {
     }
     let mut s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     s.clients.remove(&client);
+    s.watches.retain(|(of, _), _| *of != client);
     let mut alone = Vec::new();
     for (id, session) in s.sessions.iter_mut() {
         if session.attached.remove(&client) && session.attached.is_empty() && session.pipe.is_some() {
@@ -333,6 +341,37 @@ fn serve(shared: Shared, stream: UnixStream) {
     }
     drop(tx);
     let _ = writer_thread.join();
+}
+
+/// Watches `flat` and `deep` for window `client` as `id`, telling it of
+/// changes once a moment has gathered them.
+fn watch(shared: &Shared, client: u64, id: String, flat: Vec<std::path::PathBuf>, deep: Vec<std::path::PathBuf>) {
+    let key = (client, id.clone());
+    // Out of the lock: a thousand folders take a moment to watch.
+    let taken = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).watches.remove(&key);
+    let mut watch = taken.unwrap_or_else(|| {
+        let (weak, pending) = (Arc::downgrade(shared), Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        crate::watch::Watch::new(move || {
+            if pending.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                return;
+            }
+            let (weak, pending, id) = (weak.clone(), pending.clone(), id.clone());
+            std::thread::spawn(move || {
+                // A save, a checkout, a build: their events come in bursts.
+                std::thread::sleep(Duration::from_millis(150));
+                pending.store(false, std::sync::atomic::Ordering::Release);
+                if let Some(shared) = weak.upgrade() {
+                    shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).send(client, proto::encode_msg(&Msg::Changed { id }));
+                }
+            });
+        })
+    });
+    watch.sync(Arc::new(flat.into_iter().collect()), deep);
+    let mut s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // The window went meanwhile: nothing is kept for it.
+    if s.clients.contains_key(&client) {
+        s.watches.insert(key, watch);
+    }
 }
 
 fn input(shared: &Shared, id: &str, bytes: &[u8]) {

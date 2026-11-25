@@ -213,7 +213,11 @@ fn task_key(root: &Path) -> String {
 /// The task's DevTools port: below the ephemeral range, where the system
 /// gives no program one of its own choosing.
 fn task_port(root: &Path) -> u16 {
-    21000 + (fnv(&task_key(root)) % 9000) as u16
+    port_of(&task_key(root))
+}
+
+fn port_of(key: &str) -> u16 {
+    21000 + (fnv(key) % 9000) as u16
 }
 
 /// What a task's terminals are told: where its browser is, once a Web tab
@@ -3819,10 +3823,14 @@ mod tests {
 
     #[core::prelude::v1::test]
     fn a_task_keeps_its_port() {
-        let port = task_port(Path::new("/w/a"));
-        assert_eq!(port, task_port(Path::new("/w/a")));
+        // By its key, not its path: the key has the state's folder in it, which
+        // tests running beside this one change (IDEAE_STATE).
+        let port = super::port_of("/state\0/w/a");
+        assert_eq!(port, super::port_of("/state\0/w/a"));
         assert!((21000..30000).contains(&port));
-        assert_ne!(port, task_port(Path::new("/w/b")));
+        assert_ne!(port, super::port_of("/state\0/w/b"));
+        assert_ne!(port, super::port_of("/other\0/w/a"), "another state, another port");
+        assert!(super::task_key(Path::new("/w/a")).ends_with("\0/w/a"));
     }
 
     #[core::prelude::v1::test]

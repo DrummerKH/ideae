@@ -1201,8 +1201,7 @@ impl Workspace {
             t.pr = pr;
             t.main_thread = main;
             t.kept_branches = kept;
-            // Its language servers would read its files here: off for a remote one for now.
-            t.lsp_off = lsp_off || crate::hosts::is_remote(path);
+            t.lsp_off = lsp_off;
             t
         });
         cx.subscribe_in(&view, window, |this, view, event: &TaskEvent, window, cx| this.on_task_event(view, event, window, cx)).detach();
@@ -1325,8 +1324,9 @@ impl Workspace {
         }
         use std::time::Duration;
         let mut due = Vec::new();
-        // gh reads a remote project's repository here: not yet.
-        for p in self.projects.iter_mut().filter(|p| !p.pr_off && !crate::hosts::is_remote(&p.path)) {
+        // A remote project's too, once its host is connected: gh is asked here,
+        // of the repository its origin there names.
+        for p in self.projects.iter_mut().filter(|p| !p.pr_off && crate::hostfs::reachable(&p.path)) {
             for t in &mut p.tasks {
                 if t.main || t.busy.is_some() {
                     continue;
@@ -2048,6 +2048,10 @@ impl Workspace {
         let given = std::mem::take(&mut self.send_next_prompt);
         let Some(repo) = self.projects.get(project).map(|p| p.path.clone()) else { return };
         if crate::hosts::is_remote(&repo) {
+            // Variants are made there as here (git::create_variant_worktrees).
+            if notes.len() > 1 {
+                return self.create_variants(project, title, prompt, notes, agents, window, cx);
+            }
             return self.create_remote_task(project, title, prompt, agents, given, window, cx);
         }
         cx.spawn_in(window, async move |this, cx| {

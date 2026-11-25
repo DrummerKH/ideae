@@ -54,9 +54,20 @@ terminals, git, the changes and the files you open and save. The agents
 report as local ones do and go on while the window is closed or the link is
 down; the window dials again on its own. Exit ends them there too.
 
-Not there yet: language servers, the file watcher (a task in view is read
-again every ten seconds), pull requests, archive, variants, the Run panel
-and Web tabs, chat agents, passwords (keys and the ssh agent only).
+Its files are watched there, and a change shows as a local one does. Pull
+requests are asked of GitHub here, with your sign-in (`gh`), of the
+repository its origin there names: their state, checks and comments in
+the sidebar, and **PR** pushes there and opens one here. Its archive (Archive,
+Defer) is made and kept there, with what was nowhere else; here only what
+the archived list shows of it, and Restore makes its worktree there again.
+
+Variants are made there too, from one commit. Its language servers run
+there, those its login shell finds (rust-analyzer, gopls…, installed there),
+and answer for its files as for a local task's.
+
+Not there yet: its `.ideae.toml` (setup, check, teardown, copy; its .env
+files are copied as without one), the Run panel and Web tabs, chat agents,
+passwords (keys and the ssh agent only).
 
 ## Pause, archive, restore
 

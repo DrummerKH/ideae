@@ -240,9 +240,9 @@ impl InHand {
         match what {
             Star | CopyBranchName | CopyTitle => true,
             Rename => !self.main,
-            Archive | Defer | AnotherVariant => !self.main && !self.side && self.ready && !self.remote,
-            RemoveSide => self.side && self.ready && !self.remote,
-            KeepVariant => !self.main && !self.side && self.ready && self.grouped && !self.remote,
+            Archive | Defer | AnotherVariant => !self.main && !self.side && self.ready,
+            RemoveSide => self.side && self.ready,
+            KeepVariant => !self.main && !self.side && self.ready && self.grouped,
             RestartAgent => self.open && self.agent_ended,
             // With nothing in .ideae.toml yet, the Run panel tells how to begin.
             StartServices => self.open && !self.remote && (!self.services || self.services_waiting),
@@ -254,9 +254,7 @@ impl InHand {
     }
 
     pub(crate) fn git(&self, what: GitCommand) -> bool {
-        // A remote task's git runs on its host; gh, with the user's sign-in, is here: not yet.
-        let here_only = self.remote && what == GitCommand::PullRequest;
-        self.open && !here_only && GitCommand::ALL.iter().position(|w| *w == what).is_some_and(|i| self.git[i])
+        self.open && GitCommand::ALL.iter().position(|w| *w == what).is_some_and(|i| self.git[i])
     }
 }
 

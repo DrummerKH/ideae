@@ -1,7 +1,7 @@
 //! A task's pull request, as `gh` sees it: open, draft, merged or closed, and
 //! how its checks went. No `gh`, no login, no GitHub remote: no PR shown.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -46,13 +46,61 @@ impl Pr {
     }
 }
 
+/// `gh` for the repository of `root`, run here, where the user signed in
+/// to it. A remote task's repository is named (`GH_REPO`) as its origin
+/// there names it, gh having no checkout here to read it from. Off the UI
+/// thread: for a remote one it asks its host.
+pub fn gh_for(root: &Path) -> Option<std::process::Command> {
+    let mut gh = crate::procs::command("gh");
+    if crate::hosts::is_remote(root) {
+        gh.env("GH_REPO", github_repo(root)?).current_dir(std::env::temp_dir());
+    } else {
+        gh.current_dir(root);
+    }
+    Some(gh)
+}
+
+/// `HOST/OWNER/REPO` of `root`'s origin, as gh takes it: asked of the
+/// repository once found, and kept while the app runs.
+fn github_repo(root: &Path) -> Option<String> {
+    use std::{collections::HashMap, sync::Mutex};
+    static KNOWN: Mutex<Option<HashMap<PathBuf, String>>> = Mutex::new(None);
+    if let Some(known) = KNOWN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).get(root) {
+        return Some(known.clone());
+    }
+    // Not kept when not found: an origin may be added, a link come back.
+    let found = crate::git::run(root, "git", &["remote", "get-url", "origin"]).ok().and_then(|url| repo_of_url(url.trim()))?;
+    KNOWN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(root.to_path_buf(), found.clone());
+    Some(found)
+}
+
+/// `github.com/owner/repo` of a remote's URL: `git@github.com:owner/repo.git`,
+/// `https://github.com/owner/repo`, `ssh://git@host:22/owner/repo.git`.
+fn repo_of_url(url: &str) -> Option<String> {
+    let rest = url.strip_suffix('/').unwrap_or(url);
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
+    let (host, path) = match rest.split_once("://") {
+        Some((_, rest)) => {
+            let rest = rest.rsplit_once('@').map_or(rest, |(_, r)| r);
+            let (host, path) = rest.split_once('/')?;
+            (host.split(':').next()?, path)
+        }
+        None => {
+            let rest = rest.rsplit_once('@').map_or(rest, |(_, r)| r);
+            rest.split_once(':')?
+        }
+    };
+    let mut parts = path.trim_start_matches('/').split('/');
+    let (owner, name) = (parts.next()?, parts.next()?);
+    (!host.is_empty() && !owner.is_empty() && !name.is_empty() && parts.next().is_none()).then(|| format!("{host}/{owner}/{name}"))
+}
+
 /// The PR whose head is `branch`, run off the UI thread.
 pub fn lookup(root: &Path, branch: &str) -> Option<Pr> {
     if branch.is_empty() || branch.starts_with('(') {
         return None;
     }
-    let out = crate::procs::command("gh")
-        .current_dir(root)
+    let out = gh_for(root)?
         .env("GH_PROMPT_DISABLED", "1")
         .args(["pr", "view", branch, "--json", "number,url,state,isDraft,statusCheckRollup"])
         .output()
@@ -70,8 +118,7 @@ pub fn lookup(root: &Path, branch: &str) -> Option<Pr> {
 /// A PR by its number as it is now, with the branch it is of: an archived
 /// task's, which has no branch here any more. Off the UI thread.
 pub fn by_number(root: &Path, number: u64) -> Option<(Pr, String)> {
-    let out = crate::procs::command("gh")
-        .current_dir(root)
+    let out = gh_for(root)?
         .env("GH_PROMPT_DISABLED", "1")
         .args(["pr", "view", &number.to_string(), "--json", "number,url,state,isDraft,headRefName"])
         .output()
@@ -122,8 +169,7 @@ pub fn lookup_all(root: &Path, branches: &[String]) -> Option<Vec<Option<Pr>>> {
             })
             .collect();
         let query = format!("query($owner:String!,$name:String!){{repository(owner:$owner,name:$name){{{asked}}}}}");
-        let out = crate::procs::command("gh")
-            .current_dir(root)
+        let out = gh_for(root)?
             .env("GH_PROMPT_DISABLED", "1")
             // gh puts the repository of this directory in their place.
             .args(["api", "graphql", "-F", "owner={owner}", "-F", "name={repo}", "-f", &format!("query={query}")])
@@ -221,8 +267,7 @@ reviews(last:50){nodes{state body author{login}}}}}}";
 /// The unresolved review threads and asking reviews of `pr`, from GitHub.
 pub fn feedback(root: &Path, pr: &Pr) -> Option<Feedback> {
     let (owner, name) = owner_repo(&pr.url)?;
-    let out = crate::procs::command("gh")
-        .current_dir(root)
+    let out = gh_for(root)?
         .env("GH_PROMPT_DISABLED", "1")
         .args(["api", "graphql", "-f", &format!("query={FEEDBACK_QUERY}")])
         .args(["-F", &format!("owner={owner}"), "-F", &format!("name={name}"), "-F", &format!("n={}", pr.number)])
@@ -304,7 +349,7 @@ const LOG_BYTES: usize = 12 * 1024;
 /// of the log of the steps that failed. Run off the UI thread.
 pub fn failed_log(root: &Path, branch: &str) -> Result<(String, String), String> {
     let gh = |args: &[&str]| {
-        let out = crate::procs::command("gh").current_dir(root).env("GH_PROMPT_DISABLED", "1").args(args).output().map_err(|e| format!("gh: {e}"))?;
+        let out = gh_for(root).ok_or_else(|| "gh: no GitHub repository known for it".to_string())?.env("GH_PROMPT_DISABLED", "1").args(args).output().map_err(|e| format!("gh: {e}"))?;
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).into_owned())
         } else {
@@ -344,6 +389,15 @@ fn log_tail(log: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{Checks, PrState, parse, parse_feedback};
+
+    #[test]
+    fn a_remote_s_url_names_its_github_repository() {
+        assert_eq!(super::repo_of_url("git@github.com:owner/repo.git").as_deref(), Some("github.com/owner/repo"));
+        assert_eq!(super::repo_of_url("https://github.com/owner/repo").as_deref(), Some("github.com/owner/repo"));
+        assert_eq!(super::repo_of_url("https://user@github.com/owner/repo.git/").as_deref(), Some("github.com/owner/repo"));
+        assert_eq!(super::repo_of_url("ssh://git@ghe.example.com:22/team/app.git").as_deref(), Some("ghe.example.com/team/app"));
+        assert_eq!(super::repo_of_url("/srv/git/repo"), None);
+    }
 
     #[test]
     fn states_and_checks() {

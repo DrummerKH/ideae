@@ -209,12 +209,21 @@ pub enum Msg {
         /// It answers [`Call`]s.
         #[serde(default)]
         calls: bool,
+        /// It watches folders for a window (`Watch`).
+        #[serde(default)]
+        watches: bool,
     },
     /// The answer to an `Upgrade` that did not happen: this daemon goes on
     /// serving its sessions.
     Stays,
     Exited { id: String, code: Option<i32>, signal: Option<String> },
     Foreground { id: String, fg: Option<Fg> },
+    /// Window: watch these folders, each on its own (`flat`) or with all
+    /// in them (`deep`), in place of what `id` watched; the daemon says
+    /// `Changed` when anything there changes.
+    Watch { id: String, flat: Vec<PathBuf>, deep: Vec<PathBuf> },
+    Unwatch { id: String },
+    Changed { id: String },
     /// Over a link that can go quiet (ssh): the window asks, the daemon
     /// answers; a window that hears nothing for a while dials again.
     Ping,

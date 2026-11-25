@@ -64,7 +64,7 @@ fn connect() -> Option<UnixStream> {
         // Handed over forward only: to a build that can do what it cannot,
         // or to a newer one. Two windows of two builds then settle on one
         // daemon instead of handing it back and forth at each dial.
-        Some((protocol, version, calls)) if protocol == proto::PROTOCOL && calls && !newer(&crate::build::id(), &version) => {}
+        Some((protocol, version, can)) if protocol == proto::PROTOCOL && can && !newer(&crate::build::id(), &version) => {}
         Some((protocol, _, _)) => {
             let mut old = reach()?;
             let ask = if protocol == proto::PROTOCOL { Msg::Upgrade { exe: crate::paths::exe().ok()? } } else { Msg::Shutdown };
@@ -89,12 +89,13 @@ fn newer(ours: &str, theirs: &str) -> bool {
     time(ours) > time(theirs)
 }
 
-/// What the daemon says of itself: its protocol, build and whether it answers calls.
+/// What the daemon says of itself: its protocol, build and whether it does
+/// all a window asks of it (calls, watching).
 fn welcome(mut stream: UnixStream) -> Option<(u32, String, bool)> {
     proto::write_msg(&mut stream, &Msg::Hello { protocol: proto::PROTOCOL, version: crate::build::id() }).ok()?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     match proto::read_frame(&mut stream) {
-        Ok(proto::Frame::Msg(Msg::Welcome { protocol, version, calls, .. })) => Some((protocol, version, calls)),
+        Ok(proto::Frame::Msg(Msg::Welcome { protocol, version, calls, watches, .. })) => Some((protocol, version, calls && watches)),
         _ => None,
     }
 }

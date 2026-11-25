@@ -278,6 +278,8 @@ impl Workspace {
         // Archived again after a restore: in the place of the one it came from.
         let key = if !t.archive.is_empty() && !t.archive_keep { t.archive.clone() } else { archive::new_key(&t.branch, state::now()) };
         let dest = archive::file_of(&archive_dir, &repo, &key);
+        // A remote task's archive is made and kept on its host: here only its stub.
+        let dest = if crate::hosts::is_remote(path) { archive::stub_of(&dest) } else { dest };
         let (branch, unlock, title) = (t.branch.clone(), t.locked.is_some(), t.label());
         cx.notify();
         let torn_down = self.torn_down(path);
@@ -590,7 +592,7 @@ impl Workspace {
                     window
                         .spawn(cx, async move |cx| {
                             let job = file.clone();
-                            let gone = cx.background_spawn(async move { std::fs::remove_file(&job) }).await;
+                            let gone = cx.background_spawn(async move { archive::delete(&job) }).await;
                             let _ = cx.update(|window, cx| {
                                 match gone {
                                     Ok(()) => {

@@ -852,6 +852,8 @@ pub struct Known {
     age: u32,
     git_dir: Option<PathBuf>,
     refs: Option<PathBuf>,
+    /// A remote task's refs, watched there: not stamped here.
+    refs_there: Option<PathBuf>,
     has_origin: bool,
     base: Option<String>,
     /// The tracked files, by the index they were listed from.
@@ -905,6 +907,7 @@ impl Known {
             self.git_dir = git(root, &["rev-parse", "--absolute-git-dir"]).map(|dir| crate::hostfs::rekey(root, PathBuf::from(dir.trim())));
             let common = git(root, &["rev-parse", "--path-format=absolute", "--git-common-dir"]).map(|common| crate::hostfs::rekey(root, PathBuf::from(common.trim())));
             self.main_worktree = self.git_dir.is_some() && self.git_dir == common;
+            self.refs_there = common.as_ref().filter(|_| crate::hosts::is_remote(root)).map(|common| common.join("refs"));
             self.refs = common.map(|common| common.join("refs")).filter(|refs| refs.is_dir());
             self.has_origin = git(root, &["remote", "get-url", "origin"]).is_some();
             self.base = base_ref(root);
@@ -1174,7 +1177,7 @@ pub fn refresh(root: &Path, picked: Option<String>, light: bool, known: &mut Kno
         known.listed = Some(Listed { tracked, untracked: untracked.clone(), files, flat: Arc::new(flat) });
     }
     let (files, flat) = known.listed.as_ref().map(|listed| (listed.files.clone(), listed.flat.clone())).unwrap_or_default();
-    let watch = (flat, known.refs.clone().into_iter().collect());
+    let watch = (flat, known.refs.clone().or_else(|| known.refs_there.clone()).into_iter().collect());
 
     info.has_origin = known.has_origin;
     // Not for the base branch itself (main, tracking origin/main).
@@ -1877,11 +1880,41 @@ pub fn push(root: &Path, has_upstream: bool) -> Result<String, String> {
 
 /// The branch's pull request URL, creating the PR (from the commits) if needed.
 pub fn pull_request(root: &Path, has_upstream: bool) -> Result<String, String> {
+    if crate::hosts::is_remote(root) {
+        return remote_pull_request(root, has_upstream);
+    }
     if let Ok(url) = run(root, "gh", &["pr", "view", "--json", "url", "-q", ".url"]) {
         return Ok(url);
     }
     push(root, has_upstream)?;
     let out = run(root, "gh", &["pr", "create", "--fill"])?;
+    Ok(out.lines().rev().find(|l| l.starts_with("http")).unwrap_or(&out).to_string())
+}
+
+/// A remote task's PR: pushed there, asked for here, where gh has the
+/// user's sign-in. With no checkout here gh cannot fill it in itself: as
+/// `--fill` does, one commit gives its subject and body, several the
+/// branch's name and their subjects.
+fn remote_pull_request(root: &Path, has_upstream: bool) -> Result<String, String> {
+    let gh = |args: &[&str]| {
+        let out = crate::pr::gh_for(root).ok_or("gh: no GitHub repository known for its origin")?.env("GH_PROMPT_DISABLED", "1").args(args).output().map_err(|e| format!("gh: {e}"))?;
+        let said = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if out.status.success() { Ok(said) } else { Err(String::from_utf8_lossy(&out.stderr).trim().to_string()) }
+    };
+    let branch = run(root, "git", &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    if let Ok(url) = gh(&["pr", "view", &branch, "--json", "url", "-q", ".url"]) {
+        return Ok(url);
+    }
+    push(root, has_upstream)?;
+    let base = base_ref(root).unwrap_or_else(|| "origin/main".into());
+    let log = run(root, "git", &["log", "--reverse", "--format=%s%x1f%b%x1e", &format!("{base}..HEAD")])?;
+    let commits: Vec<(&str, &str)> = log.split('\x1e').map(str::trim).filter(|c| !c.is_empty()).filter_map(|c| c.split_once('\x1f')).collect();
+    let (title, body) = match commits.as_slice() {
+        [(subject, body)] => (subject.to_string(), body.trim().to_string()),
+        many => (branch.clone(), many.iter().map(|(subject, _)| format!("- {subject}")).collect::<Vec<_>>().join("\n")),
+    };
+    let into = base.strip_prefix("origin/").unwrap_or(&base);
+    let out = gh(&["pr", "create", "--head", &branch, "--base", into, "--title", &title, "--body", &body])?;
     Ok(out.lines().rev().find(|l| l.starts_with("http")).unwrap_or(&out).to_string())
 }
 
@@ -3104,6 +3137,10 @@ static WORKTREES_IN: std::sync::RwLock<Option<std::collections::HashMap<PathBuf,
 /// Settings names, a folder of the project's name in it; else beside the
 /// repository, `<repo>.worktrees`.
 pub fn task_worktrees(repo: &Path) -> PathBuf {
+    // A remote project's beside it there: Settings and a folder chosen here name places here.
+    if crate::hosts::is_remote(repo) {
+        return worktrees_beside(repo);
+    }
     let name = repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "repo".into());
     if let Some(own) = WORKTREES_IN.read().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|all| all.get(repo).cloned()) {
         return own;
@@ -3219,10 +3256,11 @@ pub fn create_task_worktree(repo: &Path, branch: &str, base: &str, copy_env: boo
 
 fn worktree_at(repo: &Path, branch: &str, base: &str, copy_env: bool) -> Result<PathBuf, String> {
     let dir = task_worktree_dir(repo, branch);
-    if dir.exists() {
-        return Err(format!("{} already exists", dir.display()));
+    // On the repository's machine (crate::hostfs), by its path there.
+    if crate::hostfs::stat(&dir).is_ok() {
+        return Err(format!("{} already exists", crate::hosts::there(&dir).display()));
     }
-    let dir_s = dir.to_string_lossy().into_owned();
+    let dir_s = crate::hosts::there(&dir).to_string_lossy().into_owned();
     git_status(repo, &["worktree", "add", "--no-track", "-b", branch, &dir_s, base])?;
     if copy_env {
         copy_env_files(repo, &dir);
@@ -3259,12 +3297,14 @@ pub struct TakenNames {
 impl TakenNames {
     pub fn read(repo: &Path) -> Self {
         let branches = git(repo, &["for-each-ref", "--format=%(refname:short)", "refs/heads"]).unwrap_or_default().lines().map(str::to_string).collect();
-        let dirs = std::fs::read_dir(task_worktree_dir(repo, ""))
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .collect();
+        let place = task_worktree_dir(repo, "");
+        let dirs = if crate::hosts::is_remote(repo) {
+            let there = crate::hosts::there(&place).display().to_string();
+            let listed = crate::hostfs::run(repo, "sh", &["-c", r#"ls -1A "$1" 2>/dev/null || true"#, "sh", &there], &[], None);
+            listed.map(|out| String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect()).unwrap_or_default()
+        } else {
+            std::fs::read_dir(place).into_iter().flatten().flatten().map(|entry| entry.file_name().to_string_lossy().into_owned()).collect()
+        };
         Self { branches, dirs }
     }
 
@@ -3368,11 +3408,19 @@ pub fn prune_parked(repo: &Path, now: u64, seconds: u64) {
     }
 }
 
-fn copy_env_files(from: &Path, to: &Path) {
+pub(crate) fn copy_env_files(from: &Path, to: &Path) {
     let Some(out) = git(from, &["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--", ":(glob)**/.env*"])
     else {
         return;
     };
+    // There: copied by its shell, in one go.
+    if crate::hosts::is_remote(from) {
+        let (from_s, to_s) = (crate::hosts::there(from).display().to_string(), crate::hosts::there(to).display().to_string());
+        let mut args = vec!["-c", r#"f=$1; t=$2; shift 2; for r; do [ -e "$t/$r" ] || { mkdir -p "$(dirname "$t/$r")" && cp -p "$f/$r" "$t/$r"; }; done"#, "sh", &from_s, &to_s];
+        args.extend(out.split('\0').filter(|f| !f.is_empty()));
+        let _ = crate::hostfs::run(from, "sh", &args, &[], None);
+        return;
+    }
     for rel in out.split('\0').filter(|f| !f.is_empty()) {
         let target = to.join(rel);
         if target.exists() {
@@ -3426,7 +3474,7 @@ pub fn free_branch_name(repo: &Path, name: &str) -> String {
     let taken = |b: &str| {
         branch_exists(repo, b)
             || git_status(repo, &["rev-parse", "--verify", "-q", &format!("refs/remotes/origin/{b}")]).is_ok()
-            || task_worktree_dir(repo, b).exists()
+            || crate::hostfs::stat(&task_worktree_dir(repo, b)).is_ok()
     };
     std::iter::once(name.to_string()).chain((2..100).map(|n| format!("{name}-{n}"))).find(|b| !taken(b)).unwrap_or_else(|| format!("{name}-{}", crate::state::now()))
 }
@@ -3469,7 +3517,9 @@ pub fn remove_side_worktree(repo: &Path, path: &Path, branch: &str) -> Result<Op
 /// returned.
 pub fn remove_task_worktree(repo: &Path, path: &Path, branch: &str, unlock: bool) -> Result<Option<String>, String> {
     let named = !branch.is_empty() && !branch.starts_with('(');
-    let only_there: u32 = if named && path.exists() && branch_exists(repo, branch) {
+    // Where the worktree's machine is (crate::hostfs), and by its path there.
+    let exists = crate::hostfs::stat(path).is_ok();
+    let only_there: u32 = if named && exists && branch_exists(repo, branch) {
         let exclude = format!("--exclude={branch}");
         git(path, &["rev-list", "--count", &format!("refs/heads/{branch}"), "--not", "HEAD", "--remotes", &exclude, "--branches"])
             .and_then(|n| n.trim().parse().ok())
@@ -3485,8 +3535,8 @@ pub fn remove_task_worktree(repo: &Path, path: &Path, branch: &str, unlock: bool
     let _ = std::fs::remove_file(log);
     // Its chat's checkpoints: refs of the repository, not of the worktree.
     crate::acp::checkpoint::forget(repo, &crate::acp::checkpoint::thread_name(Some(&journal)));
-    let path_s = path.to_string_lossy().into_owned();
-    if path.exists() {
+    let path_s = crate::hosts::there(path).to_string_lossy().into_owned();
+    if exists {
         let mut args = vec!["worktree", "remove", "--force"];
         if unlock {
             args.push("--force");

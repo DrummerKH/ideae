@@ -180,103 +180,57 @@ pub(super) fn write_in_order(
     Ok(Ok(mtime(path)))
 }
 
-/// The task's file watcher and the directories it watches now: each on its
-/// own, and those under git's refs with all that is in them.
-pub(super) struct Watching {
-    pub(super) watcher: Option<notify::RecommendedWatcher>,
-    pub(super) watched: (Arc<BTreeSet<PathBuf>>, Vec<PathBuf>),
-    /// On macOS the trees watched whole, and what lets their events through.
-    pub(super) trees: Vec<PathBuf>,
-    pub(super) filter: Arc<std::sync::RwLock<WatchFilter>>,
-}
-
-/// macOS restarts its FSEvents stream, with every path again, at each
-/// directory added or removed, and loses what happens meanwhile: a project
-/// of a thousand directories came to see its changes only at the poll ten
-/// seconds later. There one stream watches the few trees that hold them all,
-/// and the events of the directories not asked for are dropped here.
-/// `IDEAE_WHOLE_TREES=1` does it elsewhere too, to try it.
-pub(super) fn whole_trees() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| cfg!(target_os = "macos") || std::env::var_os("IDEAE_WHOLE_TREES").is_some());
-    *ON
-}
-
-#[derive(Default)]
-pub(super) struct WatchFilter {
-    flat: Arc<BTreeSet<PathBuf>>,
-    deep: Vec<PathBuf>,
-    /// A tree's path as FSEvents tells it (symlinks resolved, as /private/tmp
-    /// for /tmp) and as it is known here.
-    aliases: Vec<(PathBuf, PathBuf)>,
-}
-
-impl WatchFilter {
-    /// A path of the directories watched each on its own (or one of them),
-    /// or of the trees watched with all that is in them.
-    pub(super) fn lets_through(&self, path: &std::path::Path) -> bool {
-        let known = self.aliases.iter().find_map(|(real, known)| {
-            let rest = path.strip_prefix(real).ok()?;
-            Some(if rest.as_os_str().is_empty() { known.clone() } else { known.join(rest) })
-        });
-        let path = known.as_deref().unwrap_or(path);
-        self.flat.contains(path) || path.parent().is_some_and(|dir| self.flat.contains(dir)) || self.deep.iter().any(|d| path.starts_with(d))
-    }
-}
-
-/// The fewest directories whose trees hold all of `dirs`.
-pub(super) fn covering_trees<'a>(dirs: impl Iterator<Item = &'a PathBuf>) -> Vec<PathBuf> {
-    let mut dirs: Vec<&PathBuf> = dirs.collect();
-    dirs.sort();
-    let mut trees: Vec<PathBuf> = Vec::new();
-    for dir in dirs {
-        // Sorted, a tree's directories follow it.
-        if !trees.last().is_some_and(|tree| dir.starts_with(tree)) {
-            trees.push(dir.clone());
-        }
-    }
-    trees
+/// The task's file watcher ([`ideae_core::watch`]): here, or for a remote
+/// task its daemon's, there.
+pub(super) enum Watching {
+    Here(ideae_core::watch::Watch),
+    /// The task's key, the id its daemon tells of its changes by (its own,
+    /// not another view's of the task), and what it was last asked to watch.
+    #[cfg(unix)]
+    There { root: PathBuf, id: String, sent: Option<(Arc<BTreeSet<PathBuf>>, Vec<PathBuf>)> },
 }
 
 impl Watching {
-    pub(super) fn new(watcher: Option<notify::RecommendedWatcher>, filter: Arc<std::sync::RwLock<WatchFilter>>) -> Self {
-        Self { watcher, watched: Default::default(), trees: Vec::new(), filter }
+    /// A remote task's: told of its changes by its daemon, as `on_change`.
+    #[cfg(unix)]
+    pub(super) fn there(root: &std::path::Path, on_change: async_channel::Sender<()>) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = format!("{}#watch-{}", root.display(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        if let Some(daemon) = crate::daemon::client::for_path(root) {
+            daemon.on_change(&id, on_change);
+        }
+        Watching::There { root: root.to_path_buf(), id, sent: None }
     }
+}
 
+impl Watching {
     pub(super) fn sync(&mut self, watch: (Arc<BTreeSet<PathBuf>>, Vec<PathBuf>)) {
-        if (Arc::ptr_eq(&watch.0, &self.watched.0) || watch.0 == self.watched.0) && watch.1 == self.watched.1 {
-            return;
-        }
-        let Some(watcher) = self.watcher.as_mut() else { return };
-        if whole_trees() {
-            let trees = covering_trees(watch.0.iter().chain(&watch.1));
-            if trees != self.trees {
-                for tree in self.trees.iter().filter(|t| !trees.contains(t)) {
-                    let _ = watcher.unwatch(tree);
+        match self {
+            Watching::Here(here) => here.sync(watch.0, watch.1),
+            #[cfg(unix)]
+            Watching::There { root, id, sent } => {
+                // The same folders as last time: nothing to tell.
+                if sent.as_ref().is_some_and(|(flat, deep)| (Arc::ptr_eq(flat, &watch.0) || *flat == watch.0) && *deep == watch.1) {
+                    return;
                 }
-                for tree in trees.iter().filter(|t| !self.trees.contains(t)) {
-                    let _ = watcher.watch(tree, RecursiveMode::Recursive);
+                if let Some(daemon) = crate::daemon::client::for_path(root) {
+                    let there = |paths: &mut dyn Iterator<Item = &PathBuf>| paths.map(|p| crate::hosts::there(p)).collect::<Vec<_>>();
+                    daemon.watch(id, there(&mut watch.0.iter()), there(&mut watch.1.iter()));
                 }
-                self.trees = trees;
+                *sent = Some(watch);
             }
-            let aliases = self.trees.iter().filter_map(|t| t.canonicalize().ok().filter(|real| real != t).map(|real| (real, t.clone()))).collect();
-            *self.filter.write().unwrap() = WatchFilter { flat: watch.0.clone(), deep: watch.1.clone(), aliases };
-            self.watched = watch;
-            return;
         }
-        let (old_flat, old_rec) = std::mem::take(&mut self.watched);
-        for dir in old_flat.difference(&watch.0) {
-            let _ = watcher.unwatch(dir);
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Watching {
+    fn drop(&mut self) {
+        if let Watching::There { root, id, .. } = self {
+            if let Some(daemon) = crate::daemon::client::for_path(root) {
+                daemon.unwatch(id);
+            }
         }
-        for dir in watch.0.difference(&old_flat) {
-            let _ = watcher.watch(dir, RecursiveMode::NonRecursive);
-        }
-        for dir in old_rec.iter().filter(|d| !watch.1.contains(d)) {
-            let _ = watcher.unwatch(dir);
-        }
-        for dir in watch.1.iter().filter(|d| !old_rec.contains(d)) {
-            let _ = watcher.watch(dir, RecursiveMode::Recursive);
-        }
-        self.watched = watch;
     }
 }
 
@@ -1708,26 +1662,5 @@ mod sticky_tests {
         assert_eq!(super::place_fold(&text, &fold(0, "#region A")), Some(2));
         assert_eq!(super::place_fold(&text, &fold(9, "#region A")), Some(2));
         assert_eq!(super::place_fold(&text, &fold(2, "#region B")), None);
-    }
-}
-
-#[cfg(test)]
-mod watch_tests {
-    use super::{WatchFilter, covering_trees};
-    use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
-
-    #[test]
-    fn whole_trees_and_what_they_let_through() {
-        let p = PathBuf::from;
-        let flat: BTreeSet<PathBuf> = ["/w", "/w/src", "/w/src/a", "/repo/.git/worktrees/w"].map(p).into();
-        let deep = vec![p("/repo/.git/refs")];
-        assert_eq!(covering_trees(flat.iter().chain(&deep)), [p("/repo/.git/refs"), p("/repo/.git/worktrees/w"), p("/w")]);
-        let filter = WatchFilter { flat: Arc::new(flat), deep, aliases: vec![(p("/private/w"), p("/w"))] };
-        for yes in ["/w/Cargo.toml", "/w/src/main.rs", "/w/src/a", "/repo/.git/refs/heads/main", "/repo/.git/worktrees/w/HEAD", "/private/w/src/a/b.rs", "/private/w"] {
-            assert!(filter.lets_through(&p(yes)), "{yes}");
-        }
-        for no in ["/w/target/debug/x", "/w/src/a/deep/c.rs", "/repo/.git/objects/ab/cd", "/private/w/target/x"] {
-            assert!(!filter.lets_through(&p(no)), "{no}");
-        }
     }
 }

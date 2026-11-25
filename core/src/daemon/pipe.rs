@@ -133,10 +133,25 @@ impl ByteHandle for Handle {
         unsafe { libc::kill(-pid, libc::SIGTERM) };
         let child = self.0.child.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(3));
-            unsafe { libc::kill(-pid, libc::SIGKILL) };
+            // Reaped as soon as it is gone; killed if it is not within a moment.
             if let Some(mut child) = child {
+                let until = std::time::Instant::now() + Duration::from_secs(3);
+                // Gone but not reaped yet: its group's id is still its own,
+                // and what it started there goes before it is let go of.
+                let gone = || {
+                    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                    // SAFETY: waitid writes the siginfo given; WNOWAIT leaves the child to be reaped.
+                    let asked = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) };
+                    asked == 0 && unsafe { info.si_pid() } != 0
+                };
+                while std::time::Instant::now() < until && !gone() {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                unsafe { libc::kill(-pid, libc::SIGKILL) };
                 let _ = child.wait();
+            } else {
+                std::thread::sleep(Duration::from_secs(3));
+                unsafe { libc::kill(-pid, libc::SIGKILL) };
             }
         });
     }

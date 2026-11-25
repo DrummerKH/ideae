@@ -44,6 +44,8 @@ pub struct Wire {
     heard: Mutex<Instant>,
     /// The daemon answers pings (it said so on welcome).
     pings: AtomicBool,
+    /// The daemon watches folders (it said so on welcome).
+    watches: AtomicBool,
     up: AtomicBool,
     /// Where `ideae --hook` reports on that machine.
     socket: Mutex<Option<String>>,
@@ -62,6 +64,11 @@ impl Wire {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+
+    /// Whether the daemon there watches folders for the window.
+    pub fn watches(&self) -> bool {
+        self.watches.load(Ordering::Relaxed)
     }
 
     pub fn is_up(&self) -> bool {
@@ -94,6 +101,7 @@ struct Dialled {
     hooks: Vec<Hook>,
     sessions: Vec<String>,
     ping: bool,
+    watches: bool,
     socket: Option<String>,
 }
 
@@ -112,6 +120,7 @@ pub fn connect(remote: Remote, on_hook: impl Fn(Hook) + Send + Sync + 'static) -
         child: Mutex::new(Some(first.child)),
         heard: Mutex::new(Instant::now()),
         pings: AtomicBool::new(first.ping),
+        watches: AtomicBool::new(first.watches),
         up: AtomicBool::new(true),
         socket: Mutex::new(first.socket),
     };
@@ -148,6 +157,7 @@ pub fn connect(remote: Remote, on_hook: impl Fn(Hook) + Send + Sync + 'static) -
                 };
                 *wire.child.lock().unwrap() = Some(next.child);
                 wire.pings.store(next.ping, Ordering::Relaxed);
+                wire.watches.store(next.watches, Ordering::Relaxed);
                 *wire.socket.lock().unwrap() = next.socket;
                 wire.heard();
                 // The new writer first: a call made once the link is up goes through it.
@@ -300,9 +310,9 @@ fn dial(remote: &Remote) -> Result<Dialled, String> {
         return Err(fail(&mut child, "the link closed"));
     }
     match proto::read_frame(&mut reader) {
-        Ok(Frame::Msg(Msg::Welcome { protocol, hooks, sessions, ping, socket, .. })) if protocol == proto::PROTOCOL => {
+        Ok(Frame::Msg(Msg::Welcome { protocol, hooks, sessions, ping, socket, watches, .. })) if protocol == proto::PROTOCOL => {
             greeted.store(true, Ordering::Relaxed);
-            Ok(Dialled { child, writer: Box::new(writer), reader: Box::new(reader), hooks, sessions, ping, socket })
+            Ok(Dialled { child, writer: Box::new(writer), reader: Box::new(reader), hooks, sessions, ping, socket, watches })
         }
         Ok(Frame::Msg(Msg::Welcome { protocol, .. })) => {
             Err(fail(&mut child, &format!("the daemon there speaks protocol {protocol}, this window {}", proto::PROTOCOL)))

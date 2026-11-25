@@ -38,6 +38,8 @@ const BUNDLE: &str = "work/unpushed.bundle";
 const PATCH: &str = "work/uncommitted.patch";
 const CHAT: &str = "chat.jsonl";
 const DEFERRED: &str = "deferred.json";
+/// A remote task's archive is on its host; here only this, its facts and where it is.
+const STUB_EXT: &str = ".remote.json";
 
 /// What an archive says of its task.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -149,7 +151,7 @@ pub fn file_of(root: &Path, project: &Path, key: &str) -> PathBuf {
 
 /// The key of an archive file, its name without the extension.
 pub fn key_of(file: &Path) -> String {
-    file.file_name().map(|n| n.to_string_lossy().trim_end_matches(EXT).to_string()).unwrap_or_default()
+    file.file_name().map(|n| n.to_string_lossy().trim_end_matches(EXT).trim_end_matches(STUB_EXT).to_string()).unwrap_or_default()
 }
 
 /// A day as `2026-11-17`, UTC.
@@ -261,6 +263,9 @@ impl Drop for Scratch {
 /// and reads it back. Nothing of the worktree changes; on any error no
 /// archive is left. Returns what was written. Not for the UI thread.
 pub fn write(job: Job) -> Result<Meta, String> {
+    if crate::hosts::is_remote(&job.meta.worktree) {
+        return write_remote(job);
+    }
     let Job { mut meta, profiles, dest } = job;
     let root = meta.worktree.clone();
     let dir = dest.parent().ok_or("no folder for the archive")?.to_path_buf();
@@ -270,17 +275,7 @@ pub fn write(job: Job) -> Result<Meta, String> {
     let _ = std::fs::remove_dir_all(&scratch.0);
     std::fs::create_dir_all(&scratch.0).map_err(|e| e.to_string())?;
 
-    meta.format = FORMAT;
-    meta.ideae = env!("CARGO_PKG_VERSION").to_string();
-    meta.archived = crate::state::now();
-    meta.head = git(&root, &["rev-parse", "HEAD"]).map(|h| h.trim().to_string()).map_err(|e| format!("{}: {e}", root.display()))?;
-    if meta.base.is_empty() {
-        meta.base = crate::git::fork_point(&root).unwrap_or_default();
-    }
-    if !meta.base.is_empty() && meta.base != meta.head {
-        meta.commits = commit_lines(&root, &["-n", "50", &format!("{}..HEAD", meta.base)]);
-    }
-    meta.unpushed = unpushed_of(&root, &meta.branch);
+    fill(&mut meta, &root)?;
 
     // What exists nowhere else: in files of the scratch folder first.
     let mut work: Vec<(PathBuf, &str)> = Vec::new();
@@ -367,6 +362,135 @@ pub fn write(job: Job) -> Result<Meta, String> {
     Ok(meta)
 }
 
+/// What git tells of the task for its archive: where it is, what it made,
+/// what is nowhere else.
+fn fill(meta: &mut Meta, root: &Path) -> Result<(), String> {
+    meta.format = FORMAT;
+    meta.ideae = env!("CARGO_PKG_VERSION").to_string();
+    meta.archived = crate::state::now();
+    meta.head = git(root, &["rev-parse", "HEAD"]).map(|h| h.trim().to_string()).map_err(|e| format!("{}: {e}", root.display()))?;
+    if meta.base.is_empty() {
+        meta.base = crate::git::fork_point(root).unwrap_or_default();
+    }
+    if !meta.base.is_empty() && meta.base != meta.head {
+        meta.commits = commit_lines(root, &["-n", "50", &format!("{}..HEAD", meta.base)]);
+    }
+    meta.unpushed = unpushed_of(root, &meta.branch);
+    Ok(())
+}
+
+// ------------------------------------------------------------ on another machine
+
+/// What is kept here of a remote task's archive.
+#[derive(Serialize, Deserialize)]
+struct Stub {
+    meta: Meta,
+    /// The archive, keyed on its host ([`crate::hosts`]).
+    there: PathBuf,
+    size: u64,
+}
+
+pub fn is_stub(file: &Path) -> bool {
+    file.to_string_lossy().ends_with(STUB_EXT)
+}
+
+/// Where the stub of an archive at `file` (as [`file_of`] names it) is.
+pub fn stub_of(file: &Path) -> PathBuf {
+    file.with_file_name(format!("{}{STUB_EXT}", key_of(file)))
+}
+
+fn read_stub(file: &Path) -> Result<Stub, String> {
+    let text = std::fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
+    serde_json::from_str(&text).map_err(|e| e.to_string())
+}
+
+/// `line` in a shell on `root`'s machine, in it, with `args` as `$1`…:
+/// what it printed.
+fn sh(root: &Path, line: &str, args: &[&str], input: Option<&[u8]>) -> Result<String, String> {
+    let mut all = vec!["-c", line, "sh"];
+    all.extend_from_slice(args);
+    let out = crate::hostfs::run(root, "sh", &all, &[], input).map_err(|e| e.to_string())?;
+    if out.success() { Ok(String::from_utf8_lossy(&out.stdout).into_owned()) } else { Err(out.stderr.trim().to_string()) }
+}
+
+/// A remote task's archive, made and kept on its host: there the work
+/// nowhere else (unpushed commits, the uncommitted changes) is packed
+/// with its facts; here only a stub at `job.dest` tells of it. Its agents'
+/// conversations stay where their agents keep them there.
+fn write_remote(job: Job) -> Result<Meta, String> {
+    let Job { mut meta, dest, .. } = job;
+    let root = meta.worktree.clone();
+    let (host, _) = crate::hosts::split(&root).ok_or("not a remote task")?;
+    fill(&mut meta, &root)?;
+    let home = sh(&root, "printf %s \"$HOME\"", &[], None)?;
+    let project = project_dir(Path::new(""), &meta.project);
+    let dir = Path::new(&home).join(".local/share").join(crate::state::APP_ID).join("archive").join(&project);
+    let key = key_of(&dest);
+    let file = dir.join(format!("{key}{EXT}"));
+    let scratch = dir.join(format!(".{key}.work"));
+    let (file_s, scratch_s) = (file.display().to_string(), scratch.display().to_string());
+
+    // The work, into the scratch folder there; the names of the files not committed back.
+    let mut args = vec![scratch_s.as_str(), if meta.unpushed.is_empty() { "0" } else { "1" }];
+    let going = going_with(&root, &meta.branch);
+    args.extend(going.iter().map(String::as_str));
+    let gather = r#"set -e; s=$1; bundle=$2; shift 2
+rm -rf "$s"; mkdir -p "$s/work"
+if [ "$bundle" = 1 ]; then git bundle create -q "$s/work/unpushed.bundle" HEAD --not --remotes "$@" --branches; fi
+export GIT_INDEX_FILE="$s/index"
+git read-tree HEAD; git add -A
+git -c core.quotePath=false diff --cached --name-only -z HEAD
+git diff --cached --binary --no-color --no-ext-diff --no-textconv HEAD > "$s/work/uncommitted.patch"
+rm -f "$s/index""#;
+    let cleanup = |e: String| {
+        let _ = sh(&root, r#"rm -rf "$1""#, &[&scratch_s], None);
+        e
+    };
+    let names = sh(&root, gather, &args, None).map_err(|e| cleanup(format!("the work to keep: {e}")))?;
+    meta.uncommitted = names.split('\0').filter(|n| !n.is_empty()).map(str::to_string).collect();
+
+    // Packed there with its facts, read back, and put in place.
+    let mut entries = vec![META];
+    if !meta.unpushed.is_empty() {
+        entries.push(BUNDLE);
+    }
+    if !meta.uncommitted.is_empty() {
+        entries.push(PATCH);
+    }
+    let json = serde_json::to_vec_pretty(&meta).map_err(|e| e.to_string())?;
+    let mut args = vec![scratch_s.as_str(), file_s.as_str()];
+    args.extend(entries.iter().copied());
+    let pack = r#"set -e; s=$1; d=$2; shift 2
+cat > "$s/task.json"
+tar czf "$d.tmp" -C "$s" "$@"
+tar tzf "$d.tmp" > /dev/null
+mv -f "$d.tmp" "$d"; rm -rf "$s"
+wc -c < "$d""#;
+    let size = sh(&root, pack, &args, Some(&json)).map_err(|e| cleanup(format!("the archive there: {e}")))?;
+    let stub = Stub { meta: meta.clone(), there: crate::hosts::join(&host, &file), size: size.trim().parse().unwrap_or(0) };
+    let dir_here = dest.parent().ok_or("no folder for the archive")?;
+    std::fs::create_dir_all(dir_here).map_err(|e| format!("{}: {e}", dir_here.display()))?;
+    let tmp = dest.with_file_name(format!(".{key}.stub{}", std::process::id()));
+    let kept = std::fs::write(&tmp, serde_json::to_vec_pretty(&stub).map_err(|e| e.to_string())?).and_then(|()| std::fs::rename(&tmp, &dest));
+    if let Err(e) = kept {
+        // Nothing here would find it: not left there either.
+        let _ = std::fs::remove_file(&tmp);
+        let _ = sh(&root, r#"rm -f "$1""#, &[&file_s], None);
+        return Err(format!("{}: {e}", dest.display()));
+    }
+    Ok(meta)
+}
+
+/// Deletes an archive: a remote one's there too (not while its host cannot be asked: its stub stays).
+pub fn delete(file: &Path) -> Result<(), String> {
+    if is_stub(file) {
+        let stub = read_stub(file)?;
+        let there = crate::hosts::there(&stub.there).display().to_string();
+        sh(&stub.there.parent().unwrap_or(&stub.there).to_path_buf(), r#"rm -f "$1""#, &[&there], None)?;
+    }
+    std::fs::remove_file(file).map_err(|e| e.to_string())
+}
+
 /// A relative path as an archive names it: only plain parts, with `/`.
 fn archive_name(rel: &Path) -> Option<String> {
     let parts: Option<Vec<String>> = rel.components().map(|c| if let Component::Normal(part) = c { Some(part.to_string_lossy().into_owned()) } else { None }).collect();
@@ -403,6 +527,9 @@ pub fn entries(file: &Path) -> Result<Vec<(String, u64)>, String> {
 
 /// What an archive says of its task: only its first entry is read.
 pub fn read_meta(file: &Path) -> Result<Meta, String> {
+    if is_stub(file) {
+        return read_stub(file).map(|stub| stub.meta);
+    }
     let mut archive = open(file)?;
     let mut entries = archive.entries().map_err(|e| e.to_string())?;
     let mut first = entries.next().ok_or("an empty archive")?.map_err(|e| e.to_string())?;
@@ -525,11 +652,12 @@ pub fn list(root: &Path) -> Vec<Archived> {
         for entry in std::fs::read_dir(dir.path()).into_iter().flatten().flatten() {
             let file = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') || !name.ends_with(EXT) {
+            if name.starts_with('.') || !(name.ends_with(EXT) || name.ends_with(STUB_EXT)) {
                 continue;
             }
             let stat = entry.metadata().ok();
             let size = stat.as_ref().map_or(0, |m| m.len());
+            let size = if name.ends_with(STUB_EXT) { read_stub(&file).map_or(0, |stub| stub.size) } else { size };
             let written = stat.and_then(|m| m.modified().ok());
             let meta = match before.get(&file) {
                 Some((s, w, meta)) if *s == size && *w == written => meta.clone(),
@@ -583,6 +711,8 @@ pub fn clean_up(root: &Path, max_age: u64, now: u64) -> usize {
                 let path = entry.path();
                 let _ = if path.is_dir() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
             } else if !name.starts_with('.') && name.ends_with(EXT) && max_age > 0 && age > max_age && !kept(&entry.path()) && std::fs::remove_file(entry.path()).is_ok() {
+                removed += 1;
+            } else if !name.starts_with('.') && name.ends_with(STUB_EXT) && max_age > 0 && age > max_age && !kept(&entry.path()) && crate::hostfs::reachable(&read_stub(&entry.path()).map(|s| s.there).unwrap_or_default()) && delete(&entry.path()).is_ok() {
                 removed += 1;
             }
         }
@@ -704,6 +834,9 @@ impl Restored {
 /// puts the sessions' files where their agents look for them in it. The
 /// archive itself is not changed. Not for the UI thread.
 pub fn restore(repo: &Path, archive: &Path, meta: &Meta, plan: &Plan) -> Result<Restored, String> {
+    if is_stub(archive) {
+        return restore_remote(repo, archive, meta, plan);
+    }
     let path = match &plan.start {
         Start::Origin => crate::git::create_task_worktree(repo, &plan.branch, "", plan.copy_env && crate::project_config::resolve(repo).config.task.copy.is_none())?,
         Start::PrBranch(branch) => crate::git::remote_branch_worktree(repo, branch, plan.copy_env && crate::project_config::resolve(repo).config.task.copy.is_none())?,
@@ -759,49 +892,10 @@ pub fn restore(repo: &Path, archive: &Path, meta: &Meta, plan: &Plan) -> Result<
             }
         }
 
-        restored.commits = match (meta.unpushed.is_empty(), plan.commits) {
-            (true, _) => Applied::None,
-            (false, false) => Applied::Left,
-            (false, true) => {
-                let keep = format!("refs/ideae/restored/{}", key_of(archive));
-                let bundle_s = bundle.to_string_lossy().into_owned();
-                let fetched = git(&path, &["fetch", "-q", &bundle_s, &format!("HEAD:{keep}")]);
-                let picked = fetched.and_then(|_| {
-                    let mut args = vec!["cherry-pick".to_string(), "--allow-empty".into()];
-                    args.extend(meta.unpushed.iter().rev().map(|c| c.sha.clone()));
-                    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-                    git(&path, &args).inspect_err(|_| {
-                        let _ = git(&path, &["cherry-pick", "--abort"]);
-                    })
-                });
-                match picked {
-                    Ok(_) => {
-                        let _ = git(&path, &["update-ref", "-d", &keep]);
-                        let _ = std::fs::remove_file(&bundle);
-                        Applied::Done
-                    }
-                    Err(why) => {
-                        let kept = if git(&path, &["rev-parse", "--verify", "-q", &keep]).is_ok() { keep } else { bundle_s };
-                        Applied::Failed { why: first_line(&why), kept }
-                    }
-                }
-            }
-        };
-        restored.changes = match (meta.uncommitted.is_empty(), plan.changes) {
-            (true, _) => Applied::None,
-            (false, false) => Applied::Left,
-            (false, true) => {
-                let patch_s = patch.to_string_lossy().into_owned();
-                let applied = git(&path, &["apply", "--check", "--binary", &patch_s]).and_then(|_| git(&path, &["apply", "--binary", &patch_s]));
-                match applied {
-                    Ok(_) => {
-                        let _ = std::fs::remove_file(&patch);
-                        Applied::Done
-                    }
-                    Err(why) => Applied::Failed { why: first_line(&why), kept: patch_s },
-                }
-            }
-        };
+        let (commits, changes) = bring_back(&path, meta, plan, &key_of(archive), &bundle.to_string_lossy(), &patch.to_string_lossy(), &|file| {
+            let _ = std::fs::remove_file(file);
+        });
+        (restored.commits, restored.changes) = (commits, changes);
         Ok(restored)
     })();
     if filled.is_err() {
@@ -812,6 +906,108 @@ pub fn restore(repo: &Path, archive: &Path, meta: &Meta, plan: &Plan) -> Result<
         let _ = crate::git::remove_task_worktree(repo, &path, branch, false);
     }
     filled
+}
+
+/// A remote task back on its host, from its archive there: its worktree
+/// made there (beside the repository, named as a local task's folder), the
+/// work taken out of the archive there and brought in as here. Its agents'
+/// conversations are where they were.
+fn restore_remote(repo: &Path, archive: &Path, meta: &Meta, plan: &Plan) -> Result<Restored, String> {
+    let stub = read_stub(archive)?;
+    let (host, repo_there) = crate::hosts::split(repo).ok_or("not a remote project")?;
+    let branch = match &plan.start {
+        Start::Origin => plan.branch.clone(),
+        Start::PrBranch(branch) => branch.clone(),
+    };
+    let dir = PathBuf::from(format!("{}.worktrees", repo_there.display())).join(branch.replace('/', "-"));
+    let dir_s = dir.display().to_string();
+    let made = match &plan.start {
+        Start::Origin => sh(repo, r#"{ git fetch -q origin 2>/dev/null || true; }; git worktree add -q -b "$1" "$2" "$(git symbolic-ref -q --short refs/remotes/origin/HEAD || echo HEAD)""#, &[&branch, &dir_s], None),
+        Start::PrBranch(_) => sh(repo, r#"git fetch -q origin "$1" && git worktree add -q -B "$1" "$2" "origin/$1""#, &[&branch, &dir_s], None),
+    };
+    made.map_err(|e| format!("its worktree there: {e}"))?;
+    let path = crate::hosts::join(&host, &dir);
+    // Its .env files, as a new task's. A remote project's .ideae.toml is not read yet: no [task] copy.
+    if plan.copy_env {
+        crate::git::copy_env_files(repo, &path);
+    }
+    let filled = (|| -> Result<Restored, String> {
+        let start_word = match &plan.start {
+            Start::Origin => crate::git::base_ref(&path).unwrap_or_else(|| "the main branch".into()),
+            Start::PrBranch(branch) => format!("the PR's branch {branch}"),
+        };
+        let base = git(&path, &["rev-parse", "HEAD"]).map(|h| h.trim().to_string()).unwrap_or_default();
+        let mut restored = Restored { path: path.clone(), branch: branch.clone(), base, start_word, ..Default::default() };
+        let git_path = |name: &str| git(&path, &["rev-parse", "--path-format=absolute", "--git-path", name]).map(|p| p.trim().to_string());
+        let (bundle, patch) = (git_path("ideae-unpushed.bundle")?, git_path("ideae-uncommitted.patch")?);
+        let there = crate::hosts::there(&stub.there).display().to_string();
+        let take = r#"tar xzf "$1" -O "$2" > "$3""#;
+        if plan.commits && !meta.unpushed.is_empty() {
+            sh(&path, take, &[&there, BUNDLE, &bundle], None).map_err(|e| format!("the unpushed commits from the archive there: {e}"))?;
+        }
+        if plan.changes && !meta.uncommitted.is_empty() {
+            sh(&path, take, &[&there, PATCH, &patch], None).map_err(|e| format!("the uncommitted changes from the archive there: {e}"))?;
+        }
+        let (commits, changes) = bring_back(&path, meta, plan, &key_of(archive), &bundle, &patch, &|file| {
+            let _ = sh(&path, r#"rm -f "$1""#, &[file], None);
+        });
+        (restored.commits, restored.changes) = (commits, changes);
+        Ok(restored)
+    })();
+    if filled.is_err() {
+        let _ = crate::git::remove_task_worktree(repo, &path, &branch, false);
+    }
+    filled
+}
+
+/// The archived work brought into the restored worktree at `path`, from
+/// the bundle and patch put at `bundle` and `patch` (paths as its git
+/// names them; `remove` takes them away once applied).
+fn bring_back(path: &Path, meta: &Meta, plan: &Plan, archive_key: &str, bundle: &str, patch: &str, remove: &dyn Fn(&str)) -> (Applied, Applied) {
+    let commits = match (meta.unpushed.is_empty(), plan.commits) {
+        (true, _) => Applied::None,
+        (false, false) => Applied::Left,
+        (false, true) => {
+            let keep = format!("refs/ideae/restored/{archive_key}");
+            let bundle_s = bundle.to_string();
+            let fetched = git(path, &["fetch", "-q", &bundle_s, &format!("HEAD:{keep}")]);
+            let picked = fetched.and_then(|_| {
+                let mut args = vec!["cherry-pick".to_string(), "--allow-empty".into()];
+                args.extend(meta.unpushed.iter().rev().map(|c| c.sha.clone()));
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                git(path, &args).inspect_err(|_| {
+                    let _ = git(path, &["cherry-pick", "--abort"]);
+                })
+            });
+            match picked {
+                Ok(_) => {
+                    let _ = git(path, &["update-ref", "-d", &keep]);
+                    remove(bundle);
+                    Applied::Done
+                }
+                Err(why) => {
+                    let kept = if git(path, &["rev-parse", "--verify", "-q", &keep]).is_ok() { keep } else { bundle_s };
+                    Applied::Failed { why: first_line(&why), kept }
+                }
+            }
+        }
+    };
+    let changes = match (meta.uncommitted.is_empty(), plan.changes) {
+        (true, _) => Applied::None,
+        (false, false) => Applied::Left,
+        (false, true) => {
+            let patch_s = patch.to_string();
+            let applied = git(path, &["apply", "--check", "--binary", &patch_s]).and_then(|_| git(path, &["apply", "--binary", &patch_s]));
+            match applied {
+                Ok(_) => {
+                    remove(patch);
+                    Applied::Done
+                }
+                Err(why) => Applied::Failed { why: first_line(&why), kept: patch_s },
+            }
+        }
+    };
+    (commits, changes)
 }
 
 fn first_line(text: &str) -> String {

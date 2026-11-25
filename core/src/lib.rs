@@ -12,6 +12,7 @@ pub mod paths;
 pub mod procs;
 pub mod said;
 pub mod status;
+pub mod watch;
 
 #[cfg(test)]
 pub(crate) mod tests {

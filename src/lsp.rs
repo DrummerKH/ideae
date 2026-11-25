@@ -5,7 +5,7 @@ use std::{
     collections::{HashMap, HashSet},
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, Stdio},
+    process::{Child, Stdio},
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
@@ -133,6 +133,8 @@ pub struct LspClient {
     /// `capabilities` from the server's answer to `initialize`.
     capabilities: Mutex<Value>,
     child: Mutex<Option<Child>>,
+    /// Ends a remote task's server, which runs on its host ([`crate::lsp_remote`]).
+    stop_there: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     commanded: Commanded,
     /// One command at a time: what the server asks while it runs is its.
     command: Mutex<()>,
@@ -396,6 +398,12 @@ pub fn server_for(path: &Path) -> Result<Server, String> {
     if crate::state::settings().lsp_off.iter().any(|p| p == program) {
         return Err(format!("{program} off in Settings"));
     }
+    // A remote task's server is on its host, as its login shell finds it.
+    #[cfg(unix)]
+    if crate::hosts::is_remote(path) {
+        let command = crate::lsp_remote::locate(path, program).ok_or_else(|| format!("{program} not installed there"))?;
+        return Ok(Server { language_id, program, command, args });
+    }
     let command = locate(program).ok_or_else(|| format!("{program} not installed"))?;
     Ok(Server { language_id, program, command, args })
 }
@@ -403,6 +411,10 @@ pub fn server_for(path: &Path) -> Result<Server, String> {
 /// The server a file would have, when it is neither on PATH nor installed.
 pub fn missing_server(path: &Path) -> Option<&'static str> {
     if POWER_SAVING.load(Ordering::Relaxed) {
+        return None;
+    }
+    // Installed here, not there: nothing to offer for a remote task's.
+    if crate::hosts::is_remote(path) {
         return None;
     }
     known(path).map(|(_, program, _)| program).filter(|program| locate(program).is_none())
@@ -462,7 +474,8 @@ pub fn project_root(program: &str, file: &Path, limit: &Path) -> PathBuf {
     let mut found = None;
     let mut dir = file.parent();
     while let Some(d) = dir {
-        if markers.iter().any(|m| d.join(m).is_file()) {
+        // Where the file's machine is (crate::hostfs).
+        if markers.iter().any(|m| if crate::hosts::is_remote(d) { crate::hostfs::stat(&d.join(m)).is_ok_and(|s| s.file) } else { d.join(m).is_file() }) {
             found = Some(d.to_path_buf());
         }
         if d == limit {
@@ -651,19 +664,32 @@ impl LspClient {
         sharing: Option<crate::lsp_share::Share>,
         init_options: Value,
     ) -> Result<Arc<Self>> {
-        let mut command = crate::procs::command(executable);
-        command.args(args).args(project_args(program, root)).envs(server_env(program)).current_dir(cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
-        // A group of its own: what it starts (cargo check, a proc-macro
-        // server, tsserver) is ended with it, not left to notice.
+        // A remote task's: on its host, through its daemon.
         #[cfg(unix)]
-        std::os::unix::process::CommandExt::process_group(&mut command, 0);
-        // Dies with the app even when it exits without running destructors.
-        let mut child = crate::procs::spawn_tied(&mut command)
-            .with_context(|| format!("starting {program}"))?;
-        let stdin = child.stdin.take().expect("piped stdin");
+        let there = if crate::hosts::is_remote(root) { Some(crate::lsp_remote::start(program, executable, args, root, cwd).with_context(|| format!("starting {program} there"))?) } else { None };
+        #[cfg(not(unix))]
+        let there: Option<((), (), ())> = None;
+        let (stdin, stdout, child, stop_there): (Box<dyn Write + Send>, Box<dyn Read + Send>, Option<Child>, Option<Box<dyn FnOnce() + Send>>) = match there {
+            #[cfg(unix)]
+            Some((writer, reader, stop)) => (Box::new(writer), Box::new(reader), None, Some(stop)),
+            #[cfg(not(unix))]
+            Some(_) => unreachable!(),
+            None => {
+                let mut command = crate::procs::command(executable);
+                command.args(args).args(project_args(program, root)).envs(server_env(program)).current_dir(cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+                // A group of its own: what it starts (cargo check, a proc-macro
+                // server, tsserver) is ended with it, not left to notice.
+                #[cfg(unix)]
+                std::os::unix::process::CommandExt::process_group(&mut command, 0);
+                // Dies with the app even when it exits without running destructors.
+                let mut child = crate::procs::spawn_tied(&mut command).with_context(|| format!("starting {program}"))?;
+                let stdin = child.stdin.take().expect("piped stdin");
+                let stdout = child.stdout.take().expect("piped stdout");
+                (Box::new(stdin), Box::new(stdout), Some(child), None)
+            }
+        };
         let (out, outbox) = mpsc::channel();
         thread::Builder::new().name(format!("lsp-write-{program}")).spawn(move || write_loop(stdin, outbox))?;
-        let stdout = child.stdout.take().expect("piped stdout");
         let pending: Pending = Arc::default();
         let progress: Progress = Arc::default();
 
@@ -702,7 +728,8 @@ impl LspClient {
             import,
             problems,
             capabilities: Mutex::new(Value::Null),
-            child: Mutex::new(Some(child)),
+            child: Mutex::new(child),
+            stop_there: Mutex::new(stop_there),
             commanded,
             command: Mutex::new(()),
             sharing,
@@ -1320,6 +1347,9 @@ impl LspClient {
 impl LspClient {
     /// Ends the server now, even while files still hold the client.
     pub fn shut_down(&self) {
+        if let Some(stop) = self.stop_there.lock().unwrap().take() {
+            stop();
+        }
         let Some(mut child) = self.child.lock().unwrap().take() else { return };
         // SAFETY: a signal to the group the server was started as; not reaped yet, its id is still its own.
         #[cfg(unix)]
@@ -1522,7 +1552,7 @@ enum Out {
 /// Writes to the server, alone: callers on many threads would write out of
 /// order, a text before the file is opened or an older one after a newer,
 /// and all of them would wait on a server that has stopped reading.
-fn write_loop(mut stdin: ChildStdin, outbox: mpsc::Receiver<Out>) {
+fn write_loop(mut stdin: impl Write, outbox: mpsc::Receiver<Out>) {
     let mut ready = false;
     let mut held: Vec<Out> = Vec::new();
     // A file is opened as its version 1.
@@ -1574,7 +1604,7 @@ fn write_loop(mut stdin: ChildStdin, outbox: mpsc::Receiver<Out>) {
     }
 }
 
-fn write_message(stdin: &mut ChildStdin, message: &Value) -> Result<()> {
+fn write_message(stdin: &mut impl Write, message: &Value) -> Result<()> {
     let body = serde_json::to_vec(message)?;
     write!(stdin, "Content-Length: {}\r\n\r\n", body.len())?;
     stdin.write_all(&body)?;
@@ -1963,7 +1993,7 @@ fn server_env(program: &str) -> Vec<(&'static str, std::ffi::OsString)> {
 /// they start reads it too, of any Java: one that does not know a flag
 /// (before 12) or another collector leaves it, rather than not start. The
 /// user's own options go after, and win.
-fn java_options(program: &str, user: Option<std::ffi::OsString>) -> Option<std::ffi::OsString> {
+pub(crate) fn java_options(program: &str, user: Option<std::ffi::OsString>) -> Option<std::ffi::OsString> {
     if !matches!(program, "kotlin-lsp" | "jdtls") {
         return None;
     }

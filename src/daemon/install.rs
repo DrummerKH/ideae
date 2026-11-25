@@ -163,6 +163,23 @@ mod tests {
         assert_eq!(daemon.call(&Call::Read { path: file.clone() }, b"").unwrap().1, "é\n".as_bytes());
         assert_eq!(daemon.call(&Call::Stat { path: file.clone() }, b"").unwrap().0.stat.unwrap().len, 3);
         let _ = daemon.call(&Call::Exec { cwd: "/".into(), program: "rm".into(), args: vec![file.display().to_string()], env: Vec::new() }, b"");
+        // A folder watched there: a file made in it is told.
+        let folder = format!("/tmp/ideae-live-watch-{}", std::process::id());
+        let sh = |line: String| daemon.call(&Call::Exec { cwd: "/".into(), program: "sh".into(), args: vec!["-c".into(), line], env: Vec::new() }, b"").unwrap();
+        sh(format!("mkdir -p {folder}"));
+        let (tx, changed) = async_channel::unbounded();
+        daemon.on_change("live", tx);
+        daemon.watch("live", vec![folder.clone().into()], Vec::new());
+        std::thread::sleep(Duration::from_millis(300));
+        sh(format!("echo x > {folder}/new.txt"));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while changed.try_recv().is_err() {
+            assert!(Instant::now() < deadline, "the watcher there told of the new file");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        eprintln!("watched there");
+        daemon.unwatch("live");
+        sh(format!("rm -rf {folder}"));
 
         daemon.write(&id, b"one\n");
         let (got, _) = read("got:one");
