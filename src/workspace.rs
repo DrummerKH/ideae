@@ -1815,16 +1815,22 @@ impl Workspace {
         // The agent of each: the project's to start with.
         let first_agent = self.project_agent(project);
         let agents: Vec<Rc<RefCell<String>>> = (0..variants::MOST).map(|_| Rc::new(RefCell::new(first_agent.clone()))).collect();
+        // origin's branches, read off the UI thread once the dialog is up; the
+        // project's tasks as they are now; what of them the title names, as it is typed.
+        let origin: Rc<RefCell<Option<Vec<git::OriginBranch>>>> = Rc::default();
+        let here: Rc<Vec<(PathBuf, String, bool)>> = Rc::new(p.tasks.iter().filter(|t| !t.main).map(|t| (t.path.clone(), t.branch.clone(), t.view.is_none())).collect());
+        let finding: Rc<RefCell<Finding>> = Rc::default();
         // The title, the prompt, the variants' notes and agents, when it can be made.
         let filled_in = {
-            let (input, prompt, count, notes, agents) = (input.clone(), prompt.clone(), count.clone(), notes.clone(), agents.clone());
+            let (input, prompt, count, notes, agents, finding) = (input.clone(), prompt.clone(), count.clone(), notes.clone(), agents.clone(), finding.clone());
             move |cx: &App| {
                 let title = input.read(cx).value().trim().to_string();
                 let text = prompt.read(cx).value().trim().to_string();
                 let notes: Vec<String> = notes.iter().take(count.get()).map(|n| n.read(cx).value().trim().to_string()).collect();
                 let agents: Vec<String> = agents.iter().take(count.get()).map(|a| a.borrow().clone()).collect();
-                // Variants are sent their prompt: there has to be one.
-                (!title.is_empty() && (notes.len() < 2 || !text.is_empty())).then_some((title, text, notes, agents))
+                // Variants are sent their prompt: there has to be one. A branch here or on origin is opened, not made again.
+                let clash = notes.len() < 2 && finding.borrow().clash();
+                (!title.is_empty() && !clash && (notes.len() < 2 || !text.is_empty())).then_some((title, text, notes, agents))
             }
         };
         let this = cx.weak_entity();
@@ -1835,10 +1841,56 @@ impl Workspace {
             let filled = filled.clone();
             move |text: &str| !text.is_empty() && text == filled.borrow().trim()
         };
-        let submit = {
-            let (this, filled_in, as_filled) = (this.clone(), filled_in.clone(), as_filled.clone());
+        // The prompt the title gives a new task. The one shown follows what
+        // Enter does: when it opens what was found, what that is told instead.
+        let ticket: Rc<RefCell<String>> = Rc::default();
+        let refill: Rc<dyn Fn(&mut Window, &mut App)> = {
+            let (prompt, filled, ticket, finding, count) = (prompt.clone(), filled.clone(), ticket.clone(), finding.clone(), count.clone());
+            Rc::new(move |window: &mut Window, cx: &mut App| {
+                let current = prompt.read(cx).value().to_string();
+                if !current.trim().is_empty() && current != *filled.borrow() {
+                    return;
+                }
+                let text = {
+                    let finding = finding.borrow();
+                    match finding.chosen() {
+                        Some(found) if count.get() == 1 && finding.clash() => opening_prompt(found, &ticket.borrow()),
+                        _ => ticket.borrow().clone(),
+                    }
+                };
+                if text != current {
+                    *filled.borrow_mut() = text.clone();
+                    prompt.update(cx, |p, cx| p.set_value(text, window, cx));
+                }
+            })
+        };
+        // What Open takes: the task or branch found, the title, the prompt, the
+        // agent, and whether the dialog filled the prompt: then it is sent, and
+        // is what fits what is opened, not the title's ticket.
+        let to_open = {
+            let (finding, input, prompt, count, agent, filled, ticket) = (finding.clone(), input.clone(), prompt.clone(), count.clone(), agents[0].clone(), filled.clone(), ticket.clone());
+            move |cx: &App| {
+                let found = finding.borrow().chosen().cloned().filter(|_| count.get() == 1)?;
+                let typed = prompt.read(cx).value().trim().to_string();
+                let untouched = typed == filled.borrow().trim();
+                let text = if untouched { opening_prompt(&found, &ticket.borrow()) } else { typed };
+                let given = untouched && !text.is_empty();
+                Some((found, input.read(cx).value().trim().to_string(), text, agent.borrow().clone(), given))
+            }
+        };
+        let open = {
+            let (this, to_open) = (this.clone(), to_open.clone());
             move |window: &mut Window, cx: &mut App| {
-                let Some((title, text, notes, agents)) = filled_in(cx) else { return };
+                let Some((found, title, text, agent, given)) = to_open(cx) else { return };
+                window.close_dialog(cx);
+                let _ = this.update(cx, |this, cx| this.open_found(project, found, title, text, agent, given, window, cx));
+            }
+        };
+        // Enter: Create, or Open when there is nothing to create.
+        let submit = {
+            let (this, filled_in, as_filled, open) = (this.clone(), filled_in.clone(), as_filled.clone(), open.clone());
+            move |window: &mut Window, cx: &mut App| {
+                let Some((title, text, notes, agents)) = filled_in(cx) else { return open(window, cx) };
                 window.close_dialog(cx);
                 let send = as_filled(&text);
                 let _ = this.update(cx, |this, cx| {
@@ -1849,7 +1901,7 @@ impl Workspace {
         };
         // Runs inside this entity's update, so it cannot go through `submit`.
         let on_enter = {
-            let filled_in = filled_in.clone();
+            let (filled_in, as_filled, to_open) = (filled_in.clone(), as_filled.clone(), to_open.clone());
             move |this: &mut Self, event: &InputEvent, window: &mut Window, cx: &mut Context<Self>| {
                 // Ctrl+Enter in the prompt; Enter in the title is the dialog's.
                 let InputEvent::PressEnter { secondary: true, .. } = event else { return };
@@ -1857,6 +1909,9 @@ impl Workspace {
                     window.close_dialog(cx);
                     this.send_next_prompt = as_filled(&text);
                     this.create_task(project, title, text, notes, agents, window, cx);
+                } else if let Some((found, title, text, agent, given)) = to_open(cx) {
+                    window.close_dialog(cx);
+                    this.open_found(project, found, title, text, agent, given, window, cx);
                 }
             }
         };
@@ -1867,8 +1922,30 @@ impl Workspace {
         let from_link: Rc<RefCell<Option<(String, String)>>> = Rc::default();
         let fetch: Rc<RefCell<Option<Task<()>>>> = Rc::default();
         let repo = p.path.clone();
+        let reading = {
+            let (repo, input, origin, finding, here, refill) = (repo.clone(), input.clone(), origin.clone(), finding.clone(), here.clone(), refill.clone());
+            window.spawn(cx, async move |cx| {
+                // A task on another machine is made there from a new branch alone.
+                let listed = cx.background_spawn(async move { if crate::hosts::is_remote(&repo) { Vec::new() } else { git::origin_branches(&repo) } }).await;
+                let _ = cx.update(|window, cx| {
+                    *finding.borrow_mut() = found_for(input.read(cx).value().trim(), &here, &listed);
+                    *origin.borrow_mut() = Some(listed);
+                    refill(window, cx);
+                    window.refresh();
+                });
+            })
+        };
         {
-            let prompt = prompt.clone();
+            let (origin, finding, here) = (origin.clone(), finding.clone(), here.clone());
+            listening.push(cx.subscribe_in(&input, window, move |_, input, event: &InputEvent, _, cx| {
+                if let InputEvent::Change = event {
+                    let listed = origin.borrow();
+                    *finding.borrow_mut() = found_for(input.read(cx).value().trim(), &here, listed.as_deref().unwrap_or_default());
+                }
+            }));
+        }
+        {
+            let (prompt, ticket, refill) = (prompt.clone(), ticket.clone(), refill.clone());
             listening.push(cx.subscribe_in(&input, window, move |_, input, event: &InputEvent, window, cx| {
                 if !matches!(event, InputEvent::Change) {
                     return;
@@ -1879,14 +1956,14 @@ impl Workspace {
                     return;
                 }
                 let set = |text: String, window: &mut Window, cx: &mut App| {
-                    *filled.borrow_mut() = text.clone();
-                    prompt.update(cx, |p, cx| p.set_value(text, window, cx));
+                    *ticket.borrow_mut() = text;
+                    refill(window, cx);
                 };
                 // A link pasted: the key names the task, the link goes to the agent.
                 // A Linear link has the issue's words too: the branch is named at once.
                 if let Some((key, words, url)) = linear_link(&title) {
                     *fetch.borrow_mut() = None;
-                    let told = format!("Linear issue {key} ({url}): read it, its description and comments, and do what it asks.");
+                    let told = format!("Linear issue {key} ({url}){DO_WHAT_IT_ASKS}");
                     *from_link.borrow_mut() = Some((key.clone(), told.clone()));
                     set(told, window, cx);
                     let short = title.replace(&url, &format!("{key} {words}")).split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1897,7 +1974,7 @@ impl Workspace {
                 // Filled now: the title set from here is no change the input tells of.
                 if let Some((key, url)) = jira_link(&title) {
                     *fetch.borrow_mut() = None;
-                    let told = format!("Jira issue {key} ({url}): read it, its description and comments, and do what it asks.");
+                    let told = format!("Jira issue {key} ({url}){DO_WHAT_IT_ASKS}");
                     *from_link.borrow_mut() = Some((key.clone(), told.clone()));
                     set(told, window, cx);
                     let short = title.replace(&url, &key).split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1908,9 +1985,11 @@ impl Workspace {
                 if let Some(key) = jira_key(&title) {
                     *fetch.borrow_mut() = None;
                     let linked = from_link.borrow().clone().filter(|(k, _)| k == key).map(|(_, told)| told);
-                    set(linked.unwrap_or_else(|| format!("Jira issue {key}: read it, its description and comments, and do what it asks.")), window, cx);
+                    set(linked.unwrap_or_else(|| format!("Jira issue {key}{DO_WHAT_IT_ASKS}")), window, cx);
                 } else if let Some(number) = github_issue(&title) {
-                    let (repo, input, prompt, filled) = (repo.clone(), input.clone(), prompt.clone(), filled.clone());
+                    // Not what Open of the title before would have sent, while the issue is read.
+                    refill(window, cx);
+                    let (repo, input, prompt, filled, ticket, refill) = (repo.clone(), input.clone(), prompt.clone(), filled.clone(), ticket.clone(), refill.clone());
                     let task = window.spawn(cx, async move |cx| {
                         cx.background_executor().timer(std::time::Duration::from_millis(400)).await;
                         let issue = cx.background_spawn(crate::procs::on_thread(move || { gh_issue(&repo, number) })).await;
@@ -1920,9 +1999,8 @@ impl Workspace {
                             if !current.trim().is_empty() && current != *filled.borrow() {
                                 return;
                             }
-                            let text = format!("GitHub issue #{number}: {issue_title}\n\n{}\n", body.trim());
-                            *filled.borrow_mut() = text.clone();
-                            prompt.update(cx, |p, cx| p.set_value(text, window, cx));
+                            *ticket.borrow_mut() = format!("GitHub issue #{number}: {issue_title}\n\n{}\n", body.trim());
+                            refill(window, cx);
                             // Only the reference typed: the issue's title names the task.
                             let typed = input.read(cx).value().trim().to_string();
                             if github_issue(&typed) == Some(number) && typed.split_whitespace().count() == 1 {
@@ -1931,7 +2009,7 @@ impl Workspace {
                         });
                     });
                     *fetch.borrow_mut() = Some(task);
-                } else if !filled.borrow().is_empty() {
+                } else {
                     set(String::new(), window, cx);
                 }
             }));
@@ -1940,13 +2018,25 @@ impl Workspace {
         let on_title_enter = on_enter.clone();
         listening.push(cx.subscribe_in(&input, window, move |this, _, event: &InputEvent, window, cx| on_title_enter(this, event, window, cx)));
         listening.push(cx.subscribe_in(&prompt, window, move |this, _, event: &InputEvent, window, cx| on_enter(this, event, window, cx)));
-        let listening = Rc::new(listening);
+        let listening = Rc::new((listening, reading));
+        let choose: Rc<dyn Fn(usize, &mut Window, &mut App)> = {
+            let (finding, refill) = (finding.clone(), refill.clone());
+            Rc::new(move |ix, window, cx| {
+                finding.borrow_mut().chosen = ix;
+                refill(window, cx);
+                window.refresh();
+            })
+        };
         let focused = std::rc::Rc::new(std::cell::Cell::new(false));
         window.open_dialog(cx, move |dialog, _, cx| {
             let (input, prompt, submit, focused) = (input.clone(), prompt.clone(), submit.clone(), focused.clone());
             let (count, notes, agents) = (count.clone(), notes.clone(), agents.clone());
-            let _ = &listening;
+            let (submit, open, choose) = (submit.clone(), open.clone(), choose.clone());
             let many = count.get();
+            let shown = Some(finding.borrow().clone()).filter(|f| many == 1 && !f.found.is_empty());
+            let clash = shown.as_ref().is_some_and(Finding::clash);
+            let found = shown.as_ref().and_then(|f| f.chosen().cloned());
+            let _ = &listening;
             let several = state::with_settings(|s| s.several_agents());
             let muted = cx.theme().muted_foreground;
             dialog
@@ -1975,6 +2065,8 @@ impl Workspace {
                                     .text_color(cx.theme().muted_foreground)
                                     .child(branch_hint(&input.read(cx).value())),
                             )
+                            // A task of it here, gone back to; a colleague's branch, or one of yours from elsewhere, opened as it is.
+                            .when_some(shown.clone(), |form, shown| form.child(found_hint(&shown, &choose, cx)))
                             .child(Textarea::new(&prompt))
                             .when(many == 1 && (several || agents_ui::model_picker("probe", agents[0].clone()).is_some()), |form| {
                                 form.child(
@@ -2045,14 +2137,28 @@ impl Workspace {
                 })
                 .footer({
                     let submit = submit.clone();
+                    let tip = match &found {
+                        Some(Found::Task { .. }) => "Back to the task as it was: nothing is pulled into it.",
+                        _ => "A task on origin's branch as it is there: its commits, a local branch that follows it. Left as filled, the prompt is one for it: a review of another's, going on with yours.",
+                    };
                     h_flex()
                         .justify_end()
                         .items_center()
                         .gap_2()
                         .child(div().text_xs().text_color(muted).child(crate::keys::label("Ctrl+Enter")))
+                        .when(found.is_some(), |row| {
+                            row.child(
+                                Button::new("open-found")
+                                    .primary()
+                                    .label("Open")
+                                    .tooltip(tip)
+                                    .on_click(move |_, window, cx| open(window, cx)),
+                            )
+                        })
                         .child(
                             Button::new("create-task")
                                 .primary()
+                                .disabled(clash && many == 1)
                                 .label(if many > 1 { format!("Create {many} variants") } else { "Create".to_string() })
                                 .on_click(move |_, window, cx| submit(window, cx)),
                         )
@@ -2108,17 +2214,52 @@ impl Workspace {
         if notes.len() > 1 {
             return self.create_variants(project, title, prompt, notes, agents, window, cx);
         }
-        let Some(p) = self.projects.get_mut(project) else { return };
         let branch = naming::branch_name(&title);
-        let (repo, base) = (p.path.clone(), p.base.clone());
+        self.make_worktree_task(project, branch, false, title, prompt, agents, given, window, cx);
+    }
+
+    /// Open in New Task: the task the title names, gone back to as it was
+    /// (a prompt you wrote put into its agent's input, not sent), or
+    /// origin's branch as it is there.
+    #[allow(clippy::too_many_arguments)]
+    fn open_found(&mut self, project: usize, found: Found, title: String, text: String, agent: String, given: bool, window: &mut Window, cx: &mut Context<Self>) {
+        match found {
+            Found::Task { path, .. } => {
+                self.switch(&path, window, cx);
+                let view = self.entry_mut(&path).and_then(|entry| entry.view.clone());
+                if let (false, false, Some(view)) = (text.is_empty(), given, view) {
+                    view.update(cx, |t, cx| t.queue_prompt(text, false, window, cx));
+                }
+            }
+            // Its commits, and a local branch that follows origin's.
+            Found::Origin { branch, .. } => self.make_worktree_task(project, branch.name, true, title, text, vec![agent], given, window, cx),
+        }
+    }
+
+    /// The task's row at once, its worktree made off the UI thread: a new
+    /// branch, or origin's `branch` when `from_origin`.
+    #[allow(clippy::too_many_arguments)]
+    fn make_worktree_task(&mut self, project: usize, branch: String, from_origin: bool, title: String, prompt: String, agents: Vec<String>, given: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repo) = self.projects.get(project).map(|p| p.path.clone()) else { return };
         let path = git::task_worktree_dir(&repo, &branch);
+        // A task of that branch is here already, paused maybe: it is opened
+        // again as it is, nothing pulled into it, never a second row of its path.
+        if let Some((pi, ti)) = self.find(&path) {
+            if self.projects[pi].tasks[ti].busy.is_none() {
+                self.switch(&path, window, cx);
+                window.push_notification(Notification::info(format!("A task on {branch} is here already: it is opened as it was.")).title("The task is here"), cx);
+            }
+            return;
+        }
+        let Some(p) = self.projects.get_mut(project) else { return };
+        let base = p.base.clone();
         p.collapsed = false;
         p.tasks.push(TaskEntry {
             path: path.clone(),
             branch: branch.clone(),
             title,
             last_active: state::now(),
-            busy: Some("creating…".into()),
+            busy: Some(if from_origin { "opening…" } else { "creating…" }.into()),
             prompt: prompt.clone(),
             created: state::now(),
             agent: agents_ui::pick_profile(agents.first().map_or("", String::as_str)),
@@ -2129,11 +2270,18 @@ impl Workspace {
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let copy_env = state::settings().copy_env;
+            let worktree = path.clone();
             let result = cx
                 .background_spawn(async move {
                     let copy = crate::project_config::resolve(&repo).config.task.copy;
-                    let made = git::create_task_worktree(&repo, &branch, &base, copy_env && copy.is_none());
-                    if let (Ok(dir), Some(copy)) = (&made, copy) {
+                    // A worktree there already has its files: yours are not copied over.
+                    let new = crate::hostfs::stat(&worktree).is_err();
+                    let made = if from_origin {
+                        git::open_origin_branch(&repo, &branch, copy_env && copy.is_none())
+                    } else {
+                        git::create_task_worktree(&repo, &branch, &base, copy_env && copy.is_none()).map(|dir| (dir, None))
+                    };
+                    if let (Ok((dir, _)), Some(copy), true) = (&made, copy, new) {
                         crate::project_config::copy_ignored(&repo, dir, &copy);
                     }
                     made
@@ -2141,7 +2289,7 @@ impl Workspace {
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 match result {
-                    Ok(_) => {
+                    Ok((_, note)) => {
                         if let Some(entry) = this.entry_mut(&path) {
                             entry.busy = None;
                         }
@@ -2153,6 +2301,9 @@ impl Workspace {
                             this.switch(&path, window, cx);
                         }
                         this.task_made(&path, window, cx);
+                        if let Some(note) = note {
+                            window.push_notification(Notification::info(note).title("The branch is as it was"), cx);
+                        }
                         // To its own agent: the task in view is another when the switch did not happen.
                         let view = this.entry_mut(&path).and_then(|entry| entry.view.clone());
                         if let (false, Some(view)) = (prompt.is_empty(), view) {
@@ -2163,10 +2314,13 @@ impl Workspace {
                         }
                     }
                     Err(e) => {
+                        // Only the row made for it: no task was on its path before.
                         if let Some((pi, ti)) = this.find(&path) {
-                            this.projects[pi].tasks.remove(ti);
+                            if this.projects[pi].tasks[ti].busy.is_some() {
+                                this.projects[pi].tasks.remove(ti);
+                            }
                         }
-                        window.push_notification(Notification::error(e).title("Could not create the task"), cx);
+                        window.push_notification(Notification::error(e).title(if from_origin { "Could not open the branch" } else { "Could not create the task" }), cx);
                     }
                 }
                 cx.notify();
@@ -3404,6 +3558,129 @@ fn gh_issue(repo: &Path, number: u64) -> Option<(String, String)> {
     Some((v["title"].as_str()?.to_string(), v["body"].as_str().unwrap_or_default().to_string()))
 }
 
+/// What a New Task title names that is here already: a task of the
+/// project, gone back to as it was, or a branch on origin, opened as it is
+/// there. `exact`: the branch the title would make, which Create cannot.
+#[derive(Clone, Debug, PartialEq)]
+enum Found {
+    Task { path: PathBuf, branch: String, paused: bool, exact: bool },
+    Origin { branch: git::OriginBranch, exact: bool },
+}
+
+/// The most New Task lists of what its title names.
+const FOUND_SHOWN: usize = 8;
+
+/// All a New Task title names, and which of it Open takes.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Finding {
+    /// The project's tasks, then origin's branches, the latest first; of
+    /// each, the branch the title would make before the others.
+    found: Vec<Found>,
+    /// The one Open takes: the title's own branch to begin with, else the first.
+    chosen: usize,
+    /// How many more there are than are listed.
+    more: usize,
+}
+
+impl Finding {
+    fn chosen(&self) -> Option<&Found> {
+        self.found.get(self.chosen)
+    }
+
+    /// The branch the title would make is among them: Create cannot make it.
+    fn clash(&self) -> bool {
+        self.found.iter().any(Found::exact)
+    }
+}
+
+impl Found {
+    fn exact(&self) -> bool {
+        match self {
+            Found::Task { exact, .. } | Found::Origin { exact, .. } => *exact,
+        }
+    }
+}
+
+/// `here`: the project's tasks by path, branch and whether paused;
+/// `origin`: its branches, the latest first. The tasks come first, and
+/// origin's branch of a task here is the task. Of each, the branch the
+/// title would make comes first, then those named beginning so.
+fn found_for(title: &str, here: &[(PathBuf, String, bool)], origin: &[git::OriginBranch]) -> Finding {
+    let Some(stem) = naming::stem(title) else { return Finding::default() };
+    let wanted = naming::preview(title);
+    let mut tasks: Vec<Found> = here
+        .iter()
+        .filter(|(_, branch, _)| naming::continues(&stem, branch))
+        .map(|(path, branch, paused)| Found::Task { path: path.clone(), branch: branch.clone(), paused: *paused, exact: *branch == wanted })
+        .collect();
+    let mut theirs: Vec<Found> = origin
+        .iter()
+        .filter(|b| naming::continues(&stem, &b.name) && here.iter().all(|(_, branch, _)| *branch != b.name))
+        .map(|b| Found::Origin { branch: b.clone(), exact: b.name == wanted })
+        .collect();
+    // Stable: the others keep their order.
+    tasks.sort_by_key(|f| !f.exact());
+    theirs.sort_by_key(|f| !f.exact());
+    let mut found: Vec<Found> = tasks.into_iter().chain(theirs).collect();
+    let more = found.len().saturating_sub(FOUND_SHOWN);
+    found.truncate(FOUND_SHOWN);
+    Finding { chosen: found.iter().position(Found::exact).unwrap_or(0), found, more }
+}
+
+/// What New Task found under its title: a line for one, a choice of which
+/// Open takes for more. `choose`: a row chosen, by its index.
+fn found_hint(shown: &Finding, choose: &Rc<dyn Fn(usize, &mut Window, &mut App)>, cx: &App) -> AnyElement {
+    let (muted, color) = (cx.theme().muted_foreground, if shown.clash() { hsla(0.08, 0.9, 0.55, 1.) } else { cx.theme().muted_foreground });
+    let paused = |paused: bool| if paused { ", paused" } else { "" };
+    let whose = |branch: &git::OriginBranch| if branch.mine { "yours".to_string() } else { branch.author.clone() };
+    if let [only] = shown.found.as_slice() {
+        let told = match only {
+            Found::Task { branch, paused: p, .. } => format!("{branch} is a task here already{}: Open goes back to it as it was.", paused(*p)),
+            Found::Origin { branch, .. } => format!(
+                "origin has {} · {}, {}: Open makes a task on it as it is there, {}.",
+                branch.name,
+                whose(branch),
+                branch.when,
+                if branch.mine { "to go on with it" } else { "to review it" }
+            ),
+        };
+        return div().text_xs().text_color(color).child(told).into_any_element();
+    }
+    let rows = shown.found.iter().enumerate().map(|(ix, found)| {
+        let label = match found {
+            Found::Task { branch, paused: p, .. } => format!("{branch} · a task here{}", paused(*p)),
+            Found::Origin { branch, .. } => format!("{} · origin, {}, {}{}", branch.name, whose(branch), branch.when, if branch.mine { "" } else { ", to review" }),
+        };
+        let choose = choose.clone();
+        div().id(("found", ix)).test_support().child(Radio::new(("found-choice", ix)).small().checked(ix == shown.chosen).label(label).on_click(move |_, window, cx| choose(ix, window, cx)))
+    });
+    v_flex()
+        .gap_1()
+        .child(div().text_xs().text_color(color).child("Here already: Open goes back to the task chosen as it was, or makes a task on origin's branch as it is there."))
+        .children(rows)
+        .when(shown.more > 0, |list| list.child(div().text_xs().text_color(muted).child(format!("and {} more", shown.more))))
+        .into_any_element()
+}
+
+/// The end of the prompt an issue in the title gives: what it is, then this.
+const DO_WHAT_IT_ASKS: &str = ": read it, its description and comments, and do what it asks.";
+
+/// What Open tells the task it opens, the prompt left as the dialog filled
+/// it: nothing to a task here, which goes on as it was; for origin's branch,
+/// to review it when its last commit is another's, else to go on with it,
+/// with the issue the title names. `ticket`: what the title gives a new task.
+fn opening_prompt(found: &Found, ticket: &str) -> String {
+    let Found::Origin { branch, .. } = found else { return String::new() };
+    let (name, issue) = (&branch.name, ticket.strip_suffix(DO_WHAT_IT_ASKS));
+    match (branch.mine, issue) {
+        // One line: how a review goes is the agent's to know.
+        (false, Some(issue)) => format!("Review {issue}."),
+        (false, None) => format!("Review the branch {name}."),
+        (true, Some(_)) => format!("{ticket} {name} has work on it already, as origin has it: start from what its commits did."),
+        (true, None) => format!("{name} as origin has it: read what its commits change since it left the default branch, and tell me where it stands and what is left to do."),
+    }
+}
+
 fn branch_hint(title: &str) -> String {
     let title = title.trim();
     if title.is_empty() {
@@ -3416,7 +3693,7 @@ fn branch_hint(title: &str) -> String {
     }
 }
 
-use gpui_kit::component::{ActiveTheme as _, Selectable as _, Sizable as _};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, radio::Radio};
 use gpui_kit::prelude::FluentBuilder as _;
 
 #[cfg(test)]
@@ -3537,5 +3814,146 @@ mod ticket_tests {
         assert_eq!(super::linear_link(linear), Some(("ENG-123".into(), "fix the login form".into(), linear.into())));
         assert_eq!(crate::naming::branch_name("ENG-123 fix the login form"), "ENG-123_fixTheLoginForm");
         assert_eq!(super::linear_link("https://linear.app/acme/issue/ENG-9").map(|l| l.1), Some(String::new()), "no words: named after the first turn");
+    }
+}
+
+// They script repositories with bash, which Windows lacks or has as WSL's.
+#[cfg(all(test, unix))]
+mod origin_branch_tests {
+    use super::Workspace;
+    use crate::state::{ProjectState, State};
+    use gpui_kit::test::TestWindowExt as _;
+    use gpui_kit::{AppContext as _, Bounds, Point, TestAppContext, WindowBounds, WindowOptions, px, size};
+
+    /// A title whose branch origin has: New Task lists it with the others of
+    /// its key and opens the one chosen as it is there; it does not make a
+    /// second branch of its name.
+    #[gpui_kit::test]
+    fn a_branch_origin_has_is_opened_not_made_again(cx: &mut TestAppContext) {
+        let _one = super::variants::tests::ONE_WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ideae-origin-branch-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sh = |script: &str| assert!(std::process::Command::new("bash").arg("-ec").arg(script).current_dir(&dir).status().unwrap().success(), "{script}");
+        sh("git init -q --bare -b main remote.git
+            git clone -q remote.git theirs 2>/dev/null; cd theirs; git config user.email someone@else; git config user.name Someone
+            echo one > f.txt; git add f.txt; git commit -qm base; git push -q origin main 2>/dev/null
+            git checkout -q -b DEV-7; echo x > t.txt; git add t.txt; git commit -qm theirs; git push -q origin DEV-7 2>/dev/null
+            git checkout -q -b DEV-7_more main; echo y > u.txt; git add u.txt; git commit -qm more; git push -q origin DEV-7_more 2>/dev/null
+            cd ..; git clone -q remote.git repo 2>/dev/null; cd repo; git config user.email t@t; git config user.name t");
+        let repo = dir.join("repo");
+        // SAFETY: set before anything of the app reads them, one window at a time.
+        unsafe {
+            std::env::set_var("IDEAE_STATE", dir.join("state.json"));
+            std::env::set_var("IDEAE_NO_DAEMON", "1");
+        }
+        let saved = State { projects: vec![ProjectState { path: repo.clone(), ..Default::default() }], ..Default::default() };
+        std::fs::write(dir.join("state.json"), serde_json::to_string(&saved).unwrap()).unwrap();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            gpui_cn::init(cx);
+            crate::theme::init(cx);
+        });
+        let (handle, workspace) = cx.update(|cx| {
+            let bounds = Bounds { origin: Point::default(), size: size(px(1000.), px(700.)) };
+            let options = WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() };
+            gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| Workspace::new(Vec::new(), Some(None), None, window, cx))).expect("a test window")
+        });
+        let made = |cx: &mut TestAppContext| workspace.update(cx, |w, _| w.projects[0].tasks.iter().filter(|t| !t.main).map(|t| (t.branch.clone(), t.path.clone(), t.busy.is_some(), t.prompt.clone())).collect::<Vec<_>>());
+        let wait = |cx: &mut TestAppContext, what: &str, done: &mut dyn FnMut(&mut TestAppContext) -> bool| {
+            for _ in 0..1000 {
+                cx.run_until_parked();
+                if done(cx) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                cx.executor().advance_clock(std::time::Duration::from_millis(10));
+            }
+            panic!("waited in vain for {what}");
+        };
+        cx.update_window(handle.into(), |_, window, cx| {
+            workspace.update(cx, |w, cx| w.new_task_dialog(0, window, cx));
+            window.render_frame(cx);
+        })
+        .unwrap();
+        // The title takes the keys once the dialog has focused it.
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| window.input("DEV-7", cx)).unwrap();
+        // origin's branches are read off the UI thread.
+        wait(cx, "origin's branches", &mut |cx| {
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                window.try_find("open-found").is_some()
+            })
+            .unwrap()
+        });
+        cx.update_window(handle.into(), |_, window, cx| window.click("create-task", cx)).unwrap();
+        cx.run_until_parked();
+        assert!(made(cx).is_empty(), "Create makes no branch of the name origin has: {:?}", made(cx));
+        // Both are listed, DEV-7 chosen; the other is chosen instead.
+        let listed = cx.update_window(handle.into(), |_, window, _| (window.try_find(("found", 0usize)).is_some(), window.try_find(("found", 1usize)).is_some())).unwrap();
+        assert_eq!(listed, (true, true), "DEV-7 and DEV-7_more to choose from");
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click(("found", 1usize), cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        // Enter opens the one chosen: the task's row is there at once, its worktree on
+        // the way; the worktree itself is git's test: a task's terminals do not run in this one.
+        cx.update_window(handle.into(), |_, window, cx| window.press("enter", cx)).unwrap();
+        let opening = made(cx);
+        assert_eq!(opening.iter().map(|t| (t.0.as_str(), t.2)).collect::<Vec<_>>(), [("DEV-7_more", true)], "the branch chosen, as origin names it, being opened");
+        assert_eq!(opening[0].1, crate::git::task_worktree_dir(&repo, "DEV-7_more"));
+        assert_eq!(opening[0].3, "Review Jira issue DEV-7.", "another's branch is reviewed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod found_tests {
+    use super::{DO_WHAT_IT_ASKS, FOUND_SHOWN, Found, found_for, opening_prompt};
+    use crate::git::OriginBranch;
+    use std::path::PathBuf;
+
+    /// The tasks here come before origin's branches, the branch the title
+    /// would make before those that only start with its key; that one is
+    /// chosen to begin with, and origin's branch of a task here is the task.
+    #[test]
+    fn a_title_finds_its_tasks_then_origin_s_branches() {
+        let branch = |name: &str| OriginBranch { name: name.into(), author: "Someone".into(), when: "2 days ago".into(), mine: false };
+        let origin = [branch("DEV-7"), branch("DEV-8_fixLogin"), branch("DEV-8_review")];
+        let task = |name: &str, paused: bool| (PathBuf::from(format!("/w/{name}")), name.to_string(), paused);
+        let names = |title: &str, here: &[(PathBuf, String, bool)]| {
+            let finding = found_for(title, here, &origin);
+            (finding.found.iter().map(|f| match f { Found::Task { branch, .. } => format!("task {branch}"), Found::Origin { branch, .. } => format!("origin {}", branch.name) }).collect::<Vec<_>>(), finding.chosen, finding.clash())
+        };
+        let here = [task("DEV-7", true)];
+        assert_eq!(found_for("DEV-7", &here, &origin).found, [Found::Task { path: "/w/DEV-7".into(), branch: "DEV-7".into(), paused: true, exact: true }], "the task alone, nothing pulled");
+        assert_eq!(names("DEV-8", &here), (vec!["origin DEV-8_fixLogin".into(), "origin DEV-8_review".into()], 0, false), "the key's branches, the latest first; Create makes DEV-8");
+        assert_eq!(names("DEV-8 review", &here), (vec!["origin DEV-8_review".into(), "origin DEV-8_fixLogin".into()], 0, true), "the title's own first");
+        let here = [task("DEV-8_old", false)];
+        assert_eq!(names("DEV-8 review", &here), (vec!["task DEV-8_old".into(), "origin DEV-8_review".into(), "origin DEV-8_fixLogin".into()], 1, true), "the task first, the title's own branch chosen");
+        assert!(found_for("DEV-9", &here, &origin).found.is_empty());
+
+        let many: Vec<OriginBranch> = (0..FOUND_SHOWN + 3).map(|n| branch(&format!("DEV-5_{n}"))).collect();
+        let finding = found_for("DEV-5", &[], &many);
+        assert_eq!((finding.found.len(), finding.more), (FOUND_SHOWN, 3));
+    }
+
+    /// Open, the prompt as the dialog filled it: the issue the title names is
+    /// reviewed on another's branch, gone on with on one of yours; a task here
+    /// is told nothing.
+    #[test]
+    fn what_open_tells_what_it_opens() {
+        let origin = |mine: bool| Found::Origin { branch: OriginBranch { name: "DEV-7_fix".into(), author: "Someone".into(), when: "today".into(), mine }, exact: false };
+        let ticket = format!("Jira issue DEV-7{DO_WHAT_IT_ASKS}");
+        assert_eq!(opening_prompt(&origin(false), &ticket), "Review Jira issue DEV-7.");
+        assert_eq!(opening_prompt(&origin(false), &format!("Jira issue DEV-7 (https://x.atlassian.net/browse/DEV-7){DO_WHAT_IT_ASKS}")), "Review Jira issue DEV-7 (https://x.atlassian.net/browse/DEV-7).");
+        assert_eq!(opening_prompt(&origin(false), ""), "Review the branch DEV-7_fix.");
+        let mine = opening_prompt(&origin(true), &ticket);
+        assert!(mine.starts_with(&ticket) && mine.contains("DEV-7_fix has work on it already"), "{mine}");
+        assert!(opening_prompt(&origin(true), "").starts_with("DEV-7_fix as origin has it"));
+        let task = Found::Task { path: "/w/DEV-7".into(), branch: "DEV-7".into(), paused: true, exact: true };
+        assert_eq!(opening_prompt(&task, &ticket), "", "a task here goes on as it was");
     }
 }

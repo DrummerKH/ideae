@@ -14,6 +14,24 @@ A prompt written with the title waits in the agent's input for you to finish
 and send; Settings → Tasks → "Send the prompt at once" sends it once the agent
 is up.
 
+When the title names a task the project has (`DEV-123`, or `DEV-123_fixLogin`
+for the key alone), paused or not, the dialog says so and **Open**, beside
+Create, goes back to it as it was: nothing is pulled into it, and a prompt you
+wrote waits in its agent's input. Else, when origin has such a branch, the
+dialog names it with who committed last and when, and Open makes a task on it
+as origin has it, its local branch following origin's, the prompt going to its
+agent as for a new task; a worktree of that name left here from before is
+taken and brought up to origin's when it has no commits of its own. When
+more are found (the key's branches on origin, say), they are listed, the
+tasks first, and Open takes the one chosen: the title's own branch to begin
+with. Create never makes a branch that is there already: it is greyed, and
+Enter opens. The prompt the dialog fills follows what Enter does: what the
+title's issue asks for a new task; for origin's branch whose last commit is
+another's, to review it (against that issue); for one of yours, to go on with
+it; nothing for a task here. Open with the prompt as filled sends the one that
+fits the row chosen. A project on another machine looks for its tasks alone, not for
+origin's branches.
+
 Worktrees made outside the app show up as tasks too. Those an agent made for
 itself (Claude Code's subagents in `.claude/worktrees/`, a try in a temporary
 folder, or one its Claude Code made anywhere with `git worktree add`, which

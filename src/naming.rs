@@ -20,6 +20,11 @@ fn build(title: &str, suffix: &str) -> String {
         let summary = camel(&words(rest));
         return if summary.is_empty() { key } else { format!("{key}_{summary}") };
     }
+    let slug = slug(title);
+    if slug.is_empty() { format!("task-{suffix}") } else { format!("{slug}-{suffix}") }
+}
+
+fn slug(title: &str) -> String {
     let mut slug = String::new();
     for word in words(title) {
         if !slug.is_empty() && slug.len() + 1 + word.len() > SLUG_MAX {
@@ -31,7 +36,26 @@ fn build(title: &str, suffix: &str) -> String {
         slug.push_str(&word);
     }
     slug.truncate(SLUG_MAX);
-    if slug.is_empty() { format!("task-{suffix}") } else { format!("{slug}-{suffix}") }
+    slug
+}
+
+/// What the branch of a task with this title begins with, whatever words
+/// follow: its issue key, or its slug without the random part. None when
+/// the title has nothing to name a branch by.
+pub fn stem(title: &str) -> Option<String> {
+    let title = title.trim();
+    let stem = match split_key(title) {
+        Some((key, _)) => key,
+        None => slug(title),
+    };
+    (!stem.is_empty()).then_some(stem)
+}
+
+/// Whether `branch` is named for what `stem` names: `DEV-5`, `DEV-5_fixLogin`
+/// or `dev-5-2` for `DEV-5`, not `DEV-55`.
+pub fn continues(stem: &str, branch: &str) -> bool {
+    let rest = branch.get(stem.len()..).filter(|_| branch.get(..stem.len()).is_some_and(|head| head.eq_ignore_ascii_case(stem)));
+    rest.is_some_and(|rest| rest.is_empty() || rest.starts_with(['_', '-']))
 }
 
 /// Why git would not take `name` as a branch (its check-ref-format rules),
@@ -180,6 +204,22 @@ mod tests {
         assert_eq!(branch_name("dev-12: Fix the Login"), "DEV-12_fixTheLogin");
         assert_eq!(branch_name("[ABC-7] Чиним вход"), "ABC-7_chinimVkhod");
         assert_eq!(branch_name("DEV-5"), "DEV-5");
+    }
+
+    #[test]
+    fn stems_and_the_branches_they_continue() {
+        assert_eq!(stem("DEV-5"), Some("DEV-5".into()));
+        assert_eq!(stem("dev-5: Fix the login"), Some("DEV-5".into()));
+        assert_eq!(stem("Fix the login!"), Some("fix-the-login".into()));
+        assert_eq!(stem("  !!! "), None);
+        for branch in ["DEV-5", "DEV-5_fixLogin", "dev-5-2", &branch_name("DEV-5 Fix login")] {
+            assert!(continues("DEV-5", branch), "{branch}");
+        }
+        for branch in ["DEV-55", "DEV-5x", "XDEV-5", "DEV", "ДЕВ-5"] {
+            assert!(!continues("DEV-5", branch), "{branch}");
+        }
+        assert!(continues("fix-the-login", &branch_name("Fix the login")));
+        assert!(!continues("fix", "fixes-x"));
     }
 
     #[test]

@@ -115,6 +115,10 @@ fn names_and_what_is_shown_short() {
         let head = &TEXT[..end];
         naming::branch_name(head);
         naming::preview(&format!("DEV-1 {head}"));
+        naming::stem(head);
+        // A branch cut where the stem ends, whatever it is cut through.
+        naming::continues(head, TEXT);
+        naming::continues("ДЕВ", head);
         for max in [1, 2, 5, 40] {
             said::cap(head, max);
             said::lead(head, max);

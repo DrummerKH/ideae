@@ -2413,7 +2413,7 @@ mod lock_tests {
 // They script repositories with bash, which Windows lacks or has as WSL's.
 #[cfg(all(test, unix))]
 mod pull_tests {
-    use super::{commit_worktree, history, replay_commit, HistoryQuery, RebaseError, branch_rows, branch_worktree, delete_branch, between, conflict_marked, diff_against, hunks, pull_conflicts, pull_safe, refresh, refs, stash, stash_apply, stash_drop, stash_patch, working_patch, Known};
+    use super::{commit_worktree, history, replay_commit, HistoryQuery, RebaseError, branch_rows, branch_worktree, delete_branch, origin_branches, create_task_worktree, branch_exists, open_origin_branch, worktree_at, git, between, conflict_marked, diff_against, hunks, pull_conflicts, pull_safe, refresh, refs, stash, stash_apply, stash_drop, stash_patch, working_patch, Known};
     use std::{path::Path, process::Command};
 
     fn sh(dir: &Path, script: &str) {
@@ -2626,6 +2626,46 @@ mod pull_tests {
         let one_file = diff_against(&b, "side", Some("f.txt"));
         assert!(one_file.contains("+five") && !one_file.contains("g.txt"), "{one_file}");
         assert_eq!(diff_against(&b, "HEAD", Some("g.txt")), "", "as committed");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// origin's branches are listed with who made their last commit; a new
+    /// task does not take the name of one, and one opened as it is there
+    /// follows it.
+    #[test]
+    fn origin_branches_are_listed_and_not_taken_over() {
+        let base = setup("origin-branches");
+        let b = base.join("b");
+        sh(&b, "cd ../a; git checkout -q -b DEV-7; echo x > t.txt; git add t.txt; git -c user.name=Someone -c user.email=Someone@Else commit -qm theirs; git push -q origin DEV-7 2>/dev/null
+            git checkout -q -b DEV-6 main; echo y > y.txt; git add y.txt; git commit -qm mine; git push -q origin DEV-6 2>/dev/null
+            cd ../b; git fetch -q");
+        let listed = origin_branches(&b);
+        let theirs = listed.iter().find(|r| r.name == "DEV-7").unwrap_or_else(|| panic!("DEV-7 in {listed:?}"));
+        assert_eq!((theirs.author.as_str(), theirs.mine), ("Someone", false));
+        assert!(listed.iter().any(|r| r.name == "DEV-6" && r.mine), "made with this clone's email: {listed:?}");
+        assert!(listed.iter().all(|r| r.name != "HEAD"), "{listed:?}");
+        let refused = create_task_worktree(&b, "DEV-7", "", false);
+        assert!(refused.as_ref().is_err_and(|why| why.contains("origin has a branch DEV-7")), "{refused:?}");
+        assert!(!branch_exists(&b, "DEV-7"), "no branch of its name made");
+        let (opened, note) = open_origin_branch(&b, "DEV-7", false).unwrap();
+        assert_eq!(note, None);
+        assert!(opened.join("t.txt").is_file(), "its commits");
+        assert_eq!(git(&opened, &["rev-parse", "--abbrev-ref", "@{u}"]).map(|u| u.trim().to_string()).as_deref(), Some("origin/DEV-7"));
+
+        // Made here from the base before, by a task of that title: taken and
+        // brought up to origin's, a file of yours in it kept.
+        sh(&b, "cd ../a; git checkout -q -b DEV-8 main; echo y > u.txt; git add u.txt; git commit -qm theirs; git push -q origin DEV-8 2>/dev/null");
+        let made = worktree_at(&b, "DEV-8", "main", false).unwrap();
+        std::fs::write(made.join("notes.md"), "mine").unwrap();
+        assert_eq!(open_origin_branch(&b, "DEV-8", false), Ok((made.clone(), None)));
+        assert!(made.join("u.txt").is_file() && made.join("notes.md").is_file(), "origin's commits, and the file of yours");
+        // With a commit of its own it stays as it was, and says so.
+        sh(&b, "cd ../a; git checkout -q -b DEV-9 main; echo z > v.txt; git add v.txt; git commit -qm theirs; git push -q origin DEV-9 2>/dev/null");
+        let mine = worktree_at(&b, "DEV-9", "main", false).unwrap();
+        sh(&mine, "echo w > w.txt; git add w.txt; git commit -qm mine");
+        let (again, note) = open_origin_branch(&b, "DEV-9", false).unwrap();
+        assert_eq!(again, mine);
+        assert!(note.is_some_and(|n| n.contains("a commit that origin's has not")) && !mine.join("v.txt").exists());
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -3249,7 +3289,12 @@ pub fn home_expanded(dir: &str) -> PathBuf {
 /// `<repo>.worktrees/<branch>`, and copies the main worktree's untracked
 /// `.env*` files into it.
 /// `base`: where the project's tasks branch from, empty for the remote's default.
+/// Not on a branch origin has: that is someone's work, and a new branch of
+/// its name could not be pushed but over it.
 pub fn create_task_worktree(repo: &Path, branch: &str, base: &str, copy_env: bool) -> Result<PathBuf, String> {
+    if git_status(repo, &["rev-parse", "--verify", "-q", &format!("refs/remotes/origin/{branch}")]).is_ok() {
+        return Err(format!("origin has a branch {branch} already, someone's work or yours from elsewhere: a new one of its name could only be pushed over it. Give the task words of its own."));
+    }
     let base = if base.trim().is_empty() { new_task_base(repo) } else { chosen_base(repo, base.trim()) };
     worktree_at(repo, branch, &base, copy_env)
 }
@@ -3486,6 +3531,39 @@ pub fn free_branch_name(repo: &Path, name: &str) -> String {
     std::iter::once(name.to_string()).chain((2..100).map(|n| format!("{name}-{n}"))).find(|b| !taken(b)).unwrap_or_else(|| format!("{name}-{}", crate::state::now()))
 }
 
+/// A branch of origin as last fetched, for New Task to tell that the one a
+/// title would make is there already.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OriginBranch {
+    /// Without `origin/`.
+    pub name: String,
+    /// Of its last commit.
+    pub author: String,
+    pub when: String,
+    /// Its last commit is yours, by the email git commits with here.
+    pub mine: bool,
+}
+
+/// origin's branches, the latest first.
+pub fn origin_branches(repo: &Path) -> Vec<OriginBranch> {
+    let me = git(repo, &["config", "user.email"]).map(|email| email.trim().to_lowercase()).unwrap_or_default();
+    let listed = git(repo, &["for-each-ref", "--sort=-committerdate", "--format=%(refname:lstrip=3)%1f%(authorname)%1f%(committerdate:relative)%1f%(authoremail)", "refs/remotes/origin"]);
+    listed
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\x1f');
+            let name = parts.next()?.trim();
+            (!name.is_empty() && name != "HEAD").then(|| OriginBranch {
+                name: name.to_string(),
+                author: parts.next().unwrap_or_default().to_string(),
+                when: parts.next().unwrap_or_default().to_string(),
+                mine: parts.next().is_some_and(|email| !me.is_empty() && email.trim().trim_matches(['<', '>']).to_lowercase() == me),
+            })
+        })
+        .collect()
+}
+
 /// A task's worktree on a branch of origin, fetched first: the branch of a
 /// pull request that is still open. The local branch follows origin's.
 pub fn remote_branch_worktree(repo: &Path, branch: &str, copy_env: bool) -> Result<PathBuf, String> {
@@ -3493,6 +3571,37 @@ pub fn remote_branch_worktree(repo: &Path, branch: &str, copy_env: bool) -> Resu
     let dir = worktree_at(repo, branch, &format!("origin/{branch}"), copy_env)?;
     let _ = git_status(&dir, &["branch", "--set-upstream-to", &format!("origin/{branch}")]);
     Ok(dir)
+}
+
+/// A task on origin's `branch`, opened from New Task. One of that name made
+/// here before (from the base, by a task of the same title) is taken as it
+/// is and brought up to origin's when that loses nothing; with commits of
+/// its own it stays, and the note says so.
+pub fn open_origin_branch(repo: &Path, branch: &str, copy_env: bool) -> Result<(PathBuf, Option<String>), String> {
+    let dir = task_worktree_dir(repo, branch);
+    if !dir.exists() && !branch_exists(repo, branch) {
+        return remote_branch_worktree(repo, branch, copy_env).map(|dir| (dir, None));
+    }
+    fetch_quietly(repo, &["fetch", "--quiet", "--no-auto-maintenance", "origin", &format!("+refs/heads/{branch}:refs/remotes/origin/{branch}")])?;
+    let theirs = format!("origin/{branch}");
+    if !dir.exists() {
+        git_status(repo, &["worktree", "add", &dir.to_string_lossy(), branch])?;
+        if copy_env {
+            copy_env_files(repo, &dir);
+        }
+    }
+    let on = git(&dir, &["symbolic-ref", "-q", "--short", "HEAD"]).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    if on.as_deref() != Some(branch) {
+        return Err(format!("{} is there already, on {} rather than {branch}.", dir.display(), on.as_deref().unwrap_or("no branch")));
+    }
+    let _ = git_status(&dir, &["branch", "--set-upstream-to", &theirs]);
+    let own: u32 = git(&dir, &["rev-list", "--count", &format!("{theirs}..HEAD")]).and_then(|n| n.trim().parse().ok()).unwrap_or(0);
+    if own > 0 {
+        let commits = if own == 1 { "a commit".to_string() } else { format!("{own} commits") };
+        return Ok((dir, Some(format!("{branch} here has {commits} that origin's has not: it stays as it was, and Pull brings origin's."))));
+    }
+    let note = git_status(&dir, &["merge", "--ff-only", "--quiet", &theirs]).err().map(|why| format!("{branch} stays where it was: {}", why.trim()));
+    Ok((dir, note))
 }
 
 /// Removes a worktree an agent made for itself. Its branch goes too when
