@@ -5393,7 +5393,9 @@ mod tests {
         set_cookie(&out, "named", "api.corp-dev.test");
         set_cookie(&out, "parent", ".stand.test");
         // A host its pages were served from by this machine, as its tabs note them.
-        let profile_a = profile_of(&a);
+        // Its Chrome's own: a profile's name holds the state's folder, which tests running beside this one change.
+        let running = |owner: &Owner| slot(owner).chrome.lock().unwrap().as_ref().map(|c| c.profile.clone()).unwrap();
+        let profile_a = running(&task_a);
         std::fs::write(profile_a.join(seed::STAND_HOSTS), "app.stand.test\n").unwrap();
         let _ = out.send(Out::Close);
         while !rx.is_closed() {
@@ -5417,7 +5419,7 @@ mod tests {
         assert_eq!(names, ["named@api.corp-dev.test", "parent@.stand.test", "seen@app.stand.test", "session@127.0.0.1"]);
         let token = call(&out, "Runtime.evaluate", json!({ "expression": "localStorage.getItem('token')", "returnByValue": true })).unwrap();
         assert_eq!(token["result"]["value"], "stand-token", "the stand's local storage came along");
-        assert_eq!(std::fs::read_to_string(profile_of(&b).join(seed::STAND_HOSTS)).unwrap(), "app.stand.test\n");
+        assert_eq!(std::fs::read_to_string(running(&task_b).join(seed::STAND_HOSTS)).unwrap(), "app.stand.test\n");
         let _ = out.send(Out::Close);
         drop(quit_a);
         let _ = std::fs::remove_dir_all(&base);

@@ -711,6 +711,11 @@ impl Daemon {
         }
     }
 
+    /// Where the window's MCP socket is reached on a daemon's machine, another one.
+    pub fn window_there(&self) -> Option<std::path::PathBuf> {
+        self.wire.as_ref()?.window_there()
+    }
+
     /// The ideae-server and the home folder of a daemon's machine, another one.
     pub fn there(&self) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
         let remote = self.wire.as_ref()?.remote();

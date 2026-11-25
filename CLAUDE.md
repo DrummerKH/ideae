@@ -80,7 +80,8 @@ core/src/acp/      the host process (`ideae --acp-host`, `ideae-server --acp-hos
                    thread and its journal (carried over from a name of before), answers its file reads and writes; wire.rs the messages
                    with the window, thread.rs the conversation, checkpoint.rs the files before a prompt as a git tree, policy.rs who answers
                    its permission questions, terminal.rs commands it runs through the app (`terminal/*`)
-src/mcp.rs         ideae as an MCP server for a chat agent (`ideae --mcp`): its task's open files, problems, check; asked of the window with a worktree's token
+src/mcp.rs         the window's side of ideae's MCP server (the server an agent runs is ideae-core's mcp.rs: `ideae --mcp`, `ideae-server --mcp`
+                   on another machine, its socket reached there by ssh): tokens, the socket, the answers, a remote task's paths keyed each way
 src/db/            databases, no UI: connections (connections.json), passwords in the system's keyring, bastions shared by connections, a tunnel by the system's ssh, a session on its own thread (docs/databases.md)
   backend.rs       what a session asks of a server; mysql_backend.rs postgres_backend.rs redis_backend.rs
   statement.rs value.rs schema.rs schema_cache.rs export.rs csv.rs format.rs history.rs import.rs scratch.rs tls.rs   statements and parameters, typed cells, completions, what a schema held, writers, CSV, layout, what ran, DataGrip's sources, files of no project, what an encrypted connection trusts

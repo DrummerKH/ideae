@@ -527,9 +527,9 @@ impl Workspace {
             .detach();
         }
         // Chat agents' questions through ideae's MCP server, each about its
-        // own worktree. Tests leave the socket to the app.
+        // own worktree. Tests leave the socket to the app, but one that asks through it.
         let (mcp_tx, mcp_rx) = async_channel::unbounded::<(crate::mcp::Request, async_channel::Sender<crate::mcp::Answer>)>();
-        if !cfg!(test) {
+        if !cfg!(test) || std::env::var_os("IDEAE_TEST_MCP").is_some() {
             let _ = crate::mcp::listen(move |request, answer| {
                 let _ = mcp_tx.send_blocking((request, answer));
             })

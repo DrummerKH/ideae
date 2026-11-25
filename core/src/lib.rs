@@ -10,6 +10,7 @@ pub mod build;
 pub mod daemon;
 pub mod env;
 pub mod hook;
+pub mod mcp;
 pub mod paths;
 pub mod procs;
 pub mod said;

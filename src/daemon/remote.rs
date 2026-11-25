@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -87,6 +87,11 @@ pub struct Wire {
     socket: Mutex<Option<String>>,
     /// Ports of here reached from there (`-R`): asked again of a master made anew.
     reverses: Mutex<HashMap<u16, i64>>,
+    /// The window's MCP socket, as reached there (a socket of its user's
+    /// there): its agents there ask the window through it.
+    window_socket: Mutex<Option<(PathBuf, PathBuf)>>,
+    /// The window's socket asked to be reached: tried again with a link made anew while it is not.
+    window_wanted: Mutex<Option<PathBuf>>,
 }
 
 impl Wire {
@@ -145,6 +150,24 @@ impl Wire {
             }
             _ => Ok(()),
         }
+    }
+
+    /// The window's socket `here` reached at a socket there, for the agents
+    /// there (their MCP server): once a link, made again with it.
+    pub fn reach_window(&self, here: &Path) -> Result<PathBuf, String> {
+        *self.window_wanted.lock().unwrap() = Some(here.to_path_buf());
+        let mut held = self.window_socket.lock().unwrap();
+        if let Some((_, there)) = held.as_ref() {
+            return Ok(there.clone());
+        }
+        let there = forward_socket(&self.remote, here)?;
+        *held = Some((here.to_path_buf(), there.clone()));
+        Ok(there)
+    }
+
+    /// Where the window's socket is reached there, once it is.
+    pub fn window_there(&self) -> Option<PathBuf> {
+        self.window_socket.lock().unwrap().as_ref().map(|(_, there)| there.clone())
     }
 
     /// No longer, once its last holder has gone.
@@ -216,6 +239,8 @@ pub fn connect(remote: Remote, on_hook: impl Fn(Hook) + Send + Sync + 'static) -
         up: AtomicBool::new(true),
         socket: Mutex::new(first.socket),
         reverses: Mutex::default(),
+        window_socket: Mutex::default(),
+        window_wanted: Mutex::default(),
     };
     let daemon = Arc::new(Daemon::remote(wire, queued(first.writer), first.sessions, first.opened));
     let reading = daemon.clone();
@@ -271,6 +296,19 @@ pub fn connect(remote: Remote, on_hook: impl Fn(Hook) + Send + Sync + 'static) -
                     let _ = reverse(&wire.remote, port, "forward");
                 }
                 drop(reverses);
+                let held = wire.window_socket.lock().unwrap().clone();
+                match held {
+                    Some((here, _)) => {
+                        let _ = forward_socket(&wire.remote, &here);
+                    }
+                    // Not reached the time before: tried again.
+                    None => {
+                        let wanted = wire.window_wanted.lock().unwrap().clone();
+                        if let Some(here) = wanted {
+                            let _ = wire.reach_window(&here);
+                        }
+                    }
+                }
                 // Beyond a first host, its own link may have been made anew, its forwards gone with it.
                 if wire.remote.hop.is_some() {
                     let label = wire.remote.label();
@@ -519,6 +557,8 @@ pub(super) fn clear_first_host(remote: &Remote) {
     const CLEAR: &str = r#"cd ~/.ssh 2>/dev/null || exit 0
 for s in ideae-*-*.sock; do
   [ -e "$s" ] || continue
+  # A window's own socket there (MCP), reached directly: its host's daemon sees to those.
+  case $s in ideae-mcp-*) continue ;; esac
   t=${s#ideae-}; t=${t%%-*}; live=
   for m in ideae-"$t"-*; do
     case $m in *.sock) ;; *) [ -S "$m" ] && live=1 ;; esac
@@ -666,6 +706,51 @@ fn reverse(remote: &Remote, port: u16, how: &str) -> Result<(), String> {
         }
         _ => Ok(()),
     }
+}
+
+/// The socket `here` reached at a socket on the host, its user's alone (as
+/// sshd makes it): `~/.ssh/ideae-mcp-<run>.sock` there, a name the clearing
+/// of a first host's sockets passes by. Beyond a first host, through one of
+/// its own on it, named by the host beyond (two of them through one first
+/// host have one each). What a link before left (a socket, a forward its
+/// master still holds, which a new one of the same would not bind again)
+/// is let go of first.
+fn forward_socket(remote: &Remote, here: &Path) -> Result<PathBuf, String> {
+    masters().ok_or("no folder for ssh's master connections")?;
+    let home = remote.home.clone().ok_or("its home folder there is not known")?;
+    let there = home.join(".ssh").join(format!("ideae-mcp-{}.sock", run_token()));
+    let clear = |at: &Remote, socket: &str| run(at, &format!("mkdir -p ~/.ssh && rm -f {}", quote(socket)), None);
+    let master = |how: &str, spec: &str| -> Result<(), String> {
+        let out = ssh_with(remote, &["-O", how, "-R", spec])?.stdin(Stdio::null()).output().map_err(|e| format!("ssh: {e}"))?;
+        if out.status.success() { Ok(()) } else { Err(ssh_said(Some(255), String::from_utf8_lossy(&out.stderr).trim().to_string())) }
+    };
+    match &remote.hop {
+        None => {
+            let spec = format!("{}:{}", there.display(), here.display());
+            let _ = master("cancel", &spec);
+            clear(remote, &there.display().to_string())?;
+            master("forward", &spec)?;
+        }
+        Some(hop) => {
+            // A name of its own: the first host may be the one beyond too (a hop to itself).
+            let beyond = {
+                use std::hash::{Hash as _, Hasher as _};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                hop.hash(&mut h);
+                h.finish() as u32
+            };
+            let on_first = format!("{}/.ssh/ideae-{}-{beyond:08x}-mcp-via.sock", first_home(remote)?, run_token());
+            let to_first = format!("{on_first}:{}", here.display());
+            let _ = master("cancel", &to_first);
+            clear(&remote.first(), &on_first)?;
+            master("forward", &to_first)?;
+            let on_beyond = format!("{}:{on_first}", there.display());
+            let _ = on_hop(remote, hop, &["-O", "cancel", "-R", &on_beyond]);
+            clear(remote, &there.display().to_string())?;
+            on_hop(remote, hop, &["-O", "forward", "-R", &on_beyond])?;
+        }
+    }
+    Ok(there)
 }
 
 /// The home folder of a first host, asked once.

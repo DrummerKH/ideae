@@ -156,14 +156,13 @@ impl Drop for Link {
 
 /// A remote task's host spec, as its host there runs it: in its folder
 /// there, its journal there ([`super::journal_path`]), its agent started
-/// by the login shell there (its PATH: npx, ~/.local/bin), and no MCP
-/// server of here.
+/// by the login shell there (its PATH: npx, ~/.local/bin). Its MCP server
+/// is the ideae-server there already ([`crate::mcp::server_for`]).
 #[cfg(unix)]
 fn there_spec(mut spec: HostSpec, there: &std::path::Path) -> HostSpec {
     spec.cwd = there.to_path_buf();
     spec.journal = spec.journal.map(|j| crate::hosts::there(&j));
     spec.journal_before = spec.journal_before.map(|j| crate::hosts::there(&j));
-    spec.mcp = None;
     spec.login_shell = true;
     spec
 }

@@ -186,6 +186,27 @@ pub fn run(adopt: bool) {
     }
 }
 
+/// The windows' MCP sockets reached here through ssh (`~/.ssh/ideae-mcp-<run>.sock`)
+/// whose run is gone: sshd leaves them, and one that takes no connection is no one's.
+/// Not one just made: sshd binds it a moment before it listens.
+fn clear_window_sockets() {
+    let Some(home) = std::env::var_os("HOME") else { return };
+    let dir = std::path::Path::new(&home).join(".ssh");
+    for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !(name.starts_with("ideae-mcp-") && name.ends_with(".sock")) {
+            continue;
+        }
+        let young = entry.metadata().and_then(|m| m.modified()).is_ok_and(|at| at.elapsed().is_ok_and(|age| age < std::time::Duration::from_secs(10)));
+        if young {
+            continue;
+        }
+        if std::os::unix::net::UnixStream::connect(entry.path()).is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionRefused) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Foreground processes for the windows, and the end of an unattended daemon.
 fn housekeeping(shared: Shared) {
     loop {
@@ -260,6 +281,7 @@ fn serve(shared: Shared, stream: UnixStream) {
             }
             Frame::Bytes { .. } => {}
             Frame::Msg(Msg::Hello { .. }) => {
+                std::thread::spawn(clear_window_sockets);
                 let Ok(stream) = reader.try_clone() else { break };
                 let mut s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 s.clients.insert(client, Client { tx: tx.clone(), queued: queued.clone(), stream });

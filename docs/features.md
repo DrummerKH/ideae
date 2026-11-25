@@ -96,6 +96,12 @@ on Alpine).
 Chat agents (ACP) run there too: their host is the ideae-server there, the
 agent started by the login shell there, its conversation kept there.
 
+Its agents there have ideae's MCP tools as local ones do (the open files,
+the language servers' problems and answers, the check, questions and tasks
+for other agents, tickets): their server is the ideae-server there, which
+asks the window through its socket reached there by ssh, a socket of yours
+alone there; the files they name are those there.
+
 With **Agents on other machines drive Chrome here** on (Settings → Web
 tabs, or a space or a project of machines that are yours alone; off at
 first, never a team's file's to say), its agents there drive its Web tabs

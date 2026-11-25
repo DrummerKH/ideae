@@ -348,9 +348,12 @@ impl Workspace {
                     let (remote, hooks) = crate::daemon::install::ensure(crate::daemon::remote::Remote::for_host(&to))?;
                     crate::agents::set_host_hooks(&to, hooks);
                     let host = to.clone();
-                    crate::daemon::remote::connect(remote, move |hook| {
+                    let connected = crate::daemon::remote::connect(remote, move |hook| {
                         let _ = live.send_blocking(here(&host, hook.event()));
-                    })
+                    })?;
+                    // Its agents there ask the window (ideae's MCP server) through a socket of yours there.
+                    let unreached = connected.0.wire().and_then(|wire| wire.reach_window(&crate::mcp::socket()).err()).map(|e| crate::hosts::explain_ssh(&to, &e));
+                    Ok::<_, String>((connected, unreached))
                 })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -362,7 +365,11 @@ impl Workspace {
                     }
                 }
                 match connected {
-                    Ok((daemon, earlier)) => {
+                    Ok(((daemon, earlier), unreached)) => {
+                        if let Some(why) = unreached {
+                            let told = format!("Its agents there have no ideae tools (open files, problems, the check, other agents) until the link is made again: {why}");
+                            window.push_notification(Notification::warning(told).title(format!("{}: the window not reached from there", crate::hosts::label(&host))), cx);
+                        }
                         this.host_failed.remove(&host);
                         crate::daemon::client::add_remote(host.clone(), daemon);
                         // What its agents reported while no window listened.
@@ -610,10 +617,21 @@ mod tests {
             }
         }
         let _end = EndHosts;
+        // The window listens on its MCP socket for this test alone, not those after it.
+        struct EndMcp;
+        impl Drop for EndMcp {
+            fn drop(&mut self) {
+                // SAFETY: under the lock the tests that set it share.
+                unsafe { std::env::remove_var("IDEAE_TEST_MCP") };
+            }
+        }
+        let _mcp = EndMcp;
         cx.executor().allow_parking();
         let dir = std::env::temp_dir().join(format!("ideae-remote-project-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (home, bins) = (dir.join("box-home"), dir.join("bins"));
+        // Its home there by a short path, as a machine's is: a socket's path is 104 bytes at most.
+        let short_home = PathBuf::from(format!("/tmp/ir{}", std::process::id()));
         for d in [&home, &bins] {
             std::fs::create_dir_all(d).unwrap();
         }
@@ -665,12 +683,14 @@ exec cat >> '{pwds}.told'
             ),
         )
         .unwrap();
+        let _ = std::fs::remove_file(&short_home);
+        std::os::unix::fs::symlink(&home, &short_home).unwrap();
         let ssh = dir.join("ssh");
         std::fs::write(
             &ssh,
             format!(
-                "#!/bin/sh\n# A master connection's (-O forward, -O exit): here and there are one machine.\ncase \" $* \" in *\" -O \"*) exit 0;; esac\nwhile [ $# -gt 0 ] && [ \"$1\" != \"--\" ]; do shift; done; shift\nexport HOME='{}' IDEAE_STATE='{}' PATH='{}':\"$PATH\"\nunset XDG_RUNTIME_DIR\nexec sh -c \"$*\"\n",
-                home.display(),
+                "#!/bin/sh\n# A master connection's (-O forward, -O exit): here and there are one machine; a socket\n# forwarded (-R there:here) is a link to it.\no=; for a in \"$@\"; do if [ \"$o\" = -R ]; then case \"$a\" in /*:/*) mkdir -p \"$(dirname \"${{a%%:*}}\")\"; ln -sf \"${{a#*:}}\" \"${{a%%:*}}\";; esac; fi; o=\"$a\"; done\ncase \" $* \" in *\" -O \"*) exit 0;; esac\nwhile [ $# -gt 0 ] && [ \"$1\" != \"--\" ]; do shift; done; shift\nexport HOME='{}' IDEAE_STATE='{}' PATH='{}':\"$PATH\"\nunset XDG_RUNTIME_DIR\nexec sh -c \"$*\"\n",
+                short_home.display(),
                 dir.join("box-state.json").display(),
                 bins.display()
             ),
@@ -694,6 +714,8 @@ exec cat >> '{pwds}.told'
             std::env::set_var("IDEAE_NO_DAEMON", "1");
             std::env::set_var("IDEAE_SSH", ssh.display().to_string());
             std::env::set_var("IDEAE_SERVER_DIR", bins.display().to_string());
+            // Its agents there ask the window through its MCP socket.
+            std::env::set_var("IDEAE_TEST_MCP", "1");
         }
         // Its agents drive Chrome here: each starts once the port is reached (the stand-in ssh says so).
         crate::state::set_settings(crate::state::Settings { notifications: false, pr_status: false, remote_browser: true, send_new_prompt: true, ..Default::default() });
@@ -718,8 +740,9 @@ exec cat >> '{pwds}.told'
             .spawn()
             .unwrap();
         let url = format!("ssh://{host}{}", repo.display());
-        // Only a link beyond a first host makes its folder of ssh's there.
+        // Only a link beyond a first host leaves a socket of its own on that host (the window's, reached through it).
         let ssh_dir = home.join(".ssh");
+        let through = || std::fs::read_dir(&ssh_dir).into_iter().flatten().flatten().any(|e| e.file_name().to_string_lossy().ends_with("-mcp-via.sock"));
         let (handle, workspace) = cx.update(|cx| {
             let bounds = Bounds { origin: Point::default(), size: size(px(1300.), px(800.)) };
             let options = WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() };
@@ -752,7 +775,7 @@ exec cat >> '{pwds}.told'
         until(cx, "the main thread's agent ran there", &|_| !lines().is_empty());
         let cdp = std::fs::read_to_string(dir.join("pwds.cdp")).unwrap();
         assert!(cdp.lines().next().is_some_and(|l| l.starts_with("http://127.0.0.1:")), "started once its Chrome was reached, and told of it: {cdp:?}");
-        assert_eq!(ssh_dir.is_dir(), crate::hosts::hop(host).1.is_some(), "reached through the first host only when named so");
+        assert_eq!(through(), crate::hosts::hop(host).1.is_some(), "reached through the first host only when named so");
         assert!(old_daemon.try_wait().unwrap().is_some(), "the earlier build's daemon handed over and went");
         assert_eq!(lines(), [repo.display().to_string()], "in the folder there");
         workspace.update(cx, |w, cx| {
@@ -827,9 +850,39 @@ exec cat >> '{pwds}.told'
         until(cx, "the file came from there", &|cx| view.read_with(cx, |t, cx| t.open_text(&file, cx)).as_deref() == Some("two\n"));
         cx.update_window(handle.into(), |_, window, cx| view.update(cx, |t, cx| t.type_and_save(&file, "zero\n", window, cx))).unwrap();
         until(cx, "the file was saved there", &|_| std::fs::read_to_string(worktree.join("f.txt")).unwrap() == "zero\ntwo\n");
+        // Its agents there ask the window (ideae's MCP server there, the window's socket reached
+        // there), naming its files as they are there, and are told them so.
+        let (program, args, env) = crate::mcp::server_for(&task).expect("its MCP server there");
+        assert!(args == ["--mcp"] && program.contains("ideae-server"), "{program} {args:?}");
+        let asked_path = worktree.join("f.txt").display().to_string();
+        let input = [
+            serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }),
+            serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "open_files", "arguments": {} } }),
+            serde_json::json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": { "name": "diagnostics", "arguments": { "path": asked_path } } }),
+        ]
+        .map(|m| m.to_string())
+        .join("\n")
+            + "\n";
+        let at = task.clone();
+        let asking = std::thread::spawn(move || {
+            let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            crate::hostfs::run(&at, &program, &["--mcp"], &env, Some(input.as_bytes()))
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !asking.is_finished() {
+            assert!(std::time::Instant::now() < deadline, "the agent there was answered");
+            cx.run_until_parked();
+            cx.executor().advance_clock(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let said = String::from_utf8_lossy(&asking.join().unwrap().unwrap().stdout).into_owned();
+        assert!(said.contains("In front: f.txt"), "its open file, from the window: {said}");
+        assert!(said.contains("\"id\":3") && !said.contains("not in this task's worktree") && !said.contains("ssh:/"), "a file named as it is there: {said}");
+
         // Through a first host, its own is the link: what follows goes through the same daemon and calls.
         if crate::hosts::hop(host).1.is_some() {
             drop(_end);
+            let _ = std::fs::remove_file(&short_home);
             let _ = std::fs::remove_dir_all(&dir);
             return;
         }
@@ -1028,6 +1081,7 @@ exec cat >> '{pwds}.told'
         assert!(!item.file.exists());
 
         drop(_end);
+        let _ = std::fs::remove_file(&short_home);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

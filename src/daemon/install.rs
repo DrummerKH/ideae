@@ -85,11 +85,15 @@ pub fn ensure(mut remote: Remote) -> Result<(Remote, crate::agents::Hooks), Stri
     let json = serde_json::to_vec_pretty(&crate::agent::hooks_settings(&exe)).map_err(|e| e.to_string())?;
     run(&remote, &put(&settings, false), Some(&json))?;
     run(&remote, &put(&plugin, false), Some(crate::agents::opencode::plugin_source(&exe).as_bytes()))?;
+    // Claude Code's MCP servers: ideae's there, which asks the window through its socket reached there.
+    let mcp = settings.with_extension("mcp.json");
+    let config = serde_json::json!({ "mcpServers": { "ideae": { "command": exe, "args": ["--mcp"] } } });
+    run(&remote, &put(&mcp, false), Some(config.to_string().as_bytes()))?;
     // A daemon of its own there, apart from one an ideae of that machine
     // runs for its own window (`<app>-remote`): neither hands the other over.
     remote.ideae = format!("IDEAE_APP={app}-remote {}", q(&exe));
     (remote.exe, remote.home) = (Some(exe.clone()), Some(PathBuf::from(&home)));
-    let hooks = crate::agents::Hooks { claude_settings: Some(settings), exe: Some(exe), opencode_plugin: Some(plugin), claude_mcp: None };
+    let hooks = crate::agents::Hooks { claude_settings: Some(settings), exe: Some(exe), opencode_plugin: Some(plugin), claude_mcp: Some(mcp) };
     Ok((remote, hooks))
 }
 
@@ -254,6 +258,36 @@ mod tests {
         daemon.kill("live-task#acp");
         eprintln!("an agent's host ran there");
 
+        // Its agents there ask the window: its MCP socket reached there (beyond a hub, through one on it),
+        // ideae-server --mcp there asking through it, answered here.
+        let state = std::env::temp_dir().join(format!("ideae-live-mcp-{}", std::process::id()));
+        std::fs::create_dir_all(&state).unwrap();
+        // SAFETY: the live tests run one at a time; set before the socket's path is made of it.
+        unsafe { std::env::set_var("IDEAE_STATE", state.join("state.json")) };
+        crate::mcp::listen(|request, answer| {
+            let _ = answer.try_send(crate::mcp::Answer::ok(format!("heard {} of {}", request.tool, request.root.display())));
+        })
+        .unwrap();
+        let socket_there = daemon.wire().unwrap().reach_window(&crate::mcp::socket()).expect("the window's socket reached there");
+        let root = std::path::PathBuf::from("ssh:/live/task");
+        let token = crate::mcp::token(&root);
+        let asked = format!("{}\n", serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "open_files", "arguments": {} } }));
+        let call = Call::Exec {
+            cwd: "/".into(),
+            program: exe.display().to_string(),
+            args: vec!["--mcp".into()],
+            env: vec![("IDEAE_MCP_ROOT".into(), root.display().to_string()), ("IDEAE_MCP_TOKEN".into(), token), ("IDEAE_MCP_SOCK".into(), socket_there.display().to_string())],
+        };
+        let ask_window = |daemon: &crate::daemon::client::Daemon| {
+            let (_, out) = daemon.call(&call, asked.as_bytes()).unwrap();
+            String::from_utf8_lossy(&out).into_owned()
+        };
+        let said = ask_window(&daemon);
+        // The window's key of the task told as the path there.
+        assert!(said.contains("heard open_files of /task"), "the window answered the agent there: {said}");
+        eprintln!("an agent there asked the window");
+        let _ = std::fs::remove_dir_all(&state);
+
         daemon.write(&id, b"one\n");
         let (got, _) = read("got:one");
         assert!(got.contains("got:one"), "{got}");
@@ -267,6 +301,11 @@ mod tests {
         }
         daemon.write(&id, b"two\n");
         assert!(read("got:two").0.contains("got:two"), "the session ran on after the link was cut");
+        // The link made anew on the same master connection: its socket there made again, not left gone.
+        assert_eq!(daemon.wire().unwrap().window_there().as_deref(), Some(socket_there.as_path()));
+        let again = ask_window(&daemon);
+        assert!(again.contains("heard open_files of /task"), "asked again after the link was made anew: {again}");
+        eprintln!("an agent there asked the window again, the link made anew");
         // What was ended before the link was cut is not started again with it.
         std::thread::sleep(Duration::from_millis(500));
         let (_, body) = daemon.call(&Call::Listening { task: "live-task".into() }, b"").unwrap();

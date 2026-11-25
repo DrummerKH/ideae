@@ -138,10 +138,8 @@ tickets only (no other key, no search, no other project), read with your
 token by the window (the token never reaches the agent or a remote host),
 its text framed as the ticket's and not instructions, bounded, without
 attachments. Nothing written to the tracker: no transitions, no comments.
-Agents of tasks on another machine have no ideae MCP server, so no `ticket`
-there; their terminals still get `IDEAE_TICKET*`. Planned: the window's MCP
-server reached from the host through ssh (as a task's Chrome is), its
-tools then answering an agent there as one here.
+Agents of tasks on another machine have it too: their MCP server is the
+ideae-server there, asking the window through its socket reached there.
 
 ## A task's links
 
