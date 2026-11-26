@@ -333,13 +333,13 @@ mod tests {
         assert!(matches!(until(&events, |_| true), Event::Lost(said) if said == super::super::guard::LOCKED));
 
         // Locked again while connected: the statement is refused, the session stays.
-        super::super::guard::unlock_for(Duration::from_secs(60));
+        super::super::guard::unlock_for(Some(Duration::from_secs(60)));
         let (session, events) = Session::start(production, Some("secret".into()), None);
         assert!(matches!(until(&events, |e| matches!(e, Event::Connected { .. } | Event::Lost(_))), Event::Connected { .. }));
         super::super::guard::lock();
         let (rows, _, _, failed) = run(&session, &events, "SELECT rows 2");
         assert!(rows.is_empty() && failed.is_some_and(|f| f.starts_with(super::super::guard::LOCKED)));
-        super::super::guard::unlock_for(Duration::from_secs(60));
+        super::super::guard::unlock_for(Some(Duration::from_secs(60)));
         let (rows, _, _, failed) = run(&session, &events, "SELECT rows 2");
         assert_eq!((rows.len(), failed), (2, None));
         super::super::guard::lock();

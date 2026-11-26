@@ -437,7 +437,7 @@ impl TaskView {
                 .justify_center()
                 .text_sm()
                 .text_color(cx.theme().muted_foreground)
-                .child("The agent starts once its host reaches Chrome here (Settings → Web tabs)…")
+                .child("The agent starts once its host reaches Chrome here (Settings → Browser)…")
                 .into_any_element();
         }
         let (text, label) = match who {

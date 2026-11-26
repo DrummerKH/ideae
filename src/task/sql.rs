@@ -1827,13 +1827,13 @@ impl FileView {
 
     /// A production connection's mark: locked, or until when it is not; a click turns it.
     fn production_badge(&self, cx: &mut Context<Self>) -> AnyElement {
-        let until = crate::db::guard::open_until();
+        let until = crate::db::guard::unlocked_until();
         let red = gpui_kit::red();
         Button::new("sql-production")
             .xsmall()
             .ghost()
-            .label(match until {
-                Some(until) => format!("PRODUCTION · unlocked until {}", crate::local_time::hour_minute(until)),
+            .label(match &until {
+                Some(until) => format!("PRODUCTION · unlocked {until}"),
                 None => "PRODUCTION · locked".into(),
             })
             .text_color(red)
@@ -1937,7 +1937,7 @@ impl FileView {
                         .label("▶ Run")
                         .disabled(sql.busy())
                         .tooltip(format!("The selection, else the statement at the cursor ({})", crate::keymap::label("sql_run")))
-                        .on_click(cx.listener(|this, _, window, cx| this.run_statement(window, cx))),
+                        .on_click(crate::learn::clicked("sql_run", cx.listener(|this, _, window, cx| this.run_statement(window, cx)))),
                 )
                 .child(
                     Button::new("sql-run-file")
@@ -1946,7 +1946,7 @@ impl FileView {
                         .label("Run all")
                         .disabled(sql.busy())
                         .tooltip(format!("Every statement of the file, after asking ({})", crate::keymap::label("sql_run_file")))
-                        .on_click(cx.listener(|this, _, window, cx| this.run_file(window, cx))),
+                        .on_click(crate::learn::clicked("sql_run_file", cx.listener(|this, _, window, cx| this.run_file(window, cx)))),
                 )
                 .when(!is_redis, |bar| bar.child(
                     Button::new("sql-explain")
@@ -1964,7 +1964,7 @@ impl FileView {
                         .label("■")
                         .disabled(!sql.busy())
                         .tooltip(format!("Stop ({})", crate::keymap::label("sql_stop")))
-                        .on_click(cx.listener(|this, _, _, cx| this.stop_statement(cx))),
+                        .on_click(crate::learn::clicked("sql_stop", cx.listener(|this, _, _, cx| this.stop_statement(cx)))),
                 )
                 .children(current.as_ref().filter(|c| c.production).map(|_| self.production_badge(cx)))
                 .child(connections)

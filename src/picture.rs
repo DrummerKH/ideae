@@ -122,11 +122,11 @@ impl PictureView {
             .child(
                 h_flex()
                     .gap_1()
-                    .child(Button::new("picture-fit").xsmall().ghost().label("Fit").selected(self.zoom.is_none()).tooltip(format!("Fit in the room ({})", crate::keymap::label("picture_fit"))).on_click(cx.listener(|this, _, _, cx| this.zoom_to(None, cx))))
-                    .child(Button::new("picture-actual").xsmall().ghost().label("1:1").selected(self.zoom == Some(1.)).tooltip(format!("Its own size ({})", crate::keymap::label("picture_actual_size"))).on_click(cx.listener(|this, _, _, cx| this.zoom_to(Some(1.), cx))))
-                    .child(Button::new("picture-smaller").xsmall().ghost().label("−").tooltip(format!("Smaller ({}, Ctrl+wheel)", crate::keymap::label("picture_zoom_out"))).on_click(cx.listener(|this, _, _, cx| this.zoom_by(-3., cx))))
+                    .child(Button::new("picture-fit").xsmall().ghost().label("Fit").selected(self.zoom.is_none()).tooltip(format!("Fit in the room ({})", crate::keymap::label("picture_fit"))).on_click(crate::learn::clicked("picture_fit", cx.listener(|this, _, _, cx| this.zoom_to(None, cx)))))
+                    .child(Button::new("picture-actual").xsmall().ghost().label("1:1").selected(self.zoom == Some(1.)).tooltip(format!("Its own size ({})", crate::keymap::label("picture_actual_size"))).on_click(crate::learn::clicked("picture_actual_size", cx.listener(|this, _, _, cx| this.zoom_to(Some(1.), cx)))))
+                    .child(Button::new("picture-smaller").xsmall().ghost().label("−").tooltip(format!("Smaller ({}, Ctrl+wheel)", crate::keymap::label("picture_zoom_out"))).on_click(crate::learn::clicked("picture_zoom_out", cx.listener(|this, _, _, cx| this.zoom_by(-3., cx)))))
                     .child(div().id("picture-zoom").test_support().min_w(px(40.)).text_center().child(zoom))
-                    .child(Button::new("picture-larger").xsmall().ghost().label("+").tooltip(format!("Larger ({}, Ctrl+wheel)", crate::keymap::label("picture_zoom_in"))).on_click(cx.listener(|this, _, _, cx| this.zoom_by(3., cx)))),
+                    .child(Button::new("picture-larger").xsmall().ghost().label("+").tooltip(format!("Larger ({}, Ctrl+wheel)", crate::keymap::label("picture_zoom_in"))).on_click(crate::learn::clicked("picture_zoom_in", cx.listener(|this, _, _, cx| this.zoom_by(3., cx))))),
             )
             .child(
                 ButtonGroup::new("picture-back")

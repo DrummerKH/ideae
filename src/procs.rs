@@ -561,6 +561,29 @@ pub fn end_task_strays(task: Option<&str>, socket: &str, seen: Vec<i32>) {
 #[cfg(not(unix))]
 pub fn end_task_strays(_: Option<&str>, _: &str, _: Vec<i32>) {}
 
+/// Once everything is saved and ended at quit: what is left of the process
+/// (the window's teardown, a driver's at exit) has a few seconds, then the
+/// process ends anyway. A process that waited for good there kept its link
+/// to the agents' daemon and their output, with no window.
+pub fn end_if_stuck() {
+    const GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+    if cfg!(test) {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("end-if-stuck".into()).spawn(|| {
+        std::thread::sleep(GRACE);
+        eprintln!("ideae: still not ended {}s after quitting, ending it", GRACE.as_secs());
+        // No exit handlers: one of them may be what waits.
+        #[cfg(unix)]
+        // SAFETY: _exit ends the process at once; nothing of it runs after.
+        unsafe {
+            libc::_exit(0)
+        };
+        #[cfg(not(unix))]
+        std::process::exit(0);
+    });
+}
+
 #[cfg_attr(not(unix), allow(dead_code))]
 static QUIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 

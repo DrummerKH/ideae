@@ -25,8 +25,9 @@ pub fn production_gate(then: Then, window: &mut Window, cx: &mut App) {
             .w(px(440.))
             .content(move |content, _, _| {
                 content.child(div().text_sm().text_color(muted).child(format!(
-                    "Statements will run on production for {} minutes, then it locks again. {count} production connection{}.",
-                    config::production_minutes(),
+                    "Statements will run on production {}{}. {count} production connection{}.",
+                    guard::lasts(),
+                    if config::production_minutes() == guard::MANUAL { "" } else { ", then it locks again" },
                     if count == 1 { "" } else { "s" }
                 )))
             })

@@ -83,11 +83,11 @@ impl TaskView {
                         .cursor_pointer()
                         .hover(|s| s.text_color(cx.theme().primary))
                         .child(format!("⎇ {}", if b.head.is_empty() { "…" } else { &b.head }))
-                        .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("The repository's branches: open one as a task, compare, delete").build(window, cx))
-                        .on_click(cx.listener(|this, _, window, cx| {
+                        .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new(crate::keymap::tip("The repository's branches: open one as a task, compare, delete", "branches")).build(window, cx))
+                        .on_click(crate::learn::clicked("branches", cx.listener(|this, _, window, cx| {
                             cx.stop_propagation();
                             this.branches_dialog(window, cx)
-                        })),
+                        }))),
                 )
             })
             .when_some(b.upstream.clone(), |this, up| {
@@ -157,11 +157,11 @@ impl TaskView {
                         .xsmall()
                         .ghost()
                         .label("History")
-                        .tooltip("The branch's history (Ctrl+3)")
-                        .on_click(cx.listener(|this, _, window, cx| {
+                        .tooltip(crate::keymap::tip("The branch's history", "history"))
+                        .on_click(crate::learn::clicked("history", cx.listener(|this, _, window, cx| {
                             cx.stop_propagation();
                             this.show_tab(|k| matches!(k, TabKind::History), window, cx)
-                        })),
+                        }))),
                 )
             })
             .when(b.upstream.is_some(), |bar| {

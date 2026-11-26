@@ -317,6 +317,15 @@ pub fn label(id: &str) -> String {
     find(id).map(|s| display(&s.keys())).unwrap_or_default()
 }
 
+/// A tooltip's text with the shortcut's keys after it, " (Ctrl+3)"; just
+/// the text when its keys were taken off in Settings.
+pub fn tip(text: &str, id: &str) -> String {
+    match label(id) {
+        keys if keys.is_empty() => text.to_string(),
+        keys => format!("{text} ({keys})"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{SHORTCUTS, Scope, display, terminal_binds};

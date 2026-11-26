@@ -44,6 +44,11 @@ impl SettingPage {
         }
     }
 
+    /// ideae patch: the page's title and its groups', as the sidebar lists them.
+    pub fn titles(&self) -> (&SharedString, Vec<Option<&SharedString>>) {
+        (&self.title, self.groups.iter().map(|group| group.title.as_ref()).collect())
+    }
+
     /// Set the title of the setting page.
     pub fn title(mut self, title: impl Into<SharedString>) -> Self {
         self.title = title.into();

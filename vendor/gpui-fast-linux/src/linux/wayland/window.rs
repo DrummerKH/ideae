@@ -142,6 +142,12 @@ pub struct WaylandWindowState {
     window_controls: WindowControls,
     client_inset: Option<Pixels>,
     accesskit_adapter: Option<accesskit_unix::Adapter>,
+    /// ideae patch: the display stays connected for as long as a window is
+    /// there. At the app's end its platform, and so its connection, goes
+    /// before its windows; a window's renderer then tore its swapchain down
+    /// over a display already gone, and NVIDIA's driver waited for good on
+    /// that display's lock. Last, so the renderer goes first.
+    _connection: wayland_client::Connection,
 }
 
 pub enum WaylandSurfaceState {
@@ -567,6 +573,9 @@ impl WaylandWindowState {
         options: WindowParams,
         parent: Option<WaylandWindowStatePtr>,
     ) -> anyhow::Result<Self> {
+        let connection = wayland_client::Connection::from_backend(
+            anyhow::Context::context(surface.backend().upgrade(), "the Wayland connection is gone")?,
+        );
         let renderer = {
             let raw_window = RawWindow {
                 window: surface.id().as_ptr().cast::<c_void>(),
@@ -648,6 +657,7 @@ impl WaylandWindowState {
             window_controls: WindowControls::default(),
             client_inset: None,
             accesskit_adapter: None,
+            _connection: connection,
         })
     }
 

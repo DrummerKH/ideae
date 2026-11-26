@@ -280,8 +280,8 @@ pub fn connection_dialog(id: Option<String>, saved: Option<Saved>, window: &mut 
                         })))
                         .when(f.production.get(), |this| {
                             this.child(h_flex().gap_2().child(div().w(px(96.)).flex_none()).child(div().flex_1().text_xs().text_color(muted).child(format!(
-                                "Locked: nothing runs on it until you unlock production, which asks first, for {} minutes at a time.",
-                                config::production_minutes()
+                                "Locked: nothing runs on it until you unlock production, which asks first; then {}.",
+                                crate::db::guard::lasts()
                             ))))
                         })
                         .child(h_flex().gap_1().items_center().child(label("Color")).child({

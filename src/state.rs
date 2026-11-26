@@ -301,6 +301,9 @@ pub struct Settings {
     /// DevTools port is reached there, where that machine's other users
     /// reach it too. Off unless asked for.
     pub remote_browser: bool,
+    /// Motion in Web tabs: "reduce" (a stream of frames slows with each
+    /// animation), "full", or "" as the system asks.
+    pub web_motion: String,
     /// Said once as the battery runs low: there is a power save mode.
     pub battery_hint: bool,
     /// The system does not go to sleep while an agent works, a setup or a
@@ -423,6 +426,7 @@ impl Default for Settings {
             changes_flat: false,
             web_reload_after_turn: true,
             remote_browser: false,
+            web_motion: "reduce".into(),
             battery_hint: true,
             keep_awake: true,
             keep_awake_on_battery: true,

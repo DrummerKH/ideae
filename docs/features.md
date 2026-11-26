@@ -102,8 +102,8 @@ for other agents, tickets): their server is the ideae-server there, which
 asks the window through its socket reached there by ssh, a socket of yours
 alone there; the files they name are those there.
 
-With **Agents on other machines drive Chrome here** on (Settings → Web
-tabs, or a space or a project of machines that are yours alone; off at
+With **Agents on other machines drive Chrome here** on (Settings →
+Browser, or a space or a project of machines that are yours alone; off at
 first, never a team's file's to say), its agents there drive its Web tabs
 as a local task's do: IDEAE_BROWSER_CDP names the same port there, which
 ssh carries back to the task's Chrome here while the task is open. Any user
@@ -400,8 +400,11 @@ file.
 
 Learn the keys (Settings → Keys), as JetBrains' Key Promoter: a command that
 has keys, chosen from a menu, a right-click menu, the command palette or a
-button (Push, Pull, Back, Forward, a panel's mark), says at the bottom right
-which keys do it, and how many times it was done without them.
+button (Back, Forward, History, Go to file, Find, a panel's mark, closing a
+tab, Focus mode, the branches, a Web tab's and a picture's toolbar, Run and
+Stop of a `.sql` file, Push), shows its keys large at the bottom of the
+window for a few seconds, apart from the notifications, and how many times
+it was done without them.
 The Files panel and Go to file leave out what the system writes into folders
 for itself (.DS_Store, Thumbs.db, desktop.ini and the like); Changes still
 lists one git does not ignore.
@@ -464,7 +467,7 @@ take the whole page; say what to do with them and send them all in one prompt.
   subdomains, a host the task's pages were served from by this machine, its
   containers or VMs (a site behind a proxy here is not), a host that
   resolves to this machine as the new task starts, and the hosts named in
-  Settings → Tasks → Stand hosts (`*.app.test`), a space's or a project's;
+  Settings → Browser → Stand hosts (`*.app.test`), a space's or a project's;
   not by a repository's `.ideae.toml`, which could name every site. Its
   cookies and local storage come along; another site's, none.
 - To the sites it opens it is the Chrome it is, not a headless one: the
@@ -476,7 +479,7 @@ take the whole page; say what to do with them and send them all in one prompt.
   prompt.
 - The task's own site is a page of this machine at a port of the task: one
   of its services', or one its processes listen on. A tab showing it loads
-  it again when the agent's turn ends (Settings → Tasks → Web tabs; off for a site that
+  it again when the agent's turn ends (Settings → Browser → Pages; off for a site that
   reloads by itself and should keep its state); a page of elsewhere is left
   alone. The address bar offers the task's own addresses.
 - A page of this machine that could not be loaded (a dev server still
@@ -484,6 +487,10 @@ take the whole page; say what to do with them and send them all in one prompt.
 - The screens' mark in the toolbar shows the page at a phone's, tablet's or desktop's size
   (made smaller to fit, touches from the mouse on a phone), turned or not,
   and asks it for light or dark colors, or the IDE's.
+- Pages are told you prefer less motion (`prefers-reduced-motion`) and
+  scroll without animation: a tab is a stream of frames, and each animation
+  slows it. Settings → Browser → Motion: Reduced (at first), Full, or as
+  the system asks.
 - Addresses of this machine Ctrl+clicked in a terminal open in a Web tab of
   the task; others where the task's links open (below).
 - A task out of view as long as its language servers stay (Settings) closes
@@ -531,7 +538,7 @@ whose it is.
   seen: an element's text and picture, an area, the whole page as a picture,
   or the page's text (Page text: a ticket, an error). Its address goes
   without what may be a sign-in's (tokens, codes, signatures).
-- Settings → Tasks → Links open in (a space or a project can say otherwise):
+- Settings → Browser → Links open in (a space or a project can say otherwise):
   a tab of your own browser, as it is unless set so, or the system's
   browser. A task's links open there, a tab in that task: its ticket, its pull request, an address
   Ctrl+clicked in its terminal, a link in its chat or in a Markdown file. An

@@ -181,11 +181,11 @@ impl Render for Workspace {
                                 })
                                 .children(self.render_update(cx).filter(|_| !presenting))
                                 .children(self.render_behind(cx).filter(|_| !presenting))
-                                .children(crate::db::guard::open_until().map(|until| {
+                                .children(crate::db::guard::unlocked_until().map(|until| {
                                     Button::new("production-unlocked")
                                         .xsmall()
                                         .ghost()
-                                        .label(format!("PRODUCTION unlocked until {}", crate::local_time::hour_minute(until)))
+                                        .label(format!("PRODUCTION unlocked {until}"))
                                         .text_color(gpui_kit::red())
                                         .tooltip("Statements run on production connections until then. Click to lock now")
                                         .on_click(|_, _, cx| crate::task::lock_now(cx))
@@ -198,9 +198,9 @@ impl Render for Workspace {
                                         .ghost()
                                         .label("Go to file")
                                         .tooltip(format!("Go to file  {}", keymap::label("go_to_file")))
-                                        .on_click(cx.listener(|this, _, window, cx| {
+                                        .on_click(crate::learn::clicked("go_to_file", cx.listener(|this, _, window, cx| {
                                             this.finder(finder::FinderKind::Files, window, cx)
-                                        })),
+                                        }))),
                                 ))
                                 .when(has_task, |bar| bar.child(
                                     Button::new("find-in-files")
@@ -208,9 +208,9 @@ impl Render for Workspace {
                                         .ghost()
                                         .label("Find")
                                         .tooltip(format!("Find in files  {}", keymap::label("find_in_files")))
-                                        .on_click(cx.listener(|this, _, window, cx| {
+                                        .on_click(crate::learn::clicked("find_in_files", cx.listener(|this, _, window, cx| {
                                             this.finder(finder::FinderKind::Grep, window, cx)
-                                        })),
+                                        }))),
                                 ))
                                 .child(self.render_space_switch(cx))
                                 // The theme is in the menu and the command list: not a thing to have before the eyes all day.
@@ -315,7 +315,8 @@ impl Render for Workspace {
                     )
                 }),
             )
-
+            // Learn the keys: a command's keys, done with the pointer.
+            .children(crate::learn::overlay(cx))
             // Files dropped from a file manager anywhere but a terminal.
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                 if let Some(task) = this.active_view() {
@@ -588,7 +589,7 @@ impl Workspace {
                                 .small()
                                 .outline()
                                 .label("New task…")
-                                .on_click(cx.listener(move |this, _, window, cx| this.new_task_dialog(project, window, cx))),
+                                .on_click(crate::learn::clicked("new_task", cx.listener(move |this, _, window, cx| this.new_task_dialog(project, window, cx)))),
                         )
                     }),
             )

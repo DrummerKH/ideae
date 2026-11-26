@@ -177,7 +177,7 @@ pub fn page(draft: &Rc<RefCell<state::Settings>>, layers: &LayersDraft, scope: S
         .default_open(true)
         .resettable(false)
         .description(about)
-        .group(SettingGroup::new().items(items))
+        .group(SettingGroup::new().title("Settings").items(items))
         .group(integrations_group(draft, layers, scope))
 }
 
@@ -386,7 +386,7 @@ pub fn integrations_page(draft: &Rc<RefCell<state::Settings>>, layers: &LayersDr
         .description(
             "Trackers (Jira, Linear, YouTrack, GitHub and GitLab issues) and code hosts (GitHub, GitLab). A tracker owns the prefixes of its keys (DEV, OPS): a key is its tracker's, never guessed. A space or a project adds its own over these; Settings for: switches to them.",
         )
-        .group(SettingGroup::new().item(off))
+        .group(SettingGroup::new().title("Tickets").item(off))
         .group(integrations_group(draft, layers, Scope::Global))
         .group(keys)
 }

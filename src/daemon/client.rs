@@ -753,6 +753,13 @@ impl Daemon {
         }
     }
 
+    /// The window goes and leaves the sessions running (a restart, the
+    /// window's ×): its link is not dialled again, nor another daemon looked
+    /// for, should this process outlive its window a while.
+    pub fn leaving(&self) {
+        self.quitting.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Says on every terminal that the link is down, once per drop.
     pub(super) fn tell_terminals(&self, line: &str) {
         for p in self.peers.lock().unwrap().values() {

@@ -186,6 +186,33 @@ fn slot(owner: &Owner) -> Arc<Slot> {
     SLOTS.get_or_init(Default::default).lock().unwrap().entry(owner.clone()).or_default().clone()
 }
 
+/// The system asks for less motion: read as a Chrome starts, off the UI thread.
+static SYSTEM_CALM: AtomicBool = AtomicBool::new(false);
+
+/// GNOME's animations turned off, macOS's Reduce motion.
+fn system_asks_less_motion() -> bool {
+    let read = |program: &str, args: &[&str]| {
+        crate::procs::command(program).args(args).stdin(Stdio::null()).stderr(Stdio::null()).output().ok().map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    if cfg!(target_os = "macos") {
+        read("defaults", &["read", "com.apple.universalaccess", "reduceMotion"]).as_deref() == Some("1")
+    } else if cfg!(unix) {
+        read("gsettings", &["get", "org.gnome.desktop.interface", "enable-animations"]).as_deref() == Some("false")
+    } else {
+        false
+    }
+}
+
+/// Pages told to keep still (`prefers-reduced-motion`), and scrolled without
+/// animation: as Settings say, else as the system asks.
+pub fn calm() -> bool {
+    crate::state::with_settings(|s| match s.web_motion.as_str() {
+        "reduce" => true,
+        "full" => false,
+        _ => SYSTEM_CALM.load(Ordering::Relaxed),
+    })
+}
+
 #[cfg(unix)]
 fn find_chrome() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
@@ -478,9 +505,11 @@ fn chrome(owner: &Owner) -> Result<Arc<Chrome>> {
         let _ = std::fs::remove_dir_all(&profile);
     }
     std::fs::create_dir_all(&profile)?;
+    SYSTEM_CALM.store(system_asks_less_motion(), Ordering::Relaxed);
     let mut command = crate::procs::command(program);
     command
         .args(["--headless=new", "--no-first-run", "--no-default-browser-check", "--hide-scrollbars"])
+        .args(if calm() { &["--force-prefers-reduced-motion", "--disable-smooth-scrolling"][..] } else { &[] })
         .args(cookie_key(owner))
         .args(as_ordinary(program))
         // As many pixels to one as the window's screen has: the frames of a
@@ -2555,8 +2584,8 @@ pub struct BrowserView {
     device: Option<usize>,
     turned: bool,
     scheme: Scheme,
-    /// Dark or not, as the page was last told.
-    sent_dark: Option<bool>,
+    /// Dark or not, and calm or not, as the page was last told.
+    sent_media: Option<(bool, bool)>,
     /// Text an input method is composing.
     marked: Option<String>,
     /// In a tab that is shown, of a task in view.
@@ -2869,7 +2898,7 @@ impl BrowserView {
             device: None,
             turned: false,
             scheme: Scheme::AsTheIde,
-            sent_dark: None,
+            sent_media: None,
             marked: None,
             visible: true,
             zoom: 1.,
@@ -2932,7 +2961,7 @@ impl BrowserView {
         let (out, frames) = Self::attach(Source::Url(url), self.owner.clone(), window, cx);
         (self.out, self._frames) = (out, frames);
         self.sent_size.set((0, 0, 0, 0));
-        self.sent_dark = None;
+        self.sent_media = None;
         self.loading = true;
     }
 
@@ -3728,8 +3757,8 @@ impl BrowserView {
                         .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(told.clone()).build(window, cx)),
                 )
             })
-            .child(Button::new("back").xsmall().ghost().child(drawn("arrow-left", muted)).tooltip("Back").on_click(cx.listener(|this, _, _, _| this.back())))
-            .child(Button::new("forward").xsmall().ghost().child(drawn("arrow-right", muted)).tooltip("Forward").on_click(cx.listener(|this, _, _, _| this.forward())))
+            .child(Button::new("back").xsmall().ghost().child(drawn("arrow-left", muted)).tooltip(crate::keymap::tip("Back", "web_back")).on_click(crate::learn::clicked("web_back", cx.listener(|this, _, _, _| this.back()))))
+            .child(Button::new("forward").xsmall().ghost().child(drawn("arrow-right", muted)).tooltip(crate::keymap::tip("Forward", "web_forward")).on_click(crate::learn::clicked("web_forward", cx.listener(|this, _, _, _| this.forward()))))
             .child(if self.loading {
                 Button::new("stop")
                     .xsmall()
@@ -3738,7 +3767,7 @@ impl BrowserView {
                     .tooltip("Stop")
                     .on_click(cx.listener(|this, _, _, _| this.command("Page.stopLoading", json!({}))))
             } else {
-                Button::new("reload").xsmall().ghost().child(drawn("rotate-cw", muted)).tooltip("Reload").on_click(cx.listener(|this, _, _, _| this.reload(false)))
+                Button::new("reload").xsmall().ghost().child(drawn("rotate-cw", muted)).tooltip(crate::keymap::tip("Reload", "web_reload")).on_click(crate::learn::clicked("web_reload", cx.listener(|this, _, _, _| this.reload(false))))
             })
             // As a browser's: a click on it while the keyboard is elsewhere takes the whole
             // address, to type another over; the next click puts the caret where it lands,
@@ -3770,8 +3799,8 @@ impl BrowserView {
                         .xsmall()
                         .ghost()
                         .label(format!("{:.0}%", self.zoom * 100.))
-                        .tooltip("Back to 100%")
-                        .on_click(cx.listener(|this, _, _, cx| this.set_zoom(1., cx))),
+                        .tooltip(crate::keymap::tip("Back to 100%", "web_zoom_reset"))
+                        .on_click(crate::learn::clicked("web_zoom_reset", cx.listener(|this, _, _, cx| this.set_zoom(1., cx)))),
                 )
             })
             .when(problems > 0, |this| {
@@ -3812,8 +3841,8 @@ impl BrowserView {
                     .ghost()
                     .child(drawn("code-xml", if self.devtools.is_some() { lit } else { muted }))
                     .selected(self.devtools.is_some())
-                    .tooltip("DevTools (F12): in a panel of the tab, the page beside it")
-                    .on_click(cx.listener(|this, _, window, cx| this.toggle_devtools(window, cx))),
+                    .tooltip(format!("{}: in a panel of the tab, the page beside it", crate::keymap::tip("DevTools", "web_devtools")))
+                    .on_click(crate::learn::clicked("web_devtools", cx.listener(|this, _, window, cx| this.toggle_devtools(window, cx)))),
             )
             .when(self.user.is_some(), |bar| {
                 let url = self.url.to_string();
@@ -4355,10 +4384,15 @@ impl Render for BrowserView {
             Scheme::Light => false,
             Scheme::Dark => true,
         };
-        if self.sent_dark != Some(dark) {
-            self.sent_dark = Some(dark);
-            let value = if dark { "dark" } else { "light" };
-            self.command("Emulation.setEmulatedMedia", json!({ "features": [{ "name": "prefers-color-scheme", "value": value }] }));
+        let media = (dark, calm());
+        if self.sent_media != Some(media) {
+            self.sent_media = Some(media);
+            // One call says all: a feature left out is no longer emulated.
+            let (scheme, motion) = (if dark { "dark" } else { "light" }, if media.1 { "reduce" } else { "no-preference" });
+            self.command(
+                "Emulation.setEmulatedMedia",
+                json!({ "features": [{ "name": "prefers-color-scheme", "value": scheme }, { "name": "prefers-reduced-motion", "value": motion }] }),
+            );
         }
         let bounds = self.bounds.clone();
         let sent = self.sent_size.clone();

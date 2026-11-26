@@ -596,6 +596,10 @@ impl Workspace {
                     for view in this.views() {
                         view.update(cx, |t, cx| t.save_all_now(cx));
                     }
+                    #[cfg(unix)]
+                    for daemon in crate::daemon::client::get().into_iter().chain(crate::daemon::client::remotes()) {
+                        daemon.leaving();
+                    }
                 } else {
                     let seen = this.hook_socket.as_ref().map(|socket| crate::procs::task_processes(None, socket)).unwrap_or_default();
                     for view in this.views() {
@@ -639,6 +643,7 @@ impl Workspace {
                 crate::browser::quit();
                 crate::predict::quit();
                 crate::db::quit();
+                crate::procs::end_if_stuck();
                 async {}
             }),
         ];

@@ -952,9 +952,11 @@ impl Workspace {
             }))
             .item(PopupMenuItem::new("New task…").icon(menu_icon("square-plus")).on_click(move |_, window, cx| {
                 let _ = b.update(cx, |w, cx| w.new_task_dialog(pi, window, cx));
+                crate::learn::used("new_task", window, cx);
             }))
             .item(PopupMenuItem::new("Ask a question…").icon(menu_icon("message-circle-question-mark")).on_click(move |_, window, cx| {
                 let _ = ask.update(cx, |w, cx| w.ask_question_dialog(pi, window, cx));
+                crate::learn::used("ask_question", window, cx);
             }))
             .when(closed_questions, |menu| {
                 menu.item(PopupMenuItem::new("Closed questions…").icon(menu_icon("history")).on_click(move |_, window, cx| {

@@ -531,51 +531,8 @@ fn pages(
                 .item(SettingItem::new("Delete archived tasks after", archive_keep).description(
                     "Archives older than this are deleted, along with their agent's conversation and any commits or changes in them that were never pushed.",
                 )),
-        ).group(
-            SettingGroup::new().title("Web tabs").item(switch(
-                draft,
-                "Reload the task's site after the agent's turn",
-                "A Web tab showing the task's own site (a port of its services, or one its processes listen on) reloads when the agent finishes a turn. Other pages are left alone. Turn it off if the site reloads by itself and should keep its state.",
-                |s| s.web_reload_after_turn,
-                |s, v| s.web_reload_after_turn = v,
-            )).item({
-                let row = switch(draft, "Agents on other machines drive Chrome here", "", |s| s.remote_browser, |s, v| s.remote_browser = v);
-                row.description(about_layered(
-                    layers,
-                    "remote_browser",
-                    "A task of a project on another machine gives its agent IDEAE_BROWSER_CDP, and the task's Chrome here is reached at that port there for as long as the task is open. Every user of that machine can reach the port: turn it on only for machines that are yours alone, or on for a space or a project of them alone. Tasks opened after the change.",
-                ))
-            })
-            .item({
-                let (read, write) = (draft.clone(), draft.clone());
-                let options: Vec<(SharedString, SharedString)> = crate::layers_ui::LINKS_OPEN_IN.iter().map(|(k, v)| (SharedString::from(*k), SharedString::from(*v))).collect();
-                SettingItem::new(
-                    "Links open in",
-                    SettingField::dropdown(options, move |_| SharedString::from(Some(read.borrow().links_open_in.clone()).filter(|v| !v.is_empty()).unwrap_or_else(|| "tab".into())), move |v: SharedString, _| {
-                        write.borrow_mut().links_open_in = if v.as_ref() == "tab" { String::new() } else { v.to_string() }
-                    }),
-                )
-                .description(about_layered(layers, "links_open_in", "A task's links (its ticket, its pull request, an address in its terminal, its chat or a Markdown file) open in the system's browser, or in a tab of your own browser in the task: one for each space, your logins apart from other spaces' and out of agents' reach. This machine's addresses open in the task's own browser either way."))
-            })
-            .item({
-                let (read, write) = (draft.clone(), draft.clone());
-                SettingItem::new(
-                    "Sites for the system's browser",
-                    SettingField::input(move |_| read.borrow().system_hosts.join(" ").into(), move |value: SharedString, _| {
-                        write.borrow_mut().system_hosts = value.split([' ', ',']).map(str::trim).filter(|h| !h.is_empty()).map(str::to_string).collect()
-                    }),
-                )
-                .description("Hosts whose links open in the system's browser even when links open in tabs: sites your own browser cannot sign you in to (a passkey, a security key, a certificate). Space-parted; *.example.com for a domain and its subdomains. ↗ on a tab adds its site.")
-            })
-            .item({
-                let (read, write) = (draft.clone(), draft.clone());
-                SettingItem::new(
-                    "Stand hosts",
-                    SettingField::input(move |_| read.borrow().stand_hosts.clone().into(), move |value: SharedString, _| write.borrow_mut().stand_hosts = value.trim().to_string()),
-                )
-                .description(about_layered(layers, "stand_hosts", "A new task's browser starts signed in to the project's stands as its last task was, and to no other site. Found by themselves: localhost, hosts the task's pages were served from by this machine or its containers, hosts that resolve here. Name others here, space-parted: app.test, *.app.test for a domain and its subdomains. A space or a project can name its own; never a repository's .ideae.toml, which could name every site."))
-            }),
         ),
+        browser_page(draft, layers),
         SettingPage::new("Editor").default_open(true).group(
             SettingGroup::new().title("Typing")
                 .item(switch(
@@ -689,10 +646,10 @@ fn pages(
         SettingPage::new("Keys").default_open(true)
             .description("Click a shortcut and press the new keys: Esc leaves them, Backspace removes them.")
             .default_open(true)
-            .group(SettingGroup::new().item(switch(
+            .group(SettingGroup::new().title("Learning").item(switch(
                 draft,
                 "Learn the keys",
-                "A command that has keys, chosen with the mouse (a menu, the command palette, a button), says at the bottom which keys do it, as JetBrains' Key Promoter.",
+                "A command that has keys, done with the mouse (a menu, the command palette, a button), shows its keys large at the bottom of the window for a moment, as JetBrains' Key Promoter.",
                 |s| s.learn_keys,
                 |s, v| s.learn_keys = v,
             )))
@@ -752,6 +709,65 @@ fn pages(
         databases_page(),
         crate::layers_ui::integrations_page(draft, layers),
     ]
+}
+
+/// The browsers of the Web tabs: where links open, how pages move, the
+/// task's own Chrome.
+fn browser_page(draft: &Draft, layers: &LayersDraft) -> SettingPage {
+    SettingPage::new("Browser")
+        .default_open(true)
+        .description("Web tabs show a task's own Chrome (its stands, driven by its agent too) or your own browser (your logins, one for each space, out of agents' reach).")
+        .group(SettingGroup::new().title("Links").item({
+                let (read, write) = (draft.clone(), draft.clone());
+                let options: Vec<(SharedString, SharedString)> = crate::layers_ui::LINKS_OPEN_IN.iter().map(|(k, v)| (SharedString::from(*k), SharedString::from(*v))).collect();
+                SettingItem::new(
+                    "Links open in",
+                    SettingField::dropdown(options, move |_| SharedString::from(Some(read.borrow().links_open_in.clone()).filter(|v| !v.is_empty()).unwrap_or_else(|| "tab".into())), move |v: SharedString, _| {
+                        write.borrow_mut().links_open_in = if v.as_ref() == "tab" { String::new() } else { v.to_string() }
+                    }),
+                )
+                .description(about_layered(layers, "links_open_in", "A task's links (its ticket, its pull request, an address in its terminal, its chat or a Markdown file) open in the system's browser, or in a tab of your own browser in the task: one for each space, your logins apart from other spaces' and out of agents' reach. This machine's addresses open in the task's own browser either way."))
+            }).item({
+                let (read, write) = (draft.clone(), draft.clone());
+                SettingItem::new(
+                    "Sites for the system's browser",
+                    SettingField::input(move |_| read.borrow().system_hosts.join(" ").into(), move |value: SharedString, _| {
+                        write.borrow_mut().system_hosts = value.split([' ', ',']).map(str::trim).filter(|h| !h.is_empty()).map(str::to_string).collect()
+                    }),
+                )
+                .description("Hosts whose links open in the system's browser even when links open in tabs: sites your own browser cannot sign you in to (a passkey, a security key, a certificate). Space-parted; *.example.com for a domain and its subdomains. ↗ on a tab adds its site.")
+            }))
+        .group(SettingGroup::new().title("Pages").item({
+                let (read, write) = (draft.clone(), draft.clone());
+                let options: Vec<(SharedString, SharedString)> =
+                    [("reduce", "Reduced"), ("full", "Full"), ("", "As the system asks")].into_iter().map(|(k, v)| (SharedString::from(k), SharedString::from(v))).collect();
+                SettingItem::new(
+                    "Motion",
+                    SettingField::dropdown(options, move |_| SharedString::from(read.borrow().web_motion.clone()), move |v: SharedString, _| write.borrow_mut().web_motion = v.to_string()),
+                )
+                .description("Reduced: pages are told you prefer less motion (prefers-reduced-motion), and most sites leave out their transitions and moving parts; scrolling is not animated. A tab is a stream of frames, and each animation slows it. Full: as the site has it. As the system asks: reduced when the system's animations are off, as they were when the browser started. Scrolling follows from the next start of the browser.")
+            }).item(switch(
+                draft,
+                "Reload the task's site after the agent's turn",
+                "A Web tab showing the task's own site (a port of its services, or one its processes listen on) reloads when the agent finishes a turn. Other pages are left alone. Turn it off if the site reloads by itself and should keep its state.",
+                |s| s.web_reload_after_turn,
+                |s, v| s.web_reload_after_turn = v,
+            )))
+        .group(SettingGroup::new().title("The task's browser").item({
+                let (read, write) = (draft.clone(), draft.clone());
+                SettingItem::new(
+                    "Stand hosts",
+                    SettingField::input(move |_| read.borrow().stand_hosts.clone().into(), move |value: SharedString, _| write.borrow_mut().stand_hosts = value.trim().to_string()),
+                )
+                .description(about_layered(layers, "stand_hosts", "A new task's browser starts signed in to the project's stands as its last task was, and to no other site. Found by themselves: localhost, hosts the task's pages were served from by this machine or its containers, hosts that resolve here. Name others here, space-parted: app.test, *.app.test for a domain and its subdomains. A space or a project can name its own; never a repository's .ideae.toml, which could name every site."))
+            }).item({
+                let row = switch(draft, "Agents on other machines drive Chrome here", "", |s| s.remote_browser, |s, v| s.remote_browser = v);
+                row.description(about_layered(
+                    layers,
+                    "remote_browser",
+                    "A task of a project on another machine gives its agent IDEAE_BROWSER_CDP, and the task's Chrome here is reached at that port there for as long as the task is open. Every user of that machine can reach the port: turn it on only for machines that are yours alone, or on for a space or a project of them alone. Tasks opened after the change.",
+                ))
+            }))
 }
 
 /// The connections `.sql` files run against. Kept apart from the settings
@@ -839,17 +855,17 @@ fn databases_page() -> SettingPage {
     });
     let production = SettingItem::render(|_, _, cx| {
         let muted = cx.theme().muted_foreground;
-        let until = crate::db::guard::open_until();
+        let until = crate::db::guard::unlocked_until();
         let minutes = crate::db::config::production_minutes();
         let count = crate::db::config::list().iter().filter(|c| c.production).count();
-        let state = match until {
-            Some(until) => format!("Unlocked until {}. {count} production connections.", crate::local_time::hour_minute(until)),
+        let state = match &until {
+            Some(until) => format!("Unlocked {until}. {count} production connections."),
             None => format!("Locked. {count} production connections."),
         };
         gpui_kit::component::v_flex()
             .gap_2()
             .child(div().text_xs().text_color(muted).child(
-                "A connection with the Production profile runs nothing until production is unlocked, which asks first, and then for a while only: a statement does not go there by mistake.",
+                "A connection with the Production profile runs nothing until production is unlocked, which asks first, and then for a while only: a statement does not go there by mistake. Manual: unlocked until you lock it. Each start of the app is locked.",
             ))
             .child(div().text_sm().child(state))
             .child(
@@ -858,7 +874,7 @@ fn databases_page() -> SettingPage {
                     .items_center()
                     .child(div().text_sm().pr_2().child("Stays unlocked"))
                     .children(crate::db::guard::MINUTES.into_iter().map(|m| {
-                        Button::new(SharedString::from(format!("prod-minutes-{m}"))).xsmall().ghost().label(format!("{m} min")).selected(minutes == m).on_click(move |_, window, _| {
+                        Button::new(SharedString::from(format!("prod-minutes-{m}"))).xsmall().ghost().label(crate::db::guard::lasts_label(m)).selected(minutes == m).on_click(move |_, window, _| {
                             crate::db::config::set_production_minutes(m);
                             window.refresh();
                         })
@@ -881,10 +897,11 @@ fn databases_page() -> SettingPage {
 }
 
 /// Where the shortcuts are among the pages.
-pub const KEYS_PAGE: usize = 6;
+pub const KEYS_PAGE: usize = 7;
 pub const AGENTS_PAGE: usize = 1;
-pub const LSP_PAGE: usize = 5;
-pub const INTEGRATIONS_PAGE: usize = 10;
+pub const LSP_PAGE: usize = 6;
+pub const BROWSER_PAGE: usize = 3;
+pub const INTEGRATIONS_PAGE: usize = 11;
 
 /// The Agents page: the profiles, the default, the one for quick questions.
 fn agents_page(draft: &Draft, layers: &LayersDraft, lsp_switch: SettingItem, dials: [SettingItem; 2], token_warn: SettingField<SharedString>) -> SettingPage {
@@ -1735,6 +1752,26 @@ mod tests {
         assert_eq!(super::api_key_var(crate::agents::Kind::OpenCode, "opencode acp"), None);
     }
 
+    /// The pages' list names a page's groups: one without a title among
+    /// titled ones is in none of its rows, and is passed by.
+    #[test]
+    fn no_group_hides_among_titled_ones() {
+        let draft: super::Draft = Rc::new(RefCell::new(state::Settings::default()));
+        let layers: crate::layers_ui::LayersDraft = Rc::default();
+        let pages = super::pages(&draft, &layers, &Rc::new(std::cell::Cell::new(Appearance::Auto)), false, &Rc::default(), &Rc::default(), &Rc::default(), Vec::new(), 14.);
+        let names: Vec<String> = pages.iter().map(|page| page.titles().0.to_string()).collect();
+        let layer = crate::layers_ui::page(&draft, &layers, crate::layers_ui::Scope::Project(0));
+        for page in pages.iter().chain([&layer]) {
+            let (name, groups) = page.titles();
+            if groups.len() > 1 {
+                assert!(groups.iter().all(Option::is_some), "{name} has a group without a title among titled ones");
+            }
+        }
+        for (name, at) in [("Agents", super::AGENTS_PAGE), ("Browser", super::BROWSER_PAGE), ("Language servers", super::LSP_PAGE), ("Keys", super::KEYS_PAGE), ("Integrations", super::INTEGRATIONS_PAGE)] {
+            assert_eq!(names.get(at).map(String::as_str), Some(name), "{names:?}");
+        }
+    }
+
     use crate::theme::Appearance;
     use gpui_kit::test::TestWindowExt as _;
     use gpui_kit::{AppContext as _, Bounds, Empty, Point, ScrollDelta, TestAppContext, WindowBounds, WindowOptions, point, px, size};
@@ -1785,8 +1822,41 @@ mod tests {
         assert_eq!(saved.borrow().as_ref().map(|s| s.agent.as_str()), Some("mine"), "the older field follows the default profile");
     }
 
+    /// A page chosen in the list shows its top again, where a group may be
+    /// that no row of the list names, however far it was scrolled.
+    #[gpui_kit::test]
+    fn a_page_chosen_shows_its_top(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = window(cx);
+        cx.update_window(handle, |_, window, cx| {
+            open(state::Settings::default(), Appearance::Auto, super::KEYS_PAGE, window, cx, |_, _, _, _| {});
+            window.render_frame(cx);
+            let learn = |window: &gpui_kit::Window| window.find_all("check").into_iter().any(|s| s.label() == Some("Learn the keys") && s.visible());
+            assert!(learn(window), "at the top at first");
+            window.scroll("key-row-recent", ScrollDelta::Pixels(point(px(0.), px(-600.))), cx);
+            window.render_frame(cx);
+            assert!(!learn(window), "scrolled past it");
+            // The list's rows are "0-" and the page's place in it.
+            window.scroll("0-0", ScrollDelta::Pixels(point(px(0.), px(-800.))), cx);
+            window.render_frame(cx);
+            // Its title, not the center: the rows of its groups are under it.
+            let row = window.find(format!("0-{}", super::KEYS_PAGE)).bounds();
+            let at = point(row.center().x, row.top() + px(14.));
+            {
+                use gpui_kit::test::TestEventExt as _;
+                window.pointer_move(at, None, cx);
+                window.pointer_down(at, gpui_kit::MouseButton::Left, cx);
+                window.pointer_up(at, gpui_kit::MouseButton::Left, cx);
+            }
+            window.render_frame(cx);
+            window.render_frame(cx);
+            assert!(learn(window), "back at the top");
+        })
+        .unwrap();
+    }
+
     /// Agents on other machines reach Chrome here only when asked: the switch
-    /// is on the Tasks page, off at first, and on once turned on and saved.
+    /// is on the Browser page, off at first, and on once turned on and saved.
     #[gpui_kit::test]
     fn chrome_for_remote_agents_is_off_until_turned_on(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -1794,8 +1864,8 @@ mod tests {
         let saved: Rc<RefCell<Option<state::Settings>>> = Rc::default();
         cx.update_window(handle, |_, window, cx| {
             let saved = saved.clone();
-            // The Tasks page at its Web tabs: only the groups in view are drawn.
-            let at = super::SelectIndex { page_ix: 2, group_ix: Some(3) };
+            // The Browser page at the task's browser: only the groups in view are drawn.
+            let at = super::SelectIndex { page_ix: super::BROWSER_PAGE, group_ix: Some(2) };
             super::open_layered(state::Settings::default(), Appearance::Auto, at, Default::default(), super::Scope::Global, Default::default(), window, cx, move |settings, _, _, _, _| *saved.borrow_mut() = Some(settings));
             window.render_frame(cx);
             window.render_frame(cx);

@@ -417,8 +417,8 @@ fn draw_line(line: &Line, ix: usize, view: &WeakEntity<TaskView>, cx: &mut App) 
             .text_xs()
             .cursor_pointer()
             .child(div().text_color(gpui_kit::red()).child("PRODUCTION"))
-            .child(div().text_color(muted).child(match guard::open_until() {
-                Some(until) => format!("unlocked until {} · click to lock", crate::local_time::hour_minute(until)),
+            .child(div().text_color(muted).child(match guard::unlocked_until() {
+                Some(until) => format!("unlocked {until} · click to lock"),
                 None => "locked · click to unlock".into(),
             }))
             .on_click(|_, window, cx| {

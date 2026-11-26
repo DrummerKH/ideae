@@ -42,8 +42,11 @@ impl TaskView {
                             .ghost()
                             .label(if self.zoomed.is_some() { "⤡" } else { "⤢" })
                             .selected(self.zoomed.is_some())
-                            .tooltip("Focus mode: this pane over everything (Shift+Esc, or double-click a tab)")
-                            .on_click(cx.listener(move |this, _, window, cx| this.toggle_zoom(pane, window, cx))),
+                            .tooltip(match crate::keymap::label("focus_mode") {
+                                keys if keys.is_empty() => "Focus mode: this pane over everything (double-click a tab)".to_string(),
+                                keys => format!("Focus mode: this pane over everything ({keys}, or double-click a tab)"),
+                            })
+                            .on_click(crate::learn::clicked("focus_mode", cx.listener(move |this, _, window, cx| this.toggle_zoom(pane, window, cx)))),
                     )
                     .child(
                         Button::new("new-terminal")
@@ -219,10 +222,10 @@ impl TaskView {
                             .bg(ground)
                             .invisible()
                             .group_hover(group, |cross| cross.visible())
-                            .child(Button::new(("close", ix)).xsmall().ghost().label("×").on_click(cx.listener(move |this, _, window, cx| {
+                            .child(Button::new(("close", ix)).xsmall().ghost().label("×").on_click(crate::learn::clicked("close_tab", cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 this.close_tab(ix, window, cx)
-                            }))),
+                            })))),
                     )
                 } else {
                     item
@@ -263,7 +266,8 @@ impl TaskView {
                     .when(close, |menu| {
                         menu.item(act("Close", |t, id, _, window, cx| {
                             if let Some(ix) = id.and_then(|id| t.ix_of(id)) {
-                                t.close_tab(ix, window, cx)
+                                t.close_tab(ix, window, cx);
+                                crate::learn::used("close_tab", window, cx);
                             }
                         }).icon(icon("x")))
                     })

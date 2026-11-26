@@ -397,6 +397,7 @@ impl Workspace {
             keyed("Settings…", "settings", "app"),
             own("Keyboard shortcuts…", "app", |w, window, cx| w.open_settings_at(crate::settings_ui::KEYS_PAGE, window, cx)),
             own("Integrations…", "app: trackers and code hosts", |w, window, cx| w.open_settings_at(crate::settings_ui::INTEGRATIONS_PAGE, window, cx)),
+            own("Browser settings…", "app: where links open, motion in Web tabs", |w, window, cx| w.open_settings_at(crate::settings_ui::BROWSER_PAGE, window, cx)),
             own("Copy a ticket's branch name…", "task: the branch its task would have, no task made", |w, window, cx| w.copy_branch_for_ticket_dialog(window, cx)),
             own("Copy today's tasks", "task: for a stand-up, as Markdown, by ticket", |w, window, cx| w.copy_todays_tasks(window, cx)),
             own("Restart", "app", |w, window, cx| w.restart(window, cx)),

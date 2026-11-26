@@ -157,6 +157,9 @@ impl Settings {
                     let groups = &filter.groups[page_ix];
                     let is_page_active = selected_index.page_ix == page_ix
                         && (selected_index.group_ix.is_none() || groups.len() == 1);
+                    // ideae patch: a page chosen shows its top, where the first
+                    // groups are, however far it was scrolled before.
+                    let top = groups.first().copied();
                     SidebarMenuItem::new(page.title.clone())
                         .click_to_open(true)
                         .when_some(page.icon.clone(), |this, icon| this.icon(icon))
@@ -170,7 +173,7 @@ impl Settings {
                                         page_ix,
                                         ..Default::default()
                                     };
-                                    state.deferred_scroll_group_ix = None;
+                                    state.deferred_scroll_group_ix = top;
                                     cx.notify();
                                 })
                             }
