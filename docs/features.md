@@ -6,7 +6,14 @@ Add a repository, start a task from a title. The title becomes a branch
 (`DEV-123 Fix login` gives `DEV-123_fixLogin`, any other text a slug with a
 random suffix). The task gets a worktree in `<repo>.worktrees/<branch>`,
 branched from the remote's default branch, with the main checkout's ignored
-`.env*` files copied in. A project's [settings](services.md) can install
+`.env*` files copied in. A branch of that name on origin (a colleague's, or
+yours from another machine) is the task's start instead: its commits, the
+local branch following it, as `git checkout` does; a second branch of its
+name beside it could be pushed only over it. New task says so under the
+title, in a line of its own, with who made its last commit and when, and
+names origin's other branches of the title's key. A branch of the name here
+with no task is taken as it is; a task already on it keeps it, and the new
+one is refused. A project's [settings](services.md) can install
 what it needs there, check the agent's work after each turn and clean up
 when the task goes.
 

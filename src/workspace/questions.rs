@@ -508,14 +508,19 @@ impl Workspace {
         let Some(q) = self.projects[pi].tasks[ti].questions.iter().find(|q| q.id == n).cloned() else { return };
         let Some(profile) = state::with_settings(|s| s.profile(&q.profile).cloned()) else { return };
         let from_branch = self.projects[pi].tasks[ti].branch.clone();
+        let branch = naming::branch_name_as(&q.title, &self.projects[pi].values().branch);
+        let (repo, base) = (self.projects[pi].path.clone(), self.projects[pi].values().base.clone());
+        let task = git::task_worktree_dir(&repo, &branch);
+        // The question stays where it is, its agent with it.
+        if let Some(why) = self.task_in_the_way(pi, &task, &branch) {
+            window.push_notification(Notification::error(why).title("Could not make the task"), cx);
+            return;
+        }
         if let Some(view) = self.projects[pi].tasks[ti].view.clone() {
             view.update(cx, |t, cx| t.end_question(n, window, cx));
         }
         self.projects[pi].tasks[ti].questions.retain(|q| q.id != n);
         let p = &mut self.projects[pi];
-        let branch = naming::branch_name_as(&q.title, &p.values().branch);
-        let (repo, base) = (p.path.clone(), p.values().base.clone());
-        let task = git::task_worktree_dir(&repo, &branch);
         p.collapsed = false;
         p.tasks.push(TaskEntry {
             path: task.clone(),
@@ -541,8 +546,8 @@ impl Workspace {
             let made = cx
                 .background_spawn(async move {
                     let copy = crate::project_config::resolve(&repo).config.task.copy;
-                    let made = git::create_task_worktree(&repo, &branch, &base, copy_env && copy.is_none());
-                    if let (Ok(dir), Some(copy)) = (&made, copy) {
+                    let made = git::new_task_worktree(&repo, &branch, &base, copy_env && copy.is_none());
+                    if let (Ok((dir, _)), Some(copy)) = (&made, copy) {
                         crate::project_config::copy_ignored(&repo, dir, &copy);
                     }
                     if made.is_ok() {
@@ -553,9 +558,12 @@ impl Workspace {
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 match made {
-                    Ok(_) => {
+                    Ok((_, told)) => {
                         if let Some(entry) = this.entry_mut(&task) {
                             entry.busy = None;
+                        }
+                        if let Some(told) = told {
+                            window.push_notification(Notification::info(told).title("On a branch there was already").autohide(false), cx);
                         }
                         this.switch(&task, window, cx);
                         this.task_made(&task, window, cx);
@@ -565,9 +573,7 @@ impl Workspace {
                         }
                     }
                     Err(e) => {
-                        if let Some((pi, ti)) = this.find(&task) {
-                            this.projects[pi].tasks.remove(ti);
-                        }
+                        this.drop_unmade(&task);
                         // Not lost: back among the main thread's closed questions.
                         if let Some(entry) = this.entry_mut(&from) {
                             entry.questions.push(state::QuestionState { closed: state::now(), ..q.clone() });
