@@ -23,12 +23,13 @@ pub struct Known {
     pub chat: Option<&'static str>,
 }
 
-pub const KNOWN: [Known; 10] = [
+pub const KNOWN: [Known; 11] = [
     Known { kind: Kind::Claude, program: "claude", name: "Claude Code", url: "https://github.com/anthropics/claude-code", chat: None },
     Known { kind: Kind::Codex, program: "codex", name: "Codex", url: "https://github.com/openai/codex", chat: None },
     Known { kind: Kind::OpenCode, program: "opencode", name: "OpenCode", url: "https://opencode.ai", chat: None },
     Known { kind: Kind::Generic, program: "gemini", name: "Gemini CLI", url: "https://github.com/google-gemini/gemini-cli", chat: Some("--acp") },
-    Known { kind: Kind::Generic, program: "kimi", name: "Kimi Code", url: "https://www.kimi.com/code", chat: Some("acp") },
+    Known { kind: Kind::Kimi, program: "kimi", name: "Kimi Code", url: "https://www.kimi.com/code", chat: None },
+    Known { kind: Kind::Antigravity, program: "agy", name: "Antigravity", url: "https://antigravity.google/docs/cli", chat: None },
     Known { kind: Kind::Generic, program: "qwen", name: "Qwen Code", url: "https://github.com/QwenLM/qwen-code", chat: Some("--acp") },
     Known { kind: Kind::Generic, program: "goose", name: "Goose", url: "https://block.github.io/goose", chat: Some("acp") },
     Known { kind: Kind::Generic, program: "cursor-agent", name: "Cursor", url: "https://cursor.com/cli", chat: Some("acp") },
@@ -92,6 +93,7 @@ pub fn usual_places(home: Option<&Path>, var: impl Fn(&str) -> Option<String>) -
         places.extend(under("LOCALAPPDATA", "pnpm"));
         places.extend(under("LOCALAPPDATA", r"Microsoft\WinGet\Links"));
         places.extend(under("LOCALAPPDATA", r"Volta\bin"));
+        places.extend(under("LOCALAPPDATA", r"agy\bin"));
         if let Some(home) = home {
             places.extend([r".local\bin", r".bun\bin", r".opencode\bin", r"scoop\shims"].map(|rest| home.join(rest)));
         }
@@ -157,7 +159,7 @@ pub fn find_installed() -> Vec<Found> {
 pub fn not_added(found: &[Found], profiles: &[Profile]) -> Vec<Found> {
     found
         .iter()
-        .filter(|f| !profiles.iter().any(|p| (p.kind == f.known.kind && p.kind != Kind::Generic) || program_of(p) == f.known.program))
+        .filter(|f| !profiles.iter().any(|p| (p.kind == f.known.kind && p.kind != Kind::Generic) || (program_of(p) == f.known.program && p.kind != Kind::Glm)))
         .cloned()
         .collect()
 }
@@ -260,6 +262,9 @@ mod tests {
         let gemini = offers[1].profile(&claude);
         assert_eq!((gemini.id.as_str(), gemini.kind, gemini.command.as_str(), gemini.letter().as_str()), ("gemini-cli", Kind::Generic, "gemini --acp", "G"));
         assert!(gemini.acp, "it speaks ACP: a chat, its status told");
+        // Claude Code on GLM is not Claude Code on Anthropic's models.
+        let glm = vec![Profile { id: "z".into(), name: "Z.ai GLM".into(), kind: Kind::Glm, command: "claude".into(), ..Default::default() }];
+        assert_eq!(not_added(&only_claude, &glm).len(), 1);
         // A profile of a kind, whatever its command, counts as added.
         let mut with_codex = claude.clone();
         with_codex.push(Profile { id: "x".into(), name: "Work".into(), kind: Kind::Codex, command: "/opt/codex --full-auto".into(), ..Default::default() });

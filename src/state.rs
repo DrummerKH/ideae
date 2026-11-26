@@ -324,6 +324,10 @@ pub struct Settings {
     /// A state from before it had its agents set up already.
     #[serde(default = "yes")]
     pub agents_welcomed: bool,
+    /// Agents' own files (`~/.kimi-code/config.toml`) not to be offered
+    /// ideae's hooks again (agents/own_config.rs).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_hooks_declined: Vec<String>,
     /// Edit prediction by a local model (predict/): None until the offer
     /// to turn it on is answered.
     pub edit_prediction: Option<bool>,
@@ -431,6 +435,7 @@ impl Default for Settings {
             restore_summary: false,
             archive_keep_days: 90,
             agents_welcomed: false,
+            agent_hooks_declined: Vec::new(),
             edit_prediction: None,
             prediction_model: "auto".into(),
             menu_bar_shown: false,

@@ -1062,6 +1062,9 @@ fn kind_hint(kind: crate::agents::Kind) -> &'static str {
         Kind::Claude => "Reports through its hooks; each task resumes its own session by id. For a second account, set CLAUDE_CONFIG_DIR.",
         Kind::Codex => "Not tried live: its adapter follows Codex's source. Reports the end of each turn through notify and its approvals as terminal notifications; resumes a task's session by id. For a second account, set CODEX_HOME.",
         Kind::OpenCode => "Not tried live: its adapter follows OpenCode's source. Reports through a plugin ideae adds for the session (OPENCODE_CONFIG_CONTENT); resumes a task's session by id. Separate accounts: XDG_DATA_HOME.",
+        Kind::Kimi => "Not tried live: its adapter follows Kimi Code's documentation. Without ideae's hooks its state is guessed from its terminal and a task goes on with the latest session of its worktree. As a chat (kimi acp) it tells what it does. Separate accounts: KIMI_CODE_HOME.",
+        Kind::Antigravity => "Not tried live: its adapter follows the Antigravity CLI's documentation. Without ideae's hooks its state is guessed from its terminal and a task goes on with the latest conversation of its worktree. As a chat (agy acp) it tells what it does.",
+        Kind::Glm => "Claude Code on Z.ai's GLM models, with its hooks and sessions: the variables below point it at Z.ai (open.bigmodel.cn/api/anthropic in China), the key is your GLM Coding Plan's.",
         Kind::Generic => "Any program that runs in a terminal. Its state is guessed from its output: working while it writes, done when it goes quiet or rings the bell.",
     }
 }
@@ -1211,15 +1214,21 @@ fn chat_hint(kind: crate::agents::Kind) -> &'static str {
         Kind::Claude => "Anthropic's ACP adapter for Claude Code, always on an API key (below): an app may not offer a claude.ai plan's login. For your plan, use a terminal profile.",
         Kind::Codex => "The ACP adapter for Codex: signs in with ChatGPT or an API key (OPENAI_API_KEY), as it asks in the chat.",
         Kind::OpenCode => "OpenCode's own ACP server: its providers and models are OpenCode's (opencode auth login).",
+        Kind::Kimi => "Kimi Code's own ACP server: it signs in as the CLI does (kimi, then /login).",
+        Kind::Antigravity => "The Antigravity CLI's own ACP server: it uses the CLI's Google sign-in (agy, or agy acp --login where there is no browser).",
+        Kind::Glm => "Anthropic's ACP adapter for Claude Code, on Z.ai's GLM models: the variables below point it at Z.ai, the key is your GLM Coding Plan's.",
         Kind::Generic => "Any program that speaks ACP: what it does, asks and costs is told by it, not guessed. It signs in its own way when it asks.",
     }
 }
 
-/// The key a chat agent runs on, when it is one known: its variable, and
-/// where to make one.
-fn api_key_var(kind: crate::agents::Kind, command: &str) -> Option<(&'static str, &'static str)> {
+/// The key an agent runs on, when it is one known: its variable, and
+/// where to make one. A terminal agent signs in its own way, except on a
+/// provider's endpoint.
+fn api_key_var(kind: crate::agents::Kind, command: &str, chat: bool) -> Option<(&'static str, &'static str)> {
     use crate::agents::Kind;
     match kind {
+        Kind::Glm => Some(("ANTHROPIC_AUTH_TOKEN", "z.ai → API Keys (GLM Coding Plan)")),
+        _ if !chat => None,
         Kind::Claude => Some(("ANTHROPIC_API_KEY", "console.anthropic.com → API keys")),
         Kind::Codex => Some(("OPENAI_API_KEY", "platform.openai.com → API keys")),
         Kind::Generic if command.contains("gemini") => Some(("GEMINI_API_KEY", "aistudio.google.com → Get API key")),
@@ -1300,7 +1309,7 @@ fn profile_dialog(draft: Draft, at: Option<usize>, template: Option<crate::agent
             }
             let mut env_text = save_env.read(cx).value().to_string();
             let typed = save_key.read(cx).value().trim().to_string();
-            if let (true, Some((var, _))) = (acp && !typed.is_empty(), api_key_var(k, &command)) {
+            if let (true, Some((var, _))) = (!typed.is_empty(), api_key_var(k, &command, acp)) {
                 env_text = with_env_line(&env_text, var, &typed);
             }
             {
@@ -1310,7 +1319,7 @@ fn profile_dialog(draft: Draft, at: Option<usize>, template: Option<crate::agent
                     _ => crate::agents::new_profile_id(&name, &d.agents),
                 };
                 let choices = if save_forget.get() { Default::default() } else { editing.choices.clone() };
-                let daily_limit = save_limit.read(cx).value().trim().trim_start_matches('$').parse::<f64>().ok().filter(|l| *l > 0.0 && acp);
+                let daily_limit = save_limit.read(cx).value().trim().trim_start_matches('$').parse::<f64>().ok().filter(|l| *l > 0.0 && acp && k != crate::agents::Kind::Glm);
                 let mark: String = save_mark.read(cx).value().trim().chars().take(3).collect();
                 let mut profile = crate::agents::Profile { id, name, kind: k, command, acp, secrets: editing.secrets.clone(), choices, offered: editing.offered.clone(), daily_limit, mark, color: save_color.get(), ..Default::default() };
                 profile.set_env_text(&env_text);
@@ -1337,17 +1346,40 @@ fn profile_dialog(draft: Draft, at: Option<usize>, template: Option<crate::agent
             .content(move |content, _, cx| {
                 let current = kind.get();
                 let as_chat = chat.get();
-                let key_var = as_chat.then(|| api_key_var(current, &command.read(cx).value())).flatten();
+                let key_var = api_key_var(current, &command.read(cx).value(), as_chat);
                 // Set: in the environment below, sealed or not.
                 let key_set = key_var.is_some_and(|(var, _)| crate::agents::Profile::parse_env(&env.read(cx).value()).get(var).is_some_and(|v| !v.is_empty()));
                 let own = move |k: crate::agents::Kind, chat: bool| if chat { k.acp_command() } else { k.program() };
                 content.child(
                     gpui_kit::component::v_flex()
                         .gap_2()
-                        .child(h_flex().gap_2().items_center().child(label("Kind")).children(crate::agents::Kind::ALL.into_iter().map(|k| {
-                            let (kind, command, name) = (kind.clone(), command.clone(), name.clone());
+                        .child(h_flex().gap_2().items_start().child(label("Kind")).child(h_flex().flex_1().flex_wrap().gap_x_2().gap_y_1().children(crate::agents::Kind::ALL.into_iter().map(|k| {
+                            let (kind, command, name, env) = (kind.clone(), command.clone(), name.clone(), env.clone());
                             Button::new(("agent-kind", k as usize)).xsmall().ghost().label(k.label()).selected(current == k).on_click(move |_, window, cx| {
                                 let before = kind.replace(k);
+                                // What points it at its provider, unless set already; the old
+                                // kind's, as it put them, go.
+                                let mut text = env.read(cx).value().to_string();
+                                // A provider's variables and key of the old kind go whatever their value:
+                                // left, the new kind would run on that provider.
+                                // So does its key, a chat's or a terminal's: Claude's key with Z.ai's
+                                // endpoint would go to Z.ai.
+                                let typed = command.read(cx).value().to_string();
+                                let keys: Vec<&str> = [true, false].into_iter().filter_map(|chat| api_key_var(before, &typed, chat).map(|(var, _)| var)).collect();
+                                let theirs = |line: &str| {
+                                    let line = line.trim();
+                                    let line = line.strip_prefix("export ").unwrap_or(line);
+                                    let name = line.split_once('=').map_or("", |(name, _)| name.trim());
+                                    before != k && (before.preset_env().iter().any(|(var, _)| *var == name) || keys.contains(&name))
+                                };
+                                text = text.lines().filter(|line| !theirs(line)).collect::<Vec<_>>().join("\n");
+                                let set = crate::agents::Profile::parse_env(&text);
+                                for (var, value) in k.preset_env().iter().filter(|(var, _)| !set.contains_key(*var)) {
+                                    text = with_env_line(&text, var, value);
+                                }
+                                if text != env.read(cx).value() {
+                                    env.update(cx, |i, cx| i.set_value(text, window, cx));
+                                }
                                 // A command or name that was the old kind's own follows the new kind.
                                 if command.read(cx).value().trim() == own(before, as_chat) {
                                     command.update(cx, |i, cx| i.set_value(own(k, as_chat), window, cx));
@@ -1357,8 +1389,46 @@ fn profile_dialog(draft: Draft, at: Option<usize>, template: Option<crate::agent
                                 }
                                 window.refresh();
                             })
-                        })))
+                        }))))
                         .child(div().text_xs().text_color(muted).child(if as_chat { chat_hint(current) } else { kind_hint(current) }))
+                        .when_some(
+                            crate::agents::own_config::takes_hooks(current).then(|| {
+                                // The file of the profile as it is being edited (its KIMI_CODE_HOME too).
+                                let edited = crate::agents::Profile { kind: current, acp: as_chat, env: crate::agents::Profile::parse_env(&env.read(cx).value()), ..Default::default() };
+                                crate::agents::own_config::config_file(&edited).map(|file| (edited, file))
+                            }).flatten(),
+                            |this, (edited, file)| {
+                                use crate::agents::own_config;
+                                let on = own_config::hooked(&edited) == Some(true);
+                                let shown = own_config::shown(&file);
+                                let text = if on {
+                                    format!("ideae's hooks are in {shown}: it tells what it does. Remove takes them out, the rest of the file stays.")
+                                } else {
+                                    format!("It reads hooks from its own file alone: Add puts ideae's in {shown}, the rest of the file stays. {}", own_config::gives(current))
+                                };
+                                this.child(
+                                    h_flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .child(label("ideae's hooks"))
+                                        .child(div().flex_1().min_w_0().text_xs().text_color(muted).child(text))
+                                        .child(Button::new("agent-hooks").xsmall().outline().label(if on { "Remove" } else { "Add" }).on_click(move |_, window, cx| {
+                                            let edited = edited.clone();
+                                            window
+                                                .spawn(cx, async move |cx| {
+                                                    let done = cx.background_spawn(async move { own_config::set(&edited, !on) }).await;
+                                                    let _ = cx.update(|window, cx| {
+                                                        if let Err(e) = done {
+                                                            window.push_notification(gpui_kit::component::notification::Notification::error(e), cx);
+                                                        }
+                                                        window.refresh();
+                                                    });
+                                                })
+                                                .detach();
+                                        })),
+                                )
+                            },
+                        )
                         .child(h_flex().gap_2().items_center().child(label("Runs as")).children([(false, "Terminal"), (true, "Chat (ACP)")].into_iter().map(|(c, text)| {
                             let (chat, command) = (chat.clone(), command.clone());
                             Button::new(("agent-chat", c as usize)).xsmall().ghost().label(text).selected(as_chat == c).on_click(move |_, window, cx| {
@@ -1418,7 +1488,7 @@ fn profile_dialog(draft: Draft, at: Option<usize>, template: Option<crate::agent
                         })
                         .child(h_flex().gap_2().items_center().child(label("Command")).child(div().flex_1().child(Input::new(&command))))
                         .child(div().text_xs().text_color(muted).child(if as_chat {
-                            "What starts its ACP server: opencode acp, gemini --acp, kimi acp, qwen --acp, npx -y <package>. ideae resumes its sessions itself."
+                            "What starts its ACP server: opencode acp, gemini --acp, kimi acp, agy acp, qwen --acp, npx -y <package>. ideae resumes its sessions itself."
                         } else {
                             "The program and its flags, as typed in a shell: a model, a mode. ideae adds what starts or resumes a session and what reports to it."
                         }))
@@ -1430,7 +1500,8 @@ fn profile_dialog(draft: Draft, at: Option<usize>, template: Option<crate::agent
                                     format!("Goes in {var}, kept sealed for this machine, not in the settings. Make one at {where_}.")
                                 }))
                         })
-                        .when(as_chat, |this| {
+                        // Priced as Anthropic's models: not what a GLM plan costs.
+                        .when(as_chat && current != crate::agents::Kind::Glm, |this| {
                             this.child(h_flex().gap_2().items_center().child(label("Daily limit, $")).child(div().w(px(120.)).child(Input::new(&limit))).child(div().text_xs().text_color(muted).child(if spent > 0.0 { format!("${spent:.2} today") } else { String::new() })))
                                 .child(div().text_xs().text_color(muted).child("Its turn is stopped once its sessions cost this much today (UTC), going by the cost the agent reports. Claude Code's adapter reports it; agents that report nothing are not limited."))
                         })
@@ -1491,6 +1562,7 @@ impl Workspace {
                     let _ = this.update(cx, |w, cx| {
                         w.apply_layer_drafts(layers, cx);
                         w.apply_settings(settings, cx);
+                        w.offer_agent_hooks(window, cx);
                         if appearance != w.appearance {
                             w.set_appearance(appearance, window, cx);
                         }
@@ -1748,8 +1820,10 @@ mod tests {
         let text = "CLAUDE_CONFIG_DIR=~/.c\nexport ANTHROPIC_API_KEY=••••••••";
         assert_eq!(super::with_env_line(text, "ANTHROPIC_API_KEY", "sk-new"), "CLAUDE_CONFIG_DIR=~/.c\nANTHROPIC_API_KEY=sk-new");
         assert_eq!(super::with_env_line("", "OPENAI_API_KEY", "x"), "OPENAI_API_KEY=x");
-        assert_eq!(super::api_key_var(crate::agents::Kind::Generic, "gemini --acp").map(|k| k.0), Some("GEMINI_API_KEY"));
-        assert_eq!(super::api_key_var(crate::agents::Kind::OpenCode, "opencode acp"), None);
+        assert_eq!(super::api_key_var(crate::agents::Kind::Generic, "gemini --acp", true).map(|k| k.0), Some("GEMINI_API_KEY"));
+        assert_eq!(super::api_key_var(crate::agents::Kind::OpenCode, "opencode acp", true), None);
+        assert_eq!(super::api_key_var(crate::agents::Kind::Claude, "claude", false), None, "a terminal signs in its own way");
+        assert_eq!(super::api_key_var(crate::agents::Kind::Glm, "claude", false).map(|k| k.0), Some("ANTHROPIC_AUTH_TOKEN"));
     }
 
     /// The pages' list names a page's groups: one without a title among

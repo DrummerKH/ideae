@@ -1284,7 +1284,7 @@ impl TaskView {
         let a = &self.agent;
         let resumable = a.launch.as_ref().is_some_and(|l| {
             let adapter = l.profile.adapter();
-            l.session_id().is_some() && adapter.resumes() && adapter.events() == crate::agents::Events::All && l.hooks().is_some()
+            l.session_id().is_some() && adapter.resumes() && l.events() == crate::agents::Events::All && l.hooks().is_some()
         });
         if !resumable || !matches!(a.status, Idle | Done) || a.timers || a.queued.is_some() || a.pending_prompt.is_some() {
             return;

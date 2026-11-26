@@ -197,7 +197,11 @@ pub fn run(args: &[String], log: Option<&Path>) -> Option<(String, String)> {
     } else {
         let mut input = String::new();
         let _ = std::io::stdin().read_to_string(&mut input);
-        (event, serde_json::from_str(&input).unwrap_or(Value::Null))
+        let payload = serde_json::from_str(&input).unwrap_or(Value::Null);
+        match event.split_once(':') {
+            Some((agent, theirs)) => foreign(agent, theirs, payload)?,
+            None => (event, payload),
+        }
     };
     let (Some(socket), Some(task)) = (given("sock").or_else(|| std::env::var(SOCK_ENV).ok()), given("task").or_else(|| std::env::var(TASK_ENV).ok())) else {
         return None;
@@ -306,6 +310,36 @@ fn ancestors() -> Vec<String> {
 }
 
 
+/// A hook of an agent's own configuration (`Kimi:Stop`, `Antigravity:Stop`,
+/// written there by ideae when asked) as Claude Code's of the same meaning;
+/// what means nothing to ideae is dropped.
+pub fn foreign(agent: &str, event: &str, payload: Value) -> Option<(&'static str, Value)> {
+    let mut payload = if payload.is_object() { payload } else { json!({}) };
+    let event = match (agent, event) {
+        ("Kimi", "SessionStart") => "SessionStart",
+        ("Kimi", "UserPromptSubmit" | "PermissionResult") => "UserPromptSubmit",
+        ("Kimi", "Stop" | "StopFailure" | "Interrupt") => "Stop",
+        ("Kimi", "PermissionRequest") => {
+            let what = payload["tool_name"].as_str().map(|t| format!(": {t}")).unwrap_or_default();
+            payload["notification_type"] = json!("permission_prompt");
+            payload["message"] = json!(format!("Kimi Code needs your permission{what}"));
+            "Notification"
+        }
+        ("Antigravity", "SessionStart" | "PreInvocation" | "Stop") => {
+            if let Some(id) = payload["conversationId"].as_str().map(str::to_string) {
+                payload["session_id"] = json!(id);
+            }
+            match event {
+                "PreInvocation" => "UserPromptSubmit",
+                "Stop" => "Stop",
+                _ => "SessionStart",
+            }
+        }
+        _ => return None,
+    };
+    Some((event, payload))
+}
+
 /// Codex's notify payload as a Stop's: only a turn's end says anything.
 pub fn codex_payload(json: &str) -> Option<serde_json::Value> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
@@ -316,4 +350,17 @@ pub fn codex_payload(json: &str) -> Option<serde_json::Value> {
             "cwd": v["cwd"],
         })
     })
+}
+
+#[cfg(test)]
+#[test]
+fn an_agent_s_own_hooks_as_claude_s() {
+    let (event, payload) = foreign("Kimi", "PermissionRequest", json!({ "session_id": "s1", "tool_name": "Shell" })).unwrap();
+    assert_eq!((event, payload["notification_type"].as_str(), payload["message"].as_str()), ("Notification", Some("permission_prompt"), Some("Kimi Code needs your permission: Shell")));
+    assert_eq!(foreign("Kimi", "Interrupt", Value::Null).unwrap().0, "Stop");
+    assert!(foreign("Kimi", "PreToolUse", json!({})).is_none());
+    let (event, payload) = foreign("Antigravity", "PreInvocation", json!({ "conversationId": "c1" })).unwrap();
+    assert_eq!((event, payload["session_id"].as_str()), ("UserPromptSubmit", Some("c1")));
+    assert_eq!(foreign("Antigravity", "Stop", json!({ "session_id": "kept" })).unwrap().1["session_id"], "kept");
+    assert!(foreign("Other", "Stop", json!({})).is_none());
 }

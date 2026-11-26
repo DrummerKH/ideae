@@ -248,7 +248,7 @@ impl Workspace {
             }
             Given::Read(file) => (Start::New(id), format!("Another agent of this project has a conversation in {}. Read what you need of it for this question.\n\n{prompt}", file.display())),
         };
-        let launch = Launch { profile, start, unasked: false, aside: true, options: Vec::new(), host: crate::hosts::split(path).map(|(host, _)| host) };
+        let launch = Launch { aside: true, ..Launch::new(profile, start, crate::hosts::split(path).map(|(host, _)| host)) };
         if let Some(view) = self.entry_mut(path).and_then(|e| e.view.clone()) {
             view.update(cx, |t, cx| {
                 t.asked = true;
@@ -813,7 +813,7 @@ fn question_launch(task: &Path, q: &state::QuestionState) -> Option<Launch> {
         Some(id) => Start::Resume(id.clone()),
         None => Start::New(None),
     };
-    Some(Launch { profile, start, unasked: false, aside: true, options: Vec::new(), host: None })
+    Some(Launch { aside: true, ..Launch::new(profile, start, None) })
 }
 
 fn prompt_says_more(prompt: &str, title: &str) -> bool {

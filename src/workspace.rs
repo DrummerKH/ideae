@@ -808,6 +808,7 @@ impl Workspace {
                     }
                     if n == 1 {
                         this.welcome_agents(window, cx);
+                        this.offer_agent_hooks(window, cx);
                     }
                     // Every six hours, the first time soon after start; a
                     // checkout's fetch is cheap, so every hour.
@@ -3293,7 +3294,7 @@ impl Workspace {
             Start::New(id)
         };
         t.fresh = false;
-        Some(Launch { profile, start, unasked, aside: false, options: t.choices.clone(), host: crate::hosts::split(path).map(|(host, _)| host) })
+        Some(Launch { unasked, options: t.choices.clone(), ..Launch::new(profile, start, crate::hosts::split(path).map(|(host, _)| host)) })
     }
 
     /// New settings: they go to the state, and what they change now

@@ -14,11 +14,15 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+pub mod antigravity;
 pub mod claude;
 pub mod codex;
 pub mod find;
 pub mod generic;
+pub mod glm;
+pub mod kimi;
 pub mod opencode;
+pub mod own_config;
 pub mod registry;
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
@@ -28,11 +32,20 @@ pub enum Kind {
     Claude,
     Codex,
     OpenCode,
+    /// Moonshot's Kimi Code CLI (`kimi`).
+    Kimi,
+    /// Google's Antigravity CLI (`agy`).
+    Antigravity,
+    /// Claude Code on Z.ai's GLM models: its Anthropic endpoint and a key
+    /// of the GLM Coding Plan, set in the profile's variables.
+    Glm,
+    /// Any other program; also a kind written by a newer build.
+    #[serde(other)]
     Generic,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 4] = [Kind::Claude, Kind::Codex, Kind::OpenCode, Kind::Generic];
+    pub const ALL: [Kind; 7] = [Kind::Claude, Kind::Codex, Kind::OpenCode, Kind::Kimi, Kind::Antigravity, Kind::Glm, Kind::Generic];
 
     /// By the program a command starts: `claude`, a path to `codex`…
     pub fn detect(command: &str) -> Kind {
@@ -42,6 +55,8 @@ impl Kind {
             "claude" => Kind::Claude,
             "codex" => Kind::Codex,
             "opencode" => Kind::OpenCode,
+            "kimi" => Kind::Kimi,
+            "agy" => Kind::Antigravity,
             _ => Kind::Generic,
         }
     }
@@ -49,8 +64,11 @@ impl Kind {
     pub fn adapter(self) -> &'static dyn Adapter {
         match self {
             Kind::Claude => &claude::Claude,
+            Kind::Glm => &glm::Glm,
             Kind::Codex => &codex::Codex,
             Kind::OpenCode => &opencode::OpenCode,
+            Kind::Kimi => &kimi::Kimi,
+            Kind::Antigravity => &antigravity::Antigravity,
             Kind::Generic => &generic::Generic,
         }
     }
@@ -60,7 +78,20 @@ impl Kind {
             Kind::Claude => "Claude Code",
             Kind::Codex => "Codex",
             Kind::OpenCode => "OpenCode",
+            Kind::Kimi => "Kimi Code",
+            Kind::Antigravity => "Antigravity",
+            Kind::Glm => "Z.ai GLM",
             Kind::Generic => "Any other program",
+        }
+    }
+
+    /// The variables a new profile of it starts with: what points Claude
+    /// Code at Z.ai. Shown in the profile editor, where they can be changed
+    /// (open.bigmodel.cn's endpoint in China).
+    pub fn preset_env(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Kind::Glm => &[("ANTHROPIC_BASE_URL", GLM_BASE_URL), ("API_TIMEOUT_MS", "3000000")],
+            _ => &[],
         }
     }
 
@@ -70,8 +101,12 @@ impl Kind {
     pub fn acp_command(self) -> &'static str {
         match self {
             Kind::Claude => "npx -y @agentclientprotocol/claude-agent-acp@0.108.0 --hide-claude-auth",
+            // Claude Code's adapter, as Z.ai's endpoint speaks Anthropic's API.
+            Kind::Glm => "npx -y @agentclientprotocol/claude-agent-acp@0.108.0 --hide-claude-auth",
             Kind::Codex => "npx -y @agentclientprotocol/codex-acp",
             Kind::OpenCode => "opencode acp",
+            Kind::Kimi => "kimi acp",
+            Kind::Antigravity => "agy acp",
             Kind::Generic => "",
         }
     }
@@ -79,12 +114,18 @@ impl Kind {
     pub fn program(self) -> &'static str {
         match self {
             Kind::Claude => "claude",
+            Kind::Glm => "claude",
             Kind::Codex => "codex",
             Kind::OpenCode => "opencode",
+            Kind::Kimi => "kimi",
+            Kind::Antigravity => "agy",
             Kind::Generic => "",
         }
     }
 }
+
+/// Z.ai's Anthropic-compatible endpoint, for Claude Code on GLM.
+pub const GLM_BASE_URL: &str = "https://api.z.ai/api/anthropic";
 
 /// An agent as the user set it up.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
@@ -262,10 +303,12 @@ impl Profile {
 /// Whether `to` can go on with a session of `from` itself, a chat with a
 /// terminal's or the other way: the same agent, keeping its sessions in
 /// the same place. Claude Code's adapter shares the CLI's session ids, as
-/// OpenCode's server does; Codex's are not known to.
+/// OpenCode's server does; Codex's are not known to. Not Claude Code on
+/// GLM and on Anthropic's models: what one model thought, signed, the
+/// other's endpoint refuses.
 pub fn shares_sessions(from: &Profile, to: &Profile) -> bool {
     let store = match (from.kind, to.kind) {
-        (Kind::Claude, Kind::Claude) => "CLAUDE_CONFIG_DIR",
+        (Kind::Claude, Kind::Claude) | (Kind::Glm, Kind::Glm) => "CLAUDE_CONFIG_DIR",
         (Kind::OpenCode, Kind::OpenCode) => "XDG_DATA_HOME",
         _ => return false,
     };
@@ -497,6 +540,12 @@ pub trait Adapter: Sync {
         Events::None
     }
 
+    /// What it tells with ideae's hooks in its own configuration, put there
+    /// when the user said so ([`own_config`]).
+    fn events_hooked(&self) -> Events {
+        self.events()
+    }
+
     /// It says when its input is up (Claude Code's SessionStart); others
     /// get text once their terminal has been quiet a moment.
     fn reports_ready(&self) -> bool {
@@ -664,9 +713,22 @@ pub struct Launch {
     /// The machine it runs on, when another ([`crate::hosts`]): its hooks
     /// are files there, and this machine's MCP server is not there.
     pub host: Option<String>,
+    /// ideae's hooks were in the agent's own file when it started
+    /// ([`own_config`]): it reads them then, not later.
+    pub hooked: bool,
 }
 
 impl Launch {
+    /// Its own choices of `other`'s: unasked, aside, options.
+    fn with(self, other: &Launch) -> Launch {
+        Launch { unasked: other.unasked, aside: other.aside, options: other.options.clone(), ..self }
+    }
+
+    pub fn new(profile: Profile, start: Start, host: Option<String>) -> Launch {
+        let hooked = host.is_none() && own_config::hooked(&profile) == Some(true);
+        Launch { profile, start, unasked: false, aside: false, options: Vec::new(), host, hooked }
+    }
+
     /// What its terminal's shell is given. Variables made by a command
     /// are set before it, so that shell runs the command.
     pub fn command(&self) -> String {
@@ -705,6 +767,16 @@ impl Launch {
         env
     }
 
+    /// How it tells what it does: with ideae's hooks in its own
+    /// configuration, which is this machine's, more than without.
+    pub fn events(&self) -> Events {
+        let adapter = self.profile.adapter();
+        match self.hooked {
+            true => adapter.events_hooked(),
+            false => adapter.events(),
+        }
+    }
+
     /// The hooks it reports through: none for one on another machine.
     pub fn hooks(&self) -> Option<Hooks> {
         match &self.host {
@@ -719,7 +791,8 @@ impl Launch {
             Start::New(Some(id)) | Start::Resume(id) | Start::Fork { id: Some(id), .. } => Start::Resume(id.clone()),
             Start::New(None) | Start::Last | Start::Fork { id: None, .. } => Start::Last,
         };
-        Launch { start, ..self.clone() }
+        // Started again: with its hooks as they are now.
+        Launch { start, ..Launch::new(self.profile.clone(), Start::Last, self.host.clone()).with(self) }
     }
 
     pub fn session_id(&self) -> Option<String> {
@@ -806,8 +879,21 @@ mod tests {
         assert_eq!(Kind::detect("claude --model opus"), Kind::Claude);
         assert_eq!(Kind::detect("/usr/local/bin/codex"), Kind::Codex);
         assert_eq!(Kind::detect("opencode"), Kind::OpenCode);
+        assert_eq!(Kind::detect("kimi --model k2"), Kind::Kimi);
+        assert_eq!(Kind::detect("/home/me/.local/bin/agy"), Kind::Antigravity);
         assert_eq!(Kind::detect("aider --yes"), Kind::Generic);
         assert_eq!(Kind::detect(""), Kind::Generic);
+    }
+
+    #[test]
+    fn a_kind_of_a_newer_build_is_any_other_program() {
+        let read = |json: &str| serde_json::from_str::<Profile>(json).unwrap().kind;
+        assert_eq!(read(r#"{"kind":"kimi"}"#), Kind::Kimi);
+        assert_eq!(read(r#"{"kind":"glm"}"#), Kind::Glm);
+        assert_eq!(read(r#"{"kind":"something-new"}"#), Kind::Generic);
+        assert_eq!(serde_json::to_string(&Kind::Antigravity).unwrap(), r#""antigravity""#);
+        let glm = Profile { kind: Kind::Glm, ..Default::default() };
+        assert!(!shares_sessions(&glm, &Profile::claude_code()), "GLM's thinking, signed, is refused by Anthropic's endpoint");
     }
 
     #[test]
@@ -865,7 +951,7 @@ mod tests {
 
     #[test]
     fn restart_resumes() {
-        let launch = Launch { profile: Profile::claude_code(), start: Start::New(Some("abc".into())), unasked: false, aside: false, options: Vec::new(), host: None };
+        let launch = Launch::new(Profile::claude_code(), Start::New(Some("abc".into())), None);
         assert_eq!(launch.again().start, Start::Resume("abc".into()));
         let legacy = Launch { start: Start::Last, ..launch.clone() };
         assert_eq!(legacy.again().start, Start::Last);

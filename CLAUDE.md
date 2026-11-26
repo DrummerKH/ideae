@@ -95,7 +95,8 @@ src/secrets.rs     agents' keys out of the state: sealed for this machine in sec
 src/agent.rs       agents' reports bridge: Claude Code hooks, Codex notify, OpenCode plugin (unix socket, `ideae --hook`)
 src/agents/        agent profiles and adapters (docs/agents.md): how each kind starts, resumes, reports, is asked once
   mod.rs           profiles, resolution (task > project > default), the Adapter trait, Launch
-  claude.rs codex.rs opencode.rs generic.rs   one adapter each; Codex and OpenCode follow their source, not tried live
+  claude.rs codex.rs opencode.rs kimi.rs antigravity.rs glm.rs generic.rs   one adapter each (glm.rs: Claude Code on Z.ai, apart from claude.rs on purpose); Codex and OpenCode follow their source, Kimi and Antigravity their docs, not tried live
+  own_config.rs    ideae's hooks put in an agent's own file when the user says so (Kimi's config.toml, Antigravity's hooks.json), and taken out
   registry.rs      the ACP registry: how its agents would run here, a download checked and unpacked
 src/mac_notify.rs  macOS: notifications as the app's own (a click comes back), where the binary is in its bundle; else AppleScript's
 src/image_diff.rs  a changed image in a diff: its two versions as pictures, read from git or the worktree

@@ -23,6 +23,8 @@ use crate::{
 thread_local! {
     /// What Settings → Agents → Find installed agents found last.
     static FIND_SAID: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// The agents whose hooks were offered in this run.
+    static HOOKS_OFFERED: RefCell<std::collections::BTreeSet<std::path::PathBuf>> = const { RefCell::new(std::collections::BTreeSet::new()) };
 }
 
 /// The names of agents, as one says them: "Codex and OpenCode".
@@ -57,6 +59,90 @@ impl Workspace {
             });
         })
         .detach();
+    }
+
+    /// Agents that read hooks from their own files alone (Kimi Code,
+    /// Antigravity), run in a terminal here: once a run, ideae's hooks
+    /// are offered for their file, unless declined for good.
+    pub(crate) fn offer_agent_hooks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::agents::own_config;
+        if self.is_presenting() {
+            return;
+        }
+        let (profiles, declined) = state::with_settings(|s| (s.agents.clone(), s.agent_hooks_declined.clone()));
+        let asked = HOOKS_OFFERED.with(|o| o.borrow().clone());
+        // One offer for each file: two accounts of an agent have two.
+        let mut candidates: Vec<(crate::agents::Profile, std::path::PathBuf)> = Vec::new();
+        for p in profiles {
+            let Some(file) = own_config::config_file(&p) else { continue };
+            let key = own_config::shown(&file);
+            if !declined.contains(&key) && !asked.contains(&file) && !candidates.iter().any(|(_, f)| *f == file) {
+                candidates.push((p, file));
+            }
+        }
+        if candidates.is_empty() {
+            return;
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            let read: Vec<crate::agents::Profile> = candidates.iter().map(|(p, _)| p.clone()).collect();
+            cx.background_spawn(async move { own_config::refresh(&read) }).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                for (profile, file) in candidates.into_iter().filter(|(p, _)| own_config::hooked(p) == Some(false)) {
+                    if HOOKS_OFFERED.with(|o| o.borrow_mut().insert(file)) {
+                        this.offer_hooks_for(profile, window, cx);
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn offer_hooks_for(&mut self, profile: crate::agents::Profile, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::agents::own_config;
+        let Some(file) = own_config::config_file(&profile) else { return };
+        let name = profile.kind.label();
+        let shown = own_config::shown(&file);
+        let this = cx.weak_entity();
+        let note = Notification::new().title(format!("{name} can tell ideae what it does")).autohide(false).content(move |_, _, cx| {
+            let muted = cx.theme().muted_foreground;
+            let (profile, off) = (profile.clone(), this.clone());
+            let key = shown.clone();
+            v_flex()
+                .gap_2()
+                .child(div().text_sm().text_color(muted).child(format!(
+                    "It reads hooks from its own file alone. Add ideae's to {shown}? {} They do nothing outside ideae's tasks; the rest of the file stays as it is, and Settings → Agents takes them out.",
+                    own_config::gives(profile.kind)
+                )))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(Button::new("hooks-add").small().primary().label("Add").on_click(cx.listener(move |note, _, window, cx| {
+                            let profile = profile.clone();
+                            cx.spawn_in(window, async move |_, cx| {
+                                let done = cx.background_spawn(async move { own_config::set(&profile, true) }).await;
+                                let _ = cx.update(|window, cx| match done {
+                                    Ok(()) => window.push_notification(Notification::success("Added: it tells ideae from the next start of its agent"), cx),
+                                    Err(e) => window.push_notification(Notification::error(format!("Not added: {e}")), cx),
+                                });
+                            })
+                            .detach();
+                            note.dismiss(window, cx);
+                        })))
+                        .child(Button::new("hooks-later").small().ghost().label("Not now").on_click(cx.listener(|note, _, window, cx| note.dismiss(window, cx))))
+                        .child(Button::new("hooks-off").small().ghost().label("Don't ask again").on_click(cx.listener(move |note, _, window, cx| {
+                            let _ = off.update(cx, |w, cx| {
+                                let mut settings = state::settings();
+                                if !settings.agent_hooks_declined.contains(&key) {
+                                    settings.agent_hooks_declined.push(key.clone());
+                                }
+                                w.apply_settings(settings, cx);
+                            });
+                            note.dismiss(window, cx);
+                        }))),
+                )
+                .into_any_element()
+        });
+        window.push_notification(note, cx);
     }
 
     fn agents_welcomed(&mut self, cx: &mut Context<Self>) {
@@ -131,6 +217,7 @@ impl Workspace {
                                 }
                                 settings.agents_welcomed = true;
                                 w.apply_settings(settings, cx);
+                                w.offer_agent_hooks(window, cx);
                             });
                             note.dismiss(window, cx);
                         })))

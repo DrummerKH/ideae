@@ -29,7 +29,7 @@ impl TaskView {
     /// For an agent whose adapter does not report when it starts work.
     pub(super) fn watch_activity(&mut self, who: Who, cx: &mut Context<Self>) {
         let Some(agent) = self.agent_of(who) else { return };
-        let watched = agent.launch.as_ref().is_some_and(|l| l.profile.adapter().events() != crate::agents::Events::All);
+        let watched = agent.launch.as_ref().is_some_and(|l| l.events() != crate::agents::Events::All);
         let watch = if watched {
             let task = cx.spawn(async move |this, cx| loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
@@ -79,7 +79,7 @@ impl TaskView {
     /// A bell or a notification from the agent's terminal.
     pub(super) fn agent_signal(&mut self, who: Who, notification: Option<&str>, cx: &mut Context<Self>) {
         let Some(agent) = self.agent_of(who) else { return };
-        if agent.launch.as_ref().is_none_or(|l| l.profile.adapter().events() == crate::agents::Events::All) {
+        if agent.launch.as_ref().is_none_or(|l| l.events() == crate::agents::Events::All) {
             return;
         }
         match notification {

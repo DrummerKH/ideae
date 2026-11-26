@@ -9,12 +9,12 @@ as it always did.
 ## Installed agents
 
 On the first start the app looks for Claude Code (`claude`), Codex
-(`codex`), OpenCode (`opencode`) and Gemini CLI (`gemini`, as any other
-program) on PATH (the login shell's) and where their installers put them:
+(`codex`), OpenCode (`opencode`), Kimi Code (`kimi`), Antigravity (`agy`)
+and Gemini CLI (`gemini`, as any other program) on PATH (the login shell's) and where their installers put them:
 `~/.local/bin`, `~/.claude/local`, `~/.npm-global/bin`, `~/.bun/bin`,
 `~/.opencode/bin`, `~/.volta/bin`, nvm's and pnpm's folders, `/usr/local/bin`,
 `/opt/homebrew/bin`; on Windows `%APPDATA%\npm`, `%USERPROFILE%\.local\bin`,
-pnpm, Scoop, WinGet, Volta. Claude Code alone, and the default: nothing is
+pnpm, Scoop, WinGet, Volta, `%LOCALAPPDATA%\agy\bin`. Claude Code alone, and the default: nothing is
 said. Others found: a card offers to add them as profiles (the default stays
 unless you tick it). None: a card says where to get one, and that tasks open
 with a shell until then. "Don't show again", or Add, ends it; it never shows
@@ -23,8 +23,8 @@ and adds what it finds to the list.
 
 ## Profiles
 
-A profile has a name, a kind (Claude Code, Codex, OpenCode, or any other
-program), a command (the program and its flags: `claude --model opus`) and
+A profile has a name, a kind (Claude Code, Codex, OpenCode, Kimi Code,
+Antigravity, Z.ai GLM, or any other program), a command (the program and its flags: `claude --model opus`) and
 variables for the agent alone. Two accounts of one agent are two profiles
 with their own config folder:
 
@@ -33,6 +33,20 @@ with their own config folder:
 | Claude Code | `CLAUDE_CONFIG_DIR=~/.claude-work` |
 | Codex | `CODEX_HOME=~/.codex-work` |
 | OpenCode | `XDG_DATA_HOME=~/.local/share/opencode-work` |
+| Kimi Code | `KIMI_CODE_HOME=~/.kimi-code-work` |
+
+**Z.ai GLM** is Claude Code on Z.ai's GLM models: the kind fills in the
+variables that point it there (`ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic`,
+`API_TIMEOUT_MS`; `https://open.bigmodel.cn/api/anthropic` in China), and
+the profile editor's **API key** is your GLM Coding Plan's key, kept sealed
+as `ANTHROPIC_AUTH_TOKEN`. Everything else is Claude Code's: hooks,
+sessions, `claude -p`. Which GLM model answers for Opus, Sonnet and Haiku
+is Z.ai's mapping unless `ANTHROPIC_DEFAULT_OPUS_MODEL` and the like are
+set. **Continue with another agent** between it and Claude Code on
+Anthropic's models starts a new session told where the work stands: what
+one model thought, signed, the other's endpoint refuses. A chat on GLM has
+no daily limit, since its cost is reported at Anthropic's prices. Switching
+a profile's kind away from Z.ai GLM takes its Z.ai variables and key out.
 
 One profile is the default. A project can have its own (its menu in the
 sidebar: "New tasks: …"); it is kept in the app's state, not in
@@ -72,7 +86,7 @@ summary (see [features](features.md#pause-archive-restore)).
 
 A profile can run as a **chat** instead of a terminal (the profile editor's
 "Runs as"): its command starts the agent's Agent Client Protocol server,
-`opencode acp`, `gemini --acp`, `kimi acp`, `qwen --acp`, or an adapter such
+`opencode acp`, `gemini --acp`, `kimi acp`, `agy acp`, `qwen --acp`, or an adapter such
 as `npx -y @agentclientprotocol/codex-acp`. The agent tab then shows the
 conversation: its messages (markdown), its thinking folded, each tool call
 with its diff and output, its plan, and a prompt (Enter sends, Shift+Enter a
@@ -84,7 +98,9 @@ agents of the ACP registry by how they would run here: installed already,
 through `npx` or `uvx`, or downloaded (checked against the registry's
 sha256 and unpacked into the app's data folder). The one chosen opens in
 the profile editor, filled in. **Find installed agents** adds Gemini CLI,
-Kimi Code, Qwen Code, Goose, Cursor, Copilot and Mistral Vibe as chats.
+Qwen Code, Goose, Cursor, Copilot and Mistral Vibe as chats; Kimi Code and
+Antigravity as terminals, which Runs as → Chat makes `kimi acp` and
+`agy acp`.
 
 **Choices.** What the agent lets be chosen (model, effort, mode, and
 whatever else it offers) is a row of menus under the prompt; a long list of
@@ -239,15 +255,15 @@ or `opencode run`. Any other program cannot be asked that way.
 
 ## What each kind can do
 
-| | Claude Code | Codex | OpenCode | Any other |
-| --- | --- | --- | --- | --- |
-| Status | hooks (`--settings`) | turn end by `notify`; approvals as terminal notifications; work guessed | plugin events | guessed |
-| Session id chosen by the app | yes | no, learned | no, learned | — |
-| Resume | `--resume <id>` | `codex resume <id>` | `--session <id>` | — |
-| Variants run unasked | `--permission-mode auto` | `--sandbox workspace-write --ask-for-approval never` | `--auto` | as typed |
-| Tokens and context | transcript | rollout file (`$CODEX_HOME/sessions`) | not read (SQLite) | — |
-| One question | `claude -p` | `codex exec -` | `opencode run` | — |
-| Archived sessions | transcript and subagents | rollout file | its database, left as it is | — |
+| | Claude Code, Z.ai GLM (its own adapter, glm.rs) | Codex | OpenCode | Kimi Code | Antigravity | Any other |
+| --- | --- | --- | --- | --- | --- | --- |
+| Status | hooks (`--settings`) | turn end by `notify`; approvals as terminal notifications; work guessed | plugin events | its hooks, added when asked; else guessed | turn end by its hooks, added when asked; else guessed | guessed |
+| Session id chosen by the app | yes | no, learned | no, learned | no, learned by its hooks | no, learned by its hooks | — |
+| Resume | `--resume <id>` | `codex resume <id>` | `--session <id>` | `--session <id>`; else the worktree's latest | `--conversation <id>`; else the worktree's latest | — |
+| Variants run unasked | `--permission-mode auto` | `--sandbox workspace-write --ask-for-approval never` | `--auto` | `--yolo` (still asks what is risky) | `--mode auto` (its sandbox) | as typed |
+| Tokens and context | transcript | rollout file (`$CODEX_HOME/sessions`) | not read (SQLite) | — | — | — |
+| One question | `claude -p` | `codex exec -` | `opencode run` | — | — | — |
+| Archived sessions | transcript and subagents | rollout file | its database, left as it is | its folder, left as it is | its folder, left as it is | — |
 
 Nothing of an agent's own configuration is written. Claude Code gets its
 hooks from a `--settings` file the app writes in its runtime folder; Codex
@@ -259,8 +275,26 @@ its sessions (a new file next to the others, none replaced).
 
 **Codex and OpenCode have not been tried live**: their adapters follow their
 source code (openai/codex `codex-rs/`, anomalyco/opencode `packages/`), and
-the tests run stand-ins that behave as that code says. The profile editor
-says so.
+the tests run stand-ins that behave as that code says. Kimi Code's and
+Antigravity's follow their documentation. The profile editor says so.
+
+Kimi Code and Antigravity read hooks from their own files alone
+(`config.toml` in `KIMI_CODE_HOME`, `~/.gemini/config/hooks.json`). The app
+asks before it puts its own there: once a run, for a terminal profile of
+one of them on this machine (Add, Not now, Don't ask again), and the
+profile editor's **ideae's hooks** adds or removes them at any time. Only
+ideae's entries change: the rest of the file stays as it was, and a copy of
+it before the first change is kept beside it (`….before-ideae`). The hooks
+run `agent-hook` in the app's data folder, a script written again at each
+start with where the app is; outside a task of this app (a release and a
+debug build each have theirs) it ends at once. With them Kimi Code tells
+when it works, asks for permission and is done, and its session id, which
+a restart resumes; Antigravity tells its conversation id and a turn's end,
+its questions still read from its terminal. Without them, in a terminal
+their status is guessed and a task goes on with the latest session of its
+worktree; as chats (`kimi acp`, `agy acp`) they tell it all. Either way
+they answer no one-shot questions: they take a prompt as an argument only.
+Not on Windows yet, nor for a task on another machine.
 
 ### Guessed status
 

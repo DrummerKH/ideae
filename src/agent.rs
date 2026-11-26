@@ -138,6 +138,15 @@ impl Bridge {
         let bridge = Self { socket, socket_file, settings, plugin, mcp };
         bridge.write_settings()?;
         let exe = std::env::current_exe().ok();
+        // The script hooks in agents' own files run, and which files have them.
+        // Read before tasks are restored (a few small files, of these agents' profiles alone):
+        // an agent started with them reports, one without is watched.
+        if let Some(exe) = exe.clone().filter(|_| cfg!(unix) && !cfg!(test)) {
+            crate::agents::own_config::refresh(&crate::state::with_settings(|s| s.agents.clone()));
+            let _ = std::thread::Builder::new().name("agent-hooks".into()).spawn(move || {
+                let _ = crate::agents::own_config::write_script(&exe);
+            });
+        }
         let mut claude_mcp = None;
         if let Some(exe) = &exe {
             let _ = std::fs::write(&bridge.plugin, crate::agents::opencode::plugin_source(exe));

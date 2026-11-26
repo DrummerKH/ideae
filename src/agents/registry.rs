@@ -172,6 +172,7 @@ pub fn kind_of(entry: &Entry) -> Kind {
     match entry.id.as_str() {
         "claude-acp" => Kind::Claude,
         "codex-acp" => Kind::Codex,
+        "kimi-code" => Kind::Kimi,
         id if id.starts_with("opencode") => Kind::OpenCode,
         _ => Kind::Generic,
     }
