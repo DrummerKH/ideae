@@ -333,6 +333,11 @@ impl Workspace {
         let mut entries = vec![
             keyed("New task…", "new_task", "task"),
             keyed("Ask a question…", "ask_question", "task: beside the main thread's agent, which goes on"),
+            own("Review…", "task: a colleague's request or branch, in a task of its own", |w, window, cx| {
+                if let Some(project) = w.project_in_hand() {
+                    w.review_dialog(project, window, cx);
+                }
+            }),
             keyed("Next waiting task", "next_waiting", "task: an agent that asks or is done"),
             key(own("Recent tasks", "task", |w, window, cx| w.recent_tasks(window, cx)), "recent"),
             own("Recent files", "go to", |w, window, cx| w.recent_files(window, cx)).keys({
