@@ -55,7 +55,7 @@ pub fn take_note() -> Option<String> {
 }
 
 fn as_machine(state: &State) -> Result<Machine, String> {
-    store::migrate::from_state(&serde_json::to_value(state).map_err(|e| e.to_string())?)
+    store::migrate::from_state(&state::for_store(state).map_err(|e| e.to_string())?)
 }
 
 #[cfg(unix)]
@@ -66,7 +66,7 @@ fn ask(daemon: &crate::daemon::client::Daemon, call: crate::daemon::proto::Call,
 
 /// Opens the store at its keeper, made of `state` the first time.
 fn open_at(state: &State) -> Result<(Keeper, Machine, Option<String>), String> {
-    let value = serde_json::to_value(state).map_err(|e| e.to_string())?;
+    let value = state::for_store(state).map_err(|e| e.to_string())?;
     let (dir, file) = (state::state_dir(), state::state_path());
     #[cfg(unix)]
     if let Some(daemon) = crate::daemon::client::get().filter(|_| std::env::var_os("IDEAE_NO_DAEMON").is_none()) {

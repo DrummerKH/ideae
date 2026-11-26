@@ -324,6 +324,10 @@ impl Workspace {
             }
             return;
         }
+        if let TaskEvent::Rename = event {
+            let root = view.read(cx).root.clone();
+            return self.rename_task_dialog(&root, window, cx);
+        }
         let TaskEvent::Auto(ask) = event else {
             return cx.notify();
         };

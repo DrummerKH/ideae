@@ -239,13 +239,13 @@ impl InHand {
         }
     }
 
-    /// The main thread is not renamed or archived, a task at work gets no
+    /// The main thread is not archived, a task at work gets no
     /// variant and is not archived, a paused one has no agent.
     pub fn allows(&self, what: TaskCommand) -> bool {
         use TaskCommand::*;
         match what {
             Star | CopyBranchName | CopyTitle | ForgetUserBrowser => true,
-            Rename => !self.main,
+            Rename => true,
             Archive | Defer | AnotherVariant => !self.main && !self.side && self.ready,
             RemoveSide => self.side && self.ready,
             KeepVariant => !self.main && !self.side && self.ready && self.grouped,

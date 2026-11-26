@@ -10,6 +10,13 @@ shows only what that layer may set, each value with where it comes from
 ("from space Work", "from Settings") and ↺ where it is set there. On Global,
 a setting a space or a project sets otherwise says who does.
 
+Global keeps what you chose alone: a setting you changed is yours, written
+in the state even when it is set to its default, and stays as you set it
+when that default changes in a later version; the others follow the default.
+↺ beside a setting, or the page's own at its top, makes it follow the
+default again. A state of before this kept every setting: those as they
+were by default then are taken for ones nobody chose.
+
 | Setting | Global | Space | Team (`.ideae.toml`) | Project |
 |---|---|---|---|---|
 | Default agent | ✓ | ✓ | | ✓ |

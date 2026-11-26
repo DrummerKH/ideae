@@ -892,7 +892,7 @@ impl Workspace {
         if !t.group.is_empty() {
             return format!("{} · {}", t.label(), crate::workspace::variants::letter(t.variant));
         }
-        if !t.main && !t.title.is_empty() {
+        if !t.title.is_empty() {
             return t.title.clone();
         }
         let agent = t
@@ -982,6 +982,7 @@ impl Workspace {
             menu.item(PopupMenuItem::new("Open main thread").icon(menu_icon("house")).on_click(move |_, window, cx| {
                 let _ = a.update(cx, |w, cx| w.open_main(pi, window, cx));
             }))
+            .separator()
             .item(PopupMenuItem::new("New task…").icon(menu_icon("square-plus")).on_click(move |_, window, cx| {
                 let _ = b.update(cx, |w, cx| w.new_task_dialog(pi, window, cx));
                 crate::learn::used("new_task", window, cx);
@@ -993,6 +994,8 @@ impl Workspace {
             .item(PopupMenuItem::new("Review…").icon(menu_icon("eye")).on_click(move |_, window, cx| {
                 let _ = review.update(cx, |w, cx| w.review_dialog(pi, window, cx));
             }))
+            // What was: closed questions, archived tasks.
+            .separator()
             .when(closed_questions, |menu| {
                 menu.item(PopupMenuItem::new("Closed questions…").icon(menu_icon("history")).on_click(move |_, window, cx| {
                     let _ = asked.update(cx, |w, cx| w.closed_questions_dialog(pi, window, cx));
@@ -1002,6 +1005,7 @@ impl Workspace {
                 let _ = archived.update(cx, |w, cx| w.archived_dialog(Some(pi), window, cx));
             }))
             // Only when there is something to clean up, and how much.
+            .when(merged > 0 || stale > 0, |menu| menu.separator())
             .when(merged > 0, |menu| {
                 menu.item(PopupMenuItem::new(format!("Archive {merged} merged task{}…", if merged == 1 { "" } else { "s" })).icon(menu_icon("archive")).on_click(move |_, window, cx| {
                     let _ = d.update(cx, |w, cx| w.archive_merged(pi, window, cx));

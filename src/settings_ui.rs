@@ -33,6 +33,7 @@ type Sizes = Rc<Cell<crate::zoom::Zoom>>;
 
 fn switch(
     draft: &Draft,
+    key: &'static str,
     title: &'static str,
     hint: &'static str,
     get: fn(&state::Settings) -> bool,
@@ -42,9 +43,34 @@ fn switch(
     let field = SettingField::switch(move |_| get(&read.borrow()), move |value, cx| {
         set(&mut write.borrow_mut(), value);
         cx.refresh_windows();
-    })
-    .default_value(get(&state::Settings::default()));
-    SettingItem::new(title, field).description(hint)
+    });
+    SettingItem::new(title, own(draft, key, field)).description(hint)
+}
+
+/// A field of the setting `key`: chosen once set, even to its default; ↺
+/// beside it while it is, which takes it back to the default and makes
+/// it follow that again.
+trait Own {
+    fn own(self, draft: &Draft, key: &'static str) -> Self;
+}
+
+impl<T: Clone + 'static> Own for SettingField<T> {
+    fn own(self, draft: &Draft, key: &'static str) -> Self {
+        own(draft, key, self)
+    }
+}
+
+fn own<T: Clone + 'static>(draft: &Draft, key: &'static str, field: SettingField<T>) -> SettingField<T> {
+    let (chosen, reset, set) = (draft.clone(), draft.clone(), draft.clone());
+    field
+        .after_set(move |_| {
+            set.borrow_mut().chosen.insert(key.to_string());
+        })
+        .on_reset(move |_| chosen.borrow().is_chosen(key), move |_, cx| {
+            reset.borrow_mut().reset(key);
+            cx.refresh_windows();
+        })
+        .reset_beside()
 }
 
 /// A language with more than one server: which one runs, or none; and
@@ -130,7 +156,7 @@ fn text_group(draft: &Draft, sizes: &Sizes, fonts: Vec<SharedString>, code_size:
         SettingField::scrollable_dropdown(options, move |_| read.borrow().code_font.clone().into(), move |value, _| {
             write.borrow_mut().code_font = value.to_string()
         })
-        .default_value(SharedString::from(crate::theme::CODE_FONT))
+        .own(draft, "code_font")
     };
     let size = |kind: Kind| {
         let (read, write) = (sizes.clone(), sizes.clone());
@@ -145,14 +171,14 @@ fn text_group(draft: &Draft, sizes: &Sizes, fonts: Vec<SharedString>, code_size:
         )
         .default_value(f64::from(code_size))
     };
-    let percent = |get: fn(&state::Settings) -> u32, set: fn(&mut state::Settings, u32)| {
+    let percent = |key: &'static str, get: fn(&state::Settings) -> u32, set: fn(&mut state::Settings, u32)| {
         let (read, write) = (draft.clone(), draft.clone());
         SettingField::number_input(
             NumberFieldOptions { min: f64::from(state::SPACING.0), max: f64::from(state::SPACING.1), step: 1. },
             move |_| f64::from(get(&read.borrow())),
             move |value, _| set(&mut write.borrow_mut(), value as u32),
         )
-        .default_value(100.)
+        .own(draft, key)
     };
     SettingGroup::new()
         .title("Text")
@@ -161,6 +187,7 @@ fn text_group(draft: &Draft, sizes: &Sizes, fonts: Vec<SharedString>, code_size:
         ))
         .item(switch(
             draft,
+            "ligatures",
             "Ligatures",
             "Pairs such as -> and != are drawn as one sign where the code font has one. Terminals draw every character apart.",
             |s| s.ligatures,
@@ -170,11 +197,11 @@ fn text_group(draft: &Draft, sizes: &Sizes, fonts: Vec<SharedString>, code_size:
         .item(SettingItem::new("Text size in Changes", size(Kind::Changes)))
         .item(SettingItem::new("Text size in terminals", size(Kind::Terminal)))
         .item(
-            SettingItem::new("Letter spacing in terminals", percent(|s| s.terminal_letter_spacing, |s, v| s.terminal_letter_spacing = v))
+            SettingItem::new("Letter spacing in terminals", percent("terminal_letter_spacing", |s| s.terminal_letter_spacing, |s, v| s.terminal_letter_spacing = v))
                 .description("The width of a terminal's cell, in percent of the font's. Below 100 the letters come closer."),
         )
         .item(
-            SettingItem::new("Line height in terminals", percent(|s| s.terminal_line_height, |s, v| s.terminal_line_height = v))
+            SettingItem::new("Line height in terminals", percent("terminal_line_height", |s| s.terminal_line_height, |s, v| s.terminal_line_height = v))
                 .description("The height of a terminal's cell, in percent of the font's."),
         )
 }
@@ -191,7 +218,6 @@ fn pages(
     fonts: Vec<SharedString>,
     code_size: f32,
 ) -> Vec<SettingPage> {
-    let default = state::Settings::default();
     let idle = {
         let (read, write) = (draft.clone(), draft.clone());
         SettingField::number_input(
@@ -199,7 +225,7 @@ fn pages(
             move |_| f64::from(read.borrow().lsp_idle_minutes),
             move |value, _| write.borrow_mut().lsp_idle_minutes = value as u32,
         )
-        .default_value(f64::from(default.lsp_idle_minutes))
+        .own(draft, "lsp_idle_minutes")
     };
     let fetch = {
         let (read, write) = (draft.clone(), draft.clone());
@@ -210,7 +236,7 @@ fn pages(
         SettingField::dropdown(options, move |_| read.borrow().fetch_minutes.to_string().into(), move |value, _| {
             write.borrow_mut().fetch_minutes = value.parse().unwrap_or(0)
         })
-        .default_value(SharedString::from(default.fetch_minutes.to_string()))
+        .own(draft, "fetch_minutes")
     };
     let tab_limit = {
         let (read, write) = (draft.clone(), draft.clone());
@@ -221,7 +247,7 @@ fn pages(
         SettingField::dropdown(options, move |_| read.borrow().tab_limit.to_string().into(), move |value, _| {
             write.borrow_mut().tab_limit = value.parse().unwrap_or(0)
         })
-        .default_value(SharedString::from(default.tab_limit.to_string()))
+        .own(draft, "tab_limit")
     };
     let token_warn = {
         let (read, write) = (draft.clone(), draft.clone());
@@ -232,7 +258,7 @@ fn pages(
         SettingField::dropdown(options, move |_| read.borrow().token_warn_k.to_string().into(), move |value, _| {
             write.borrow_mut().token_warn_k = value.parse().unwrap_or(0)
         })
-        .default_value(SharedString::from(default.token_warn_k.to_string()))
+        .own(draft, "token_warn_k")
     };
     let blame_place = {
         let (read, write) = (draft.clone(), draft.clone());
@@ -240,7 +266,7 @@ fn pages(
         SettingField::dropdown(options, move |_| SharedString::from(if read.borrow().blame_at_line_end { "line" } else { "header" }), move |value, _| {
             write.borrow_mut().blame_at_line_end = value.as_ref() == "line"
         })
-        .default_value(SharedString::from("line"))
+        .own(draft, "blame_at_line_end")
     };
     let notices_at = {
         let (read, write) = (draft.clone(), draft.clone());
@@ -251,7 +277,7 @@ fn pages(
         SettingField::dropdown(options, move |_| read.borrow().notices_at.clone().into(), move |value, _| {
             write.borrow_mut().notices_at = value.to_string()
         })
-        .default_value(SharedString::from(default.notices_at.clone()))
+        .own(draft, "notices_at")
     };
     let restore_with = {
         let (read, write) = (draft.clone(), draft.clone());
@@ -259,7 +285,7 @@ fn pages(
         SettingField::dropdown(options, move |_| SharedString::from(if read.borrow().restore_summary { "summary" } else { "full" }), move |value, _| {
             write.borrow_mut().restore_summary = value.as_ref() == "summary"
         })
-        .default_value(SharedString::from("full"))
+        .own(draft, "restore_summary")
     };
     let archive_keep = {
         let (read, write) = (draft.clone(), draft.clone());
@@ -270,7 +296,7 @@ fn pages(
         SettingField::dropdown(options, move |_| read.borrow().archive_keep_days.to_string().into(), move |value, _| {
             write.borrow_mut().archive_keep_days = value.parse().unwrap_or(0)
         })
-        .default_value(SharedString::from(default.archive_keep_days.to_string()))
+        .own(draft, "archive_keep_days")
     };
     let present_zoom = {
         let (read, write) = (draft.clone(), draft.clone());
@@ -278,7 +304,7 @@ fn pages(
         SettingField::dropdown(options, move |_| read.borrow().present_zoom.to_string().into(), move |value, _| {
             write.borrow_mut().present_zoom = value.parse().unwrap_or(100)
         })
-        .default_value(SharedString::from(default.present_zoom.to_string()))
+        .own(draft, "present_zoom")
     };
     let rail_open = {
         let (read, write) = (draft.clone(), draft.clone());
@@ -289,7 +315,7 @@ fn pages(
         SettingField::dropdown(options, move |_| read.borrow().rail_open_ms.to_string().into(), move |value, _| {
             write.borrow_mut().rail_open_ms = value.parse().unwrap_or(750)
         })
-        .default_value(SharedString::from(default.rail_open_ms.to_string()))
+        .own(draft, "rail_open_ms")
     };
     let side = |dark: bool| {
         let (read, write) = (draft.clone(), draft.clone());
@@ -309,7 +335,7 @@ fn pages(
                 }
             },
         )
-        .default_value(SharedString::from(default.theme.clone()))
+        .own(draft, if dark { "dark_theme" } else { "theme" })
     };
     let (light_theme, dark_theme) = (side(false), side(true));
     let appearance = {
@@ -357,6 +383,7 @@ fn pages(
             SettingGroup::new().title("Notices")
                 .item(switch(
                     draft,
+                    "notifications",
                     "Notifications",
                     "A desktop notification when an agent finishes or needs your answer while ideae is not the window in front; in front, the sidebar's Needs you has it.",
                     |s| s.notifications,
@@ -364,6 +391,7 @@ fn pages(
                 ))
                 .item(switch(
                     draft,
+                    "notify_said",
                     "What the agent said, in notifications",
                     "The notification includes the agent's last answer or its question. When off, it says only Finished or Needs your answer, with the task's name. Never while presenting.",
                     |s| s.notify_said,
@@ -371,6 +399,7 @@ fn pages(
                 ))
                 .item(switch(
                     draft,
+                    "show_said",
                     "What the agent said, in Needs you",
                     "In Needs you, a finished task shows the start of its agent's last answer, and a waiting one shows its question. The task's tooltip shows it too. Never while presenting.",
                     |s| s.show_said,
@@ -383,6 +412,7 @@ fn pages(
             SettingGroup::new().title("Sidebar")
                 .item(switch(
                     draft,
+                    "show_side_worktrees",
                     "Worktrees made by agents",
                     "Worktrees an agent creates for itself (Claude Code's subagents, a try in a temporary folder) are listed under the task they came from and open without an agent. When off, they are hidden.",
                     |s| s.show_side_worktrees,
@@ -396,6 +426,7 @@ fn pages(
             SettingGroup::new().title("Title bar")
                 .item(switch(
                     draft,
+                    "show_load",
                     "Load",
                     "CPU and memory, and how much of it the app and its tasks use. Hover it to see every process.",
                     |s| s.show_load,
@@ -403,6 +434,7 @@ fn pages(
                 ))
                 .item(switch(
                     draft,
+                    "show_tokens",
                     "Tokens",
                     "Tokens used in the last 24 hours by the agents of the tasks in this window.",
                     |s| s.show_tokens,
@@ -411,6 +443,7 @@ fn pages(
                 // macOS has its own at the top of the screen.
                 .items((!cfg!(target_os = "macos")).then(|| switch(
                     draft,
+                    "menu_bar_shown",
                     "Menu bar always shown",
                     "File, Edit, View and the rest always show in the title bar. When off, they are under ☰, or appear when you press Alt.",
                     |s| s.menu_bar_shown,
@@ -420,6 +453,7 @@ fn pages(
             SettingGroup::new().title("Power")
                 .item(switch(
                     draft,
+                    "keep_awake",
                     "Keep the system awake while agents work",
                     "While an agent works, or a setup or a check runs, the system does not go to sleep for being left alone; the screen still dims and locks. A closed lid sleeps all the same.",
                     |s| s.keep_awake,
@@ -427,6 +461,7 @@ fn pages(
                 ))
                 .item(switch(
                     draft,
+                    "keep_awake_on_battery",
                     "Also on the battery",
                     "Off: only while plugged in.",
                     |s| s.keep_awake_on_battery,
@@ -434,6 +469,7 @@ fn pages(
                 ))
                 .item(switch(
                     draft,
+                    "battery_hint",
                     "Say when the battery runs low",
                     "Once, when the battery drops to 30% while unplugged: a notice suggesting Power Save Mode, with a button to turn it on.",
                     |s| s.battery_hint,
@@ -442,6 +478,7 @@ fn pages(
         ).group(
             SettingGroup::new().title("Updates").item(switch(
                 draft,
+                "check_updates",
                 "Check for updates",
                 "From time to time the app checks GitHub for a newer release; a build of a checkout, for new commits of its main branch, which one click pulls and builds.",
                 |s| s.check_updates,
@@ -453,6 +490,7 @@ fn pages(
             layers,
             switch(
                 draft,
+                "agent_lsp",
                 "Agents' language servers",
                 "Language servers agents run for themselves, such as Claude Code's LSP plugins: one rust-analyzer or the like per agent. They let an agent jump to definitions, but each takes a lot of memory. Applies to agents started after Save.",
                 |s| s.agent_lsp,
@@ -461,6 +499,7 @@ fn pages(
             [
                 switch(
                     draft,
+                    "context_dial",
                     "Context dial on tasks",
                     "A dial next to each task in the sidebar showing how full its agent's context is.",
                     |s| s.context_dial,
@@ -468,6 +507,7 @@ fn pages(
                 ),
                 switch(
                     draft,
+                    "context_on_tab",
                     "Context dial on the agent's tab",
                     "A dial on the agent tab of the open task showing how full its context is.",
                     |s| s.context_on_tab,
@@ -480,6 +520,7 @@ fn pages(
             SettingGroup::new().title("New tasks")
                 .item(switch(
                     draft,
+                    "copy_env",
                     "Copy .env files",
                     "New worktrees get copies of the main checkout's ignored .env* files, unless the project's settings list other files to copy.",
                     |s| s.copy_env,
@@ -487,6 +528,7 @@ fn pages(
                 ))
                 .item(switch(
                     draft,
+                    "send_new_prompt",
                     "Send the prompt at once",
                     "The prompt written with a new task is sent once its agent is up. When off, it waits in the agent's input for you to finish and send.",
                     |s| s.send_new_prompt,
@@ -499,7 +541,8 @@ fn pages(
                         SettingField::input(
                             move |_| read.borrow().worktrees_dir.clone().into(),
                             move |value: SharedString, _| write.borrow_mut().worktrees_dir = value.trim().to_string(),
-                        ),
+                        )
+                        .own(draft, "worktrees_dir"),
                     )
                     .description(about_layered(layers, "worktrees_dir", "Empty: beside each repository, in <repository>.worktrees, where the tools of the folders above it still apply. A folder (~/worktrees): one of each project's name in it, as for a repository in a synced folder. New tasks only; a space or a project can name its own."))
                 }),
@@ -510,7 +553,7 @@ fn pages(
                     SettingField::number_input(NumberFieldOptions { min: 0., max: 24. * 60., step: 5. }, move |_| f64::from(read.borrow().question_sleep_minutes), move |value, _| {
                         write.borrow_mut().question_sleep_minutes = value as u32
                     })
-                    .default_value(f64::from(state::Settings::default().question_sleep_minutes))
+                    .own(draft, "question_sleep_minutes")
                 }).description(
                     "Minutes; 0 means never. A question whose agent is neither working nor waiting for an answer, and whose tab is not in front, stops its agent to free its memory. The question stays open, and its agent resumes its conversation when you open it.",
                 ))
@@ -519,7 +562,7 @@ fn pages(
                     SettingField::number_input(NumberFieldOptions { min: 0., max: 365., step: 1. }, move |_| f64::from(read.borrow().question_close_days), move |value, _| {
                         write.borrow_mut().question_close_days = value as u32
                     })
-                    .default_value(f64::from(state::Settings::default().question_close_days))
+                    .own(draft, "question_close_days")
                 }).description(
                     "Days; 0 means never. An open question with no message for this long, neither yours nor its agent's, goes to the closed ones, where it can be picked up again.",
                 )),
@@ -537,6 +580,7 @@ fn pages(
             SettingGroup::new().title("Typing")
                 .item(switch(
                     draft,
+                    "hump_words",
                     "CamelHumps words",
                     "Moving, selecting and deleting by word stop at camelCase humps and snake_case underscores.",
                     |s| s.hump_words,
@@ -544,6 +588,7 @@ fn pages(
                 ))
                 .item(switch(
                     draft,
+                    "complete_as_typed",
                     "Completions as you type",
                     "The language server's suggestions appear as you type. When off, ask for them with Ctrl+Space.",
                     |s| s.complete_as_typed,
@@ -551,6 +596,7 @@ fn pages(
                 ))
                 .item(switch(
                     draft,
+                    "format_on_save",
                     "Reformat on save",
                     "Ctrl+S asks the language server to reformat the file before saving. The save made when you leave a file does not reformat.",
                     |s| s.format_on_save,
@@ -560,6 +606,7 @@ fn pages(
             SettingGroup::new().title("Tabs")
                 .item(switch(
                     draft,
+                    "preview_tabs",
                     "Preview tab",
                     "Files opened just to look at (a jump to a definition or usage, a search result, a click in Files) share one tab in italics, which the next such file replaces. Edit the file or double-click the tab to keep it.",
                     |s| s.preview_tabs,
@@ -572,6 +619,7 @@ fn pages(
             SettingGroup::new().title("Shown in the code")
                 .item(switch(
                     draft,
+                    "semantic_colors",
                     "Colors from the language server",
                     "Names are colored by what the server knows they are (a type, a parameter, a method), on top of the syntax colors.",
                     |s| s.semantic_colors,
@@ -579,6 +627,7 @@ fn pages(
                 ))
                 .item(switch(
                     draft,
+                    "inlay_hints",
                     "Hints from the language server",
                     "Inferred types after names, and parameter names before arguments, shown inline in the code.",
                     |s| s.inlay_hints,
@@ -589,6 +638,7 @@ fn pages(
                 ))
                 .item(switch(
                     draft,
+                    "gutter_since_base",
                     "Gutter marks against the base branch",
                     "The marks beside the line numbers show everything the task changed since it branched off, not only since the last commit.",
                     |s| s.gutter_since_base,
@@ -599,6 +649,7 @@ fn pages(
             SettingGroup::new().title("Diffs")
                 .item(switch(
                     draft,
+                    "diff_unified",
                     "Unified diff",
                     "The Changes tab opens with old and new lines one above the other instead of side by side.",
                     |s| s.diff_unified,
@@ -606,6 +657,7 @@ fn pages(
                 ))
                 .item(switch(
                     draft,
+                    "diff_ignore_whitespace",
                     "Ignore whitespace",
                     "Diffs hide changes to spaces, tabs, line endings and blank lines, like GitHub's \"Hide whitespace\". Staging or reverting a single change then applies only what you see.",
                     |s| s.diff_ignore_whitespace,
@@ -614,6 +666,7 @@ fn pages(
         ).group(
             SettingGroup::new().title("Conflicts").item(switch(
                 draft,
+                "conflicts_to_agent",
                 "Conflicts go to the agent",
                 "A pull, rebase, cherry-pick or revert that would conflict is not started; the agent is asked to do it and resolve the conflicts instead. When off, you are only told.",
                 |s| s.conflicts_to_agent,
@@ -625,7 +678,7 @@ fn pages(
                     "Keeps origin's main branch up to date in the background, so each task can show how far behind it is.",
                 ))
                 .item({
-                    let row = switch(draft, "Pull request status", "", |s| s.pr_status, |s, v| s.pr_status = v);
+                    let row = switch(draft, "pr_status", "Pull request status", "", |s| s.pr_status, |s, v| s.pr_status = v);
                     row.description(about_layered(layers, "pull_requests", "Asks gh about each task's pull request and shows its status on the task's row. A space or a project can turn it off or on for itself."))
                 }),
         ),
@@ -633,6 +686,7 @@ fn pages(
             SettingGroup::new().title("Servers").items(servers),
             SettingGroup::new().title("Sharing").item(switch(
                 draft,
+                "lsp_separate",
                 "A language server for each task",
                 "Off, the tasks of a project share one server per language: a task's worktree is one more folder of it, and what they have alike (the standard library, the dependencies) is read once, a third of the memory for three tasks. rust-analyzer, clangd, gopls, basedpyright and the TypeScript server; the others run one per task anyway. Turn it on if a shared server gets something wrong.",
                 |s| s.lsp_separate,
@@ -648,6 +702,7 @@ fn pages(
             .default_open(true)
             .group(SettingGroup::new().title("Learning").item(switch(
                 draft,
+                "learn_keys",
                 "Learn the keys",
                 "A command that has keys, done with the mouse (a menu, the command palette, a button), shows its keys large at the bottom of the window for a moment, as JetBrains' Key Promoter.",
                 |s| s.learn_keys,
@@ -686,6 +741,7 @@ fn pages(
                 SettingGroup::new().title("Kept out of sight")
                     .item(switch(
                         draft,
+                        "present_rail",
                         "Sidebar as a rail",
                         "The remaining tasks show as a narrow rail with the start of their names; rest the pointer on it to see the whole list.",
                         |s| s.present_rail,
@@ -693,6 +749,7 @@ fn pages(
                     ))
                     .item(switch(
                         draft,
+                        "present_veil",
                         "Hide files git ignores",
                         "Files git ignores (keys, local settings) are left out of the Files tree, and their contents are hidden behind a notice until you ask to see them; so are the tabs of your own browser.",
                         |s| s.present_veil,
@@ -700,6 +757,7 @@ fn pages(
                     ))
                     .item(switch(
                         draft,
+                        "present_hide_readouts",
                         "Hide load and tokens",
                         "The title bar's load and token readouts are hidden while presenting.",
                         |s| s.present_hide_readouts,
@@ -726,7 +784,8 @@ fn browser_page(draft: &Draft, layers: &LayersDraft) -> SettingPage {
                     "Links open in",
                     SettingField::dropdown(options, move |_| SharedString::from(Some(read.borrow().links_open_in.clone()).filter(|v| !v.is_empty()).unwrap_or_else(|| "tab".into())), move |v: SharedString, _| {
                         write.borrow_mut().links_open_in = if v.as_ref() == "tab" { String::new() } else { v.to_string() }
-                    }),
+                    })
+                    .own(draft, "links_open_in"),
                 )
                 .description(about_layered(layers, "links_open_in", "A task's links (its ticket, its pull request, an address in its terminal, its chat or a Markdown file) open in the system's browser, or in a tab of your own browser in the task: one for each space, your logins apart from other spaces' and out of agents' reach. This machine's addresses open in the task's own browser either way."))
             }).item({
@@ -735,7 +794,8 @@ fn browser_page(draft: &Draft, layers: &LayersDraft) -> SettingPage {
                     "Sites for the system's browser",
                     SettingField::input(move |_| read.borrow().system_hosts.join(" ").into(), move |value: SharedString, _| {
                         write.borrow_mut().system_hosts = value.split([' ', ',']).map(str::trim).filter(|h| !h.is_empty()).map(str::to_string).collect()
-                    }),
+                    })
+                    .own(draft, "system_hosts"),
                 )
                 .description("Hosts whose links open in the system's browser even when links open in tabs: sites your own browser cannot sign you in to (a passkey, a security key, a certificate). Space-parted; *.example.com for a domain and its subdomains. ↗ on a tab adds its site.")
             }))
@@ -745,11 +805,12 @@ fn browser_page(draft: &Draft, layers: &LayersDraft) -> SettingPage {
                     [("reduce", "Reduced"), ("full", "Full"), ("", "As the system asks")].into_iter().map(|(k, v)| (SharedString::from(k), SharedString::from(v))).collect();
                 SettingItem::new(
                     "Motion",
-                    SettingField::dropdown(options, move |_| SharedString::from(read.borrow().web_motion.clone()), move |v: SharedString, _| write.borrow_mut().web_motion = v.to_string()),
+                    SettingField::dropdown(options, move |_| SharedString::from(read.borrow().web_motion.clone()), move |v: SharedString, _| write.borrow_mut().web_motion = v.to_string()).own(draft, "web_motion"),
                 )
                 .description("Reduced: pages are told you prefer less motion (prefers-reduced-motion), and most sites leave out their transitions and moving parts; scrolling is not animated. A tab is a stream of frames, and each animation slows it. Full: as the site has it. As the system asks: reduced when the system's animations are off, as they were when the browser started. Scrolling follows from the next start of the browser.")
             }).item(switch(
                 draft,
+                "web_reload_after_turn",
                 "Reload the task's site after the agent's turn",
                 "A Web tab showing the task's own site (a port of its services, or one its processes listen on) reloads when the agent finishes a turn. Other pages are left alone. Turn it off if the site reloads by itself and should keep its state.",
                 |s| s.web_reload_after_turn,
@@ -759,11 +820,11 @@ fn browser_page(draft: &Draft, layers: &LayersDraft) -> SettingPage {
                 let (read, write) = (draft.clone(), draft.clone());
                 SettingItem::new(
                     "Stand hosts",
-                    SettingField::input(move |_| read.borrow().stand_hosts.clone().into(), move |value: SharedString, _| write.borrow_mut().stand_hosts = value.trim().to_string()),
+                    SettingField::input(move |_| read.borrow().stand_hosts.clone().into(), move |value: SharedString, _| write.borrow_mut().stand_hosts = value.trim().to_string()).own(draft, "stand_hosts"),
                 )
                 .description(about_layered(layers, "stand_hosts", "A new task's browser starts signed in to the project's stands as its last task was, and to no other site. Found by themselves: localhost, hosts the task's pages were served from by this machine or its containers, hosts that resolve here. Name others here, space-parted: app.test, *.app.test for a domain and its subdomains. A space or a project can name its own; never a repository's .ideae.toml, which could name every site."))
             }).item({
-                let row = switch(draft, "Agents on other machines drive Chrome here", "", |s| s.remote_browser, |s, v| s.remote_browser = v);
+                let row = switch(draft, "remote_browser", "Agents on other machines drive Chrome here", "", |s| s.remote_browser, |s, v| s.remote_browser = v);
                 row.description(about_layered(
                     layers,
                     "remote_browser",
@@ -779,7 +840,7 @@ fn http_page(draft: &Draft) -> SettingPage {
         SettingField::number_input(NumberFieldOptions { min: 1., max: 3600., step: 5. }, move |_| f64::from(read.borrow().http_timeout_secs), move |value, _| {
             write.borrow_mut().http_timeout_secs = value as u32
         })
-        .default_value(f64::from(state::Settings::default().http_timeout_secs))
+        .own(draft, "http_timeout_secs")
     };
     SettingPage::new("HTTP Client")
         .default_open(true)
@@ -789,6 +850,7 @@ fn http_page(draft: &Draft) -> SettingPage {
                 .item(SettingItem::new("Give up after (seconds)", timeout).description("How long a request may take. A line `# @timeout 120` over a request is its own."))
                 .item(switch(
                     draft,
+                    "http_follow_redirects",
                     "Follow redirects",
                     "A 301 or 302 is followed to where it points, up to ten times. Off, or with `# @no-redirect` over a request, the redirect itself is the answer.",
                     |s| s.http_follow_redirects,
@@ -796,6 +858,7 @@ fn http_page(draft: &Draft) -> SettingPage {
                 ))
                 .item(switch(
                     draft,
+                    "http_verify_tls",
                     "Check the certificates of local hosts",
                     "Turn it off for a stand on this machine or a private network that signs its own certificate (localhost, *.localhost, *.local, *.test, 10.x, 192.168.x). Any other host's certificate is checked whatever this says; for one of those, an environment's \"SSLConfiguration\": {\"verifyHostCertificate\": false} in http-client.private.env.json turns the check off for that environment alone.",
                     |s| s.http_verify_tls,
@@ -803,6 +866,7 @@ fn http_page(draft: &Draft) -> SettingPage {
                 ))
                 .item(switch(
                 draft,
+                "http_scripts",
                 "Run a request's JavaScript",
                 "`< {% … %}` before a request and `> {% … %}` on its answer: tests, values kept for the next request (client.global), signatures (crypto). A script reads the request, the answer and the environment, and nothing else: no files, no network.",
                 |s| s.http_scripts,
@@ -1024,10 +1088,12 @@ fn agents_page(draft: &Draft, layers: &LayersDraft, lsp_switch: SettingItem, dia
             d.default_agent = value.to_string();
             d.normalize();
         })
+        .own(draft, "default_agent")
     };
     let quick_agent = {
         let (read, write) = (draft.clone(), draft.clone());
         SettingField::dropdown(choices(true), move |_| read.borrow().quick_agent.clone().into(), move |value: SharedString, _| write.borrow_mut().quick_agent = value.to_string())
+            .own(draft, "quick_agent")
     };
     let several = draft.borrow().agents.len() > 1;
     let mut choose = SettingGroup::new().title("Which one");
@@ -1058,12 +1124,13 @@ fn agents_page(draft: &Draft, layers: &LayersDraft, lsp_switch: SettingItem, dia
                     SettingField::number_input(NumberFieldOptions { min: 0., max: 24. * 60., step: 5. }, move |_| f64::from(read.borrow().agent_idle_minutes), move |value, _| {
                         write.borrow_mut().agent_idle_minutes = value as u32
                     })
-                    .default_value(f64::from(state::Settings::default().agent_idle_minutes))
+                    .own(draft, "agent_idle_minutes")
                 })
                 .description("Minutes; 0 means never. A chat agent that is neither working nor waiting for an answer, in a task you have not opened for this long, is stopped to free its memory (hundreds of MB each). Its conversation is kept, and it resumes when you open the task."),
             )
             .item(switch(
                 draft,
+                "sleep_terminal_agents",
                 "Terminal agents too",
                 "Claude Code in a terminal is stopped the same way, unless it has something of its own running: a command in the background, a timer it set, text you typed and did not send. Its tab says it is asleep; opening the task resumes its session. Agents that do not report their status, or whose session is not known, keep running.",
                 |s| s.sleep_terminal_agents,
@@ -1075,15 +1142,16 @@ fn agents_page(draft: &Draft, layers: &LayersDraft, lsp_switch: SettingItem, dia
                     SettingField::number_input(NumberFieldOptions { min: 0., max: 24. * 60., step: 5. }, move |_| f64::from(read.borrow().agent_unanswered_minutes), move |value, _| {
                         write.borrow_mut().agent_unanswered_minutes = value as u32
                     })
-                    .default_value(f64::from(state::Settings::default().agent_unanswered_minutes))
+                    .own(draft, "agent_unanswered_minutes")
                 })
                 .description("Minutes; 0 means never. A chat agent keeps working after the window closes; its questions come as desktop notifications and wait for you. With a limit, a question is declined after this long and the agent moves on."),
             ),
         )
         .group(SettingGroup::new().title("Agents starting agents").item(switch(
             draft,
+            "agents_start_agents",
             "Agents may start agents",
-            "A task's agent can ask other agents of its project a question, which starts at once, can only read and spends tokens, and propose tasks of their own, which you start or decline in Needs you. For agents started after this is turned on.",
+            "A task's agent can ask other agents of its project a question, which starts at once, can only read and spends your subscription's limit or tokens as any agent does, and propose tasks of their own, which you start or decline in Needs you. For agents started after a change.",
             |s| s.agents_start_agents,
             |s, v| s.agents_start_agents = v,
         )))
@@ -1923,9 +1991,11 @@ mod tests {
         cx.update_window(handle, |_, window, cx| {
             let mut current = state::Settings::default();
             current.agents[0].command = "mine".into();
+            current.keys.insert("quit".into(), "ctrl-alt-q".into());
             let saved = saved.clone();
             open(current, Appearance::Auto, super::KEYS_PAGE, window, cx, move |settings, _, _, _| *saved.borrow_mut() = Some(settings));
             window.render_frame(cx);
+            assert!(window.try_find("key-reset-quit").is_some() && window.try_find("reset-here").is_none(), "a shortcut's own ↺ alone");
             let before = window.find("key-row-recent").bounds();
             assert!(window.try_find("key-row-comment").is_none_or(|row| !row.visible()), "the last keys start below the fold");
             window.scroll("key-row-recent", ScrollDelta::Pixels(point(px(0.), px(-300.))), cx);
@@ -2001,7 +2071,35 @@ mod tests {
             window.click("settings-save", cx);
         })
         .unwrap();
-        assert_eq!(saved.borrow().as_ref().map(|s| s.remote_browser), Some(true));
+        assert_eq!(saved.borrow().as_ref().map(|s| (s.remote_browser, s.is_chosen("remote_browser"))), Some((true, true)));
+    }
+
+    /// A setting chosen at its default has its ↺ all the same, and one
+    /// changed has it at once; ↺ makes it follow the default again.
+    #[gpui_kit::test]
+    fn a_setting_chosen_is_reset(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = window(cx);
+        let saved: Rc<RefCell<Option<state::Settings>>> = Rc::default();
+        cx.update_window(handle, |_, window, cx| {
+            let saved = saved.clone();
+            let mut current = state::Settings::default();
+            current.chosen.insert("remote_browser".into());
+            let at = super::SelectIndex { page_ix: super::BROWSER_PAGE, group_ix: Some(2) };
+            super::open_layered(current, Appearance::Auto, at, Default::default(), super::Scope::Global, Default::default(), window, cx, move |settings, _, _, _, _| *saved.borrow_mut() = Some(settings));
+            window.render_frame(cx);
+            window.render_frame(cx);
+            let resets = |window: &gpui_kit::Window| window.find_all("reset-here").into_iter().filter(|r| r.visible()).count();
+            assert_eq!(resets(window), 1, "chosen, though as by default");
+            window.click("reset-here", cx);
+            window.render_frame(cx);
+            assert_eq!(resets(window), 0);
+            window.click("settings-save", cx);
+        })
+        .unwrap();
+        let saved = saved.borrow();
+        let saved = saved.as_ref().expect("saved");
+        assert!(saved.chosen.is_empty() && !saved.remote_browser);
     }
 
     /// The Agents page lists the profiles; one removed is gone on Save,

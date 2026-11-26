@@ -246,6 +246,8 @@ impl TaskView {
             let to_right = !t.closed_together(pane, |ix, _| ix > from, cx).is_empty();
             let all = !t.closed_together(pane, |_, _| true, cx).is_empty();
             let close = tab.is_some_and(closable);
+            // The task's own agent's tab stands for the task: it is renamed from there too.
+            let renames = tab.is_some_and(|tab| tab.agent == Some(Who::Main));
             let paths = tab.and_then(|tab| match &tab.kind {
                 TabKind::File(file) => {
                     let path = file.read(cx).path.clone();
@@ -263,6 +265,13 @@ impl TaskView {
             let icon = crate::sidebar::menu_icon;
             let menu = match id {
                 Some(_) => menu
+                    .when(renames, |menu| {
+                        let view = view.downgrade();
+                        menu.item(PopupMenuItem::new("Rename task…").icon(icon("pencil")).on_click(move |_, _, cx| {
+                            let _ = view.update(cx, |_, cx| cx.emit(TaskEvent::Rename));
+                        }))
+                        .separator()
+                    })
                     .when(close, |menu| {
                         menu.item(act("Close", |t, id, _, window, cx| {
                             if let Some(ix) = id.and_then(|id| t.ix_of(id)) {

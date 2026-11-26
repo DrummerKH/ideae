@@ -34,6 +34,8 @@ pub struct State {
     pub space_id: Option<String>,
     pub power_saving: bool,
     pub window: Option<WindowPlace>,
+    /// What was chosen of them alone (`Settings::written`).
+    #[serde(with = "chosen_only")]
     pub settings: Settings,
     pub active_task: Option<PathBuf>,
     /// Text size per kind of view.
@@ -109,30 +111,30 @@ pub struct Settings {
     pub agent: String,
     /// Trackers and code hosts for every project (crate::integrations),
     /// the Global layer of the list a space and a project add to.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub integrations: Vec<crate::layers::Entry>,
     /// Tickets off: no marks, questions, variables or tools of tickets,
     /// and the integrations of a team's file stay silent.
-    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    #[serde(default = "yes")]
     pub tickets: bool,
     /// Global's layer of how a ticket's task names its branch, its request's
     /// title, and what the request says of its tickets (crate::layers).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(default)]
     pub branch_template: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(default)]
     pub pr_title: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(default)]
     pub pr_closes: String,
     /// Hosts of dev stands a new task's browser is signed in to besides
     /// those found (browser/seed.rs): Global's layer of `stand_hosts`.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(default)]
     pub stand_hosts: String,
     /// Global's layer of `links_open_in`: system, tab; empty for the default.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(default)]
     pub links_open_in: String,
     /// Sites a task's links always open in the system's browser, whatever
     /// `links_open_in` says: ones the user's own browser cannot sign in to.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub system_hosts: Vec<String>,
     /// The agents to choose from (agents/mod.rs); none, and tasks get a
     /// plain shell. `--agent` and `--no-agent` on the command line win.
@@ -143,20 +145,17 @@ pub struct Settings {
     pub default_agent: String,
     /// The one asked one-shot questions (commit messages, the variants'
     /// judge); empty for the default.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(default)]
     pub quick_agent: String,
     /// Language servers (program names) never started.
     pub lsp_off: Vec<String>,
     /// Where tasks' worktrees go, a folder of each project's name in it;
     /// empty: beside each repository.
-    #[serde(skip_serializing_if = "String::is_empty")]
     pub worktrees_dir: String,
     /// The hints said no more of, in every project ("check", "setup").
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub hints_off: Vec<String>,
     /// For a language with more than one server (`lsp::ALTERNATIVES`), the
     /// one it runs, by the language's key; none, the first.
-    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub lsp_choice: std::collections::BTreeMap<String, String>,
     /// A licence key typed in Settings, on its way to the sealed store
     /// (`secrets`), never written here: empty to remove the one kept.
@@ -218,7 +217,6 @@ pub struct Settings {
     /// The theme drawn while light, by the name of its family: "Ayu", "Gruvbox"…
     pub theme: String,
     /// The one drawn while dark; empty for the same family as [`Self::theme`].
-    #[serde(skip_serializing_if = "String::is_empty")]
     pub dark_theme: String,
     /// A new task's prompt is sent once its agent is up, not left in the
     /// agent's input to finish.
@@ -278,11 +276,9 @@ pub struct Settings {
     pub diff_files_width: f32,
     /// How much of a file's room its text takes beside its drawing, by what
     /// it is drawn as ("markdown", "svg", "table", "mermaid"), as last dragged.
-    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub split_shares: std::collections::BTreeMap<String, f32>,
     /// How a file is shown when it opens, by what it is drawn as, as last
     /// chosen: "code", "split", "preview".
-    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub file_looks: std::collections::BTreeMap<String, String>,
     /// Changed files as a list of paths, not a tree of folders: in the
     /// Changes panel and beside a diff.
@@ -332,7 +328,7 @@ pub struct Settings {
     pub agents_welcomed: bool,
     /// Agents' own files (`~/.kimi-code/config.toml`) not to be offered
     /// ideae's hooks again (agents/own_config.rs).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub agent_hooks_declined: Vec<String>,
     /// Edit prediction by a local model (predict/): None until the offer
     /// to turn it on is answered.
@@ -341,10 +337,11 @@ pub struct Settings {
     pub prediction_model: String,
     /// Linux and Windows: the menu names stay in the title bar; off, they are behind ☰.
     pub menu_bar_shown: bool,
-}
-
-fn is_true(on: &bool) -> bool {
-    *on
+    /// The settings chosen, by their names in the state: written even at
+    /// their default, which the others follow when it changes. ↺ takes
+    /// one out (`Settings::reset`).
+    #[serde(skip)]
+    pub chosen: std::collections::BTreeSet<String>,
 }
 
 fn yes() -> bool {
@@ -378,7 +375,7 @@ impl Default for Settings {
             lsp_idle_minutes: 15,
             agent_idle_minutes: 30,
             sleep_terminal_agents: false,
-            agents_start_agents: false,
+            agents_start_agents: true,
             question_sleep_minutes: 15,
             question_close_days: 3,
             agent_unanswered_minutes: 0,
@@ -449,6 +446,7 @@ impl Default for Settings {
             edit_prediction: None,
             prediction_model: "auto".into(),
             menu_bar_shown: false,
+            chosen: Default::default(),
         }
     }
 }
@@ -501,6 +499,153 @@ impl Settings {
     }
 }
 
+/// In the state's settings: the keys chosen, of a build that keeps what was
+/// chosen (beside them only the Machine layer, for a daemon there). A
+/// state without it has every setting, the defaults of then among them.
+const CHOSEN_ONLY: &str = "chosen_only";
+
+/// Defaults of the builds that wrote every setting, where they are not
+/// the ones now: a state of then at one of them had it by default.
+const DEFAULTS_BEFORE: &[(&str, fn() -> serde_json::Value)] = &[("agents_start_agents", || false.into())];
+
+type Fields = serde_json::Map<String, serde_json::Value>;
+
+fn fields(settings: &Settings) -> Fields {
+    match serde_json::to_value(settings) {
+        Ok(serde_json::Value::Object(all)) => all,
+        _ => Fields::new(),
+    }
+}
+
+impl Settings {
+    pub fn is_chosen(&self, key: &str) -> bool {
+        self.chosen.contains(key)
+    }
+
+    /// As the state keeps them: what was chosen, and what is not as by
+    /// default (set by no hand: a state's of before, normalized).
+    pub fn written(&self) -> serde_json::Result<serde_json::Value> {
+        let serde_json::Value::Object(mut all) = serde_json::to_value(self)? else {
+            return Err(serde::ser::Error::custom("the settings are not a map"));
+        };
+        let default = fields(&Settings::default());
+        let chosen: Vec<String> = all.iter().filter(|(k, v)| self.chosen.contains(*k) || default.get(*k) != Some(*v)).map(|(k, _)| k.clone()).collect();
+        // The Machine layer and the profiles whole: a daemon there makes its store of state.json
+        // (StoreOpenHere), knowing no defaults. Read back, they are not chosen for being there.
+        let machine = |k: &str| k == "agents" || ideae_core::store::migrate::MACHINE_FIELDS.contains(&k);
+        all.retain(|k, _| chosen.contains(k) || machine(k));
+        all.insert(CHOSEN_ONLY.into(), chosen.into());
+        Ok(serde_json::Value::Object(all))
+    }
+
+    /// Read from the state: what it has is chosen; of a state of before,
+    /// what was not as by default then (`DEFAULTS_BEFORE`), the others as
+    /// by default now.
+    pub fn read(value: serde_json::Value) -> Result<Settings, serde_json::Error> {
+        let serde_json::Value::Object(mut given) = value else { return serde_json::from_value(value) };
+        let listed = given.remove(CHOSEN_ONLY);
+        if let Some(serde_json::Value::Array(chosen)) = &listed {
+            let chosen: Vec<&str> = chosen.iter().filter_map(serde_json::Value::as_str).collect();
+            given.retain(|k, _| chosen.contains(&k.as_str()));
+        } else if listed.is_none() {
+            let before: Vec<(String, serde_json::Value)> = DEFAULTS_BEFORE.iter().map(|(k, v)| (k.to_string(), v())).collect();
+            for (k, v) in &before {
+                given.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            let mut then: Settings = serde_json::from_value(serde_json::Value::Object(given))?;
+            then.normalize();
+            let mut by_default = fields(&Settings::default());
+            by_default.extend(before);
+            given = fields(&then).into_iter().filter(|(k, v)| by_default.get(k) != Some(v)).collect();
+        }
+        // What is not there is as by default, not as an older state's missing field reads.
+        let mut all = fields(&Settings::default());
+        let chosen = given.keys().cloned().collect();
+        all.extend(given);
+        let mut settings: Settings = serde_json::from_value(serde_json::Value::Object(all))?;
+        settings.chosen = chosen;
+        Ok(settings)
+    }
+
+    /// One setting back to its default, not chosen any more.
+    pub fn reset(&mut self, key: &str) {
+        self.chosen.remove(key);
+        let mut all = fields(self);
+        match fields(&Settings::default()).remove(key) {
+            Some(default) => all.insert(key.into(), default),
+            None => all.remove(key),
+        };
+        if let Ok(mut back) = serde_json::from_value::<Settings>(serde_json::Value::Object(all)) {
+            back.chosen = std::mem::take(&mut self.chosen);
+            back.lsp_licence = self.lsp_licence.take();
+            // A default agent of the defaults may be a profile removed since.
+            back.normalize();
+            *self = back;
+        }
+    }
+
+    /// What changed since `old` is chosen, but what was taken out of the
+    /// chosen since (reset).
+    fn choose_changed(&mut self, old: &Settings) {
+        if self == old {
+            return;
+        }
+        let (now, was) = (fields(self), fields(old));
+        let keys: std::collections::BTreeSet<&String> = now.keys().chain(was.keys()).collect();
+        for key in keys {
+            if now.get(key) != was.get(key) && !(old.chosen.contains(key) && !self.chosen.contains(key)) {
+                self.chosen.insert(key.clone());
+            }
+        }
+    }
+
+    /// Those of `machine` (the store's Machine layer, every field it keeps)
+    /// taken in: one another window changed is chosen, or not when it is at
+    /// its default now; the others keep their marks.
+    pub fn take_machine(&mut self, machine: &Fields) -> serde_json::Result<()> {
+        let default = fields(&Settings::default());
+        let mut all = fields(self);
+        let changed: Vec<&String> = machine.iter().filter(|(k, v)| all.get(*k) != Some(*v)).map(|(k, _)| k).collect();
+        for (k, v) in machine {
+            all.insert(k.clone(), v.clone());
+        }
+        let mut taken: Settings = serde_json::from_value(serde_json::Value::Object(all))?;
+        taken.chosen = std::mem::take(&mut self.chosen);
+        taken.lsp_licence = self.lsp_licence.take();
+        for k in changed {
+            if default.get(k) == machine.get(k) {
+                taken.chosen.remove(k);
+            } else {
+                taken.chosen.insert(k.clone());
+            }
+        }
+        *self = taken;
+        Ok(())
+    }
+}
+
+/// The state's settings: what was chosen alone, every field when read.
+mod chosen_only {
+    use super::Settings;
+    use serde::{Deserialize as _, Serialize as _};
+
+    pub fn serialize<S: serde::Serializer>(settings: &Settings, to: S) -> Result<S::Ok, S::Error> {
+        settings.written().map_err(serde::ser::Error::custom)?.serialize(to)
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(from: D) -> Result<Settings, D::Error> {
+        Settings::read(serde_json::Value::deserialize(from)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// The state as the machine's store takes it in (crate::machine): every
+/// setting it keeps, at its default too, not only those chosen.
+pub fn for_store(state: &State) -> serde_json::Result<serde_json::Value> {
+    let mut value = serde_json::to_value(state)?;
+    value["settings"] = serde_json::to_value(&state.settings)?;
+    Ok(value)
+}
+
 static SETTINGS: std::sync::RwLock<Option<Settings>> = std::sync::RwLock::new(None);
 
 /// The settings in force, readable from any thread.
@@ -539,9 +684,15 @@ pub fn update_profile(id: &str, change: impl FnOnce(&mut crate::agents::Profile)
     }
 }
 
+/// The settings in force from now; what changed of them is chosen, but
+/// what `settings` was reset of (chosen before, not now).
 pub fn set_settings(mut settings: Settings) {
     settings.normalize();
-    *SETTINGS.write().unwrap() = Some(settings);
+    let mut current = SETTINGS.write().unwrap();
+    if let Some(old) = current.as_ref() {
+        settings.choose_changed(old);
+    }
+    *current = Some(settings);
 }
 
 /// The window's size and place. Wayland lets no app choose its position;
@@ -891,11 +1042,107 @@ mod agents_tests {
             ..Default::default()
         };
         let state = State { settings: s, projects: vec![ProjectState { agent: Some("codex".into()), tasks: vec![task], ..Default::default() }], ..Default::default() };
-        let back: State = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        let mut back: State = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert!(back.settings.is_chosen("default_agent"), "what is not as by default is written, so chosen");
+        back.settings.chosen.clear();
         assert!(back == state);
         // What an older state has not: none of it.
         let old: TaskState = serde_json::from_str(r#"{"path":"/w/t"}"#).unwrap();
         assert!(old.sessions.is_empty() && old.agent.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod chosen_tests {
+    use super::*;
+
+    fn written(settings: &Settings) -> serde_json::Value {
+        serde_json::to_value(State { settings: settings.clone(), ..Default::default() }).unwrap()["settings"].clone()
+    }
+
+    fn read(settings: serde_json::Value) -> Settings {
+        serde_json::from_value::<State>(serde_json::json!({ "settings": settings })).unwrap().settings
+    }
+
+    /// A state of before kept every setting: those as by default then are
+    /// nobody's, and follow the default now (agents starting agents, off
+    /// then).
+    #[test]
+    fn a_state_of_before_keeps_what_differs_from_the_default() {
+        let mut old = serde_json::to_value(Settings::default()).unwrap();
+        old["agents_start_agents"] = false.into();
+        old["theme"] = "One".into();
+        let settings = read(old);
+        assert_eq!(settings.chosen.iter().map(String::as_str).collect::<Vec<_>>(), ["theme"]);
+        assert!(settings.agents_start_agents && settings.theme == "One");
+        // Turned on by hand then: as by default now, and chosen.
+        let mut old = serde_json::to_value(Settings::default()).unwrap();
+        old["agents_start_agents"] = true.into();
+        assert!(read(old).is_chosen("agents_start_agents"));
+        // A field an older state had not reads as it did then: chosen when that is not the default.
+        let older = read(serde_json::json!({ "agent": "claude" }));
+        assert_eq!(older.chosen.iter().map(String::as_str).collect::<Vec<_>>(), ["agents_welcomed"]);
+        assert!(older.agents_welcomed);
+    }
+
+    #[test]
+    fn what_was_chosen_is_written_even_at_its_default() {
+        let mut settings = Settings::default();
+        settings.fetch_minutes = 5;
+        settings.chosen.insert("fetch_minutes".into());
+        settings.tab_limit = 20;
+        let json = written(&settings);
+        assert_eq!(json["chosen_only"], serde_json::json!(["fetch_minutes", "tab_limit"]));
+        assert!(json.get("theme").is_none() && json.get("keep_awake").is_some(), "the Machine layer written whole, for a daemon there");
+        let back = read(json);
+        assert_eq!((back.fetch_minutes, back.tab_limit), (5, 20));
+        assert_eq!(back.chosen.iter().map(String::as_str).collect::<Vec<_>>(), ["fetch_minutes", "tab_limit"]);
+        // Chosen at a default that is empty: written all the same.
+        let empty = Settings { chosen: ["links_open_in".to_string(), "tickets".to_string()].into(), ..Default::default() };
+        let back = read(written(&empty));
+        assert!(back.is_chosen("links_open_in") && back.is_chosen("tickets") && back.tickets);
+        // Nothing chosen: the defaults when read, not an older state's.
+        let mut old_default = written(&Settings::default());
+        old_default["keep_awake"] = false.into();
+        assert!(read(old_default).keep_awake, "a Machine field written, not chosen, follows the default");
+        let fresh = read(written(&Settings::default()));
+        assert!(fresh == Settings::default() && !fresh.agents_welcomed);
+    }
+
+    #[test]
+    fn a_reset_follows_the_default_again() {
+        let mut settings = Settings { tab_limit: 20, archive_keep_days: 30, ..Default::default() };
+        settings.chosen.extend(["tab_limit".to_string(), "archive_keep_days".to_string()]);
+        settings.reset("tab_limit");
+        assert_eq!((settings.tab_limit, settings.archive_keep_days), (Settings::default().tab_limit, 30));
+        assert!(!settings.is_chosen("tab_limit") && settings.is_chosen("archive_keep_days"));
+        // Reset and saved: the change back is not taken for a choice.
+        let old = Settings { tab_limit: 20, chosen: ["tab_limit".to_string()].into(), ..Default::default() };
+        let mut now = old.clone();
+        now.reset("tab_limit");
+        now.archive_keep_days = 90;
+        now.choose_changed(&old);
+        assert!(!now.is_chosen("tab_limit"));
+        // Changed to its default, it is chosen: it stays when the default changes.
+        let old = Settings { archive_keep_days: 30, ..Default::default() };
+        let mut now = Settings { archive_keep_days: Settings::default().archive_keep_days, ..old.clone() };
+        now.choose_changed(&old);
+        assert!(now.is_chosen("archive_keep_days") && written(&now).get("archive_keep_days").is_some());
+    }
+
+    /// The machine's settings from another window: one at its default is
+    /// not chosen here, the store keeps every field of the Machine layer.
+    #[test]
+    fn the_machine_s_settings_are_taken_in() {
+        let mut settings = Settings { lsp_idle_minutes: 60, chosen: ["lsp_idle_minutes".to_string(), "keep_awake".to_string()].into(), ..Default::default() };
+        let machine = serde_json::json!({ "lsp_idle_minutes": Settings::default().lsp_idle_minutes, "worktrees_dir": "~/wt", "keep_awake": true });
+        settings.take_machine(machine.as_object().unwrap()).unwrap();
+        assert_eq!((settings.lsp_idle_minutes, settings.worktrees_dir.as_str()), (Settings::default().lsp_idle_minutes, "~/wt"));
+        assert_eq!(settings.chosen.iter().map(String::as_str).collect::<Vec<_>>(), ["keep_awake", "worktrees_dir"], "one unchanged keeps its mark");
+        let state = State { settings: Settings::default(), ..Default::default() };
+        let store = ideae_core::store::migrate::from_state(&for_store(&state).unwrap()).unwrap();
+        assert_eq!(store.settings["keep_awake"], true, "every field of it, not only those chosen");
+        assert!(!store.profiles.is_empty());
     }
 }
 

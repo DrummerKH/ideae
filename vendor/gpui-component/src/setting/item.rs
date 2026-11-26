@@ -280,7 +280,7 @@ impl SettingItem {
                     reset_here,
                     ..
                 } => {
-                    let reset = (reset_here && !disabled && field.is_resettable(cx)).then(|| field.clone());
+                    let reset = ((reset_here || field.resets_beside()) && !disabled && field.is_resettable(cx)).then(|| field.clone());
                     let layout = if options.layout().is_vertical() {
                         Axis::Vertical
                     } else {
@@ -337,7 +337,7 @@ impl SettingItem {
                                             .xsmall()
                                             .ghost()
                                             .label("↺")
-                                            .tooltip("Reset: take the value from the layer below")
+                                            .tooltip(if reset_here { "Reset: take the value from the layer below" } else { "Reset to the default" })
                                             .on_click(move |_, window, cx| field.reset(window, cx)),
                                     )
                                 }),

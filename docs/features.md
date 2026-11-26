@@ -316,8 +316,9 @@ the first question is asked.
 
 ## Agents that start agents
 
-With Settings → Agents → "Agents may start agents" on (it is off at first; it
-reaches agents started after), a task's agent can, through ideae's MCP server
+With Settings → Agents → "Agents may start agents" on (it is on at first; a
+question starts at once and spends your subscription's limit or tokens like
+any agent's turn; a change reaches agents started after), a task's agent can, through ideae's MCP server
 (Claude Code gets it with the hooks), start other agents of the same project
 and wait for what they say; off, it is not shown those tools at all:
 

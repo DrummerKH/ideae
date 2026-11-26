@@ -546,7 +546,7 @@ impl Workspace {
             .map(|(pi, ti)| {
                 let p = &self.projects[pi];
                 let t = &p.tasks[ti];
-                if t.main { format!("{} · {}", p.name, t.branch) } else { format!("{} · {}", p.name, t.label()) }
+                if t.main && t.title.is_empty() { format!("{} · {}", p.name, t.branch) } else { format!("{} · {}", p.name, t.label()) }
             })
             .unwrap_or_else(|| state::APP_ID.into());
         div().flex_1().min_w_0().px_3().truncate().text_sm().text_color(cx.theme().muted_foreground).child(title)

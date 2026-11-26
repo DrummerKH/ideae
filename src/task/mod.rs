@@ -494,6 +494,8 @@ pub enum TaskEvent {
     TeamFile,
     /// Of a question asked aside (agent_tab.rs).
     Asked(Asked),
+    /// Rename task…, from its agent's tab.
+    Rename,
 }
 
 impl EventEmitter<TaskEvent> for TaskView {}

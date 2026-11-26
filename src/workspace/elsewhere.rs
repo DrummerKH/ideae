@@ -246,19 +246,16 @@ impl Workspace {
             self.crew.take_in(&machine.crew, &changes.crew_before);
         }
         if changes.settings || changes.profiles {
-            let mut settings = state::with_settings(|s| serde_json::to_value(s).unwrap_or_default());
-            if let Some(all) = settings.as_object_mut() {
-                if let Some(fields) = machine.settings.as_object().filter(|_| changes.settings) {
-                    for (k, v) in fields {
-                        all.insert(k.clone(), v.clone());
-                    }
-                }
-                if changes.profiles {
-                    all.insert("agents".into(), serde_json::Value::Array(machine.profiles.clone()));
-                }
+            let mut settings = state::settings();
+            let mut fields = serde_json::Map::new();
+            if let Some(machine) = machine.settings.as_object().filter(|_| changes.settings) {
+                fields.extend(machine.clone());
             }
-            match serde_json::from_value(settings) {
-                Ok(settings) => state::set_settings(settings),
+            if changes.profiles {
+                fields.insert("agents".into(), serde_json::Value::Array(machine.profiles.clone()));
+            }
+            match settings.take_machine(&fields) {
+                Ok(()) => state::set_settings(settings),
                 Err(e) => eprintln!("ideae: the machine's settings changed elsewhere not taken in: {e}"),
             }
         }

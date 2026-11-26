@@ -1069,7 +1069,7 @@ mod tests {
 
         let main = super::menus(Shown { task: Some(InHand { main: true, starred: false, ..task }), ..Default::default() });
         assert!(live(&main, "Task", "Star Task") && live(&main, "Task", "Pause Task"));
-        assert!(!live(&main, "Task", "Rename Task…") && !live(&main, "Task", "Archive Task"));
+        assert!(live(&main, "Task", "Rename Task…") && !live(&main, "Task", "Archive Task"), "the main thread is named too, never archived");
 
         // A worktree an agent made for itself is removed, not archived, and has no variants.
         let side = super::menus(Shown { task: Some(InHand { side: true, ..task }), ..Default::default() });
@@ -1166,8 +1166,8 @@ mod bar {
             window.render_frame(cx);
             assert!(window.try_find_by_label("New Task…").is_none() && window.try_find_by_label("Star Task").is_some(), "Task, by the pointer");
 
-            // The main thread has no name of its own to change.
-            click_label(window, "Rename Task…", cx);
+            // The main thread is not archived.
+            click_label(window, "Archive Task", cx);
             window.render_frame(cx);
             assert!(sent.borrow().is_empty() && bar.read(cx).is_open(), "a grey item does nothing");
 

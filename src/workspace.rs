@@ -1907,7 +1907,8 @@ impl Workspace {
     /// A new title for a task; its branch and worktree stay as they are.
     pub fn rename_task_dialog(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
         let Some(entry) = self.entry_mut(path) else { return };
-        let current = entry.label();
+        // The main thread unnamed shows its agent's name or its branch: kept as a title, it would not follow them.
+        let current = if entry.main { entry.title.clone() } else { entry.label() };
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("Task title"));
         input.update(cx, |i, cx| {
             i.set_value(current, window, cx);
@@ -1917,10 +1918,8 @@ impl Workspace {
         let apply = {
             let (input, path) = (input.clone(), path.clone());
             move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+                // Empty: named as by default again (by its agent, its branch).
                 let title = input.read(cx).value().trim().to_string();
-                if title.is_empty() {
-                    return;
-                }
                 // The variants of a task are one task by name.
                 let group = this.entry_mut(&path).map(|entry| entry.group.clone()).unwrap_or_default();
                 for entry in this.projects.iter_mut().flat_map(|p| &mut p.tasks) {
@@ -1928,6 +1927,7 @@ impl Workspace {
                         entry.title = title.clone();
                     }
                 }
+                this.save_later(cx);
                 window.close_dialog(cx);
                 cx.notify();
             }
@@ -1956,7 +1956,7 @@ impl Workspace {
                         v_flex()
                             .gap_1()
                             .child(Input::new(&input))
-                            .child(div().text_xs().text_color(cx.theme().muted_foreground).child("The branch keeps its name.")),
+                            .child(div().text_xs().text_color(cx.theme().muted_foreground).child("The branch keeps its name. Empty: the name its agent gives it.")),
                     )
                 })
                 .footer(h_flex().justify_end().child(Button::new("rename-task").primary().label("Rename").on_click(

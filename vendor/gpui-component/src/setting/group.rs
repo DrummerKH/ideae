@@ -122,7 +122,11 @@ impl SettingGroup {
             .id(SharedString::from(format!("group-{}", options.group_ix())))
             .with_variant(self.variant.unwrap_or(options.group_variant()))
             .when_some(self.title.clone(), |this, title| {
-                this.title(v_flex().gap_1().child(title).when_some(
+                // ideae patch: a group's title stands out from the settings' own,
+                // a line under it across the page.
+                this.title(v_flex().gap_1().pb_1p5().border_b_1().border_color(cx.theme().border).child(
+                    gpui::div().font_semibold().text_color(cx.theme().foreground).child(title),
+                ).when_some(
                     self.description.clone(),
                     |this, description| {
                         this.child(

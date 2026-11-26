@@ -149,6 +149,8 @@ pub struct SettingField<T> {
     /// The first closure reports whether the field is "dirty" (controls the
     /// reset button visibility), the second performs the reset.
     pub(crate) reset_handler: Option<ResetHandler>,
+    /// ideae patch: its ↺ beside it (`reset_beside`).
+    pub(crate) reset_beside: bool,
 }
 
 impl SettingField<bool> {
@@ -283,6 +285,7 @@ impl<T> SettingField<T> {
             set_value: Rc::new(set_value),
             default_value: None,
             reset_handler: None,
+            reset_beside: false,
         }
     }
 
@@ -314,6 +317,25 @@ impl<T> SettingField<T> {
         self.reset_handler = Some((Rc::new(is_dirty), Rc::new(reset)));
         self
     }
+
+    /// ideae patch: a ↺ beside the field while it can be reset.
+    pub fn reset_beside(mut self) -> Self {
+        self.reset_beside = true;
+        self
+    }
+
+    /// ideae patch: `then` runs after each value set, by the field or its reset.
+    pub fn after_set(mut self, then: impl Fn(&mut App) + 'static) -> Self
+    where
+        T: 'static,
+    {
+        let set = self.set_value.clone();
+        self.set_value = Rc::new(move |value, cx| {
+            set(value, cx);
+            then(cx);
+        });
+        self
+    }
 }
 
 impl<T> Styled for SettingField<T> {
@@ -331,6 +353,8 @@ pub trait AnySettingField {
     fn style(&self) -> &StyleRefinement;
     fn is_resettable(&self, cx: &App) -> bool;
     fn reset(&self, window: &mut Window, cx: &mut App);
+    /// ideae patch: its ↺ beside it.
+    fn resets_beside(&self) -> bool;
 }
 
 impl<T: Clone + PartialEq + Send + Sync + 'static> AnySettingField for SettingField<T> {
@@ -384,5 +408,9 @@ impl<T: Clone + PartialEq + Send + Sync + 'static> AnySettingField for SettingFi
         };
 
         (self.set_value)(default_value.clone(), cx)
+    }
+
+    fn resets_beside(&self) -> bool {
+        self.reset_beside
     }
 }

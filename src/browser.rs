@@ -167,6 +167,9 @@ struct Slot {
     /// Listening at the task's port while its Chrome is ended: told to stop
     /// when a tab starts one.
     waker: Mutex<Option<Arc<AtomicBool>>>,
+    /// Its page last pressed so as to open a link apart (`opens_a_tab`), and
+    /// when: a page of no opener a moment after is that page's.
+    clicked: Mutex<Option<(String, Instant)>>,
 }
 
 /// What the task's Chrome tells the task, beside what its tabs show.
@@ -808,6 +811,14 @@ fn note_task_page(owner: &Owner, target: &str, root: &Path) {
     }
 }
 
+/// A press that opens a link in a tab or a window of its own: the middle
+/// button, or the left with Ctrl, Cmd or Shift. Chrome tells no opener of
+/// the page it opens.
+fn opens_a_tab(params: &Value) -> bool {
+    let modifiers = params["modifiers"].as_u64().unwrap_or(0);
+    params["type"] == "mousePressed" && (params["button"] == "middle" || (params["button"] == "left" && modifiers & (2 | 4 | 8) != 0))
+}
+
 /// What the task's Chrome has for the task: pages no tab opened, downloads.
 pub fn page_events(root: &Path) -> async_channel::Receiver<PageEvent> {
     let (tx, rx) = async_channel::unbounded();
@@ -873,7 +884,8 @@ fn watch(chrome: Weak<Chrome>, slot: Arc<Slot>, user: bool) {
             task.and_then(|t| tasks.get(t).cloned())
         };
         socket.set_timeout(Some(Duration::from_millis(200)));
-        type Waiting = Vec<(String, Option<String>, Instant)>;
+        // A page, its opener, and whether it is to be shown in front (opened by a script, not a click).
+        type Waiting = Vec<(String, Option<String>, bool, Instant)>;
         let mut waiting: Waiting = Vec::new();
         // A download's name and the page it came from, by its id.
         let mut downloads: HashMap<String, (String, Option<String>)> = HashMap::new();
@@ -883,11 +895,15 @@ fn watch(chrome: Weak<Chrome>, slot: Arc<Slot>, user: bool) {
                 Some("Target.targetCreated") if params["targetInfo"]["type"] == "page" => {
                     let info = &params["targetInfo"];
                     let id = info["targetId"].as_str().unwrap_or_default().to_string();
-                    waiting.push((id, info["openerId"].as_str().map(str::to_string), Instant::now()));
+                    let opener = info["openerId"].as_str().map(str::to_string);
+                    let front = opener.is_some();
+                    let clicked = || slot.clicked.lock().unwrap().take_if(|(_, at)| at.elapsed() < Duration::from_secs(3)).map(|(page, _)| page);
+                    let opener = opener.or_else(|| (info["url"] != "about:blank").then(clicked).flatten());
+                    waiting.push((id, opener, front, Instant::now()));
                 }
                 Some("Target.targetDestroyed") => {
                     let id = params["targetId"].as_str().unwrap_or_default();
-                    waiting.retain(|(w, _, _)| w != id);
+                    waiting.retain(|(w, ..)| w != id);
                     slot.page_tasks.lock().unwrap().remove(id);
                 }
                 Some("Browser.downloadWillBegin") => {
@@ -950,8 +966,8 @@ fn watch(chrome: Weak<Chrome>, slot: Arc<Slot>, user: bool) {
                 }
             }
             let due = Duration::from_millis(500);
-            while let Some(ix) = waiting.iter().position(|(_, _, at)| at.elapsed() > due) {
-                let (target, opener, _) = waiting.remove(ix);
+            while let Some(ix) = waiting.iter().position(|(.., at)| at.elapsed() > due) {
+                let (target, opener, front, _) = waiting.remove(ix);
                 if chrome.claimed.lock().unwrap().contains(&target) {
                     continue;
                 }
@@ -961,7 +977,7 @@ fn watch(chrome: Weak<Chrome>, slot: Arc<Slot>, user: bool) {
                         if let Some(task) = task {
                             slot.page_tasks.lock().unwrap().insert(target.clone(), task);
                         }
-                        let _ = tx.try_send(PageEvent::Opened { target, by_page: opener.is_some() });
+                        let _ = tx.try_send(PageEvent::Opened { target, by_page: front });
                     }
                     None if user => {
                         let _ = socket.send("Target.closeTarget", json!({ "targetId": target }));
@@ -1705,12 +1721,12 @@ fn run_page(owner: Owner, source: Source, in_tx: &async_channel::Sender<In>, out
     let closing = Arc::new(AtomicBool::new(false));
     {
         let writer = socket.writer()?;
-        let (replies, closing, target_id) = (replies.clone(), closing.clone(), target_id.clone());
+        let (replies, closing, target_id, owner) = (replies.clone(), closing.clone(), target_id.clone(), owner.clone());
         let session = socket.session.clone().unwrap_or_default();
         std::thread::Builder::new().name("cdp-write".into()).spawn(move || {
             // Chrome stays while the page is written to.
             let _keep = (open, chrome);
-            write_page(writer, session, &target_id, out_rx, &replies, &closing);
+            write_page(&owner, writer, session, &target_id, out_rx, &replies, &closing);
         })?;
     }
 
@@ -1869,6 +1885,7 @@ fn read_message(mut msg: Value, target: &str, main_frame: &mut String, in_tx: &a
 /// the last of them; a resize while frames come waits for the size to settle.
 #[allow(clippy::too_many_arguments)]
 fn write_page(
+    owner: &Owner,
     writer: Writer,
     session: String,
     target: &str,
@@ -1943,7 +1960,12 @@ fn write_page(
                     None,
                 )
             }
-            Some(Out::Command(method, params)) => send(method, params, true, None),
+            Some(Out::Command(method, params)) => {
+                if method == "Input.dispatchMouseEvent" && opens_a_tab(&params) {
+                    *slot(owner).clicked.lock().unwrap() = Some((target.to_string(), Instant::now()));
+                }
+                send(method, params, true, None)
+            }
             Some(Out::Raw(mut msg, reply)) => {
                 let id = writer.borrow_mut().next_id();
                 msg["id"] = json!(id);
@@ -4505,8 +4527,8 @@ impl Render for BrowserView {
                     .min_w_0()
                     .relative()
                     .overflow_hidden()
-                    // A screen narrower than the tab sits on the panel's color.
-                    .bg(if device.is_some() { cx.theme().muted } else { gpui_kit::white() })
+                    // A screen narrower than the tab sits on the panel's color; a page not drawn yet on the theme's, not a white flash.
+                    .bg(if device.is_some() { cx.theme().muted } else { cx.theme().background })
                     .track_focus(&self.focus)
                     .cursor(if self.picking { CursorStyle::Crosshair } else { self.cursor })
                     .on_mouse_down(MouseButton::Left, cx.listener(|this, e: &MouseDownEvent, window, cx| this.press(e, window, cx)))
@@ -5138,6 +5160,27 @@ mod tests {
         };
         let _ = out.send(Out::Move(json!({ "type": "mouseMoved", "x": 20., "y": 110. })));
         wait("the link's cursor", &mut |m| matches!(m, In::Cursor(c) if c == "pointer"));
+        // A link Ctrl+clicked, or with the middle button: a tab of its own, behind.
+        for (button, bit, modifiers) in [("left", 1, 2), ("middle", 4, 0)] {
+            for kind in ["mousePressed", "mouseReleased"] {
+                let _ = out.send(Out::Command(
+                    "Input.dispatchMouseEvent",
+                    json!({ "type": kind, "x": 20., "y": 110., "button": button, "buttons": if kind == "mousePressed" { bit } else { 0 }, "clickCount": 1, "modifiers": modifiers }),
+                ));
+            }
+            let asked = Instant::now();
+            loop {
+                assert!(asked.elapsed() < Duration::from_secs(15), "the link opened by the {button} button, offered to the task");
+                match adopted.try_recv() {
+                    Ok(PageEvent::Opened { target, .. }) => {
+                        let _ = call(&out, "Target.closeTarget", json!({ "targetId": target }));
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+        }
 
         mouse("mousePressed", 20., 15.);
         mouse("mouseReleased", 20., 15.);
@@ -5597,6 +5640,23 @@ mod tests {
         assert!(to_b.try_recv().is_err(), "nothing of A's went to B");
         // Whatever the opened page opens is A's too.
         assert_eq!(slot(&owner).page_tasks.lock().unwrap().get(&opened), Some(&a));
+        // A link Ctrl+clicked in A: Chrome tells no opener, it is A's all the same, behind.
+        let link = "document.body.innerHTML = \"<a href='about:blank#ctrl' style='position:fixed;left:0;top:0;width:200px;height:50px;display:block'>link</a>\"";
+        let _ = in_a.send(Out::Command("Runtime.evaluate", json!({ "expression": link })));
+        std::thread::sleep(Duration::from_millis(200));
+        for kind in ["mousePressed", "mouseReleased"] {
+            let _ = in_a.send(Out::Command("Input.dispatchMouseEvent", json!({ "type": kind, "x": 20., "y": 20., "button": "left", "buttons": u32::from(kind == "mousePressed"), "clickCount": 1, "modifiers": 2 })));
+        }
+        let started = Instant::now();
+        loop {
+            assert!(started.elapsed() < Duration::from_secs(10), "the page A's link opened came to A");
+            if let Ok(PageEvent::Opened { by_page, .. }) = to_a.try_recv() {
+                assert!(!by_page, "behind, as a browser opens it");
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(to_b.try_recv().is_err(), "nothing of A's went to B");
     }
 
     /// DevTools for a page of the user's Chrome, which has no port to serve
