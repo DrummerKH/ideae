@@ -1138,6 +1138,33 @@ impl Workspace {
 
     // ------------------------------------------------------------ lookup
 
+    /// Why a task of this title cannot be made in the project: one is on its
+    /// branch already. Asked by New task before it closes, not to lose what was typed.
+    fn title_in_the_way(&self, project: usize, title: &str) -> Option<String> {
+        let p = self.projects.get(project)?;
+        let branch = naming::branch_name_as(title, &p.values().branch);
+        self.task_in_the_way(project, &git::task_worktree_dir(&p.path, &branch), &branch)
+    }
+
+    /// Why a new task cannot go to `path` on `branch`: a task is there
+    /// already. Two rows of one path would be one task twice.
+    pub(super) fn task_in_the_way(&self, project: usize, path: &Path, branch: &str) -> Option<String> {
+        let there = self.projects.iter().flat_map(|p| &p.tasks).find(|t| t.path == path);
+        let on_it = || self.projects.get(project)?.tasks.iter().find(|t| !t.main && t.branch == branch);
+        let t = there.or_else(on_it)?;
+        Some(format!("A task is on {branch} already: {}. Switch to it, or give the new one words of its own.", t.label()))
+    }
+
+    /// The row of a task that could not be made, and none other of its path.
+    pub(super) fn drop_unmade(&mut self, path: &Path) {
+        for p in &mut self.projects {
+            if let Some(ti) = p.tasks.iter().rposition(|t| t.path == path && t.busy.is_some()) {
+                p.tasks.remove(ti);
+                return;
+            }
+        }
+    }
+
     pub fn find(&self, path: &Path) -> Option<(usize, usize)> {
         self.projects.iter().enumerate().find_map(|(pi, p)| {
             p.tasks.iter().position(|t| t.path == path).map(|ti| (pi, ti))
@@ -1965,6 +1992,10 @@ impl Workspace {
             let (this, filled_in, as_filled) = (this.clone(), filled_in.clone(), as_filled.clone());
             move |window: &mut Window, cx: &mut App| {
                 let Some((title, text, notes, agents)) = filled_in(cx) else { return };
+                if let Some(why) = this.upgrade().and_then(|w| w.read(cx).title_in_the_way(project, &title)).filter(|_| notes.len() < 2) {
+                    window.push_notification(Notification::error(why).title("Could not create the task"), cx);
+                    return;
+                }
                 window.close_dialog(cx);
                 let send = as_filled(&text);
                 let _ = this.update(cx, |this, cx| {
@@ -1980,6 +2011,10 @@ impl Workspace {
                 // Ctrl+Enter in the prompt; Enter in the title is the dialog's.
                 let InputEvent::PressEnter { secondary: true, .. } = event else { return };
                 if let Some((title, text, notes, agents)) = filled_in(cx) {
+                    if let Some(why) = this.title_in_the_way(project, &title).filter(|_| notes.len() < 2) {
+                        window.push_notification(Notification::error(why).title("Could not create the task"), cx);
+                        return;
+                    }
                     window.close_dialog(cx);
                     this.send_next_prompt = as_filled(&text);
                     this.create_task(project, title, text, notes, agents, window, cx);
@@ -1996,6 +2031,20 @@ impl Workspace {
         let integrations = crate::integrations::of_resolved(&p.resolved);
         let template = p.values().branch.clone();
         let keyed_history = p.keys_in_history == Some(true);
+        // origin's branches as last fetched, read once as the dialog opens, no
+        // network: what Create will start from is said before it. Create asks origin itself.
+        let on_origin: Rc<RefCell<OnOrigin>> = Rc::default();
+        {
+            let (repo, on_origin) = (repo.clone(), on_origin.clone());
+            cx.spawn_in(window, async move |_, cx| {
+                // On the app's executor: a thread of its own would wake the dialog
+                // from outside it, which a test's scheduler takes for a race.
+                let read = cx.background_spawn(async move { OnOrigin::read(&repo) }).await;
+                *on_origin.borrow_mut() = read;
+                let _ = cx.update(|window, _| window.refresh());
+            })
+            .detach();
+        }
         // The same ticket's task, open or archived: one ticket, one task.
         let existing: Rc<RefCell<Option<Existing>>> = Rc::default();
         let read_texts: Rc<RefCell<std::collections::HashMap<String, String>>> = Rc::default();
@@ -2163,7 +2212,7 @@ impl Workspace {
         window.open_dialog(cx, move |dialog, _, cx| {
             let (input, prompt, submit, focused) = (input.clone(), prompt.clone(), submit.clone(), focused.clone());
             let (same, go) = (existing.borrow().clone(), this_for_existing.clone());
-            let template = template.clone();
+            let (template, on_origin) = (template.clone(), on_origin.clone());
             let clipboard = from_clipboard.clone().filter(|_| input.read(cx).value().trim().is_empty());
             let (count, notes, agents) = (count.clone(), notes.clone(), agents.clone());
             let _ = &listening;
@@ -2196,6 +2245,10 @@ impl Workspace {
                                     .text_color(cx.theme().muted_foreground)
                                     .child(branch_hint(&input.read(cx).value(), &template)),
                             )
+                            // Not to be missed: someone's work may be on it.
+                            .when_some(origin_note(&input.read(cx).value(), &template, &on_origin.borrow()), |form, said| {
+                                form.child(div().text_xs().text_color(cx.theme().warning).child(said))
+                            })
                             .when_some(same.clone(), |form, same| form.child(existing_row(same, go.clone(), cx)))
                             .when_some(clipboard.clone(), |form, (key, url)| {
                                 let input = input.clone();
@@ -2345,10 +2398,15 @@ impl Workspace {
         if let Some((kind, number, url)) = title.split_whitespace().find_map(|w| crate::integrations::request_of_url(w).map(|(k, n)| (k, n, w.to_string()))) {
             return self.create_request_task(project, kind, number, url, prompt, agents, given, window, cx);
         }
-        let Some(p) = self.projects.get_mut(project) else { return };
+        let Some(p) = self.projects.get(project) else { return };
         let branch = naming::branch_name_as(&title, &p.values().branch);
         let (repo, base) = (p.path.clone(), p.values().base.clone());
         let path = git::task_worktree_dir(&repo, &branch);
+        if let Some(why) = self.task_in_the_way(project, &path, &branch) {
+            window.push_notification(Notification::error(why).title("Could not create the task"), cx);
+            return;
+        }
+        let p = &mut self.projects[project];
         p.collapsed = false;
         let links = crate::integrations::tickets::links_for_task(&title, &prompt, &crate::integrations::of_resolved(&p.resolved));
         p.tasks.push(TaskEntry {
@@ -2375,8 +2433,8 @@ impl Workspace {
             let result = cx
                 .background_spawn(async move {
                     let copy = crate::project_config::resolve(&repo).config.task.copy;
-                    let made = git::create_task_worktree(&repo, &branch, &base, copy_env && copy.is_none());
-                    if let (Ok(dir), Some(copy)) = (&made, copy) {
+                    let made = git::new_task_worktree(&repo, &branch, &base, copy_env && copy.is_none());
+                    if let (Ok((dir, _)), Some(copy)) = (&made, copy) {
                         crate::project_config::copy_ignored(&repo, dir, &copy);
                     }
                     made
@@ -2384,9 +2442,13 @@ impl Workspace {
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 match result {
-                    Ok(_) => {
+                    Ok((_, told)) => {
                         if let Some(entry) = this.entry_mut(&path) {
                             entry.busy = None;
+                        }
+                        // Not from the base: on origin's branch of its name, or one here.
+                        if let Some(told) = told {
+                            window.push_notification(Notification::info(told).title("On a branch there was already").autohide(false), cx);
                         }
                         // One an agent started runs out of view: what you look at stays.
                         let spawned = this.entry_mut(&path).is_some_and(|entry| entry.spawned_by.is_some());
@@ -2407,9 +2469,7 @@ impl Workspace {
                         }
                     }
                     Err(e) => {
-                        if let Some((pi, ti)) = this.find(&path) {
-                            this.projects[pi].tasks.remove(ti);
-                        }
+                        this.drop_unmade(&path);
                         window.push_notification(Notification::error(e).title("Could not create the task"), cx);
                     }
                 }
@@ -3636,20 +3696,179 @@ fn existing_row(same: Existing, this: WeakEntity<Workspace>, cx: &App) -> impl I
         .child(button)
 }
 
+/// origin's branches as last fetched: by name, and by the ticket keys in
+/// their names, the latest first.
+#[derive(Default)]
+struct OnOrigin {
+    named: std::collections::HashMap<String, git::OriginBranch>,
+    keyed: std::collections::HashMap<String, Vec<String>>,
+}
+
+impl OnOrigin {
+    fn read(repo: &Path) -> Self {
+        Self::from_branches(git::origin_branches(repo))
+    }
+
+    fn from_branches(branches: Vec<git::OriginBranch>) -> Self {
+        let mut on = Self::default();
+        for branch in branches {
+            for key in crate::integrations::tickets::keys_in(&branch.name) {
+                on.keyed.entry(key).or_default().push(branch.name.clone());
+            }
+            on.named.insert(branch.name.clone(), branch);
+        }
+        on
+    }
+}
+
 fn branch_hint(title: &str, template: &str) -> String {
     let title = title.trim();
     if title.is_empty() {
         "The branch name comes from the title.".into()
     } else if crate::integrations::tickets::key_at_start(title) == Some(title) {
-        format!("Branch: {title}. The title is named from what its agent reads in the issue")
+        format!("Branch: {}. The title is named from what its agent reads in the issue", naming::preview(title, template))
     } else {
         let branch = naming::preview(title, template);
         format!("Branch: {branch}")
     }
 }
 
+/// What origin has of the branch a title makes, apart from the branch's
+/// line: that branch, which the task then starts from; or others of its key.
+fn origin_note(title: &str, template: &str, origin: &OnOrigin) -> Option<String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return None;
+    }
+    let branch = naming::preview(title, template);
+    let by = |b: &git::OriginBranch| format!("last commit by {}, {}", b.author, b.when);
+    if let Some(there) = origin.named.get(&branch) {
+        return Some(format!("{branch} is on origin already ({}): Create starts the task on it, from its commits.", by(there)));
+    }
+    let key = crate::integrations::tickets::key_at_start(title)?;
+    let others: Vec<&git::OriginBranch> = origin.keyed.get(key).into_iter().flatten().filter_map(|name| origin.named.get(name)).collect();
+    let first = others.first()?;
+    let more = match others.len() - 1 {
+        0 => String::new(),
+        n => format!(" and {n} more"),
+    };
+    Some(format!("{key} has {} on origin ({}){more}: Create makes {branch} beside it.", first.name, by(first)))
+}
+
 use gpui_kit::component::{ActiveTheme as _, Selectable as _, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
+
+#[cfg(test)]
+mod origin_hint_tests {
+    use super::{OnOrigin, branch_hint, origin_note};
+    use crate::git::OriginBranch;
+
+    /// What origin has of the title's branch, apart from the branch's line:
+    /// that branch, which Create starts on; else others of its key.
+    #[test]
+    fn the_hint_says_what_origin_has_of_the_branch() {
+        let branch = |name: &str| OriginBranch { name: name.into(), author: "Someone".into(), when: "2 days ago".into() };
+        let origin = OnOrigin::from_branches(vec![branch("DEV-7"), branch("DEV-7_more"), branch("DEV-8_fixLogin")]);
+        let template = crate::naming::DEFAULT_TEMPLATE;
+        assert_eq!(branch_hint("DEV-7", template), "Branch: DEV-7. The title is named from what its agent reads in the issue");
+        assert_eq!(
+            origin_note("DEV-7", template, &origin).as_deref(),
+            Some("DEV-7 is on origin already (last commit by Someone, 2 days ago): Create starts the task on it, from its commits.")
+        );
+        assert!(origin_note("DEV-8 Fix login", template, &origin).is_some_and(|said| said.starts_with("DEV-8_fixLogin is on origin already")));
+        assert_eq!(
+            origin_note("DEV-8", template, &origin).as_deref(),
+            Some("DEV-8 has DEV-8_fixLogin on origin (last commit by Someone, 2 days ago): Create makes DEV-8 beside it.")
+        );
+        assert_eq!(origin_note("Plain words", template, &origin), None);
+        assert_eq!(branch_hint("Plain words", template), "Branch: plain-words-…");
+        assert_eq!(origin_note("DEV-9 Fix", template, &OnOrigin::default()), None);
+        // The branch Create makes, by the project's template, a key alone too.
+        let feature = OnOrigin::from_branches(vec![branch("feature/DEV-7"), branch("DEV-8")]);
+        assert_eq!(branch_hint("DEV-7", "feature/{key}-{slug}"), "Branch: feature/DEV-7. The title is named from what its agent reads in the issue");
+        assert!(origin_note("DEV-7", "feature/{key}-{slug}", &feature).is_some_and(|said| said.starts_with("feature/DEV-7 is on origin already")));
+        assert!(origin_note("DEV-8", "feature/{key}-{slug}", &feature).is_some_and(|said| said.ends_with("Create makes feature/DEV-8 beside it.")));
+    }
+}
+
+// They script a repository with bash, which Windows lacks or has as WSL's.
+#[cfg(all(test, unix))]
+mod in_the_way_tests {
+    use super::{TaskEntry, Workspace};
+    use crate::state::{ProjectState, State};
+    use gpui_kit::{AppContext as _, Bounds, Point, TestAppContext, WindowBounds, WindowOptions, px, size};
+
+    /// A task already on the branch a new one would make keeps its row: the
+    /// new one is refused before git. One git fails takes only its own row,
+    /// the one still being made, whichever else is at its path.
+    #[gpui_kit::test]
+    fn a_new_task_leaves_the_row_of_one_there(cx: &mut TestAppContext) {
+        let _one = super::variants::tests::ONE_WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ideae-in-the-way-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ok = std::process::Command::new("bash")
+            .arg("-ec")
+            .arg("git init -q -b main repo; cd repo; git config user.email t@t; git config user.name t; echo one > f.txt; git add f.txt; git commit -qm base")
+            .current_dir(&dir)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        let repo = dir.join("repo");
+        // SAFETY: set before anything of the app reads them, one window at a time.
+        unsafe {
+            std::env::set_var("IDEAE_STATE", dir.join("state.json"));
+            std::env::set_var("IDEAE_NO_DAEMON", "1");
+        }
+        let saved = State { projects: vec![ProjectState { path: repo.clone(), ..Default::default() }], ..Default::default() };
+        std::fs::write(dir.join("state.json"), serde_json::to_string(&saved).unwrap()).unwrap();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            gpui_cn::init(cx);
+            crate::theme::init(cx);
+        });
+        let (handle, workspace) = cx.update(|cx| {
+            let bounds = Bounds { origin: Point::default(), size: size(px(1000.), px(700.)) };
+            let options = WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() };
+            gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| Workspace::new(Vec::new(), Some(None), None, window, cx))).expect("a test window")
+        });
+        let path = crate::git::task_worktree_dir(&repo, "DEV-7");
+        let rows = |cx: &mut TestAppContext| workspace.update(cx, |w, _| w.projects[0].tasks.iter().filter(|t| !t.main).map(|t| (t.title.clone(), t.busy.is_some())).collect::<Vec<_>>());
+        // A real worktree: the list keeps no row of a task git has none of.
+        let made = std::process::Command::new("git").arg("-C").arg(&repo).args(["worktree", "add", "-q", "-b", "DEV-7"]).arg(&path).status().unwrap().success();
+        assert!(made);
+        cx.run_until_parked();
+        workspace.update(cx, |w, _| {
+            let tasks = &mut w.projects[0].tasks;
+            match tasks.iter_mut().find(|t| t.path == path) {
+                Some(t) => t.title = "DEV-7 paused".into(),
+                None => tasks.push(TaskEntry { path: path.clone(), branch: "DEV-7".into(), title: "DEV-7 paused".into(), ..Default::default() }),
+            }
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            workspace.update(cx, |w, cx| w.create_worktree_task(0, "DEV-7".into(), String::new(), vec![String::new()], Vec::new(), false, window, cx));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(rows(cx), [("DEV-7 paused".to_string(), false)], "refused: one task of the branch, the one there");
+        // Its folder there already, of no task: git refuses, its row goes.
+        std::fs::create_dir_all(crate::git::task_worktree_dir(&repo, "DEV-8")).unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            workspace.update(cx, |w, cx| w.create_worktree_task(0, "DEV-8".into(), String::new(), vec![String::new()], Vec::new(), false, window, cx));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(rows(cx), [("DEV-7 paused".to_string(), false)], "failed: its own row gone, the other kept");
+        // One made at its path anyway (by an older build) and failed: its row goes, not the other.
+        workspace.update(cx, |w, _| {
+            w.projects[0].tasks.push(TaskEntry { path: path.clone(), branch: "DEV-7".into(), title: "DEV-7".into(), busy: Some("creating…".into()), ..Default::default() });
+            w.drop_unmade(&path);
+        });
+        assert_eq!(rows(cx), [("DEV-7 paused".to_string(), false)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
 
 #[cfg(test)]
 mod ticket_tests {

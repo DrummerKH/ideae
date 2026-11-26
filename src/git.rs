@@ -2472,6 +2472,55 @@ mod pull_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A new task whose branch origin has starts from it, not from the base:
+    /// a second branch of its name could be pushed only over it. Asked of
+    /// origin, not of what was fetched; a branch of the name here is taken.
+    #[test]
+    fn a_new_task_starts_on_origin_s_branch_of_its_name() {
+        let base = setup("origin-branch");
+        let b = base.join("b");
+        let upstream = |dir: &Path| super::git(dir, &["rev-parse", "--abbrev-ref", "@{u}"]).map(|u| u.trim().to_string());
+        // Pushed after b last fetched.
+        sh(&b, "cd ../a; git checkout -q -b DEV-7; echo x > t.txt; git add t.txt; git -c user.name=Someone -c user.email=someone@else commit -qm theirs; git push -q origin DEV-7 2>/dev/null");
+        let (task, told) = super::new_task_worktree(&b, "DEV-7", "", false).unwrap();
+        assert!(task.join("t.txt").is_file(), "its commits");
+        assert_eq!(upstream(&task).as_deref(), Some("origin/DEV-7"), "and follows it");
+        assert!(told.is_some_and(|t| t.contains("on origin already")));
+        let listed = super::origin_branches(&b);
+        assert!(listed.iter().any(|r| r.name == "DEV-7" && r.author == "Someone") && listed.iter().all(|r| r.name != "HEAD"), "{listed:?}");
+
+        let (fresh, told) = super::new_task_worktree(&b, "DEV-8", "", false).unwrap();
+        assert_eq!((told, upstream(&fresh)), (None, None), "none there: a new branch from the base, as ever");
+
+        // Here, behind origin's: brought up to it.
+        sh(&b, "git branch DEV-9; cd ../a; git checkout -q -b DEV-9 main; echo y > u.txt; git add u.txt; git commit -qm more; git push -q origin DEV-9 2>/dev/null");
+        let (behind, told) = super::new_task_worktree(&b, "DEV-9", "", false).unwrap();
+        assert!(behind.join("u.txt").is_file() && told.is_some_and(|t| t.contains("up to date")));
+        assert_eq!(upstream(&behind).as_deref(), Some("origin/DEV-9"));
+        // Here with a commit of its own: as it was.
+        sh(&b, "git checkout -q -b DEV-10 main; echo w > w.txt; git add w.txt; git commit -qm mine; git checkout -q main
+            cd ../a; git checkout -q -b DEV-10 main; echo z > v.txt; git add v.txt; git commit -qm theirs; git push -q origin DEV-10 2>/dev/null");
+        let (own, told) = super::new_task_worktree(&b, "DEV-10", "", false).unwrap();
+        assert!(own.join("w.txt").is_file() && !own.join("v.txt").exists());
+        assert!(told.is_some_and(|t| t.contains("a commit that origin's has not")));
+        // Here alone, no task on it: taken as it is.
+        sh(&b, "git branch DEV-11");
+        let (left, told) = super::new_task_worktree(&b, "DEV-11", "", false).unwrap();
+        assert_eq!(super::git(&left, &["branch", "--show-current"]).map(|b| b.trim().to_string()).as_deref(), Some("DEV-11"));
+        assert!(told.is_some_and(|t| t.contains("with no task")));
+        assert!(super::new_task_worktree(&b, "DEV-11", "", false).is_err_and(|why| why.contains("already exists")), "its worktree is there");
+        // An origin that does not answer: given up, as last fetched.
+        let started = std::time::Instant::now();
+        let silent = super::git_status_within(&b, &["-c", "protocol.ext.allow=always", "ls-remote", "ext::sleep 3"], std::time::Duration::from_millis(300));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "given up in time");
+        assert!(silent.as_ref().is_err_and(|e| e.contains("no answer")), "{silent:?}");
+        // A clone of one branch fetches no other: origin's is taken all the same.
+        sh(&base, "git clone -q --single-branch remote.git c");
+        let (single, told) = super::new_task_worktree(&base.join("c"), "DEV-7", "", false).unwrap();
+        assert!(single.join("t.txt").is_file() && told.is_some_and(|t| t.contains("on origin already")), "single-branch clone");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn a_folder_without_git_lists_its_files() {
         let dir = std::env::temp_dir().join(format!("ideae-plain-folder-{}", std::process::id()));
@@ -3310,14 +3359,113 @@ pub fn create_task_worktree(repo: &Path, branch: &str, base: &str, copy_env: boo
     worktree_at(repo, branch, &base, copy_env)
 }
 
+/// A new task's worktree: on origin's branch of its name when it has one,
+/// the local branch following it, someone's work or yours from elsewhere,
+/// which a new branch of its name beside it could be pushed only over. A
+/// branch of that name here with no worktree is taken as it is. Else as
+/// `create_task_worktree`, with nothing to tell; what it did instead comes
+/// back with the worktree.
+pub fn new_task_worktree(repo: &Path, branch: &str, base: &str, copy_env: bool) -> Result<(PathBuf, Option<String>), String> {
+    let theirs = format!("origin/{branch}");
+    let on_origin = match git_status_within(repo, &["ls-remote", "--heads", "origin", &format!("refs/heads/{branch}")], ORIGIN_ASKED_FOR) {
+        Ok(listed) => !listed.trim().is_empty(),
+        // Not reached (offline, no origin, a network that does not answer): as last fetched.
+        Err(_) => git_status(repo, &["rev-parse", "--verify", "-q", &format!("refs/remotes/{theirs}")]).is_ok(),
+    };
+    let here = branch_exists(repo, branch);
+    if !on_origin && !here {
+        return create_task_worktree(repo, branch, base, copy_env).map(|dir| (dir, None));
+    }
+    if on_origin {
+        // Its commits as they are now; offline, as last fetched.
+        let _ = git_status(repo, &["fetch", "--quiet", "--no-auto-maintenance", "origin", &format!("+refs/heads/{branch}:refs/remotes/{theirs}")]);
+    }
+    // Followed apart from making it: `--track` fails where no fetch refspec
+    // maps to origin's branch (a single-branch or shallow clone).
+    let follow = |dir: &Path| git_status(dir, &["branch", "--set-upstream-to", &theirs]).is_ok();
+    if !here {
+        let dir = worktree_at(repo, branch, &theirs, copy_env)?;
+        let told = if follow(&dir) { "the task starts from its commits and follows it" } else { "the task starts from its commits" };
+        return Ok((dir, Some(format!("{branch} is on origin already: {told}."))));
+    }
+    let dir = add_worktree(repo, branch, &[], branch, copy_env)?;
+    if !on_origin {
+        return Ok((dir, Some(format!("{branch} was a branch here already, with no task: the task is on it as it was."))));
+    }
+    let follows = follow(&dir);
+    let own: u32 = git(&dir, &["rev-list", "--count", &format!("{theirs}..HEAD")]).and_then(|n| n.trim().parse().ok()).unwrap_or(0);
+    let told = if own > 0 {
+        let commits = if own == 1 { "a commit".to_string() } else { format!("{own} commits") };
+        format!("{branch} was a branch here already, with {commits} that origin's has not: the task is on it as it was, and Pull brings origin's.")
+    } else if let Err(why) = git_status(&dir, &["merge", "--ff-only", "--quiet", &theirs]) {
+        format!("{branch} was a branch here already and stays where it was: {}", why.trim())
+    } else if follows {
+        format!("{branch} was a branch here already: the task is on it, up to date with origin's, and follows it.")
+    } else {
+        format!("{branch} was a branch here already: the task is on it, up to date with origin's.")
+    };
+    Ok((dir, Some(told)))
+}
+
+/// How long a new task waits for origin to say whether it has its branch:
+/// a network that does not answer (a VPN gone, ssh waiting for a passphrase)
+/// would leave it "creating…" for minutes.
+const ORIGIN_ASKED_FOR: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// `git_status`, given up after `within`: an error then, and git ended.
+fn git_status_within(root: &Path, args: &[&str], within: std::time::Duration) -> Result<String, String> {
+    let gave_up = || format!("git {}: no answer in {} s", args.first().copied().unwrap_or_default(), within.as_secs());
+    // On another machine: its daemon runs it there; this side stops waiting.
+    if crate::hosts::is_remote(root) {
+        let (root, args): (PathBuf, Vec<String>) = (root.to_path_buf(), args.iter().map(|a| a.to_string()).collect());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let _ = tx.send(git_status(&root, &args));
+        });
+        return rx.recv_timeout(within).unwrap_or_else(|_| Err(gave_up()));
+    }
+    let mut child = crate::procs::command("git")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("git: {e}"))?;
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(gave_up());
+            }
+        }
+    }
+    // Its output is a line or two: it fits the pipe while git runs.
+    let out = child.wait_with_output().map_err(|e| format!("git: {e}"))?;
+    if out.status.success() { Ok(String::from_utf8_lossy(&out.stdout).into_owned()) } else { Err(String::from_utf8_lossy(&out.stderr).trim().to_string()) }
+}
+
 fn worktree_at(repo: &Path, branch: &str, base: &str, copy_env: bool) -> Result<PathBuf, String> {
+    add_worktree(repo, branch, &["--no-track", "-b", branch], base, copy_env)
+}
+
+/// `git worktree add <how> <the task's dir of branch> <start>`.
+fn add_worktree(repo: &Path, branch: &str, how: &[&str], start: &str, copy_env: bool) -> Result<PathBuf, String> {
     let dir = task_worktree_dir(repo, branch);
     // On the repository's machine (crate::hostfs), by its path there.
     if crate::hostfs::stat(&dir).is_ok() {
         return Err(format!("{} already exists", crate::hosts::there(&dir).display()));
     }
     let dir_s = crate::hosts::there(&dir).to_string_lossy().into_owned();
-    git_status(repo, &["worktree", "add", "--no-track", "-b", branch, &dir_s, base])?;
+    let args: Vec<&str> = ["worktree", "add"].into_iter().chain(how.iter().copied()).chain([dir_s.as_str(), start]).collect();
+    git_status(repo, &args)?;
     if copy_env {
         copy_env_files(repo, &dir);
     }
@@ -3540,6 +3688,31 @@ pub fn free_branch_name(repo: &Path, name: &str) -> String {
             || crate::hostfs::stat(&task_worktree_dir(repo, b)).is_ok()
     };
     std::iter::once(name.to_string()).chain((2..100).map(|n| format!("{name}-{n}"))).find(|b| !taken(b)).unwrap_or_else(|| format!("{name}-{}", crate::state::now()))
+}
+
+/// A branch of origin as last fetched, for New Task to tell that the one a
+/// title would make is there already.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OriginBranch {
+    /// Without `origin/`.
+    pub name: String,
+    /// Of its last commit.
+    pub author: String,
+    pub when: String,
+}
+
+/// origin's branches as last fetched, the latest first: no network.
+pub fn origin_branches(repo: &Path) -> Vec<OriginBranch> {
+    let listed = git(repo, &["for-each-ref", "--sort=-committerdate", "--format=%(refname:lstrip=3)%1f%(authorname)%1f%(committerdate:relative)", "refs/remotes/origin"]);
+    listed
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\x1f');
+            let name = parts.next()?.trim();
+            (!name.is_empty() && name != "HEAD").then(|| OriginBranch { name: name.to_string(), author: parts.next().unwrap_or_default().to_string(), when: parts.next().unwrap_or_default().to_string() })
+        })
+        .collect()
 }
 
 /// A task's worktree on a branch of origin, fetched first: the branch of a

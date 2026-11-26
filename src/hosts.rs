@@ -18,6 +18,13 @@ pub fn split(path: &Path) -> Option<(String, PathBuf)> {
 }
 
 /// The key of `there` on `host`.
+/// The key of a path there as text, its parts parted by `/` as they are
+/// there, whatever this machine's own separator: for what is told to a
+/// program on that machine.
+pub fn key_text(host: &str, there: &str) -> String {
+    format!("{SCHEME}/{host}/{}", there.trim_start_matches('/'))
+}
+
 pub fn join(host: &str, there: &Path) -> PathBuf {
     let there = there.strip_prefix("/").unwrap_or(there);
     PathBuf::from(format!("{SCHEME}/{host}")).join(there)

@@ -215,11 +215,12 @@ fn keyed_args(args: &mut serde_json::Value, root: &Path) {
     let Some(path) = args.get("path").and_then(|p| p.as_str()).filter(|p| p.starts_with('/')).map(PathBuf::from) else { return };
     let taken = match path.strip_prefix(&there) {
         // The worktree itself: its folder, not no path.
-        Ok(rel) if rel.as_os_str().is_empty() => PathBuf::from("."),
-        Ok(rel) => rel.to_path_buf(),
-        Err(_) => crate::hosts::join(&host, &path),
+        Ok(rel) if rel.as_os_str().is_empty() => ".".to_string(),
+        Ok(rel) => rel.display().to_string(),
+        // With `/` on Windows too: a PathBuf there would part it with `\`.
+        Err(_) => crate::hosts::key_text(&host, &path.to_string_lossy()),
     };
-    args["path"] = serde_json::Value::String(taken.display().to_string());
+    args["path"] = serde_json::Value::String(taken);
 }
 
 /// The window's answer, its keys of the host's files named as they are there.
