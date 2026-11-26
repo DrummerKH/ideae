@@ -5,6 +5,8 @@
 //! alone, with no gpui, for a server to run.
 
 pub mod acp;
+pub mod awake;
+pub mod battery;
 pub mod build;
 #[cfg(unix)]
 pub mod daemon;

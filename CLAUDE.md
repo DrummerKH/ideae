@@ -99,9 +99,11 @@ src/agents/        agent profiles and adapters (docs/agents.md): how each kind s
   registry.rs      the ACP registry: how its agents would run here, a download checked and unpacked
 src/mac_notify.rs  macOS: notifications as the app's own (a click comes back), where the binary is in its bundle; else AppleScript's
 src/image_diff.rs  a changed image in a diff: its two versions as pictures, read from git or the worktree
-src/battery.rs     how full the battery is and whether it is in use, to say once that there is a power save mode
 src/local_time.rs  the machine's calendar: weekdays and hours for Defer
 src/crash.rs       what a panic leaves: crashes.log next to the state, told at the next start
+core/src/awake.rs  the machine kept up while agents work: by the window for its own, by the daemon for every agent it runs
+                   (a laptop's too, its own window closed), as its Machine layer says; core/src/battery.rs how full the
+                   battery is and whether it is in use
 src/stalls.rs      debug aid: tells when the UI thread was held (debug builds, `IDEAE_DEBUG`): stderr and stalls.log
 src/git.rs         git CLI wrappers, worktrees
 src/lsp.rs         language server client

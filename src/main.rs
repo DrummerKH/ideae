@@ -3,10 +3,10 @@
 
 mod acp;
 mod agent;
-mod battery;
+use ideae_core::battery;
 mod copying;
 mod agents;
-mod awake;
+use ideae_core::awake;
 mod archive;
 mod browser;
 mod crash;

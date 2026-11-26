@@ -34,6 +34,8 @@ struct Session {
     pipe: Option<Arc<super::pipe::Pipe>>,
     /// The window that opened it, as it says it is (`Owner`): across its links.
     owner: Option<String>,
+    /// When it last printed: a chat agent's host writes while its turn runs.
+    spoke: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -260,9 +262,47 @@ fn clear_window_sockets() {
 }
 
 /// Foreground processes for the windows, and the end of an unattended daemon.
+/// Whether an agent works here: one whose last report is of a turn under way
+/// (a terminal agent's hooks), or a chat agent's host that wrote a moment
+/// ago (it writes while its turn runs). Not a terminal that prints (a dev
+/// server's log): what the window held the machine up for was agents.
+fn agents_at_work(s: &Server) -> bool {
+    let turns: Vec<(&str, bool)> = s.hooks.values().map(|h| (h.task.as_str(), matches!(event_of(h).status(), Some(crate::status::AgentStatus::Working)))).collect();
+    let sessions: Vec<(&str, bool, Option<Duration>)> = s.sessions.iter().map(|(id, x)| (id.as_str(), x.pipe.is_some(), x.spoke.map(|at| at.elapsed()))).collect();
+    at_work_of(&turns, &sessions)
+}
+
+/// `turns`: each agent's task and whether its turn is under way; `sessions`:
+/// each one's id, whether it is a chat agent's host, how long since it wrote.
+fn at_work_of(turns: &[(&str, bool)], sessions: &[(&str, bool, Option<Duration>)]) -> bool {
+    let reported = turns.iter().any(|(task, working)| *working && sessions.iter().any(|(id, _, _)| id.starts_with(&format!("{task}#"))));
+    reported || sessions.iter().any(|(_, host, spoke)| *host && spoke.is_some_and(|ago| ago < AT_WORK_FOR))
+}
+
+/// Printing this long ago still counts as at work: a turn's pauses for a tool, a thought.
+const AT_WORK_FOR: Duration = Duration::from_secs(120);
+
+/// This machine kept up while its agents work, as its Machine layer says
+/// (`keep_awake`, `keep_awake_on_battery`): whichever window started them,
+/// one of another machine too, with this machine's own window closed.
+fn keep_awake(working: bool) {
+    static AWAKE: Mutex<Option<crate::awake::Awake>> = Mutex::new(None);
+    let setting = |key: &str| {
+        STORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().and_then(|h| h.machine().settings.get(key).and_then(serde_json::Value::as_bool)).unwrap_or(true)
+    };
+    let (on, on_battery) = (setting("keep_awake"), setting("keep_awake_on_battery"));
+    AWAKE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_with(Default::default).want(working && on, !on_battery);
+}
+
 fn housekeeping(shared: Shared) {
+    let mut looked = Instant::now();
     loop {
         std::thread::sleep(Duration::from_secs(1));
+        if looked.elapsed() >= Duration::from_secs(5) {
+            looked = Instant::now();
+            let working = agents_at_work(&shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+            keep_awake(working);
+        }
         let unattended = {
             let s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             s.alone_since.is_some_and(|since| s.sessions.is_empty() && since.elapsed() > EMPTY)
@@ -700,6 +740,7 @@ fn open(shared: &Shared, client: u64, id: String, spec: Spec, size: Size) {
             size,
             pipe,
             owner,
+            spoke: None,
         },
     );
     drop(s);
@@ -738,6 +779,9 @@ fn pump(shared: Shared, id: String, handle: Arc<Mutex<Box<dyn ByteHandle>>>, sin
             return;
         }
         let mut frames = Vec::new();
+        if !batch.output.is_empty() {
+            session.spoke = Some(Instant::now());
+        }
         for chunk in &batch.output {
             if session.pipe.is_none() {
                 session.replay.extend(chunk.iter().copied());
@@ -1085,6 +1129,7 @@ mod handover {
                     size: session.size,
                     pipe,
                     owner: session.owner,
+                    spoke: None,
                 },
             );
             let shared = shared.clone();
@@ -1099,6 +1144,17 @@ mod handover {
 mod tests {
     use super::*;
     use std::io::Read as _;
+
+    #[test]
+    fn the_machine_is_kept_up_while_an_agent_works() {
+        let now = Some(Duration::from_secs(3));
+        assert!(at_work_of(&[("/w/a", true)], &[("/w/a#agent", false, None)]), "a terminal agent's turn under way");
+        assert!(!at_work_of(&[("/w/a", false)], &[("/w/a#agent", false, now)]), "its turn over, its terminal printing");
+        assert!(!at_work_of(&[("/w/a", true)], &[("/w/b#agent", false, None)]), "a report of a task with no session left");
+        assert!(at_work_of(&[], &[("/w/a#acp", true, now)]), "a chat agent's host writing");
+        assert!(!at_work_of(&[], &[("/w/a#acp", true, Some(AT_WORK_FOR))]), "one quiet a while");
+        assert!(!at_work_of(&[], &[("/w/a#shell", false, now)]), "a dev server's log is no agent");
+    }
 
     #[test]
     fn a_window_at_work_is_one_heard() {

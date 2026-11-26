@@ -610,4 +610,7 @@ whose it is.
   load readout; on a battery running low the app suggests it once.
 - While an agent works, or a setup or a check runs, the system does not go to
   sleep for being left alone (the screen still dims and locks); Settings can
-  keep it to the times the machine is plugged in, or turn it off.
+  keep it to the times the machine is plugged in, or turn it off. It is the
+  machine the agent runs on that stays up: a desktop working for a laptop's
+  agents with its own window closed too; the laptop is not kept up for
+  agents running elsewhere.

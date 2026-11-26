@@ -3187,7 +3187,8 @@ impl Workspace {
     /// The system kept from sleeping while a task works, as the settings say.
     fn keep_awake(&mut self, cx: &mut Context<Self>) {
         let (on, battery) = state::with_settings(|s| (s.keep_awake, s.keep_awake_on_battery));
-        let working = on && self.projects.iter().flat_map(|p| &p.tasks).any(|t| t.view.as_ref().is_some_and(|v| v.read(cx).at_work()));
+        // Agents of this machine: another's keeps itself up (its daemon), this one need not.
+        let working = on && self.projects.iter().flat_map(|p| &p.tasks).any(|t| !crate::hosts::is_remote(&t.path) && t.view.as_ref().is_some_and(|v| v.read(cx).at_work()));
         self.awake.want(working, !battery);
     }
 
