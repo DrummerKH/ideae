@@ -2626,6 +2626,15 @@ pub struct BrowserView {
     burst: u32,
     last_frame: Option<Instant>,
     _frames: Task<()>,
+    /// Frames taken so far, to tell whether one came since a moment.
+    frames_taken: u64,
+    /// The last frame as Chrome sent it, compressed: shown again at once
+    /// when the tab comes back in view, before the stream sends a new one.
+    last_jpeg: Option<Arc<[u8]>>,
+    /// A picture asked of the page when no frames come after it loads or
+    /// comes back in view: the stream sends one only when the page is drawn
+    /// again, and may stay quiet on a page that already was.
+    _probe: Task<()>,
     /// A sharp PNG of the page once screencast frames stop coming: the JPEG
     /// frames are for motion.
     _sharpen: Task<()>,
@@ -2774,14 +2783,19 @@ impl BrowserView {
             while let Ok(message) = in_rx.recv().await {
                 let message = match message {
                     In::Frame(jpeg, ack) => {
-                        let image = cx.background_spawn(async move { decode(&jpeg, image::ImageFormat::Jpeg) }).await;
-                        Ok((image, ack))
+                        let (image, jpeg) = cx
+                            .background_spawn(async move {
+                                let jpeg: Arc<[u8]> = jpeg.into();
+                                (decode(&jpeg, image::ImageFormat::Jpeg), jpeg)
+                            })
+                            .await;
+                        Ok((image, jpeg, ack))
                     }
                     other => Err(other),
                 };
                 let ok = this.update_in(cx, |this, window, cx| {
                     match message {
-                        Ok((image, ack)) => this.take_frame(image, ack, cx),
+                        Ok((image, jpeg, ack)) => this.take_frame(image, jpeg, ack, cx),
                         Err(other) => this.take(other, window, cx),
                     }
                     cx.notify();
@@ -2927,6 +2941,9 @@ impl BrowserView {
             burst: 0,
             last_frame: None,
             _frames: frames,
+            frames_taken: 0,
+            last_jpeg: None,
+            _probe: Task::ready(()),
             _sharpen: Task::ready(()),
         }
     }
@@ -2942,7 +2959,9 @@ impl BrowserView {
         self.out = mpsc::channel().0;
         self._frames = Task::ready(());
         self._sharpen = Task::ready(());
+        self._probe = Task::ready(());
         self._wait = Task::ready(());
+        self.last_jpeg = None;
         self.asleep = true;
         self.loading = false;
         // Its DevTools was of a page that is gone; it opens again with the page.
@@ -2965,13 +2984,15 @@ impl BrowserView {
         self.loading = true;
     }
 
-    fn take_frame(&mut self, image: Option<Arc<RenderImage>>, ack: i64, cx: &mut Context<Self>) {
+    fn take_frame(&mut self, image: Option<Arc<RenderImage>>, jpeg: Arc<[u8]>, ack: i64, cx: &mut Context<Self>) {
         let _ = self.out.send(Out::Ack(ack));
         let Some(image) = image else { return };
         // One sent before the page was told to stop.
         if !self.visible {
             return drop_later(image, cx);
         }
+        self.frames_taken += 1;
+        self.last_jpeg = Some(jpeg);
         let close = self.last_frame.is_some_and(|at| at.elapsed() < Duration::from_millis(300));
         self.burst = if close { self.burst + 1 } else { 1 };
         self.last_frame = Some(Instant::now());
@@ -3002,6 +3023,8 @@ impl BrowserView {
                 (self.select, self.picker) = (None, None);
                 self.error = None;
                 self.failed = failed.then(|| url.clone());
+                // A picture of the page before is not shown for this one.
+                self.last_jpeg = None;
                 self.wait_for_server(cx);
                 self.set_url(url, window, cx);
             }
@@ -3010,7 +3033,13 @@ impl BrowserView {
                 self.page_title = title.into();
                 cx.emit(BrowserEvent::Navigated);
             }
-            In::Loading(loading) => self.loading = loading,
+            In::Loading(loading) => {
+                // Told at the load event and at the main frame's stop: probed once.
+                let was = std::mem::replace(&mut self.loading, loading);
+                if was && !loading {
+                    self.probe(cx);
+                }
+            }
             In::Dialog(dialog) => {
                 if dialog.kind == "prompt" {
                     self.prompt_input.update(cx, |input, cx| {
@@ -3021,6 +3050,7 @@ impl BrowserView {
                     self.focus.focus(window, cx);
                 }
                 self.dialog = Some(dialog);
+                self._probe = Task::ready(());
             }
             In::DialogClosed => self.dialog = None,
             In::FileChooser { node, multiple } => {
@@ -3098,9 +3128,13 @@ impl BrowserView {
             devtools.update(cx, |d, cx| d.set_visible(visible, cx));
         }
         self.wait_for_server(cx);
-        if !visible {
+        if visible {
+            self.show_last(cx);
+            self.probe(cx);
+        } else {
             self.sent_size.set((0, 0, 0, 0));
             self._sharpen = Task::ready(());
+            self._probe = Task::ready(());
             self.last_frame = None;
             if let Some(old) = self.frame.take() {
                 // Once this update is over: a window in the middle of one is
@@ -3149,6 +3183,62 @@ impl BrowserView {
         cx.notify();
     }
 
+    /// The last frame, kept compressed while out of view, drawn again until
+    /// the stream sends a new one.
+    fn show_last(&mut self, cx: &mut Context<Self>) {
+        let Some(jpeg) = self.last_jpeg.clone().filter(|_| self.frame.is_none()) else {
+            return;
+        };
+        let taken = self.frames_taken;
+        cx.spawn(async move |this, cx| {
+            let Some(image) = cx.background_spawn(async move { decode(&jpeg, image::ImageFormat::Jpeg) }).await else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                if this.visible && this.frame.is_none() && this.frames_taken == taken {
+                    this.show_frame(image, cx)
+                } else {
+                    drop_later(image, cx)
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// When no frame comes for a while after the page loads or comes back
+    /// in view, a picture of it is asked for and shown: it is what the page
+    /// is now, and drawing it gets the stream going again.
+    fn probe(&mut self, cx: &mut Context<Self>) {
+        if !self.visible || self.asleep || self.dialog.is_some() {
+            self._probe = Task::ready(());
+            return;
+        }
+        let taken = self.frames_taken;
+        let out = self.out.clone();
+        self._probe = cx.spawn(async move |this, cx| {
+            for wait in [400, 1200] {
+                cx.background_executor().timer(Duration::from_millis(wait)).await;
+                // A page with a dialog open answers no picture.
+                let quiet = |this: &mut Self| this.visible && !this.asleep && this.dialog.is_none() && this.frames_taken == taken;
+                if !this.update(cx, |this, _| quiet(this)).unwrap_or(false) {
+                    return;
+                }
+                let out = out.clone();
+                let image = cx
+                    .background_spawn(async move {
+                        let result = call(&out, "Page.captureScreenshot", json!({ "format": "png" }))?;
+                        let png = base64::engine::general_purpose::STANDARD.decode(result["data"].as_str()?).ok()?;
+                        decode(&png, image::ImageFormat::Png)
+                    })
+                    .await;
+                if let Some(image) = image {
+                    let _ = this.update(cx, |this, cx| if quiet(this) { this.show_frame(image, cx) } else { drop_later(image, cx) });
+                    return;
+                }
+            }
+        });
+    }
+
     /// After 300 ms without new frames, replace the last JPEG with a PNG.
     /// Not after a frame alone: a caret blinking sends one twice a second.
     fn sharpen_later(&mut self, cx: &mut Context<Self>) {
@@ -3157,6 +3247,7 @@ impl BrowserView {
             return;
         }
         let out = self.out.clone();
+        let taken = self.frames_taken;
         self._sharpen = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_millis(300)).await;
             let image = cx
@@ -3167,7 +3258,7 @@ impl BrowserView {
                 })
                 .await;
             if let Some(image) = image {
-                let _ = this.update(cx, |this, cx| if this.visible { this.show_frame(image, cx) } else { drop_later(image, cx) });
+                let _ = this.update(cx, |this, cx| if this.visible && this.frames_taken == taken { this.show_frame(image, cx) } else { drop_later(image, cx) });
             }
         });
     }
