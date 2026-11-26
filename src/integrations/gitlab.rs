@@ -178,6 +178,35 @@ impl CodeHost for GitLab {
         let v = self.get(&format!("{}/issues/{number}", self.project()))?;
         Ok((v["title"].as_str().ok_or(IntError::NotFound)?.to_string(), v["description"].as_str().unwrap_or_default().to_string()))
     }
+
+    fn open_requests(&self, _root: &Path) -> Result<Vec<super::OpenRequest>, IntError> {
+        // Who you are, to tell yours and those asking your review; not told, none.
+        let me = self.get("user").ok().and_then(|v| v["username"].as_str().map(str::to_string)).unwrap_or_default();
+        let v = self.get(&format!("{}/merge_requests?state=opened&per_page=100&order_by=updated_at", self.project()))?;
+        Ok(parse_open_rest(&v, &me))
+    }
+}
+
+/// Open merge requests as the REST API lists them; `me` the user's name.
+fn parse_open_rest(v: &Value, me: &str) -> Vec<super::OpenRequest> {
+    let is_me = |name: Option<&str>| !me.is_empty() && name == Some(me);
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|mr| {
+            Some(super::OpenRequest {
+                number: mr["iid"].as_u64()?,
+                title: mr["title"].as_str().unwrap_or_default().to_string(),
+                url: mr["web_url"].as_str().unwrap_or_default().to_string(),
+                head: mr["source_branch"].as_str()?.to_string(),
+                author: mr["author"]["username"].as_str().unwrap_or_default().to_string(),
+                cross: mr["source_project_id"].as_u64() != mr["target_project_id"].as_u64(),
+                draft: mr["draft"].as_bool().or_else(|| mr["work_in_progress"].as_bool()).unwrap_or(false),
+                for_me: mr["reviewers"].as_array().into_iter().flatten().any(|r| is_me(r["username"].as_str())),
+                mine: is_me(mr["author"]["username"].as_str()),
+            })
+        })
+        .collect()
 }
 
 /// A value put in a query string: what is not a letter, digit or `-._~` escaped.
@@ -301,6 +330,18 @@ fn without_sections(trace: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Open merge requests: yours and those asking your review by your name.
+    #[test]
+    fn open_merge_requests_are_marked_yours_or_asking_you() {
+        let v: serde_json::Value = serde_json::from_str(r#"[
+            {"iid":3,"title":"Fix","web_url":"https://gitlab.com/g/p/-/merge_requests/3","source_branch":"DEV-3","author":{"username":"ann"},"source_project_id":1,"target_project_id":1,"draft":false,"reviewers":[{"username":"me"}]},
+            {"iid":4,"title":"Mine","web_url":"https://gitlab.com/g/p/-/merge_requests/4","source_branch":"x","author":{"username":"me"},"source_project_id":2,"target_project_id":1,"work_in_progress":true,"reviewers":[]}
+        ]"#).unwrap();
+        let open = super::parse_open_rest(&v, "me");
+        assert_eq!(open.iter().map(|r| (r.number, r.for_me, r.mine, r.draft, r.cross)).collect::<Vec<_>>(), [(3, true, false, false, false), (4, false, true, true, true)]);
+        assert!(super::parse_open_rest(&v, "").iter().all(|r| !r.for_me && !r.mine), "nobody known: nothing marked");
+    }
+
     use super::*;
 
     #[test]

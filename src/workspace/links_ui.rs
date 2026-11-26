@@ -466,6 +466,9 @@ impl Workspace {
                 buttons.push(("Open ticket", Then::Open(ticket.url.clone())));
             }
             (format!("#{} merged: {label}", new.number), buttons)
+        } else if new.state == PrState::Closed && old.state != PrState::Closed && t.review {
+            // A review's request closed unmerged: nothing left to review.
+            (format!("#{} closed: {label}", new.number), vec![("Archive task", Then::Archive)])
         } else if new.checks == Checks::Failed && old.checks != Checks::Failed && !in_view {
             (format!("#{} CI failed: {label}", new.number), vec![("Show task", Then::Show)])
         } else if new.open_feedback > old.open_feedback && !in_view {

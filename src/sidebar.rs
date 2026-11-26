@@ -977,7 +977,8 @@ impl Workspace {
             let (profiles, project_agent, agent_w, inherited) = (profiles.clone(), project_agent.clone(), this.clone(), inherited.clone());
             let settings = this.clone();
             let (a, b, d) = (this.clone(), this.clone(), this.clone());
-            let (archived, ask, asked, stale_w) = (this.clone(), this.clone(), this.clone(), this);
+            let (archived, ask, asked, review) = (this.clone(), this.clone(), this.clone(), this.clone());
+            let stale_w = this;
             menu.item(PopupMenuItem::new("Open main thread").icon(menu_icon("house")).on_click(move |_, window, cx| {
                 let _ = a.update(cx, |w, cx| w.open_main(pi, window, cx));
             }))
@@ -988,6 +989,9 @@ impl Workspace {
             .item(PopupMenuItem::new("Ask a question…").icon(menu_icon("message-circle-question-mark")).on_click(move |_, window, cx| {
                 let _ = ask.update(cx, |w, cx| w.ask_question_dialog(pi, window, cx));
                 crate::learn::used("ask_question", window, cx);
+            }))
+            .item(PopupMenuItem::new("Review…").icon(menu_icon("eye")).on_click(move |_, window, cx| {
+                let _ = review.update(cx, |w, cx| w.review_dialog(pi, window, cx));
             }))
             .when(closed_questions, |menu| {
                 menu.item(PopupMenuItem::new("Closed questions…").icon(menu_icon("history")).on_click(move |_, window, cx| {

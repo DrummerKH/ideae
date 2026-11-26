@@ -112,6 +112,14 @@ impl TaskView {
     /// asks first what it says of them: Fixes (its tracker may close them
     /// when it is merged), Refs, or nothing.
     pub(super) fn make_request(&mut self, upstream: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // A review's branch with no request yet: making one pushes it.
+        if self.review && self.pr.is_none() {
+            return self.confirm_review_push(Rc::new(move |t: &mut Self, window: &mut Window, cx: &mut Context<Self>| t.make_request_now(upstream, window, cx)), window, cx);
+        }
+        self.make_request_now(upstream, window, cx);
+    }
+
+    fn make_request_now(&mut self, upstream: bool, window: &mut Window, cx: &mut Context<Self>) {
         let tickets: Vec<String> = self.links.iter().filter(|l| l.is_ticket()).map(|l| l.key.clone()).collect();
         // Its request there already: opened, nothing to ask.
         if tickets.is_empty() || self.pr.is_some() || !crate::state::with_settings(|s| s.tickets) {

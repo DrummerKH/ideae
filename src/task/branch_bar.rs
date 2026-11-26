@@ -164,6 +164,21 @@ impl TaskView {
                         }))),
                 )
             })
+            // A colleague pushed to the branch under review: what came, reviewed again.
+            .when(self.review && b.behind > 0, |bar| {
+                bar.child(
+                    Button::new("review-again")
+                        .xsmall()
+                        .primary()
+                        .disabled(self.busy.is_some())
+                        .label(format!("Review again ↓{}", b.behind))
+                        .tooltip("Bring in origin's new commits and put a review of what they change in the agent's input, to send as it is or edit")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.review_again(window, cx)
+                        })),
+                )
+            })
             .when(b.upstream.is_some(), |bar| {
                 let busy = self.busy.is_some();
                 bar.child(

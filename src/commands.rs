@@ -86,6 +86,7 @@ pub enum ProjectCommand {
     Remove,
     ArchiveMerged,
     EditSpaces,
+    Review,
 }
 
 impl ProjectCommand {
@@ -94,6 +95,7 @@ impl ProjectCommand {
             ProjectCommand::Remove => "Remove Project from List…",
             ProjectCommand::ArchiveMerged => "Archive Merged Tasks…",
             ProjectCommand::EditSpaces => "Edit Spaces…",
+            ProjectCommand::Review => "Review…",
         }
     }
 }
@@ -345,6 +347,7 @@ impl Workspace {
             (ProjectCommand::EditSpaces, _) => self.spaces_dialog(window, cx),
             (ProjectCommand::Remove, Some(project)) => self.remove_project(project, window, cx),
             (ProjectCommand::ArchiveMerged, Some(project)) => self.archive_merged(project, window, cx),
+            (ProjectCommand::Review, Some(project)) => self.review_dialog(project, window, cx),
             _ => {}
         }
     }

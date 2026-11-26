@@ -221,6 +221,24 @@ pub struct RequestInfo {
     pub cross: bool,
 }
 
+/// An open request as the host lists it: to choose one to review.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OpenRequest {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    /// Its branch.
+    pub head: String,
+    pub author: String,
+    /// From a fork: its branch is not one this repository's remote has.
+    pub cross: bool,
+    pub draft: bool,
+    /// Its review is asked of you.
+    pub for_me: bool,
+    /// You made it.
+    pub mine: bool,
+}
+
 /// `(kind, number)` of a link to a request: `…/pull/12`, `…/-/merge_requests/12`.
 pub fn request_of_url(url: &str) -> Option<(Kind, u64)> {
     let number = |after: &str| after.split(|c: char| !c.is_ascii_digit()).next().and_then(|n| n.parse().ok());
@@ -283,6 +301,8 @@ pub trait CodeHost: Send + Sync {
     fn merged_and_open(&self, root: &Path) -> Result<(Vec<ListedPr>, Vec<ListedPr>), IntError>;
     /// An issue's title and body.
     fn issue(&self, root: &Path, number: u64) -> Result<(String, String), IntError>;
+    /// The requests open now, with whose they are and whose review they ask.
+    fn open_requests(&self, root: &Path) -> Result<Vec<OpenRequest>, IntError>;
 }
 
 // ---------------------------------------------------------------- what applies where

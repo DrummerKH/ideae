@@ -191,6 +191,7 @@ mod merged_ui;
 pub mod automation;
 pub mod layered;
 mod links_ui;
+mod review_ui;
 mod tickets_ui;
 pub mod present;
 pub mod questions;
@@ -1402,7 +1403,7 @@ impl Workspace {
             }
         }
         let entry = self.entry_mut(path)?;
-        let (root, branch, session, pr, links) = (entry.path.clone(), entry.branch.clone(), entry.session.clone(), entry.pr.clone(), entry.links.clone());
+        let (root, branch, session, pr, links, review) = (entry.path.clone(), entry.branch.clone(), entry.session.clone(), entry.pr.clone(), entry.links.clone(), entry.review);
         let commit_key = self.find(path).and_then(|(pi, ti)| self.commit_key(pi, ti));
         let fill = self.usage.get(path).map_or(0., |(_, usage)| usage.fill());
         let main = self.entry_mut(path).is_some_and(|entry| entry.main);
@@ -1425,6 +1426,7 @@ impl Workspace {
             t.set_commit_key(commit_key, window, cx);
             t.restore(&session, window, cx);
             t.pr = pr;
+            t.review = review;
             t.main_thread = main;
             t.kept_branches = kept;
             t.lsp_off = lsp_off;
@@ -1550,6 +1552,7 @@ impl Workspace {
         }
         use std::time::Duration;
         let mut due = Vec::new();
+        let mut reviewed = Vec::new();
         // A remote project's too, once its host is connected: gh is asked here,
         // of the repository its origin there names.
         for p in self.projects.iter_mut().filter(|p| p.values().pull_requests && crate::hostfs::reachable(&p.path)) {
@@ -1567,15 +1570,23 @@ impl Workspace {
                 if stale && (!now || active) {
                     t.pr_checked = Some(std::time::Instant::now());
                     due.push((p.path.clone(), t.path.clone(), t.branch.clone()));
+                    // A review's branch is a colleague's: what they push since, fetched with it.
+                    if t.review {
+                        reviewed.push(t.path.clone());
+                    }
                 }
             }
         }
         if due.is_empty() {
             return;
         }
+        let reviewed_now = reviewed.clone();
         cx.spawn_in(window, async move |this, cx| {
             let found = cx
                 .background_spawn(crate::procs::on_thread(move || {
+                    for task in &reviewed {
+                        let _ = crate::git::fetch_upstream(task);
+                    }
                     // One question to GitHub for a repository's branches, not
                     // two for each; each on its own where that is not answered.
                     let mut found = Vec::with_capacity(due.len());
@@ -1600,6 +1611,12 @@ impl Workspace {
                 }))
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
+                // Fetched: the branch bar tells what came (Review again).
+                for task in &reviewed_now {
+                    if let Some(view) = this.entry_mut(task).and_then(|e| e.view.clone()) {
+                        view.read(cx).wake_refresh();
+                    }
+                }
                 for (path, pr) in found {
                     if let Some(old) = this.find(&path).and_then(|(pi, ti)| this.projects[pi].tasks[ti].pr.clone()) {
                         this.request_changed(&path, &old, pr.as_ref(), window, cx);
@@ -2310,8 +2327,22 @@ impl Workspace {
                                     .child(branch_hint(&input.read(cx).value(), &template)),
                             )
                             // Not to be missed: someone's work may be on it.
-                            .when_some(origin_note(&input.read(cx).value(), &template, &on_origin.borrow()), |form, said| {
-                                form.child(div().text_xs().text_color(cx.theme().warning).child(said))
+                            .when_some(origin_note(&input.read(cx).value(), &template, &on_origin.borrow()), |form, (said, find)| {
+                                let go = go.clone();
+                                form.child(
+                                    h_flex()
+                                        .id("on-origin")
+                                        .test_support()
+                                        .gap_2()
+                                        .items_center()
+                                        // Wrapped, the button kept in the dialog.
+                                        .child(div().flex_1().min_w_0().text_xs().text_color(cx.theme().warning).child(said))
+                                        .child(Button::new("review-instead").flex_none().xsmall().outline().label("Review instead…").tooltip("A colleague's work: review it in a task marked a review, not go on with it").on_click(move |_, window, cx| {
+                                            window.close_dialog(cx);
+                                            let find = find.clone();
+                                            let _ = go.update(cx, |w, cx| w.review_dialog_with(project, Some(find), window, cx));
+                                        })),
+                                )
                             })
                             .when_some(same.clone(), |form, same| form.child(existing_row(same, go.clone(), cx)))
                             .when_some(clipboard.clone(), |form, (key, url)| {
@@ -2464,6 +2495,25 @@ impl Workspace {
         }
         let Some(p) = self.projects.get(project) else { return };
         let branch = naming::branch_name_as(&title, &p.values().branch);
+        self.create_task_on_branch(project, branch, title, prompt, agents, given, false, window, cx);
+    }
+
+    /// A task on `branch`: origin's of that name when it has one (git), else
+    /// a new one from the base. `review`: on a colleague's branch, to review.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn create_task_on_branch(
+        &mut self,
+        project: usize,
+        branch: String,
+        title: String,
+        prompt: String,
+        agents: Vec<String>,
+        given: bool,
+        review: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(p) = self.projects.get(project) else { return };
         let (repo, base) = (p.path.clone(), p.values().base.clone());
         let path = git::task_worktree_dir(&repo, &branch);
         if let Some(why) = self.task_in_the_way(project, &path, &branch) {
@@ -2486,6 +2536,7 @@ impl Workspace {
             agent: agents_ui::pick_profile(agents.first().map_or("", String::as_str)),
             choices: agents_ui::pick_choices(agents.first().map_or("", String::as_str)),
             fresh: true,
+            review,
             ..Default::default()
         });
         if let Some(link) = self.projects[project].tasks.last().and_then(|t| t.ticket().cloned()) {
@@ -2497,7 +2548,9 @@ impl Workspace {
             let result = cx
                 .background_spawn(async move {
                     let copy = crate::project_config::resolve(&repo).config.task.copy;
-                    let made = git::new_task_worktree(&repo, &branch, &base, copy_env && copy.is_none());
+                    let copy_env = copy_env && copy.is_none();
+                    // A review is of a branch there is, never a new one from the base.
+                    let made = if review { git::review_worktree(&repo, &branch, copy_env) } else { git::new_task_worktree(&repo, &branch, &base, copy_env) };
                     if let (Ok((dir, _)), Some(copy)) = (&made, copy) {
                         crate::project_config::copy_ignored(&repo, dir, &copy);
                     }
@@ -3813,9 +3866,10 @@ fn branch_hint(title: &str, template: &str) -> String {
     }
 }
 
-/// What origin has of the branch a title makes, apart from the branch's
+/// What origin has of the branch a title makes, told apart from the branch's
 /// line: that branch, which the task then starts from; or others of its key.
-fn origin_note(title: &str, template: &str, origin: &OnOrigin) -> Option<String> {
+/// With what to look for in Review… instead: someone's work is reviewed there.
+fn origin_note(title: &str, template: &str, origin: &OnOrigin) -> Option<(String, String)> {
     let title = title.trim();
     if title.is_empty() {
         return None;
@@ -3823,7 +3877,7 @@ fn origin_note(title: &str, template: &str, origin: &OnOrigin) -> Option<String>
     let branch = naming::preview(title, template);
     let by = |b: &git::OriginBranch| format!("last commit by {}, {}", b.author, b.when);
     if let Some(there) = origin.named.get(&branch) {
-        return Some(format!("{branch} is on origin already ({}): Create starts the task on it, from its commits.", by(there)));
+        return Some((format!("{branch} is on origin already ({}): Create starts the task on it, from its commits.", by(there)), branch));
     }
     let key = crate::integrations::tickets::key_at_start(title)?;
     let others: Vec<&git::OriginBranch> = origin.keyed.get(key).into_iter().flatten().filter_map(|name| origin.named.get(name)).collect();
@@ -3832,7 +3886,7 @@ fn origin_note(title: &str, template: &str, origin: &OnOrigin) -> Option<String>
         0 => String::new(),
         n => format!(" and {n} more"),
     };
-    Some(format!("{key} has {} on origin ({}){more}: Create makes {branch} beside it.", first.name, by(first)))
+    Some((format!("{key} has {} on origin ({}){more}: Create makes {branch} beside it.", first.name, by(first)), key.to_string()))
 }
 
 use gpui_kit::component::{ActiveTheme as _, Selectable as _, Sizable as _};
@@ -3852,13 +3906,13 @@ mod origin_hint_tests {
         let template = crate::naming::DEFAULT_TEMPLATE;
         assert_eq!(branch_hint("DEV-7", template), "Branch: DEV-7. The title is named from what its agent reads in the issue");
         assert_eq!(
-            origin_note("DEV-7", template, &origin).as_deref(),
-            Some("DEV-7 is on origin already (last commit by Someone, 2 days ago): Create starts the task on it, from its commits.")
+            origin_note("DEV-7", template, &origin),
+            Some(("DEV-7 is on origin already (last commit by Someone, 2 days ago): Create starts the task on it, from its commits.".into(), "DEV-7".into()))
         );
-        assert!(origin_note("DEV-8 Fix login", template, &origin).is_some_and(|said| said.starts_with("DEV-8_fixLogin is on origin already")));
+        assert!(origin_note("DEV-8 Fix login", template, &origin).is_some_and(|(said, find)| said.starts_with("DEV-8_fixLogin is on origin already") && find == "DEV-8_fixLogin"));
         assert_eq!(
-            origin_note("DEV-8", template, &origin).as_deref(),
-            Some("DEV-8 has DEV-8_fixLogin on origin (last commit by Someone, 2 days ago): Create makes DEV-8 beside it.")
+            origin_note("DEV-8", template, &origin),
+            Some(("DEV-8 has DEV-8_fixLogin on origin (last commit by Someone, 2 days ago): Create makes DEV-8 beside it.".into(), "DEV-8".into()))
         );
         assert_eq!(origin_note("Plain words", template, &origin), None);
         assert_eq!(branch_hint("Plain words", template), "Branch: plain-words-…");
@@ -3866,8 +3920,8 @@ mod origin_hint_tests {
         // The branch Create makes, by the project's template, a key alone too.
         let feature = OnOrigin::from_branches(vec![branch("feature/DEV-7"), branch("DEV-8")]);
         assert_eq!(branch_hint("DEV-7", "feature/{key}-{slug}"), "Branch: feature/DEV-7. The title is named from what its agent reads in the issue");
-        assert!(origin_note("DEV-7", "feature/{key}-{slug}", &feature).is_some_and(|said| said.starts_with("feature/DEV-7 is on origin already")));
-        assert!(origin_note("DEV-8", "feature/{key}-{slug}", &feature).is_some_and(|said| said.ends_with("Create makes feature/DEV-8 beside it.")));
+        assert!(origin_note("DEV-7", "feature/{key}-{slug}", &feature).is_some_and(|(said, _)| said.starts_with("feature/DEV-7 is on origin already")));
+        assert!(origin_note("DEV-8", "feature/{key}-{slug}", &feature).is_some_and(|(said, _)| said.ends_with("Create makes feature/DEV-8 beside it.")));
     }
 }
 

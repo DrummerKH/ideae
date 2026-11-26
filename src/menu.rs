@@ -760,6 +760,7 @@ fn menus(shown: Shown) -> Vec<Menu> {
     let mut file = vec![
         when(projects, key("New Task…", "new_task")),
         when(projects, key("Ask a Question…", "ask_question")),
+        project_item(ProjectCommand::Review),
         sep(),
         when(!presenting, act("Add Project…", AddProject)),
         when(!presenting, act("Add Project on Another Machine…", AddRemoteProject)),

@@ -91,6 +91,39 @@ impl CodeHost for GitHub {
         let v = json(&gh_run(root, &["issue", "view", &number.to_string(), "--json", "title,body"])?)?;
         Ok((v["title"].as_str().ok_or(IntError::NotFound)?.to_string(), v["body"].as_str().unwrap_or_default().to_string()))
     }
+
+    fn open_requests(&self, root: &Path) -> Result<Vec<super::OpenRequest>, IntError> {
+        let listed = json(&gh_run(root, &["pr", "list", "--state", "open", "--limit", "200", "--json", "number,title,url,headRefName,author,isCrossRepository,isDraft"])?)?;
+        // Yours and those asking your review (a team's of yours too); not told, none.
+        let status = gh_run(root, &["pr", "status", "--json", "number"]).ok().and_then(|out| json(&out).ok()).unwrap_or_default();
+        Ok(parse_open(&listed, &status))
+    }
+}
+
+/// `gh pr list` of open requests, marked by `gh pr status`: `createdBy`
+/// yours, `needsReview` those asking your review.
+fn parse_open(listed: &Value, status: &Value) -> Vec<super::OpenRequest> {
+    let numbers = |key: &str| status[key].as_array().into_iter().flatten().filter_map(|v| v["number"].as_u64()).collect::<Vec<_>>();
+    let (mine, for_me) = (numbers("createdBy"), numbers("needsReview"));
+    listed
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| {
+            let number = v["number"].as_u64()?;
+            Some(super::OpenRequest {
+                number,
+                title: v["title"].as_str().unwrap_or_default().to_string(),
+                url: v["url"].as_str().unwrap_or_default().to_string(),
+                head: v["headRefName"].as_str()?.to_string(),
+                author: v["author"]["login"].as_str().unwrap_or_default().to_string(),
+                cross: v["isCrossRepository"].as_bool().unwrap_or(false),
+                draft: v["isDraft"].as_bool().unwrap_or(false),
+                for_me: for_me.contains(&number),
+                mine: mine.contains(&number),
+            })
+        })
+        .collect()
 }
 
 const LIST_FIELDS: &str = "number,title,headRefName,headRefOid,mergedAt,headRepository,headRepositoryOwner,isCrossRepository";
@@ -319,6 +352,21 @@ fn log_tail(log: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Open requests as `gh` lists them, yours and those asking your review marked.
+    #[test]
+    fn open_requests_are_marked_yours_or_asking_you() {
+        let listed: serde_json::Value = serde_json::from_str(r#"[
+            {"number":7,"title":"Fix login","url":"https://github.com/o/r/pull/7","headRefName":"DEV-7_fixLogin","author":{"login":"ann"},"isCrossRepository":false,"isDraft":false},
+            {"number":8,"title":"Mine","url":"https://github.com/o/r/pull/8","headRefName":"mine","author":{"login":"me"},"isCrossRepository":false,"isDraft":true},
+            {"number":9,"title":"From a fork","url":"https://github.com/o/r/pull/9","headRefName":"main","author":{"login":"bob"},"isCrossRepository":true,"isDraft":false}
+        ]"#).unwrap();
+        let status: serde_json::Value = serde_json::from_str(r#"{"createdBy":[{"number":8}],"needsReview":[{"number":7}],"currentBranch":null}"#).unwrap();
+        let open = super::parse_open(&listed, &status);
+        assert_eq!(open.iter().map(|r| (r.number, r.for_me, r.mine, r.draft, r.cross)).collect::<Vec<_>>(), [(7, true, false, false, false), (8, false, true, true, false), (9, false, false, false, true)]);
+        assert_eq!((open[0].head.as_str(), open[0].author.as_str(), open[0].url.as_str()), ("DEV-7_fixLogin", "ann", "https://github.com/o/r/pull/7"));
+        assert!(super::parse_open(&listed, &serde_json::Value::Null).iter().all(|r| !r.for_me && !r.mine), "no status: nothing marked");
+    }
+
     #[test]
     fn a_fork_s_head_names_its_owner() {
         assert_eq!(super::head_of_fork("me/app", "fix"), "me:fix");

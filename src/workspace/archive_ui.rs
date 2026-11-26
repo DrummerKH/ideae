@@ -274,6 +274,7 @@ impl Workspace {
             note: t.note.clone(),
             created: t.created,
             links: t.links.clone(),
+            reviewing: t.review,
             ..Default::default()
         };
         // Archived again after a restore: in the place of the one it came from.
@@ -917,6 +918,7 @@ impl Workspace {
                 entry.agent = m.agent.clone();
                 entry.links = m.links.clone();
                 entry.links_read = !m.links.is_empty();
+                entry.review = m.reviewing;
                 entry.base = restored.base.clone();
                 entry.archive = key.clone();
                 entry.archive_keep = restored.left_something();

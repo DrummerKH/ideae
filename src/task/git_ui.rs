@@ -949,8 +949,43 @@ impl TaskView {
     }
 
     /// Pushes; turned down for commits the remote has, asks whether to
-    /// pull them first or overwrite them.
+    /// pull them first or overwrite them. In a review, asks first: the
+    /// branch is a colleague's.
     pub(super) fn push(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy.is_some() {
+            return;
+        }
+        if self.review {
+            return self.confirm_review_push(Rc::new(Self::push_now), window, cx);
+        }
+        self.push_now(window, cx);
+    }
+
+    /// Asks before a push from a review, then does `then`: it puts commits
+    /// on a colleague's branch.
+    pub(super) fn confirm_review_push(&mut self, then: Rc<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)>, window: &mut Window, cx: &mut Context<Self>) {
+        let (this, branch) = (cx.weak_entity(), self.branch.clone());
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (this, then) = (this.clone(), then.clone());
+            dialog
+                .title("Push to the branch under review?")
+                .w(px(480.))
+                .child(div().text_sm().child(format!("This task reviews {branch}, a colleague's: a push puts commits on their branch.")))
+                .footer(
+                    h_flex()
+                        .w_full()
+                        .gap_2()
+                        .justify_end()
+                        .child(Button::new("review-push-cancel").small().ghost().label("Cancel").on_click(|_, window, cx| window.close_dialog(cx)))
+                        .child(Button::new("review-push").small().primary().label("Push anyway").on_click(move |_, window, cx| {
+                            window.close_dialog(cx);
+                            let _ = this.update(cx, |task, cx| then(task, window, cx));
+                        })),
+                )
+        });
+    }
+
+    fn push_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy.is_some() {
             return;
         }
@@ -970,6 +1005,47 @@ impl TaskView {
                         this.diverged_dialog(diverged, window, cx);
                     }
                     Err(Err(error)) => this.action = Some((false, format!("Push: {error}"))),
+                }
+                let _ = this.refresh_tx.try_send(());
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Origin's new commits of the branch under review brought in, and the
+    /// agent's input given a review of what they change: there to send as
+    /// it is or edit, not sent.
+    pub(super) fn review_again(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy.is_some() {
+            return;
+        }
+        // Its review goes to the agent's input: with none running it would be
+        // lost, and the commits brought in with nothing said of them.
+        if self.agent_of(Who::Main).is_none_or(|a| a.launch.is_none()) {
+            self.action = Some((false, "Review again: start the agent first".into()));
+            cx.notify();
+            return;
+        }
+        self.save_all_now(cx);
+        self.busy = Some("Review again");
+        self.action = None;
+        cx.notify();
+        let root = self.root.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let brought = cx
+                .background_spawn(crate::procs::on_thread(move || git::follow_upstream(&root)))
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.busy = None;
+                match brought {
+                    Ok((old, new)) if old != new => {
+                        this.action = Some((true, format!("Review again: {old}..{new}")));
+                        let told = format!("The branch has new commits since the last review ({old}..{new}): review what they change, `git diff {old}..{new}`. Do not push.");
+                        this.queue_prompt(told, false, window, cx);
+                    }
+                    Ok(_) => this.action = Some((true, "Review again: nothing new".into())),
+                    Err(e) => this.action = Some((false, format!("Review again: {e}"))),
                 }
                 let _ = this.refresh_tx.try_send(());
                 cx.notify();
