@@ -353,7 +353,9 @@ impl Workspace {
                     })?;
                     // Its agents there ask the window (ideae's MCP server) through a socket of yours there.
                     let unreached = connected.0.wire().and_then(|wire| wire.reach_window(&crate::mcp::socket()).err()).map(|e| crate::hosts::explain_ssh(&to, &e));
-                    Ok::<_, String>((connected, unreached))
+                    // Its store: its projects' tasks and their work are there, not here.
+                    let store = crate::machine::open_remote(&to, connected.0.clone()).inspect_err(|e| eprintln!("ideae: the store of {to} not opened: {e}")).ok();
+                    Ok::<_, String>((connected, unreached, store))
                 })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -365,13 +367,17 @@ impl Workspace {
                     }
                 }
                 match connected {
-                    Ok(((daemon, earlier), unreached)) => {
+                    Ok(((daemon, earlier), unreached, store)) => {
                         if let Some(why) = unreached {
                             let told = format!("Its agents there have no ideae tools (open files, problems, the check, other agents) until the link is made again: {why}");
                             window.push_notification(Notification::warning(told).title(format!("{}: the window not reached from there", crate::hosts::label(&host))), cx);
                         }
                         this.host_failed.remove(&host);
                         crate::daemon::client::add_remote(host.clone(), daemon);
+                        // Its tasks as the machine has them, before any of them starts.
+                        if let Some(machine) = store {
+                            this.take_in_host(&host, machine, true, window, cx);
+                        }
                         // What its agents reported while no window listened.
                         for hook in earlier {
                             let at = hook.at;
@@ -691,7 +697,7 @@ exec cat >> '{pwds}.told'
             format!(
                 "#!/bin/sh\n# A master connection's (-O forward, -O exit): here and there are one machine; a socket\n# forwarded (-R there:here) is a link to it.\no=; for a in \"$@\"; do if [ \"$o\" = -R ]; then case \"$a\" in /*:/*) mkdir -p \"$(dirname \"${{a%%:*}}\")\"; ln -sf \"${{a#*:}}\" \"${{a%%:*}}\";; esac; fi; o=\"$a\"; done\ncase \" $* \" in *\" -O \"*) exit 0;; esac\nwhile [ $# -gt 0 ] && [ \"$1\" != \"--\" ]; do shift; done; shift\nexport HOME='{}' IDEAE_STATE='{}' PATH='{}':\"$PATH\"\nunset XDG_RUNTIME_DIR\nexec sh -c \"$*\"\n",
                 short_home.display(),
-                dir.join("box-state.json").display(),
+                dir.join("box-state").join("state.json").display(),
                 bins.display()
             ),
         )
@@ -733,8 +739,8 @@ exec cat >> '{pwds}.told'
         let mut old_daemon = std::process::Command::new(&older)
             .arg("--daemon")
             .env("HOME", &home)
-            .env("IDEAE_STATE", dir.join("box-state.json"))
-            .env("IDEAE_APP", format!("{}-remote", crate::state::APP_ID))
+            .env("IDEAE_STATE", dir.join("box-state").join("state.json"))
+            .env("IDEAE_APP", crate::state::APP_ID)
             .env("PATH", format!("{}:{}", bins.display(), std::env::var("PATH").unwrap_or_default()))
             .env_remove("XDG_RUNTIME_DIR")
             .spawn()
@@ -820,6 +826,76 @@ exec cat >> '{pwds}.told'
         assert_eq!(worktree.parent(), Some(repo.with_file_name("repo.worktrees").as_path()));
         let branch = String::from_utf8(std::process::Command::new("git").args(["branch", "--show-current"]).current_dir(&worktree).output().unwrap().stdout).unwrap();
         let task = crate::hosts::join(host, &worktree);
+        // Its work is that machine's: in its store there, keyed as it is there; state.json here has its tabs alone.
+        let in_store = |cx: &mut TestAppContext| {
+            workspace.update(cx, |w, cx| w.save(cx));
+            let machine: ideae_core::store::Machine = std::fs::read(dir.join("box-state").join("machine.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+            machine.projects.iter().flat_map(|p| &p.tasks).find(|t| t.path == worktree).map(|t| t.title.clone())
+        };
+        until(cx, "the task in its machine's store", &|cx| in_store(cx).as_deref() == Some("Fix it"));
+        let here: crate::state::State = serde_json::from_slice(&std::fs::read(dir.join("state.json")).unwrap()).unwrap();
+        let mirrored = here.projects.iter().flat_map(|p| &p.tasks).find(|t| t.path == task).expect("its tabs kept here");
+        assert!(mirrored.title.is_empty() && mirrored.prompt.is_empty(), "nothing of its work here");
+        // That machine's own window renames it there: shown here.
+        let desk_change = |change: &dyn Fn(&mut ideae_core::store::Machine)| {
+            use crate::daemon::proto::{self, Frame, Msg};
+            let box_state = dir.join("box-state").join("state.json");
+            let mut desk = std::os::unix::net::UnixStream::connect(proto::socket_for(Some(box_state.as_os_str()))).expect("the machine's daemon");
+            proto::write_msg(&mut desk, &Msg::Hello { protocol: proto::PROTOCOL, version: crate::build_watch::build_id() }).unwrap();
+            desk.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let call = |desk: &mut std::os::unix::net::UnixStream, call: proto::Call, body: &[u8]| -> Vec<u8> {
+                proto::write_bytes(desk, proto::KIND_CALL, "d", &proto::pack(&call, body)).unwrap();
+                loop {
+                    if let Ok(Frame::Bytes { kind: proto::KIND_REPLY, bytes, .. }) = proto::read_frame(desk) {
+                        let (reply, body) = proto::unpack::<proto::Reply>(&bytes).unwrap();
+                        assert_eq!(reply.error, None);
+                        return body.to_vec();
+                    }
+                }
+            };
+            let base: ideae_core::store::Machine = serde_json::from_slice(&call(&mut desk, proto::Call::StoreGet, b"")).unwrap();
+            let mut wanted = base.clone();
+            change(&mut wanted);
+            call(&mut desk, proto::Call::StoreSync, &serde_json::to_vec(&serde_json::json!({ "base": base, "wanted": wanted })).unwrap());
+        };
+        let desk_rename = |path: &std::path::Path, title: &str| {
+            desk_change(&|m| m.projects.iter_mut().flat_map(|p| &mut p.tasks).find(|t| t.path == path).unwrap().title = title.into());
+        };
+        desk_rename(&worktree, "Fixed at the desk");
+        until(cx, "the desk's rename here", &|cx| workspace.update(cx, |w, _| w.entry_mut(&task).is_some_and(|t| t.title == "Fixed at the desk")));
+        // A project made at that machine's desk: offered here, not put in the list.
+        let other = dir.join("other");
+        desk_change(&|m| {
+            let task = ideae_core::store::Task { path: other.clone(), branch: "main".into(), main: true, title: "Other's main".into(), ..Default::default() };
+            m.projects.push(ideae_core::store::Project { path: other.clone(), tasks: vec![task], ..Default::default() });
+        });
+        let other_here = crate::hosts::join(host, &other);
+        let hop_host = crate::hosts::split(&task).unwrap().0;
+        until(cx, "the machine's other project offered", &|cx| {
+            workspace.update(cx, |w, _| w.more_elsewhere.get(&hop_host).is_some_and(|more| more.iter().any(|(p, name)| *p == other_here && name == "other")))
+        });
+        workspace.update(cx, |w, _| assert!(w.projects.iter().all(|p| p.path != other_here), "not in the list until shown"));
+        cx.update_window(handle.into(), |_, window, cx| {
+            use gpui_kit::test::TestWindowExt as _;
+            window.render_frame(cx);
+            assert!(window.try_find(gpui_kit::SharedString::from(format!("more-elsewhere-{hop_host}"))).is_some(), "its row in the sidebar");
+        })
+        .unwrap();
+        cx.update_window(handle.into(), |_, window, cx| workspace.update(cx, |w, cx| w.show_elsewhere(&hop_host, std::slice::from_ref(&other_here), window, cx))).unwrap();
+        workspace.update(cx, |w, _| {
+            let p = w.projects.iter().find(|p| p.path == other_here).expect("shown");
+            assert_eq!(p.tasks.iter().find(|t| t.main).map(|t| t.title.as_str()), Some("Other's main"), "with its tasks as the machine has them");
+            assert!(!w.more_elsewhere.contains_key(&hop_host), "offered no more");
+        });
+        // Removed from the list here, as Remove does: it stays there, offered again.
+        workspace.update(cx, |w, cx| {
+            w.projects.retain(|p| p.path != other_here);
+            w.find_more_elsewhere(&hop_host);
+            w.save(cx);
+        });
+        workspace.update(cx, |w, _| assert!(w.more_elsewhere.get(&hop_host).is_some_and(|more| more.iter().any(|(p, _)| *p == other_here))));
+        let kept: ideae_core::store::Machine = serde_json::from_slice(&std::fs::read(dir.join("box-state").join("machine.json")).unwrap()).unwrap();
+        assert!(kept.projects.iter().any(|p| p.path == other), "still that machine's");
         workspace.update(cx, |w, _| {
             assert_eq!(w.active.as_deref(), Some(task.as_path()));
             assert_eq!(w.entry_mut(&task).unwrap().branch, branch.trim());
@@ -1079,6 +1155,23 @@ exec cat >> '{pwds}.told'
         assert_eq!(log.trim(), "Saved there");
         crate::archive::delete(&item.file).unwrap();
         assert!(!item.file.exists());
+
+        // A start again: state.json here has no more of that machine's projects than the
+        // window's own; their tasks come from its store once it is reached.
+        desk_rename(&repo, "Main at the desk");
+        workspace.update(cx, |w, cx| w.save(cx));
+        cx.update_window(handle.into(), |_, window, _| window.remove_window()).unwrap();
+        cx.run_until_parked();
+        let (handle, workspace) = cx.update(|cx| {
+            let bounds = gpui_kit::Bounds { origin: gpui_kit::Point::default(), size: gpui_kit::size(gpui_kit::px(1300.), gpui_kit::px(800.)) };
+            let options = gpui_kit::WindowOptions { window_bounds: Some(gpui_kit::WindowBounds::Windowed(bounds)), ..Default::default() };
+            gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| Workspace::new(Vec::new(), Some(Some(agent.clone())), None, window, cx))).expect("a test window")
+        });
+        let _ = handle;
+        until(cx, "the machine's own name of its main thread, after a start again", &|cx| workspace.update(cx, |w, _| w.entry_mut(&main).is_some_and(|t| t.title == "Main at the desk")));
+        // Nothing started elsewhere than there: a window that lost its projects opens the folder it was started in.
+        let canon_dir = dir.canonicalize().unwrap();
+        assert!(lines().iter().all(|l| std::path::Path::new(l).starts_with(&canon_dir) || std::path::Path::new(l).starts_with(&dir)), "agents ran only there: {:?}", lines());
 
         drop(_end);
         let _ = std::fs::remove_file(&short_home);

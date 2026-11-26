@@ -104,6 +104,69 @@ pub struct TaskEntry {
 }
 
 impl TaskEntry {
+    /// A task as it was saved (or as the store has it): not running.
+    fn of_saved(t: &state::TaskState) -> Self {
+        TaskEntry {
+                path: t.path.clone(),
+                branch: t.branch.clone(),
+                title: t.title.clone(),
+                main: t.main,
+                starred: t.starred,
+                last_active: t.last_active,
+                session: t.session.clone(),
+                view: None,
+                busy: None,
+                locked: None,
+                left_view: None,
+                pr: None,
+                pr_checked: None,
+                port_slot: t.port_slot,
+                group: t.group.clone(),
+                variant: t.variant,
+                note: t.note.clone(),
+                prompt: t.prompt.clone(),
+                created: t.created,
+                done_at: t.done_at,
+                seen_at: t.seen_at,
+                base: t.base.clone(),
+                head: None,
+                side: None,
+                agent: t.agent.clone(),
+                choices: t.choices.clone(),
+                sessions: t.sessions.clone(),
+                fresh: t.fresh,
+                archive: t.archive.clone(),
+                archive_keep: t.archive_keep,
+                woke: t.woke.clone(),
+                questions: t.questions.clone(),
+                asked: t.asked,
+                spawned_by: t.spawned_by.clone(),
+                links: t.links.clone(),
+                links_read: t.links_read,
+                review: t.review,
+            }
+    }
+
+    /// What a saved task (another window's, by way of the store) has of the
+    /// machine's, over this one's; its tabs and what runs stay.
+    fn take_saved(&mut self, t: &state::TaskState) {
+        let mut again = Self::of_saved(t);
+        let mut session = std::mem::take(&mut self.session);
+        session.review = t.session.review.clone();
+        session.viewed = t.session.viewed.clone();
+        session.bookmarks = t.session.bookmarks.clone();
+        again.session = session;
+        again.view = self.view.take();
+        again.busy = self.busy.take();
+        again.left_view = self.left_view.take();
+        again.pr = self.pr.take();
+        again.pr_checked = self.pr_checked.take();
+        again.locked = self.locked.take();
+        again.head = self.head.take();
+        again.side = self.side.take();
+        *self = again;
+    }
+
     /// Its request as a link: added, or brought up to date.
     pub fn set_pr_link(&mut self, pr: &crate::pr::Pr) {
         let link = state::TaskLink { what: "pr".into(), key: format!("#{}", pr.number), url: pr.url.clone(), ..Default::default() };
@@ -121,6 +184,7 @@ impl TaskEntry {
 
 pub mod agents_ui;
 pub mod archive_ui;
+mod elsewhere;
 mod hosts_ui;
 pub(crate) use hosts_ui::HostState;
 mod merged_ui;
@@ -147,7 +211,8 @@ impl TaskEntry {
     /// the latest in the folder, unless questions asked there made others.
     pub fn session_ref(&self) -> Option<crate::agents::SessionRef> {
         let session = self.sessions.last().filter(|s| s.id.is_some() || self.asked == 0)?;
-        let profile = state::with_settings(|s| s.profile(&session.profile).cloned())?;
+        // Of the machine it runs on.
+        let profile = crate::agents::profiles_for(&self.path).0.into_iter().find(|p| p.id == session.profile)?;
         Some(crate::agents::SessionRef { profile, id: session.id.clone() })
     }
 
@@ -292,6 +357,12 @@ pub struct Workspace {
     quiet_start: std::collections::HashSet<PathBuf>,
     /// Agents tasks' agents started (crew.rs).
     crew: crew::Crew,
+    /// The machine's store this window opened (crate::machine): its saves go to that one alone.
+    store: u64,
+    /// Projects of each connected machine this window does not show (its
+    /// sidebar offers them: "box: 3 more projects"), by host: path and name.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub more_elsewhere: std::collections::BTreeMap<String, Vec<(PathBuf, String)>>,
     /// The next task made sends its prompt: the dialog filled it, nobody
     /// has anything to add.
     send_next_prompt: bool,
@@ -507,6 +578,9 @@ impl Workspace {
                 None => eprintln!("daemon unavailable: terminals run in the window"),
             }
         }
+        // This machine's projects and tasks are its store's: its daemon's, or this window's where there is none.
+        let store = crate::machine::open(&mut saved);
+        Self::follow_store(window, cx);
         // What ssh asks (a password, a passphrase) for a project on another machine.
         #[cfg(unix)]
         {
@@ -592,6 +666,8 @@ impl Workspace {
             // window; any other quit ends them with everything else.
             cx.on_app_quit(|this: &mut Self, cx| {
                 this.save(cx);
+                // Its changes to other machines' projects there before their links close.
+                crate::machine::flush_remote(std::time::Duration::from_secs(3));
                 if this.keep_terminals {
                     for view in this.views() {
                         view.update(cx, |t, cx| t.save_all_now(cx));
@@ -877,6 +953,8 @@ impl Workspace {
             last_run: Default::default(),
             quiet_start: Default::default(),
             crew: crew::Crew::from_records(&saved.crew),
+            store,
+            more_elsewhere: Default::default(),
             send_next_prompt: false,
             naming_tasks: Default::default(),
             fork_copies: Default::default(),
@@ -952,6 +1030,13 @@ impl Workspace {
                     this.tell_unlisted(window, cx);
                     cx.notify();
                 });
+            })
+            .detach();
+        }
+        // What the start found of this machine's store, said once: once the window can show it.
+        if let Some(note) = crate::machine::take_note() {
+            cx.spawn_in(window, async move |_, cx| {
+                let _ = cx.update(|window, cx| window.push_notification(Notification::warning(note).title("Your tasks"), cx));
             })
             .detach();
         }
@@ -1050,72 +1135,37 @@ impl Workspace {
         this
     }
 
+    /// A project as it was saved (or as the store has it), its judges'
+    /// verdicts and its tasks' checks taken in.
+    fn project_of_saved(&mut self, p: &state::ProjectState) -> Project {
+        let mut project = Project::new(p.path.clone());
+        project.space = p.space_id.clone();
+        project.collapsed = p.collapsed;
+        project.check = p.check.clone();
+        project.check_auto = p.check_auto;
+        project.settings = p.settings.clone();
+        project.trusted = p.trusted.clone();
+        project.hints_off = p.hints_off.iter().cloned().collect();
+        project.made_by_agents = p.made_by_agents.clone();
+        crate::project_config::set_own(&p.path, p.own.clone());
+        // What the judge said and how the checks went: paid for, kept.
+        for (group, verdict) in &p.verdicts {
+            self.judges.insert(group.clone(), verdict.clone());
+            self.judged.insert(group.clone());
+        }
+        self.stale_verdicts.extend(p.stale_verdicts.iter().cloned());
+        for t in &p.tasks {
+            if let Some(check) = &t.check {
+                self.checks.insert(t.path.clone(), check.clone());
+            }
+        }
+        project.tasks = p.tasks.iter().map(TaskEntry::of_saved).collect();
+        project
+    }
+
     fn restore(&mut self, saved: &State, window: &mut Window, cx: &mut Context<Self>) {
         for p in &saved.projects {
-            let mut project = Project::new(p.path.clone());
-            project.space = p.space_id.clone();
-            project.collapsed = p.collapsed;
-            project.check = p.check.clone();
-            project.check_auto = p.check_auto;
-            project.settings = p.settings.clone();
-            project.trusted = p.trusted.clone();
-            project.hints_off = p.hints_off.iter().cloned().collect();
-            project.made_by_agents = p.made_by_agents.clone();
-            crate::project_config::set_own(&p.path, p.own.clone());
-            // What the judge said and how the checks went: paid for, kept.
-            for (group, verdict) in &p.verdicts {
-                self.judges.insert(group.clone(), verdict.clone());
-                self.judged.insert(group.clone());
-            }
-            self.stale_verdicts.extend(p.stale_verdicts.iter().cloned());
-            for t in &p.tasks {
-                if let Some(check) = &t.check {
-                    self.checks.insert(t.path.clone(), check.clone());
-                }
-            }
-            project.tasks = p
-                .tasks
-                .iter()
-                .map(|t| TaskEntry {
-                    path: t.path.clone(),
-                    branch: t.branch.clone(),
-                    title: t.title.clone(),
-                    main: t.main,
-                    starred: t.starred,
-                    last_active: t.last_active,
-                    session: t.session.clone(),
-                    view: None,
-                    busy: None,
-                    locked: None,
-                    left_view: None,
-                    pr: None,
-                    pr_checked: None,
-                    port_slot: t.port_slot,
-                    group: t.group.clone(),
-                    variant: t.variant,
-                    note: t.note.clone(),
-                    prompt: t.prompt.clone(),
-                    created: t.created,
-                    done_at: t.done_at,
-                    seen_at: t.seen_at,
-                    base: t.base.clone(),
-                    head: None,
-                    side: None,
-                    agent: t.agent.clone(),
-                    choices: t.choices.clone(),
-                    sessions: t.sessions.clone(),
-                    fresh: t.fresh,
-                    archive: t.archive.clone(),
-                    archive_keep: t.archive_keep,
-                    woke: t.woke.clone(),
-                    questions: t.questions.clone(),
-                    asked: t.asked,
-                    spawned_by: t.spawned_by.clone(),
-                    links: t.links.clone(),
-                    links_read: t.links_read,
-                    review: t.review,
-                })
-                .collect();
+            let project = self.project_of_saved(p);
             self.projects.push(project);
         }
         self.tell_user_browsers();
@@ -1191,6 +1241,46 @@ impl Workspace {
 
     // ------------------------------------------------------------ state
 
+    /// A task as it is saved: what it has, its tabs from its view when it runs.
+    fn task_state(&self, t: &TaskEntry, cx: &App) -> TaskState {
+        TaskState {
+            path: t.path.clone(),
+            branch: t.branch.clone(),
+            title: t.title.clone(),
+            main: t.main,
+            starred: t.starred,
+            last_active: t.last_active,
+            open: t.view.is_some() || self.restoring.contains(&t.path),
+            port_slot: t.port_slot,
+            session: match &t.view {
+                Some(view) => view.read(cx).session(cx),
+                None => t.session.clone(),
+            },
+            group: t.group.clone(),
+            variant: t.variant,
+            note: t.note.clone(),
+            prompt: t.prompt.clone(),
+            created: t.created,
+            done_at: t.done_at,
+            seen_at: t.seen_at,
+            base: t.base.clone(),
+            check: self.checks.get(&t.path).filter(|run| run.is_over()).cloned(),
+            agent: t.agent.clone(),
+            choices: t.choices.clone(),
+            sessions: t.sessions.clone(),
+            fresh: t.fresh,
+            archive: t.archive.clone(),
+            archive_keep: t.archive_keep,
+            woke: t.woke.clone(),
+            questions: t.questions.clone(),
+            asked: t.asked,
+            spawned_by: t.spawned_by.clone(),
+            links: t.links.clone(),
+            links_read: t.links_read,
+            review: t.review,
+        }
+    }
+
     fn snapshot(&self, cx: &App) -> State {
         State {
             appearance: Some(self.appearance.label().to_lowercase()),
@@ -1213,6 +1303,8 @@ impl Workspace {
             zoom: crate::zoom::current(cx),
             crew: self.crew.records(),
             learn_counts: crate::learn::counts(),
+            // Set as it is written (crate::machine::sync).
+            machine_rev: 0,
             projects: self
                 .projects
                 .iter()
@@ -1242,48 +1334,18 @@ impl Workspace {
                         .filter(|(group, run)| run.is_over() && p.tasks.iter().any(|t| &t.group == *group))
                         .map(|(group, run)| (group.clone(), run.clone()))
                         .collect(),
-                    stale_verdicts: self.stale_verdicts.iter().filter(|group| p.tasks.iter().any(|t| &t.group == *group)).cloned().collect(),
+                    // Sorted: a set lists itself in each process's order, which would look like a change to another window.
+                    stale_verdicts: {
+                        let mut stale: Vec<String> = self.stale_verdicts.iter().filter(|group| p.tasks.iter().any(|t| &t.group == *group)).cloned().collect();
+                        stale.sort();
+                        stale
+                    },
                     tasks: p
                         .tasks
                         .iter()
                         // One being archived is kept till it is: the app may quit before.
                         .filter(|t| t.busy.is_none() || t.view.is_some() || !t.group.is_empty() || t.busy.as_deref() == Some(archive_ui::ARCHIVING))
-                        .map(|t| TaskState {
-                            path: t.path.clone(),
-                            branch: t.branch.clone(),
-                            title: t.title.clone(),
-                            main: t.main,
-                            starred: t.starred,
-                            last_active: t.last_active,
-                            open: t.view.is_some() || self.restoring.contains(&t.path),
-                            port_slot: t.port_slot,
-                            session: match &t.view {
-                                Some(view) => view.read(cx).session(cx),
-                                None => t.session.clone(),
-                            },
-                            group: t.group.clone(),
-                            variant: t.variant,
-                            note: t.note.clone(),
-                            prompt: t.prompt.clone(),
-                            created: t.created,
-                            done_at: t.done_at,
-                            seen_at: t.seen_at,
-                            base: t.base.clone(),
-                            check: self.checks.get(&t.path).filter(|run| run.is_over()).cloned(),
-                            agent: t.agent.clone(),
-                            choices: t.choices.clone(),
-                            sessions: t.sessions.clone(),
-                            fresh: t.fresh,
-                            archive: t.archive.clone(),
-                            archive_keep: t.archive_keep,
-                            woke: t.woke.clone(),
-                            questions: t.questions.clone(),
-                            asked: t.asked,
-                            spawned_by: t.spawned_by.clone(),
-                            links: t.links.clone(),
-                            links_read: t.links_read,
-                            review: t.review,
-                        })
+                        .map(|t| self.task_state(t, cx))
                         .collect(),
                 }
                 })
@@ -1291,25 +1353,27 @@ impl Workspace {
         }
     }
 
-    fn serialize(&self, cx: &App) -> String {
-        serde_json::to_string_pretty(&self.snapshot(cx)).unwrap_or_default()
+    /// Tasks the snapshot leaves out as they are busy (a remote one connecting,
+    /// one being made): not gone, so the store keeps them as they were.
+    fn kept_aside(&self) -> Vec<PathBuf> {
+        self.projects.iter().flat_map(|p| &p.tasks).filter(|t| t.busy.is_some() && t.view.is_none() && t.group.is_empty() && t.busy.as_deref() != Some(archive_ui::ARCHIVING)).map(|t| t.path.clone()).collect()
     }
 
     /// On disk when it returns: before the window or the app goes.
     pub fn save(&mut self, cx: &App) {
-        let json = self.serialize(cx);
+        let snapshot = (self.snapshot(cx), crate::machine::taken_in(self.store), self.kept_aside());
         self.save_seq += 1;
-        write_state(&self.last_saved, self.save_seq, json);
+        write_state(&self.last_saved, self.save_seq, snapshot);
         crate::secrets::flush();
     }
 
     /// The now-and-then save: what it takes from the UI thread is the copy
     /// of the state; turning it into text and writing it happen off it.
     pub(crate) fn save_later(&mut self, cx: &mut Context<Self>) {
-        let snapshot = self.snapshot(cx);
+        let snapshot = (self.snapshot(cx), crate::machine::taken_in(self.store), self.kept_aside());
         self.save_seq += 1;
         let (seq, last) = (self.save_seq, self.last_saved.clone());
-        cx.background_spawn(async move { write_state(&last, seq, serde_json::to_string_pretty(&snapshot).unwrap_or_default()) }).detach();
+        cx.background_spawn(async move { write_state(&last, seq, snapshot) }).detach();
     }
 
     // ------------------------------------------------------------ tasks
@@ -1890,7 +1954,7 @@ impl Workspace {
         if let Some(entry) = self.entry_mut(path) {
             entry.starred = !entry.starred;
         }
-        self.save(cx);
+        self.save_later(cx);
         cx.notify();
     }
 
@@ -2608,7 +2672,11 @@ impl Workspace {
             dialog
                 .confirm()
                 .title(format!("Remove {name} from the list?"))
-                .description("Its files and worktrees stay on disk; running tasks are stopped.")
+                .description(if crate::hosts::is_remote(&path) {
+                    "It stays on its machine, with its tasks, for its own window and others; running tasks here are stopped. Shown again from its machine's row below the projects."
+                } else {
+                    "Its files and worktrees stay on disk; running tasks are stopped."
+                })
                 .ok_text("Remove")
                 .on_ok(move |_, window, cx| {
                     let _ = this.update(cx, |this, cx| {
@@ -2616,9 +2684,16 @@ impl Workspace {
                             this.stop(task, window, cx);
                         }
                         this.projects.retain(|p| p.path != path);
-                        // Its deferred tasks no longer come back: archives like the others.
-                        let (root, project) = (this.archive_dir.clone(), path.clone());
-                        cx.background_spawn(async move { crate::archive::undefer_project(&root, &project) }).detach();
+                        // Another machine's stays there, with its deferred tasks: shown no more here, offered again.
+                        if let Some((host, _)) = crate::hosts::split(&path) {
+                            #[cfg(unix)]
+                            this.find_more_elsewhere(&host);
+                            let _ = host;
+                        } else {
+                            // Its deferred tasks no longer come back: archives like the others.
+                            let (root, project) = (this.archive_dir.clone(), path.clone());
+                            cx.background_spawn(async move { crate::archive::undefer_project(&root, &project) }).detach();
+                        }
                         cx.notify();
                     });
                     true
@@ -3007,7 +3082,7 @@ impl Workspace {
             .filter(|t| t.view.is_some())
             .flat_map(|t| t.questions.iter().filter(|q| q.closed == 0).map(move |q| (t, q)))
             .filter_map(|(t, q)| {
-                let profile = state::with_settings(|s| s.profile(&q.profile).cloned())?;
+                let profile = crate::agents::profile_of(&t.path, &q.profile)?;
                 let who = crate::agents::SessionRef { profile, id: Some(q.session.clone()?) };
                 Some((t.path.clone(), q.id, who, self.question_usage.get(&(t.path.clone(), q.id)).copied().flatten()))
             })
@@ -3193,9 +3268,9 @@ impl Workspace {
             Some(None) => return None,
             Some(Some(command)) => crate::agents::Profile { id: String::new(), ..crate::agents::Profile::from_command(command) },
             None => {
-                let settings = state::settings();
+                let (agents, default) = crate::agents::profiles_for(&t.path);
                 let last = t.sessions.last().map(|s| s.profile.clone()).unwrap_or_default();
-                crate::agents::resolve(&settings.agents, &[&last, &t.agent], Some(&project_agent), &settings.default_agent)?.clone()
+                crate::agents::resolve(&agents, &[&last, &t.agent], Some(&project_agent), &default)?.clone()
             }
         };
         let same = t.sessions.last().is_some_and(|s| s.profile == profile.id);
@@ -3299,7 +3374,7 @@ impl Workspace {
             }
         }
         crate::predict::settings_changed(&old, &new, cx);
-        self.save(cx);
+        self.save_later(cx);
         cx.notify();
     }
 
@@ -3599,7 +3674,7 @@ impl Workspace {
     pub fn set_appearance(&mut self, appearance: Appearance, window: &mut Window, cx: &mut Context<Self>) {
         self.appearance = appearance;
         theme::apply(appearance, window, cx);
-        self.save(cx);
+        self.save_later(cx);
         cx.notify();
     }
 }
@@ -3607,12 +3682,16 @@ impl Workspace {
 /// "DEV-123" at the start of a title.
 /// Writes the state when it is not what was written last, saves in the
 /// order they were asked for.
-fn write_state(last: &std::sync::Mutex<(u64, String)>, seq: u64, json: String) {
+/// The store first (crate::machine), then state.json with its rev.
+/// `snapshot`: the state, and where the model was when it was taken (crate::machine::taken_in).
+fn write_state(last: &std::sync::Mutex<(u64, String)>, seq: u64, (mut snapshot, taken_in, aside): (State, u64, Vec<PathBuf>)) {
     let mut last = last.lock().unwrap();
     if seq < last.0 {
         return;
     }
     last.0 = seq;
+    crate::machine::sync(&mut snapshot, taken_in, &aside);
+    let json = serde_json::to_string_pretty(&snapshot).unwrap_or_default();
     if json != last.1 {
         match state::save(&json) {
             Ok(()) => last.1 = json,

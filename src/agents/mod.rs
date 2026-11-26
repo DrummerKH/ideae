@@ -284,6 +284,68 @@ pub fn new_profile_id(name: &str, taken: &[Profile]) -> String {
     std::iter::once(stem.clone()).chain((2..).map(|n| format!("{stem}-{n}"))).find(|id| !taken.iter().any(|p| &p.id == id)).unwrap_or(stem)
 }
 
+/// The agents' profiles of the machine `path` is on, and its default: a
+/// task of another machine runs that machine's (their commands and keys
+/// are its), with its default, or the one of the same name as this one's;
+/// a machine with none of its own (a server no ideae of its own runs on)
+/// runs this one's.
+pub fn profiles_for(path: &std::path::Path) -> (Vec<Profile>, String) {
+    let (here, default) = crate::state::with_settings(|s| (s.agents.clone(), s.default_agent.clone()));
+    #[cfg(unix)]
+    if let Some((host, _)) = crate::hosts::split(path) {
+        return pick_profiles(here, default, crate::machine::machine_settings(&host));
+    }
+    let _ = path;
+    (here, default)
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+/// This computer's profiles and default, or `machine`'s (its Machine layer
+/// and profiles) when it has any: its default, else this one's by id, else
+/// by name.
+fn pick_profiles(here: Vec<Profile>, default: String, machine: Option<(serde_json::Value, Vec<serde_json::Value>)>) -> (Vec<Profile>, String) {
+    let Some((settings, profiles)) = machine else { return (here, default) };
+    let theirs: Vec<Profile> = profiles.into_iter().filter_map(|p| serde_json::from_value(p).ok()).collect();
+    if theirs.is_empty() {
+        return (here, default);
+    }
+    let named = here.iter().find(|p| p.id == default).map(|p| p.name.clone());
+    let theirs_default = settings
+        .get("default_agent")
+        .and_then(|v| v.as_str())
+        .filter(|id| theirs.iter().any(|p| p.id == *id))
+        .map(String::from)
+        .or_else(|| theirs.iter().find(|p| p.id == default).map(|p| p.id.clone()))
+        .or_else(|| named.and_then(|name| theirs.iter().find(|p| p.name == name).map(|p| p.id.clone())))
+        .unwrap_or_default();
+    (theirs, theirs_default)
+}
+
+#[cfg(test)]
+#[test]
+fn a_machine_s_tasks_run_its_own_agents() {
+    let profile = |id: &str, name: &str, command: &str| Profile { id: id.into(), name: name.into(), command: command.into(), ..Profile::claude_code() };
+    let here = vec![profile("claude", "Claude Code", "claude"), profile("codex", "Codex", "codex")];
+    let as_json = |p: &[Profile]| p.iter().map(|p| serde_json::to_value(p).unwrap()).collect::<Vec<_>>();
+    // A machine with none of its own: this one's.
+    let (all, default) = pick_profiles(here.clone(), "codex".into(), Some((serde_json::json!({}), Vec::new())));
+    assert_eq!((all.len(), default.as_str()), (2, "codex"));
+    // Its own, its own default.
+    let theirs = vec![profile("cc", "Claude Code", "/opt/claude"), profile("x", "Codex", "/opt/codex")];
+    let (all, default) = pick_profiles(here.clone(), "claude".into(), Some((serde_json::json!({ "default_agent": "x" }), as_json(&theirs))));
+    assert_eq!((all[0].command.as_str(), default.as_str()), ("/opt/claude", "x"));
+    // No default of its own: this one's by id, else by name.
+    let (_, default) = pick_profiles(here.clone(), "claude".into(), Some((serde_json::json!({}), as_json(&theirs))));
+    assert_eq!(default, "cc", "Claude Code by its name there");
+    let (_, default) = pick_profiles(here, "x".into(), Some((serde_json::json!({ "default_agent": "gone" }), as_json(&theirs))));
+    assert_eq!(default, "x", "by id");
+}
+
+/// The profile `id` of the machine `path` is on ([`profiles_for`]).
+pub fn profile_of(path: &std::path::Path, id: &str) -> Option<Profile> {
+    profiles_for(path).0.into_iter().find(|p| p.id == id)
+}
+
 /// The agent of a task: the one it runs now (its last session's), else
 /// the one chosen when it was made, else its project's, else the default.
 /// A profile since removed counts as none.

@@ -400,11 +400,11 @@ fn user_profile_path(browser: &UserBrowser) -> PathBuf {
 /// A user's browser's profile, made when it has none: no logins seeded
 /// from any other, and only the user may read it.
 fn user_profile(browser: &UserBrowser) -> Result<PathBuf> {
-    let all = user_profiles_dir();
     let dir = user_profile_path(browser);
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        let all = user_profiles_dir();
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
         for made in [&all, &dir] {
             std::fs::set_permissions(made, std::fs::Permissions::from_mode(0o700))?;

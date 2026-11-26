@@ -15,6 +15,7 @@ pub mod paths;
 pub mod procs;
 pub mod said;
 pub mod status;
+pub mod store;
 pub mod watch;
 
 #[cfg(test)]

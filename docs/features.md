@@ -74,7 +74,24 @@ its own version there (static, for Linux x86_64 and aarch64 and macOS; no
 network needed there) and its tasks run there: their worktrees, agents and
 terminals, git, the changes and the files you open and save. The agents
 report as local ones do and go on while the window is closed or the link is
-down; the window dials again on its own. Exit ends them there too.
+down; the window dials again on its own. Exit ends those this window
+started there, and not the others: those another window shows (a second
+computer of yours at work on that machine) or that machine's own ideae
+started (its window closed with × leaves them running). They run in that user's own ideae daemon there, the one that
+machine's own ideae runs its tasks in too, and the tasks themselves are that
+machine's: their titles, notes, links, questions and review notes are kept
+there, shared with its own ideae's window (a task renamed at that machine's
+desk is renamed here), and this computer keeps no more of them than its
+tabs. The projects of that machine this window does not show (made at its
+desk, or removed here, where they are only no longer shown) are offered
+below the projects: **box: 3 more projects ▾**, each to show, or all. Its tasks run that machine's agents
+(the profiles its own ideae has, their commands and keys being its): its
+default agent, else the one of the same name as this computer's; a
+machine with none of its own (a server no ideae of its own runs on) runs
+this computer's. An ideae-server there that a newer window cannot
+speak with is replaced, unless another window is at work on it: then the
+window says why it cannot connect. That machine's own ideae is never
+replaced from here: one too old for this window is to be updated there.
 
 Its files are watched there, and a change shows as a local one does. Pull
 requests are asked of GitHub here, with your sign-in (`gh`), of the
@@ -110,12 +127,13 @@ asks the window through its socket reached there by ssh, a socket of yours
 alone there; the files they name are those there.
 
 With **Agents on other machines drive Chrome here** on (Settings →
-Browser, or a space or a project of machines that are yours alone; off at
+Browser, or a space or a project of machines whose root you trust; off at
 first, never a team's file's to say), its agents there drive its Web tabs
 as a local task's do: IDEAE_BROWSER_CDP names the same port there, which
-ssh carries back to the task's Chrome here while the task is open. Any user
-of that machine can reach that port: only for machines that are yours
-alone.
+ssh carries back to the task's Chrome here while the task is open. That port
+lets through only your user's processes there; another user's is closed
+unanswered (its root can still reach it: only for machines whose root you
+trust).
 
 ## Pause, archive, restore
 

@@ -41,6 +41,27 @@ pub enum Call {
     /// The TCP ports the processes of task `task`'s sessions listen on, as
     /// JSON `[{port, pid, name}]`: its servers, for the window to reach.
     Listening { task: String },
+    /// Port `port` of this machine's loopback reaches `socket` (a window's
+    /// Chrome carried here by ssh) for this user's processes alone; None
+    /// lets go of it.
+    Relay { port: u16, socket: Option<PathBuf> },
+    /// This machine's store (crate::store), kept by the daemon for its
+    /// windows: opened with the window's state.json (the body), its file
+    /// and the store's rev it was written at. Answered with JSON
+    /// `{machine, note}`.
+    StoreOpen { dir: PathBuf, state_file: PathBuf, machine_rev: u64 },
+    /// This machine's own store, for a window of another machine (over ssh):
+    /// made, the first time, of the state.json an ideae of this machine
+    /// keeps, if any. Answered as `StoreOpen`.
+    StoreOpenHere,
+    /// What the window changed: the body `{base, wanted}` (sync.rs); answered
+    /// `{rev, refused}`. The other windows are told `StoreChanged`.
+    StoreSync,
+    /// The store as it is: the body.
+    StoreGet,
+    /// An id given now, never again: a question's of the task at
+    /// `question_of`, else a crew record's. Answered with the number.
+    StoreReserve { question_of: Option<PathBuf> },
 }
 
 /// A file as [`Call::Stat`] finds it, its links not followed.
@@ -190,11 +211,18 @@ pub enum Msg {
     Kill { id: String },
     /// Ends every session not listed: what the window does not show any more.
     Prune { keep: Vec<String> },
-    /// Ends every session and the daemon.
+    /// Ends every session and the daemon. With another window at work on
+    /// it, only the sessions this one alone is attached to, and it says
+    /// `Stays`.
     Shutdown,
     /// Hands every session to a daemon started from `exe`, the build the
     /// window runs, and exits; the programs go on.
     Upgrade { exe: PathBuf },
+    /// Window: which window it is (its machine and state.json), the same
+    /// across its links: the sessions it opens are its own, which its Exit
+    /// and prune end and another window's do not. Sent when `Welcome` says
+    /// `owners`.
+    Owner { owner: String },
     // `ideae --hook` → daemon → windows
     Hook(Hook),
     // daemon → window
@@ -218,9 +246,17 @@ pub enum Msg {
         /// It says `Opened` for each `Open` it took.
         #[serde(default)]
         opened: bool,
+        /// Run by the app of that machine (`ideae --daemon`, which tells the
+        /// desktop when no window is there), not by ideae-server: a window
+        /// from elsewhere does not replace it with its own.
+        #[serde(default)]
+        app: bool,
+        /// It takes `Owner`.
+        #[serde(default)]
+        owners: bool,
     },
-    /// The answer to an `Upgrade` that did not happen: this daemon goes on
-    /// serving its sessions.
+    /// The answer to an `Upgrade` or a `Shutdown` that did not happen: this
+    /// daemon goes on serving its sessions.
     Stays,
     Exited { id: String, code: Option<i32>, signal: Option<String> },
     /// Daemon: an `Open` was taken (started, or attached to): a session the
@@ -233,6 +269,8 @@ pub enum Msg {
     Watch { id: String, flat: Vec<PathBuf>, deep: Vec<PathBuf> },
     Unwatch { id: String },
     Changed { id: String },
+    /// Daemon: another window changed this machine's store; it is at `rev`.
+    StoreChanged { rev: u64 },
     /// Over a link that can go quiet (ssh): the window asks, the daemon
     /// answers; a window that hears nothing for a while dials again.
     Ping,
@@ -322,6 +360,9 @@ pub struct Handover {
     /// A pipe session: two descriptors travel for it, its input then its output.
     #[serde(default)]
     pub pipe: bool,
+    /// The window that opened it (`Owner`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -331,8 +372,13 @@ pub struct Handovers {
 }
 
 pub fn socket_path() -> PathBuf {
+    socket_for(std::env::var_os("IDEAE_STATE").as_deref())
+}
+
+/// The daemon's socket of a run whose IDEAE_STATE is `state`.
+pub fn socket_for(state: Option<&std::ffi::OsStr>) -> PathBuf {
     let dir = crate::paths::runtime_dir();
-    match std::env::var_os("IDEAE_STATE") {
+    match state {
         Some(state) => {
             use std::hash::{Hash as _, Hasher as _};
             let mut h = std::collections::hash_map::DefaultHasher::new();

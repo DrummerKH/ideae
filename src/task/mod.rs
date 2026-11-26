@@ -507,9 +507,7 @@ impl Drop for ReachedHere {
         let (daemon, port) = (self.daemon.clone(), self.port);
         // It runs ssh: not on the thread that drops the task.
         std::thread::spawn(move || {
-            if let Some(wire) = daemon.wire() {
-                wire.release_here(port);
-            }
+            daemon.release_here(port);
         });
     }
 }
@@ -773,11 +771,11 @@ impl TaskView {
             cx.spawn_in(window, async move |this, cx| {
                 let ok = cx
                     .background_spawn(async move {
-                        let reached = asked.wire().map(|wire| wire.reach_here(port));
-                        if let Some(Err(e)) = &reached {
+                        let reached = asked.reach_here(port);
+                        if let Err(e) = &reached {
                             eprintln!("the task's Chrome not reached from its host: {e}");
                         }
-                        matches!(reached, Some(Ok(())))
+                        reached.is_ok()
                     })
                     .await;
                 let _ = this.update_in(cx, |t, window, cx| {

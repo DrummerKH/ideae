@@ -765,7 +765,7 @@ fn browser_page(draft: &Draft, layers: &LayersDraft) -> SettingPage {
                 row.description(about_layered(
                     layers,
                     "remote_browser",
-                    "A task of a project on another machine gives its agent IDEAE_BROWSER_CDP, and the task's Chrome here is reached at that port there for as long as the task is open. Every user of that machine can reach the port: turn it on only for machines that are yours alone, or on for a space or a project of them alone. Tasks opened after the change.",
+                    "A task of a project on another machine gives its agent IDEAE_BROWSER_CDP, and the task's Chrome here is reached at that port there for as long as the task is open. Only your user's processes there get through, and that machine's root: turn it on only for machines whose root you trust, or on for a space or a project of them alone. Tasks opened after the change.",
                 ))
             }))
 }

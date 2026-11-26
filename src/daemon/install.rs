@@ -89,9 +89,10 @@ pub fn ensure(mut remote: Remote) -> Result<(Remote, crate::agents::Hooks), Stri
     let mcp = settings.with_extension("mcp.json");
     let config = serde_json::json!({ "mcpServers": { "ideae": { "command": exe, "args": ["--mcp"] } } });
     run(&remote, &put(&mcp, false), Some(config.to_string().as_bytes()))?;
-    // A daemon of its own there, apart from one an ideae of that machine
-    // runs for its own window (`<app>-remote`): neither hands the other over.
-    remote.ideae = format!("IDEAE_APP={app}-remote {}", q(&exe));
+    // That user's own daemon there, the one an ideae of that machine runs for
+    // its own window too (of the same app: ideae, or ideae-dev for a debug
+    // build): their windows share its agents and its store.
+    remote.ideae = format!("IDEAE_APP={app} {}", q(&exe));
     (remote.exe, remote.home) = (Some(exe.clone()), Some(PathBuf::from(&home)));
     let hooks = crate::agents::Hooks { claude_settings: Some(settings), exe: Some(exe), opencode_plugin: Some(plugin), claude_mcp: Some(mcp) };
     Ok((remote, hooks))
@@ -225,17 +226,26 @@ mod tests {
         // A port of here (a task's Chrome) reached there at the same port: an agent there asks it.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let mine = listener.local_addr().unwrap().port();
+        // Each that reaches it answered: one let through that should not be is seen.
         std::thread::spawn(move || {
-            if let Ok((mut client, _)) = listener.accept() {
+            for mut client in listener.incoming().flatten() {
                 let _ = std::io::Write::write_all(&mut client, b"from here\n");
             }
         });
-        daemon.wire().unwrap().reach_here(mine).expect("reached from there");
+        daemon.reach_here(mine).expect("reached from there");
         let asked = Call::Exec { cwd: "/".into(), program: "sh".into(), args: vec!["-c".into(), format!("nc 127.0.0.1 {mine} </dev/null")], env: Vec::new() };
         let (_, out) = daemon.call(&asked, b"").unwrap();
         assert_eq!(String::from_utf8_lossy(&out).trim(), "from here", "port {mine} of here, asked there");
+        // Another user of that machine reaches the port and is answered nothing.
+        if let Ok(other) = std::env::var("IDEAE_LIVE_OTHER") {
+            let words: Vec<&str> = other.split_whitespace().collect();
+            let theirs = std::process::Command::new(words[0]).args(&words[1..]).args(["sh", "-c", &format!("nc -w 3 127.0.0.1 {mine} </dev/null; echo done")]).output().unwrap();
+            let said = String::from_utf8_lossy(&theirs.stdout);
+            assert!(said.contains("done") && !said.contains("from here"), "another user there is answered nothing: {said:?} {}", String::from_utf8_lossy(&theirs.stderr));
+            eprintln!("another user there refused");
+        }
         // Let go of with its task: no longer there.
-        daemon.wire().unwrap().release_here(mine);
+        daemon.release_here(mine);
         let (_, out) = daemon.call(&asked, b"").unwrap();
         assert!(String::from_utf8_lossy(&out).trim().is_empty(), "port {mine} let go of there too");
         eprintln!("port {mine} of here reached there");

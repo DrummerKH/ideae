@@ -225,7 +225,7 @@ layered! {
         "Pull request status", "Tasks' pull requests are asked of gh: their state, CI and review on each task.",
         [Global, Space, Project];
     remote_browser: bool = false,
-        "Agents there drive Chrome here", "A project on another machine: its agents are given IDEAE_BROWSER_CDP, and the task's Chrome here is reached at that port there. Every user of that machine can reach the port: on only for machines that are yours alone. Never a team's file's to say.",
+        "Agents there drive Chrome here", "A project on another machine: its agents are given IDEAE_BROWSER_CDP, and the task's Chrome here is reached at that port there. Only your user's processes there get through, and its root: on only for machines whose root you trust. Never a team's file's to say.",
         [Global, Space, Project];
     language_servers: bool = true,
         "Language servers", "Completion, types and go to definition from a server. Which servers run is in Settings → Language servers.",

@@ -70,6 +70,23 @@ impl TaskView {
         editor.update(cx, |state, cx| state.set_bookmarks(&rows, bookmark_color(), cx));
     }
 
+    /// The task's work as another window left it (its store, crate::machine):
+    /// its review notes, files marked viewed, bookmarks, the open files' too.
+    pub fn take_work(&mut self, review: Vec<crate::state::ReviewNote>, viewed: BTreeMap<String, u64>, bookmarks: BTreeMap<String, Vec<u32>>, cx: &mut Context<Self>) {
+        self.changes.update(cx, |c, cx| {
+            c.review = review;
+            cx.notify();
+        });
+        self.viewed = viewed;
+        self.bookmarks = bookmarks;
+        let files: Vec<Entity<FileView>> = self.tabs.iter().filter_map(|t| if let TabKind::File(file) = &t.kind { Some(file.clone()) } else { None }).collect();
+        for file in files {
+            let (path, editor) = { let f = file.read(cx); (f.path.clone(), f.editor.clone()) };
+            self.give_bookmarks(&path, &editor, cx);
+        }
+        cx.notify();
+    }
+
     /// A file closes: its bookmarks are kept for when it opens again.
     pub(super) fn keep_bookmarks(&mut self, file: &Entity<FileView>, cx: &App) {
         let f = file.read(cx);

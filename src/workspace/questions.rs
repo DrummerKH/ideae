@@ -41,7 +41,7 @@ enum Given {
 
 /// Not for the UI thread: it reads and copies the conversation's files.
 fn give_context(source: &QuestionSource, asked: Option<&str>, to: &Path) -> Given {
-    let Some(profile) = state::with_settings(|s| s.profile(&source.profile).cloned()) else { return Given::Nothing };
+    let Some(profile) = crate::agents::profile_of(&source.root, &source.profile) else { return Given::Nothing };
     if asked == Some(source.profile.as_str()) && profile.adapter().forks() {
         let copies = if source.root == to { Vec::new() } else { carry_session(&profile, &source.root, to, Some(&source.session), None) };
         return Given::Fork { from: source.session.clone(), copies };
@@ -54,7 +54,8 @@ impl Workspace {
     /// The agents of a project with a conversation to start a question from.
     fn question_sources(&self, pi: usize) -> Vec<QuestionSource> {
         let Some(p) = self.projects.get(pi) else { return Vec::new() };
-        let usable = |id: &str| state::with_settings(|s| s.profile(id).is_some_and(|profile| !profile.acp && (profile.adapter().forks() || profile.adapter().session_base(profile, &p.path).is_some())));
+        let profiles = crate::agents::profiles_for(&p.path).0;
+        let usable = |id: &str| profiles.iter().find(|profile| profile.id == id).is_some_and(|profile| !profile.acp && (profile.adapter().forks() || profile.adapter().session_base(profile, &p.path).is_some()));
         let mut sources = Vec::new();
         for t in p.tasks.iter().filter(|t| t.busy.is_none()) {
             if let Some(who) = t.session_ref().filter(|who| usable(&who.profile.id)) {
@@ -174,8 +175,8 @@ impl Workspace {
         // not known, is found now, while it is the latest in the folder.
         let unpinned = (entry.asked == 0).then(|| entry.session_ref()).flatten().filter(|who| who.id.is_none());
         let root = path.clone();
-        let settings = state::settings();
-        let asked = crate::agents::resolve(&settings.agents, &[&profile], Some(&p.values().agent), &settings.default_agent).map(|profile| profile.id.clone());
+        let (agents, default) = crate::agents::profiles_for(&path);
+        let asked = crate::agents::resolve(&agents, &[&profile], Some(&p.values().agent), &default).map(|profile| profile.id.clone());
         let to = path.clone();
         cx.spawn_in(window, async move |this, cx| {
             let pinned = match unpinned {
@@ -186,6 +187,11 @@ impl Workspace {
                 Some(source) => cx.background_spawn(async move { give_context(&source, asked.as_deref(), &to) }).await,
                 None => Given::Nothing,
             };
+            // Its number, the machine's store's: another window asking one of this task meanwhile has another.
+            let reserved = {
+                let task = path.clone();
+                cx.background_spawn(async move { crate::machine::reserve(Some(&task)) }).await
+            };
             let _ = this.update_in(cx, |this, window, cx| {
                 if let (Some(id), Some(entry)) = (pinned, this.entry_mut(&path)) {
                     if let Some(session) = entry.sessions.last_mut().filter(|s| s.id.is_none()) {
@@ -195,7 +201,7 @@ impl Workspace {
                         view.update(cx, |t, _| t.agent.learned_session(&id));
                     }
                 }
-                let asked = this.ask_now(pi, &path, prompt, profile, given, then.is_some(), window, cx);
+                let asked = this.ask_now(pi, &path, prompt, profile, given, then.is_some(), reserved, window, cx);
                 if let Some(then) = then {
                     then(this, &path, asked, cx);
                 }
@@ -206,10 +212,12 @@ impl Workspace {
 
     /// The question's number, once asked.
     /// `quiet`: asked by an agent, the window stays on what you look at.
-    fn ask_now(&mut self, pi: usize, path: &Path, prompt: String, profile: String, given: Given, quiet: bool, window: &mut Window, cx: &mut Context<Self>) -> Option<u32> {
-        let settings = state::settings();
+    /// `reserved`: its number, given by the store; none without one.
+    #[allow(clippy::too_many_arguments)]
+    fn ask_now(&mut self, pi: usize, path: &Path, prompt: String, profile: String, given: Given, quiet: bool, reserved: Option<u32>, window: &mut Window, cx: &mut Context<Self>) -> Option<u32> {
         let project_agent = self.projects[pi].values().agent.clone();
-        let Some(profile) = crate::agents::resolve(&settings.agents, &[&profile], Some(&project_agent), &settings.default_agent).cloned() else {
+        let (agents, default) = crate::agents::profiles_for(path);
+        let Some(profile) = crate::agents::resolve(&agents, &[&profile], Some(&project_agent), &default).cloned() else {
             window.push_notification(Notification::warning("No agent to ask: add one in Settings → Agents."), cx);
             return None;
         };
@@ -223,8 +231,11 @@ impl Workspace {
             self.switch_quietly(path, window, cx);
         }
         let entry = self.entry_mut(path)?;
-        entry.asked += 1;
-        let n = entry.asked;
+        // The store's number when it gave one (another window may have asked meanwhile) and no
+        // question here has it (one numbered here, not yet brought there); else the next of all.
+        let next = entry.questions.iter().map(|q| q.id).max().unwrap_or(0).max(entry.asked) + 1;
+        let n = reserved.filter(|n| !entry.questions.iter().any(|q| q.id == *n)).unwrap_or(next);
+        entry.asked = entry.asked.max(n);
         let title = first_line(&prompt);
         entry.questions.push(state::QuestionState { id: n, title: title.clone(), profile: profile.id.clone(), session: id.clone(), created: state::now(), ..Default::default() });
         let (start, told) = match given {
@@ -326,7 +337,7 @@ impl Workspace {
     pub(super) fn give_questions(&self, entry: &TaskEntry, view: &mut crate::task::TaskView) {
         view.asked = entry.asked > 0;
         for q in entry.questions.iter().filter(|q| q.closed == 0) {
-            if let Some(launch) = question_launch(q) {
+            if let Some(launch) = question_launch(&entry.path, q) {
                 view.add_question(q.id, q.title.clone().into(), launch);
                 if q.asleep {
                     view.question_sleeps(q.id);
@@ -487,7 +498,7 @@ impl Workspace {
         let Some(q) = entry.questions.iter_mut().find(|q| q.id == n) else { return };
         q.closed = 0;
         q.asleep = false;
-        let (title, launch) = (q.title.clone(), question_launch(q));
+        let (title, launch) = (q.title.clone(), question_launch(path, q));
         self.switch_quietly(path, window, cx);
         if let (Some(view), Some(launch)) = (self.entry_mut(path).and_then(|e| e.view.clone()), launch) {
             view.update(cx, |t, cx| {
@@ -506,7 +517,7 @@ impl Workspace {
     pub fn question_to_task(&mut self, path: &Path, n: u32, window: &mut Window, cx: &mut Context<Self>) {
         let Some((pi, ti)) = self.find(path) else { return };
         let Some(q) = self.projects[pi].tasks[ti].questions.iter().find(|q| q.id == n).cloned() else { return };
-        let Some(profile) = state::with_settings(|s| s.profile(&q.profile).cloned()) else { return };
+        let Some(profile) = crate::agents::profile_of(path, &q.profile) else { return };
         let from_branch = self.projects[pi].tasks[ti].branch.clone();
         let branch = naming::branch_name_as(&q.title, &self.projects[pi].values().branch);
         let (repo, base) = (self.projects[pi].path.clone(), self.projects[pi].values().base.clone());
@@ -796,8 +807,8 @@ fn moved_here(q: &state::QuestionState, from: &Path, from_branch: &str, to: &Pat
 
 /// How a question's agent starts again: its session by id. One whose id
 /// never came starts a new one, not the latest in the folder.
-fn question_launch(q: &state::QuestionState) -> Option<Launch> {
-    let profile = state::with_settings(|s| s.profile(&q.profile).cloned())?;
+fn question_launch(task: &Path, q: &state::QuestionState) -> Option<Launch> {
+    let profile = crate::agents::profile_of(task, &q.profile)?;
     let start = match &q.session {
         Some(id) => Start::Resume(id.clone()),
         None => Start::New(None),

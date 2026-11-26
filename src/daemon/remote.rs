@@ -86,7 +86,8 @@ pub struct Wire {
     /// Where `ideae --hook` reports on that machine.
     socket: Mutex<Option<String>>,
     /// Ports of here reached from there (`-R`): asked again of a master made anew.
-    reverses: Mutex<HashMap<u16, i64>>,
+    /// Its holders, and whether the forward is made (a failed one is asked again by the next holder).
+    reverses: Mutex<HashMap<u16, (i64, bool)>>,
     /// The window's MCP socket, as reached there (a socket of its user's
     /// there): its agents there ask the window through it.
     window_socket: Mutex<Option<(PathBuf, PathBuf)>>,
@@ -128,27 +129,31 @@ impl Wire {
 
     /// Port `port` of here reached at the same port there (a task's Chrome,
     /// for its agent there), now and after the link is made anew.
-    pub fn reach_here(&self, port: u16) -> Result<(), String> {
+    /// The socket there it is reached at; the host's daemon makes a port of
+    /// it ([`super::client::Daemon::reach_here`]).
+    pub(super) fn reach_here(&self, port: u16) -> Result<PathBuf, String> {
         // Counted, and asked of ssh under the same lock: a task's view let go of
         // while a new one of it takes the port again leaves the port reached;
         // one let go of before its taking was done (below zero) leaves it not.
         let mut reverses = self.reverses.lock().unwrap();
-        let holders = reverses.entry(port).or_insert(0);
+        let (holders, made) = reverses.entry(port).or_insert((0, false));
         *holders += 1;
         match *holders {
-            1 => {
-                let made = reverse(&self.remote, port, "forward");
-                // Not reached: the next to ask tries again.
-                if made.is_err() {
-                    reverses.remove(&port);
-                }
-                made
-            }
             0 => {
                 reverses.remove(&port);
-                Ok(())
+                Err("let go of meanwhile".into())
             }
-            _ => Ok(()),
+            // The first, or one after a forward that failed: made now. Not reached, it is
+            // still counted: its holder lets go of it as of one that was (once for each asking).
+            _ if !*made => {
+                let done = reverse(&self.remote, port, "forward");
+                *made = done.is_ok();
+                done
+            }
+            _ => {
+                let home = self.remote.home.clone().ok_or("its home folder there is not known")?;
+                Ok(home.join(".ssh").join(format!("ideae-cdp-{}-{port}.sock", run_token())))
+            }
         }
     }
 
@@ -171,14 +176,17 @@ impl Wire {
     }
 
     /// No longer, once its last holder has gone.
-    pub fn release_here(&self, port: u16) {
+    /// Whether that was its last holder: the port there is let go of too.
+    pub(super) fn release_here(&self, port: u16) -> bool {
         let mut reverses = self.reverses.lock().unwrap();
-        let holders = reverses.entry(port).or_insert(0);
+        let (holders, _) = reverses.entry(port).or_insert((0, false));
         *holders -= 1;
         if *holders == 0 {
             reverses.remove(&port);
             let _ = reverse(&self.remote, port, "cancel");
+            return true;
         }
+        false
     }
 
     pub(super) fn remote(&self) -> &Remote {
@@ -291,11 +299,21 @@ pub fn connect(remote: Remote, on_hook: impl Fn(Hook) + Send + Sync + 'static) -
                 reading.set_acks(next.opened);
                 reading.reopen(&next.sessions);
                 // A master made anew has none of the old one's forwards.
-                let reverses = wire.reverses.lock().unwrap();
-                for (&port, _) in reverses.iter().filter(|(_, held)| **held > 0) {
-                    let _ = reverse(&wire.remote, port, "forward");
+                let mut reverses = wire.reverses.lock().unwrap();
+                let mut relays: Vec<(u16, PathBuf)> = Vec::new();
+                for (&port, (_, made)) in reverses.iter_mut().filter(|(_, (held, _))| *held > 0) {
+                    let done = reverse(&wire.remote, port, "forward");
+                    *made = done.is_ok();
+                    relays.extend(done.ok().map(|socket| (port, socket)));
                 }
                 drop(reverses);
+                // Its daemon may be another (upgraded): asked again, once the link reads its answers.
+                let asking = reading.clone();
+                std::thread::spawn(move || {
+                    for (port, socket) in relays {
+                        let _ = asking.relay(port, Some(socket));
+                    }
+                });
                 let held = wire.window_socket.lock().unwrap().clone();
                 match held {
                     Some((here, _)) => {
@@ -469,8 +487,11 @@ fn dial(remote: &Remote) -> Result<Dialled, String> {
         return Err(fail(&mut child, "the link closed"));
     }
     match proto::read_frame(&mut reader) {
-        Ok(Frame::Msg(Msg::Welcome { protocol, hooks, sessions, ping, socket, watches, opened, .. })) if protocol == proto::PROTOCOL => {
+        Ok(Frame::Msg(Msg::Welcome { protocol, hooks, sessions, ping, socket, watches, opened, owners, .. })) if protocol == proto::PROTOCOL => {
             greeted.store(true, Ordering::Relaxed);
+            if owners && proto::write_msg(&mut writer, &Msg::Owner { owner: super::client::window_id() }).is_err() {
+                return Err(fail(&mut child, "the link closed"));
+            }
             Ok(Dialled { child, writer: Box::new(writer), reader: Box::new(reader), hooks, sessions, ping, socket, watches, opened })
         }
         Ok(Frame::Msg(Msg::Welcome { protocol, .. })) => {
@@ -558,7 +579,7 @@ pub(super) fn clear_first_host(remote: &Remote) {
 for s in ideae-*-*.sock; do
   [ -e "$s" ] || continue
   # A window's own socket there (MCP), reached directly: its host's daemon sees to those.
-  case $s in ideae-mcp-*) continue ;; esac
+  case $s in ideae-mcp-*|ideae-cdp-*) continue ;; esac
   t=${s#ideae-}; t=${t%%-*}; live=
   for m in ideae-"$t"-*; do
     case $m in *.sock) ;; *) [ -S "$m" ] && live=1 ;; esac
@@ -672,40 +693,56 @@ pub fn close_beyond(remote: &Remote) {
     }
 }
 
-/// Port `port` of here, reached at the same port on the host through ssh's
-/// master connection (`-R`).
+/// Port `port` of here (a task's Chrome), reached at a socket of the
+/// host's user alone (as sshd makes it): `~/.ssh/ideae-cdp-<run>-<port>.sock`
+/// there, a name the clearing of a first host's sockets passes by; the
+/// host's daemon makes the same port there of it, for that user's processes
+/// alone ([`Call::Relay`]). Beyond a first host, through a socket of this
+/// run's on it. What a link before left there is let go of first.
 /// `how`: "forward", or "cancel" to end it.
-/// Beyond a first host, through a socket of this run's on it (its user's
-/// alone, as sshd makes it): no port of that host is taken, or reached by
-/// its other users.
-fn reverse(remote: &Remote, port: u16, how: &str) -> Result<(), String> {
+fn reverse(remote: &Remote, port: u16, how: &str) -> Result<PathBuf, String> {
     masters().ok_or("no folder for ssh's master connections")?;
-    let (here, beyond) = match &remote.hop {
-        Some(_) => {
-            let socket = format!("{}/.ssh/ideae-{}-r{port}.sock", first_home(remote)?, run_token());
-            // A socket a link before left there takes the path (sshd leaves it): what of it is still asked is let go of first.
-            if how == "forward" {
-                let _ = ssh_with(remote, &["-O", "cancel", "-R", &format!("{socket}:127.0.0.1:{port}")]).and_then(|mut c| c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().map_err(|e| e.to_string()));
-                let _ = run(&remote.first(), &format!("rm -f '{socket}'"), None);
-            }
-            (format!("{socket}:127.0.0.1:{port}"), Some(format!("{port}:{socket}")))
-        }
-        None => (format!("{port}:127.0.0.1:{port}"), None),
+    let home = remote.home.clone().ok_or("its home folder there is not known")?;
+    let there = home.join(".ssh").join(format!("ideae-cdp-{}-{port}.sock", run_token()));
+    let forwarding = how == "forward";
+    let clear = |at: &Remote, socket: &str| run(at, &format!("mkdir -p ~/.ssh && rm -f {}", quote(socket)), None);
+    let master = |how: &str, spec: &str| -> Result<(), String> {
+        let out = ssh_with(remote, &["-O", how, "-R", spec])?.stdin(Stdio::null()).output().map_err(|e| format!("ssh: {e}"))?;
+        if out.status.success() { Ok(()) } else { Err(ssh_said(Some(255), String::from_utf8_lossy(&out.stderr).trim().to_string())) }
     };
-    let out = ssh_with(remote, &["-O", how, "-R", &here])?.stdin(Stdio::null()).output().map_err(|e| format!("ssh: {e}"))?;
-    if !out.status.success() {
-        return Err(ssh_said(Some(255), String::from_utf8_lossy(&out.stderr).trim().to_string()));
-    }
-    match (&remote.hop, beyond) {
-        (Some(hop), Some(beyond)) => {
-            let done = on_hop(remote, hop, &["-O", how, "-R", &beyond]);
-            if how == "cancel" {
-                let _ = run(&remote.first(), &format!("rm -f ~/.ssh/ideae-{}-r{port}.sock", run_token()), None);
+    match &remote.hop {
+        None => {
+            let spec = format!("{}:127.0.0.1:{port}", there.display());
+            if forwarding {
+                let _ = master("cancel", &spec);
+                clear(remote, &there.display().to_string())?;
             }
-            done
+            master(how, &spec)?;
         }
-        _ => Ok(()),
+        Some(hop) => {
+            let on_first = format!("{}/.ssh/ideae-{}-r{port}.sock", first_home(remote)?, run_token());
+            let to_first = format!("{on_first}:127.0.0.1:{port}");
+            let on_beyond = format!("{}:{on_first}", there.display());
+            if forwarding {
+                let _ = master("cancel", &to_first);
+                clear(&remote.first(), &on_first)?;
+            }
+            master(how, &to_first)?;
+            if forwarding {
+                let _ = on_hop(remote, hop, &["-O", "cancel", "-R", &on_beyond]);
+                clear(remote, &there.display().to_string())?;
+            }
+            let done = on_hop(remote, hop, &["-O", how, "-R", &on_beyond]);
+            if !forwarding {
+                let _ = run(&remote.first(), &format!("rm -f {}", quote(&on_first)), None);
+            }
+            done?;
+        }
     }
+    if !forwarding {
+        let _ = run(remote, &format!("rm -f {}", quote(&there.display().to_string())), None);
+    }
+    Ok(there)
 }
 
 /// The socket `here` reached at a socket on the host, its user's alone (as

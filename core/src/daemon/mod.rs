@@ -5,6 +5,7 @@ pub mod bridge;
 pub mod calls;
 pub mod pipe;
 pub mod proto;
+pub mod relay;
 pub mod server;
 
 /// `ideae --hook` in a terminal of the daemon: reports there.

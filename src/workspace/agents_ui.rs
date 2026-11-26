@@ -127,7 +127,8 @@ impl Workspace {
         }
         let last = t.sessions.last().map(|s| s.profile.clone()).unwrap_or_default();
         let project = self.projects[pi].values().agent.clone();
-        state::with_settings(|s| agents::resolve(&s.agents, &[&last, &t.agent], Some(&project), &s.default_agent).cloned())
+        let (all, default) = agents::profiles_for(&t.path);
+        agents::resolve(&all, &[&last, &t.agent], Some(&project), &default).cloned()
     }
 
     /// Asks which agent carries the task on.
@@ -182,7 +183,7 @@ impl Workspace {
     /// Stops the task's agent and starts the profile `id` in its place,
     /// in a new session, told where the work stands.
     pub fn continue_with(&mut self, path: &Path, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(profile) = state::with_settings(|s| s.profile(id).cloned()) else { return };
+        let Some(profile) = agents::profile_of(path, id) else { return };
         let before = self.task_profile(path, cx);
         // The same agent's session, gone on with rather than told about.
         let resume = self.task_session(path, cx).filter(|_| before.as_ref().is_some_and(|b| agents::shares_sessions(b, &profile)));

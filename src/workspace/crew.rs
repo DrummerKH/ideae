@@ -21,7 +21,7 @@ const MOST: usize = 4;
 const WAIT: u64 = 300;
 const WAIT_MOST: u64 = 600;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 enum Child {
     /// Being asked: its number comes once its agent is set up.
     Asking,
@@ -56,6 +56,34 @@ enum Now {
 }
 
 impl Workspace {
+    /// `ask_agent`, its id given (by the store; none: the window's own).
+    #[allow(clippy::too_many_arguments)]
+    fn ask_for_crew(&mut self, parent: PathBuf, question: String, with_context: bool, given: Option<u32>, answer: async_channel::Sender<Answer>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((pi, _)) = self.find(&parent) else {
+            let _ = answer.try_send(Answer::error("This task is not open in ideae now."));
+            return;
+        };
+        let id = self.crew.add(parent.clone(), Child::Asking, given);
+        let by = parent.clone();
+        let then: questions::AskedThen = Box::new(move |this, main, n, cx| {
+            if let Some(q) = n.and_then(|n| this.entry_mut(main).and_then(|e| e.questions.iter_mut().find(|q| q.id == n))) {
+                q.asked_by = Some(by);
+            }
+            if let Some(started) = this.crew.started.get_mut(&id) {
+                started.child = match n {
+                    Some(n) => Child::Question { main: main.to_path_buf(), n },
+                    None => Child::Failed("It could not be asked: no agent to ask it (ideae: Settings → Agents).".into()),
+                };
+                started.told = Some(std::time::Instant::now());
+            }
+            cx.notify();
+        });
+        let from = with_context.then_some(parent.as_path());
+        self.ask_for_agent(pi, question, from, then, window, cx);
+        self.save_later(cx);
+        let _ = answer.try_send(Answer::ok(format!("Asked, as id {id}. wait_for with id {id} gives its answer.")));
+    }
+
     /// `ask_agent`, `start_task`, `wait_for`, `tell_agent`, for the task whose
     /// worktree the request names (its token was checked).
     pub(super) fn on_crew(&mut self, request: Request, answer: async_channel::Sender<Answer>, window: &mut Window, cx: &mut Context<Self>) {
@@ -80,38 +108,34 @@ impl Workspace {
                 if let Err(why) = self.may_start(&request, cx) {
                     return reply(Answer::error(why));
                 }
-                let Some((pi, _)) = self.find(&parent) else { return reply(Answer::error("This task is not open in ideae now.")) };
-                let from = request.args.get("with_my_context").and_then(serde_json::Value::as_bool).unwrap_or(false).then_some(parent.as_path());
-                let id = self.crew.add(parent.clone(), Child::Asking);
-                let by = parent.clone();
-                let then: questions::AskedThen = Box::new(move |this, main, n, cx| {
-                    if let Some(q) = n.and_then(|n| this.entry_mut(main).and_then(|e| e.questions.iter_mut().find(|q| q.id == n))) {
-                        q.asked_by = Some(by);
-                    }
-                    if let Some(started) = this.crew.started.get_mut(&id) {
-                        started.child = match n {
-                            Some(n) => Child::Question { main: main.to_path_buf(), n },
-                            None => Child::Failed("It could not be asked: no agent to ask it (ideae: Settings → Agents).".into()),
-                        };
-                        started.told = Some(std::time::Instant::now());
-                    }
-                    cx.notify();
-                });
-                self.ask_for_agent(pi, question, from, then, window, cx);
-                self.save_later(cx);
-                reply(Answer::ok(format!("Asked, as id {id}. wait_for with id {id} gives its answer.")));
+                if self.find(&parent).is_none() {
+                    return reply(Answer::error("This task is not open in ideae now."));
+                }
+                let with_context = request.args.get("with_my_context").and_then(serde_json::Value::as_bool).unwrap_or(false);
+                // Its id the machine's store's (another window's agents ask too), given off the UI thread.
+                cx.spawn_in(window, async move |this, cx| {
+                    let given = cx.background_spawn(async { crate::machine::reserve(None) }).await;
+                    let _ = this.update_in(cx, |this, window, cx| this.ask_for_crew(parent, question, with_context, given, answer, window, cx));
+                })
+                .detach();
             }
             "start_task" => {
                 let (Some(title), Some(prompt)) = (text("title"), text("prompt")) else { return reply(Answer::error("A title and a prompt are needed.")) };
                 if let Err(why) = self.may_start(&request, cx) {
                     return reply(Answer::error(why));
                 }
-                let id = self.crew.add(parent.clone(), Child::Proposed { title: title.clone(), prompt });
-                self.propose_task(&parent, &title, window, cx);
-                self.save_later(cx);
-                reply(Answer::ok(format!(
-                    "Proposed to the user, as id {id}. wait_for with id {id} tells whether it was allowed, and then what its agent says when its turn ends."
-                )));
+                cx.spawn_in(window, async move |this, cx| {
+                    let given = cx.background_spawn(async { crate::machine::reserve(None) }).await;
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        let id = this.crew.add(parent.clone(), Child::Proposed { title: title.clone(), prompt }, given);
+                        this.propose_task(&parent, &title, window, cx);
+                        this.save_later(cx);
+                        let _ = answer.try_send(Answer::ok(format!(
+                            "Proposed to the user, as id {id}. wait_for with id {id} tells whether it was allowed, and then what its agent says when its turn ends."
+                        )));
+                    });
+                })
+                .detach();
             }
             "wait_for" => {
                 let Some(id) = id.filter(|id| self.crew.started.get(id).is_some_and(|s| s.parent == parent)) else {
@@ -396,11 +420,35 @@ impl Crew {
         crew
     }
 
-    fn add(&mut self, parent: PathBuf, child: Child) -> u32 {
+    /// `given`: its id, by the machine's store; none, the next of this window's.
+    fn add(&mut self, parent: PathBuf, child: Child, given: Option<u32>) -> u32 {
         // Ids go on from the highest kept, never given twice.
-        self.next += 1;
-        self.started.insert(self.next, Started { parent, child, told: Some(std::time::Instant::now()) });
-        self.next
+        let id = given.filter(|id| !self.started.contains_key(id)).unwrap_or(self.next + 1);
+        self.next = self.next.max(id);
+        self.started.insert(id, Started { parent, child, told: Some(std::time::Instant::now()) });
+        id
+    }
+
+    /// The records another window keeps (by way of the store): theirs in;
+    /// this window's own kept that are under way (being asked), not yet
+    /// brought to the store (not in `before`, what it had of the store) or
+    /// changed here since (a proposal allowed, not yet brought).
+    pub fn take_in(&mut self, records: &[state::CrewRecord], before: &[state::CrewRecord]) {
+        let theirs = Crew::from_records(records);
+        let mine: std::collections::HashMap<u32, state::CrewRecord> = self.records().into_iter().map(|r| (r.id, r)).collect();
+        let had = |id: &u32| before.iter().find(|r| r.id == *id);
+        let changed_here = |id: &u32| mine.get(id).is_some_and(|m| had(id) != Some(m));
+        self.started.retain(|id, s| theirs.started.contains_key(id) || matches!(s.child, Child::Asking | Child::Failed(_)) || had(id).is_none() || changed_here(id));
+        for (id, started) in theirs.started {
+            if changed_here(&id) {
+                continue;
+            }
+            let same = self.started.get(&id).is_some_and(|m| m.parent == started.parent && m.child == started.child);
+            if !same {
+                self.started.insert(id, started);
+            }
+        }
+        self.next = self.next.max(theirs.next);
     }
 }
 
@@ -443,6 +491,30 @@ fn state_of(agent: &AgentState, told: Option<std::time::Instant>) -> Now {
         }
         AgentStatus::Exited => Now::Over("Its agent has stopped.".into()),
         _ => Now::Busy(agent.doing.clone().unwrap_or_else(|| "at work".into())),
+    }
+}
+
+#[cfg(test)]
+mod take_in_tests {
+    use super::{Child, Crew};
+    use crate::state;
+
+    #[test]
+    fn another_window_s_crew_does_not_take_this_one_s_back() {
+        let rec = |id: u32, kind: &str| state::CrewRecord { id, parent: "/w/a".into(), kind: kind.into(), path: (kind == "task").then(|| "/w/t".into()), title: "T".into(), ..Default::default() };
+        let before = vec![rec(1, "proposed"), rec(2, "proposed")];
+        let mut crew = Crew::from_records(&before);
+        // Allowed here, not yet brought: 1 is a task now. 3 is new here.
+        crew.started.get_mut(&1).unwrap().child = Child::Task("/w/t".into());
+        crew.add("/w/a".into(), Child::Proposed { title: "N".into(), prompt: String::new() }, Some(3));
+        // Another window's: 2 declined there, 4 asked there; 1 as it was.
+        let theirs = vec![rec(1, "proposed"), rec(2, "declined"), rec(4, "question")];
+        crew.take_in(&theirs, &before);
+        let now: std::collections::HashMap<u32, String> = crew.records().into_iter().map(|r| (r.id, r.kind)).collect();
+        assert_eq!(now.get(&1).map(String::as_str), Some("task"), "its own change kept");
+        assert_eq!(now.get(&2).map(String::as_str), Some("declined"), "theirs taken in");
+        assert_eq!(now.get(&3).map(String::as_str), Some("proposed"), "its own new one kept");
+        assert!(!now.contains_key(&4) || now.get(&4).map(String::as_str) == Some("question"));
     }
 }
 

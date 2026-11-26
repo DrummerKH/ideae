@@ -86,6 +86,11 @@ src/db/            databases, no UI: connections (connections.json), passwords i
   backend.rs       what a session asks of a server; mysql_backend.rs postgres_backend.rs redis_backend.rs
   statement.rs value.rs schema.rs schema_cache.rs export.rs csv.rs format.rs history.rs import.rs scratch.rs tls.rs   statements and parameters, typed cells, completions, what a schema held, writers, CSV, layout, what ran, DataGrip's sources, files of no project, what an encrypted connection trusts
   fake.rs live.rs  a stand-in server and ssh for the check; real servers behind a real bastion, by hand
+src/machine.rs     this machine's store, kept by the daemon for its windows (by the window where there is none): at the start
+                   its projects and tasks are the store's (made of state.json the first time, again when an older build wrote
+                   it since), the window's own from state.json; at each save what the window changed since it last took the
+                   store in goes to it; state.json written whole as before, with the store's rev (IDEAE_NO_STORE=1: state.json
+                   alone). workspace/elsewhere.rs: what another window changed, taken into the model field by field
 src/secrets.rs     agents' keys out of the state: sealed for this machine in secrets.json, no keyring
 src/agent.rs       agents' reports bridge: Claude Code hooks, Codex notify, OpenCode plugin (unix socket, `ideae --hook`)
 src/agents/        agent profiles and adapters (docs/agents.md): how each kind starts, resumes, reports, is asked once
@@ -114,6 +119,11 @@ src/daemon/        the window's side of daemons (`ideae --daemon`, unix): this m
 core/              ideae-core, no gpui: the daemon itself (daemon/: server, pipes, bridge for `--daemon --stdio`, calls: a program run, a file read or written
                    for a window elsewhere), hook reports (`--hook`), what an agent said, paths. `ideae-server` is built from it alone for servers
                    (scripts/server.sh: static Linux x86_64/aarch64, macOS); a window of another build makes the daemon hand its ptys to a new one (SCM_RIGHTS)
+core/src/store/     a machine's store, kept by the daemon (host.rs; by the window where there is none, src/machine.rs): its
+                   projects, tasks and their work, changed by ops that give
+                   what must be one machine-wide (ids, ports' slots, variants, questions, crew, archive keys) and
+                   refuse what breaks it (a path taken, a task another window holds); machine.json beside the state,
+                   its lock; records.rs the records the window's state shares; migrate.rs from a state.json of before
 src/hosts.rs       projects on another machine: their key `ssh:/<host>/<path there>` (`hub>mac` for one reached through another), never a
                    path here; ssh_for (IDEAE_SSH); what ssh said, told in words (explain_ssh)
 src/askpass.rs     what ssh asks (a password, a passphrase, a host not met), asked in the window: ideae run as ssh's SSH_ASKPASS
@@ -147,7 +157,7 @@ scripts/           Xvfb driver for UI checks, wayland.sh (the same in a headless
 - So has the start: `cargo test -- --ignored the_tasks_of_the_last_run` after changing how the tasks of the last run are restored.
 - So has archiving and restoring: `cargo test -- --ignored an_archived_task` after changing either.
 - And chat agents (ACP): `cargo build && cargo test -- --ignored an_acp_agent` after changing the host, the chat's link or the daemon's pipes (a stand-in agent, the real daemon, an upgrade of it).
-- And the daemon's terminals: `cargo test -- --ignored a_window_that_does_not_read` after changing how output goes from a session to a window (it floods one that reads nothing).
+- And the daemon's terminals: `cargo test -- --ignored a_window_that_does_not_read` after changing how output goes from a session to a window (it floods one that reads nothing); `a_window_that_quits_leaves` after changing what Exit or a prune ends (two windows on one daemon); `two_windows_share_the_store` after changing the store's calls or how a window's changes are counted (core/src/store/sync.rs).
 - And projects on another machine: `cargo build && cargo test -- --ignored a_remote_daemon a_remote_project` after changing the bridge, the remote link, calls, hostfs or hosts_ui (a stand-in ssh to this machine, ideae-server from target/debug). Against real sshd: `scripts/remote-live.sh` (Docker: two throwaway containers, each reached directly and one through the other, a password asked once; `IDEAE_LIVE_PLATFORM=linux/amd64` for the other architecture) after changing the remote link, ssh's master connections, forwards or the install. Against a host of your own: `scripts/server.sh && IDEAE_LIVE_REMOTE="ssh -i key -p 2222 me@host" cargo test -- --ignored a_real_server`.
 - And a project's setup, check and teardown: `cargo test -- --ignored a_task_is_set_up_checked_and_torn_down` after changing them.
 - And Web tabs (needs Chrome): `cargo test -- --ignored a_page_tells_the_tab a_task_s_browser_wakes_when_called a_user_browser_has_no_port a_new_task_is_signed_in_to_its_stands_only a_page_opened_by_a_user_tab_goes_to_its_task devtools_without_a_port` after changing browser.rs: a page's dialog, select, pickers, cursor, errors, title, user agent, DevTools and the pages it opens; a task's Chrome started again by a call at its port; the user's Chrome over its pipe, two pages on one connection, no port listening; a new task's Chrome given a stand's logins, not a company's; a page a user's tab opened going to that tab's task; DevTools of a user's page carried over the pipe, kept from its other pages.

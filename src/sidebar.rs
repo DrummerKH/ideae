@@ -209,7 +209,7 @@ impl Workspace {
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.starred_collapsed = !this.starred_collapsed;
-                            this.save(cx);
+                            this.save_later(cx);
                             cx.notify();
                         })),
                 );
@@ -307,6 +307,37 @@ impl Workspace {
                 for ti in tasks {
                     list = self.render_questions(list, pi, ti, QuestionRows::Live, cx);
                 }
+            }
+        }
+        // Each connected machine's projects not shown here: offered, not put in the
+        // list (one made there later too), as the window shows what you choose.
+        #[cfg(unix)]
+        if query.is_empty() && !self.is_presenting() {
+            for (host, more) in &self.more_elsewhere {
+                let label = format!("{}: {} more project{}", crate::hosts::label(host), more.len(), if more.len() == 1 { "" } else { "s" });
+                let (host, items, this) = (host.clone(), more.clone(), cx.weak_entity());
+                list = list.child(
+                    div().id(SharedString::from(format!("more-elsewhere-{host}"))).test_support().px_3().py_1().child(
+                        Button::new(SharedString::from(format!("more-elsewhere-button-{host}")))
+                            .xsmall()
+                            .ghost()
+                            .label(label)
+                            .dropdown_menu(move |menu, _, _| {
+                                let mut menu = menu;
+                                for (path, name) in &items {
+                                    let (this, host, path) = (this.clone(), host.clone(), path.clone());
+                                    menu = menu.item(PopupMenuItem::new(name.clone()).icon(menu_icon("folder")).on_click(move |_, window, cx| {
+                                        let _ = this.update(cx, |w, cx| w.show_elsewhere(&host, std::slice::from_ref(&path), window, cx));
+                                    }));
+                                }
+                                let all: Vec<std::path::PathBuf> = items.iter().map(|(p, _)| p.clone()).collect();
+                                let (this, host) = (this.clone(), host.clone());
+                                menu.separator().item(PopupMenuItem::new("Show all").on_click(move |_, window, cx| {
+                                    let _ = this.update(cx, |w, cx| w.show_elsewhere(&host, &all, window, cx));
+                                }))
+                            }),
+                    ),
+                );
             }
         }
         // Dropping below the last project moves it to the end.

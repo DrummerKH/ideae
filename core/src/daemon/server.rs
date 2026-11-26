@@ -32,6 +32,8 @@ struct Session {
     size: Size,
     /// A program on pipes (an agent's host), not a shell on a pty.
     pipe: Option<Arc<super::pipe::Pipe>>,
+    /// The window that opened it, as it says it is (`Owner`): across its links.
+    owner: Option<String>,
 }
 
 #[derive(Default)]
@@ -61,6 +63,51 @@ struct Client {
     queued: Arc<std::sync::atomic::AtomicUsize>,
     /// Its socket, to let go of a window that takes nothing.
     stream: UnixStream,
+    /// It opened, asked or watched something: a window at work, not one
+    /// that only said hello (a build asking what this daemon is).
+    used: bool,
+    /// When it last sent anything, and whether it pings (one over ssh does,
+    /// every few seconds): one that stopped is a link gone that sshd has not
+    /// noticed yet (a laptop asleep), no window at work.
+    heard: Instant,
+    pings: bool,
+    /// Which window it is (`Owner`).
+    owner: Option<String>,
+}
+
+impl Server {
+    /// Whether `session` is window `client`'s to end: it alone is attached
+    /// to it, or none is and that window opened it (by what it says it is);
+    /// one of a window unknown, by this machine's own window when no other
+    /// is at work (never by one of another machine: this one's desk may have
+    /// agents here no window shows now).
+    fn this_window_s(&self, client: u64, session: &Session) -> bool {
+        if session.attached.iter().any(|c| *c != client) {
+            return false;
+        }
+        if session.attached.contains(&client) {
+            return true;
+        }
+        let me = self.clients.get(&client).and_then(|c| c.owner.as_ref());
+        match (&session.owner, me) {
+            (Some(owner), Some(me)) => owner == me,
+            (Some(_), None) => false,
+            (None, _) => !self.clients.get(&client).is_some_and(|c| c.pings) && !self.clients.iter().any(|(id, other)| *id != client && other.at_work()),
+        }
+    }
+}
+
+impl Client {
+    fn at_work(&self) -> bool {
+        at_work(self.used, self.pings, self.heard.elapsed())
+    }
+}
+
+/// A window pinging every few seconds is gone when this long quiet.
+const QUIET: Duration = Duration::from_secs(30);
+
+fn at_work(used: bool, pings: bool, quiet: Duration) -> bool {
+    used && (!pings || quiet < QUIET)
 }
 
 /// With this much waiting for a window, a session's output stays in its
@@ -186,22 +233,27 @@ pub fn run(adopt: bool) {
     }
 }
 
-/// The windows' MCP sockets reached here through ssh (`~/.ssh/ideae-mcp-<run>.sock`)
-/// whose run is gone: sshd leaves them, and one that takes no connection is no one's.
-/// Not one just made: sshd binds it a moment before it listens.
+/// The windows' sockets reached here through ssh whose run is gone: sshd
+/// leaves them. A window's MCP socket (`~/.ssh/ideae-mcp-<run>.sock`) that
+/// takes no connection is no one's; a task's Chrome's (`ideae-cdp-<run>-
+/// <port>.sock`) goes with its run's MCP socket, never asked itself (a
+/// connection there wakes that Chrome). Not one just made: sshd binds it a
+/// moment before it listens.
 fn clear_window_sockets() {
     let Some(home) = std::env::var_os("HOME") else { return };
     let dir = std::path::Path::new(&home).join(".ssh");
-    for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !(name.starts_with("ideae-mcp-") && name.ends_with(".sock")) {
-            continue;
+    let old = |entry: &std::fs::DirEntry| !entry.metadata().and_then(|m| m.modified()).is_ok_and(|at| at.elapsed().is_ok_and(|age| age < Duration::from_secs(10)));
+    let entries: Vec<std::fs::DirEntry> = std::fs::read_dir(&dir).into_iter().flatten().flatten().collect();
+    let name = |e: &std::fs::DirEntry| e.file_name().to_string_lossy().into_owned();
+    for entry in entries.iter().filter(|e| name(e).starts_with("ideae-mcp-") && name(e).ends_with(".sock") && old(e)) {
+        if UnixStream::connect(entry.path()).is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionRefused) {
+            let _ = std::fs::remove_file(entry.path());
         }
-        let young = entry.metadata().and_then(|m| m.modified()).is_ok_and(|at| at.elapsed().is_ok_and(|age| age < std::time::Duration::from_secs(10)));
-        if young {
-            continue;
-        }
-        if std::os::unix::net::UnixStream::connect(entry.path()).is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionRefused) {
+    }
+    for entry in entries.iter().filter(|e| name(e).starts_with("ideae-cdp-") && name(e).ends_with(".sock") && old(e)) {
+        let n = name(entry);
+        let run = n.trim_start_matches("ideae-cdp-").rsplit_once('-').map(|(run, _)| run.to_string()).unwrap_or_default();
+        if !run.is_empty() && !dir.join(format!("ideae-mcp-{run}.sock")).exists() {
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -263,7 +315,19 @@ fn serve(shared: Shared, stream: UnixStream) {
     });
     let mut reader = stream;
     let mut registered = false;
+    // What the shared state was last told of this window: heard at, pings, used.
+    let mut told = (Instant::now().checked_sub(Duration::from_secs(2)).unwrap_or_else(Instant::now), false, false);
     while let Ok(frame) = proto::read_frame(&mut reader) {
+        // Told the shared state when it changes, and that it is heard once a second at most: not each keystroke.
+        let (pings, used) = (matches!(frame, Frame::Msg(Msg::Ping)), matches!(frame, Frame::Bytes { kind: proto::KIND_CALL, .. } | Frame::Msg(Msg::Open { .. } | Msg::Watch { .. })));
+        if (pings && !told.1) || (used && !told.2) || told.0.elapsed() >= Duration::from_secs(1) {
+            if let Some(c) = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clients.get_mut(&client) {
+                c.heard = Instant::now();
+                c.pings |= pings;
+                c.used |= used;
+                told = (c.heard, c.pings, c.used);
+            }
+        }
         match frame {
             Frame::Bytes { kind: KIND_BYTES, id, bytes } => input(&shared, &id, &bytes),
             Frame::Bytes { kind: proto::KIND_CALL, id, bytes } => {
@@ -272,6 +336,13 @@ fn serve(shared: Shared, stream: UnixStream) {
                 std::thread::spawn(move || {
                     let reply = match proto::unpack::<proto::Call>(&bytes) {
                         Some((proto::Call::Listening { task }, _)) => listening(&shared, &task),
+                        Some((call @ (proto::Call::StoreOpen { .. } | proto::Call::StoreOpenHere | proto::Call::StoreSync | proto::Call::StoreGet | proto::Call::StoreReserve { .. }), body)) => store_call(&shared, client, call, body),
+                        Some((proto::Call::Relay { port, socket }, _)) => match super::relay::set(client, port, socket, &|window| {
+                            shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clients.get(&window).is_some_and(Client::at_work)
+                        }) {
+                            Ok(()) => (proto::Reply::default(), Vec::new()),
+                            Err(e) => (proto::Reply { error: Some(e), ..Default::default() }, Vec::new()),
+                        },
                         Some((call, body)) => super::calls::answer(call, body),
                         None => (proto::Reply { error: Some("a call not understood".into()), ..Default::default() }, Vec::new()),
                     };
@@ -284,7 +355,7 @@ fn serve(shared: Shared, stream: UnixStream) {
                 std::thread::spawn(clear_window_sockets);
                 let Ok(stream) = reader.try_clone() else { break };
                 let mut s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                s.clients.insert(client, Client { tx: tx.clone(), queued: queued.clone(), stream });
+                s.clients.insert(client, Client { tx: tx.clone(), queued: queued.clone(), stream, used: false, heard: Instant::now(), pings: false, owner: None });
                 s.alone_since = None;
                 registered = true;
                 let welcome = Msg::Welcome {
@@ -297,6 +368,8 @@ fn serve(shared: Shared, stream: UnixStream) {
                     calls: true,
                     watches: true,
                     opened: true,
+                    app: NOTIFY.get().is_some(),
+                    owners: true,
                 };
                 s.send(client, proto::encode_msg(&welcome));
             }
@@ -312,13 +385,42 @@ fn serve(shared: Shared, stream: UnixStream) {
                 }
             }
             Frame::Msg(Msg::Kill { id }) => kill(&shared, &id),
+            Frame::Msg(Msg::Owner { owner }) => {
+                if let Some(c) = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clients.get_mut(&client) {
+                    c.owner = Some(owner);
+                }
+            }
             Frame::Msg(Msg::Prune { keep }) => {
-                let gone: Vec<String> = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).sessions.keys().filter(|id| !keep.contains(id)).cloned().collect();
+                // Not one another window shows, nor one another opened (its link dropped).
+                let s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let gone: Vec<String> = s.sessions.iter().filter(|(id, session)| !keep.contains(id) && s.this_window_s(client, session)).map(|(id, _)| id.clone()).collect();
+                drop(s);
                 for id in gone {
                     kill(&shared, &id);
                 }
             }
-            Frame::Msg(Msg::Shutdown) => shutdown(&shared),
+            Frame::Msg(Msg::Shutdown) => {
+                let s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                // A window of this machine with no other at work ends it all. One of another machine
+                // (it pings, over ssh) never: this machine's own window may have agents here that
+                // no window shows now (closed with ×).
+                let from_elsewhere = s.clients.get(&client).is_some_and(|c| c.pings);
+                if !from_elsewhere && !s.clients.iter().any(|(id, other)| *id != client && other.at_work()) {
+                    drop(s);
+                    shutdown(&shared);
+                }
+                // Another window at work here (a second laptop on this
+                // server): what it shows goes on; only what this one alone
+                // shows ends, and the daemon stays. One no window shows is
+                // no one's to say: a window attaches again to all of its
+                // own when its link is made anew, so it is not this one's.
+                let mine: Vec<String> = s.sessions.iter().filter(|(_, session)| s.this_window_s(client, session)).map(|(id, _)| id.clone()).collect();
+                drop(s);
+                for id in mine {
+                    kill(&shared, &id);
+                }
+                shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).send(client, proto::encode_msg(&Msg::Stays));
+            }
             Frame::Msg(Msg::Watch { id, flat, deep }) => watch(&shared, client, id, flat, deep),
             Frame::Msg(Msg::Unwatch { id }) => {
                 shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).watches.remove(&(client, id));
@@ -362,6 +464,9 @@ fn serve(shared: Shared, stream: UnixStream) {
         s.alone_since = Some(Instant::now());
     }
     drop(s);
+    // Its Chrome's ports here, once it is no client (a port it asks for
+    // meanwhile is refused): out of the lock, as their accepting threads end.
+    super::relay::drop_owner(client);
     // An agent's host is told no window is there: what it asks now goes
     // to the desktop.
     for id in alone {
@@ -370,6 +475,95 @@ fn serve(shared: Shared, stream: UnixStream) {
     drop(tx);
     let _ = writer_thread.join();
 }
+
+/// This machine's store, kept here for every window (crate::store): opened
+/// by the first window that asks, with its state.json.
+static STORE: Mutex<Option<crate::store::host::Host>> = Mutex::new(None);
+
+fn store_call(shared: &Shared, client: u64, call: proto::Call, body: &[u8]) -> (proto::Reply, Vec<u8>) {
+    let failed = |e: String| (proto::Reply { error: Some(e), ..Default::default() }, Vec::new());
+    let mut held = STORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // This machine's own: its state.json is the one an ideae here keeps.
+    let (call, here) = match call {
+        proto::Call::StoreOpenHere => {
+            let file = crate::paths::state_file();
+            let state = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).unwrap_or_else(|| serde_json::json!({}));
+            let machine_rev = state.get("machine_rev").and_then(serde_json::Value::as_u64).unwrap_or(0);
+            let dir = file.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+            let body = serde_json::to_vec(&state).unwrap_or_default();
+            (proto::Call::StoreOpen { dir, state_file: file, machine_rev }, Some(body))
+        }
+        call => (call, None),
+    };
+    let body = here.as_deref().unwrap_or(body);
+    match call {
+        proto::Call::StoreOpen { dir, state_file, machine_rev } => {
+            let note = match held.as_ref() {
+                Some(host) if host.dir() == dir => None,
+                Some(host) => return failed(format!("this daemon keeps the store of {}, not {}", host.dir().display(), dir.display())),
+                None => {
+                    let Ok(state) = serde_json::from_slice::<serde_json::Value>(body) else { return failed("a state not understood".into()) };
+                    match crate::store::host::Host::open(&dir, &state_file, &state, machine_rev, true) {
+                        Ok((host, note)) => {
+                            *held = Some(host);
+                            note
+                        }
+                        Err(e) => return failed(e),
+                    }
+                }
+            };
+            let machine = held.as_ref().map(|h| h.machine());
+            (proto::Reply::default(), serde_json::to_vec(&serde_json::json!({ "machine": machine, "note": note })).unwrap_or_default())
+        }
+        proto::Call::StoreSync => {
+            let Some(host) = held.as_mut() else { return failed(STORE_NOT_OPEN.into()) };
+            #[derive(serde::Deserialize)]
+            struct Asked {
+                base: crate::store::Machine,
+                wanted: crate::store::Machine,
+                #[serde(default)]
+                mirrors: bool,
+            }
+            let asked: Asked = match serde_json::from_slice(body) {
+                Ok(asked) => asked,
+                Err(e) => return failed(format!("a sync not understood: {e}")),
+            };
+            let before = host.machine().rev;
+            let (rev, refused) = host.sync(client, &asked.base, &asked.wanted, asked.mirrors);
+            drop(held);
+            if rev != before {
+                let s = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let frame = proto::encode_msg(&Msg::StoreChanged { rev });
+                for (&other, c) in &s.clients {
+                    if other != client {
+                        c.queue(frame.clone());
+                    }
+                }
+            }
+            let refused: Vec<String> = refused.iter().map(ToString::to_string).collect();
+            (proto::Reply::default(), serde_json::to_vec(&serde_json::json!({ "rev": rev, "refused": refused })).unwrap_or_default())
+        }
+        proto::Call::StoreReserve { question_of } => {
+            let Some(host) = held.as_mut() else { return failed(STORE_NOT_OPEN.into()) };
+            let op = match question_of {
+                Some(task) => crate::store::Op::ReserveQuestion { task },
+                None => crate::store::Op::ReserveCrew,
+            };
+            match host.reserve(client, op) {
+                Ok(n) => (proto::Reply::default(), n.to_string().into_bytes()),
+                Err(e) => failed(e.to_string()),
+            }
+        }
+        proto::Call::StoreGet => match held.as_ref() {
+            Some(host) => (proto::Reply::default(), serde_json::to_vec(host.machine()).unwrap_or_default()),
+            None => failed(STORE_NOT_OPEN.into()),
+        },
+        _ => failed("not a call of the store".into()),
+    }
+}
+
+/// What a store call says to a daemon started since the window opened it: open it again.
+pub const STORE_NOT_OPEN: &str = "the store is not open in this daemon";
 
 /// The ports the sessions of `task` listen on: their leaders' sessions,
 /// all they started in them.
@@ -493,6 +687,7 @@ fn open(shared: &Shared, client: u64, id: String, spec: Spec, size: Size) {
     }
     let handle = Arc::new(Mutex::new(handle));
     let detached = Arc::new(detached);
+    let owner = s.clients.get(&client).and_then(|c| c.owner.clone());
     s.sessions.insert(
         id.clone(),
         Session {
@@ -504,6 +699,7 @@ fn open(shared: &Shared, client: u64, id: String, spec: Spec, size: Size) {
             fg: None,
             size,
             pipe,
+            owner,
         },
     );
     drop(s);
@@ -711,7 +907,7 @@ mod handover {
                 let Some((pid, input, output)) = pipe.handover() else { return };
                 fds.push(input);
                 fds.push(output);
-                state.sessions.push(Handover { id: id.clone(), pid, size: session.size, fg: None, replay: Vec::new(), pipe: true });
+                state.sessions.push(Handover { id: id.clone(), pid, size: session.size, fg: None, replay: Vec::new(), pipe: true, owner: session.owner.clone() });
                 continue;
             }
             for chunk in session.sink.next(Duration::ZERO).output {
@@ -729,6 +925,7 @@ mod handover {
                 fg: session.fg.clone(),
                 replay: session.replay.iter().copied().collect(),
                 pipe: false,
+                owner: session.owner.clone(),
             });
         }
         let Ok(result) = send(exe, &state, &fds) else { return };
@@ -887,6 +1084,7 @@ mod handover {
                     fg: session.fg,
                     size: session.size,
                     pipe,
+                    owner: session.owner,
                 },
             );
             let shared = shared.clone();
@@ -901,6 +1099,14 @@ mod handover {
 mod tests {
     use super::*;
     use std::io::Read as _;
+
+    #[test]
+    fn a_window_at_work_is_one_heard() {
+        assert!(!at_work(false, false, Duration::ZERO), "only said hello: a build asking what this is");
+        assert!(at_work(true, false, Duration::from_secs(3600)), "one here, on its socket, that does not ping");
+        assert!(at_work(true, true, Duration::from_secs(6)));
+        assert!(!at_work(true, true, QUIET), "its pings stopped: a link gone sshd has not noticed");
+    }
 
     #[test]
     fn a_report_without_words_keeps_those_that_still_hold() {
@@ -928,6 +1134,200 @@ mod tests {
         assert!(!carries(&tool, &idle), "a turn cut short said nothing to keep");
         assert!(!carries(&stop, &asks), "a turn's words are no question");
         assert!(!carries(&stop, &hook("UserPromptSubmit", None, None)));
+    }
+
+    /// Two windows at work on one daemon (two laptops on a server): the
+    /// one that quits (Exit) or prunes ends only what it alone shows; the
+    /// other's sessions, and the daemon, go on.
+    #[test]
+    #[ignore]
+    fn a_window_that_quits_leaves_another_s_sessions() {
+        let _one = crate::tests::ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ideae-daemon-two-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // SAFETY: set before anything of this daemon reads it, under the lock the tests that set it share.
+        unsafe { std::env::set_var("IDEAE_STATE", dir.join("state.json")) };
+        let path = proto::socket_path();
+        // The next test's state is its own, not this one's folder, gone.
+        struct Unset;
+        impl Drop for Unset {
+            fn drop(&mut self) {
+                // SAFETY: under the lock the tests that set it share.
+                unsafe { std::env::remove_var("IDEAE_STATE") };
+            }
+        }
+        let _unset = Unset;
+        std::thread::spawn(|| run(false));
+        let window = |opens: &[&str]| {
+            let mut stream = (0..200)
+                .find_map(|_| {
+                    std::thread::sleep(Duration::from_millis(20));
+                    UnixStream::connect(&path).ok()
+                })
+                .expect("the daemon listens");
+            proto::write_msg(&mut stream, &Msg::Hello { protocol: proto::PROTOCOL, version: crate::build::id() }).unwrap();
+            let Ok(Frame::Msg(Msg::Welcome { mut sessions, .. })) = proto::read_frame(&mut stream) else { panic!("no welcome") };
+            sessions.sort();
+            for id in opens {
+                let spec = Spec { cwd: dir.clone(), env: Vec::new(), input: None, program: vec!["sleep".into(), "60".into()] };
+                proto::write_msg(&mut stream, &Msg::Open { id: id.to_string(), spec, size: Size { cols: 80, rows: 24, cell_w: 8, cell_h: 16 } }).unwrap();
+            }
+            stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            (stream, sessions)
+        };
+        // Until a frame `want` takes comes, what else comes passed by.
+        let until = |stream: &mut UnixStream, want: &dyn Fn(&Msg) -> bool| loop {
+            match proto::read_frame(stream) {
+                Ok(Frame::Msg(msg)) if want(&msg) => return msg,
+                Ok(_) => {}
+                Err(e) => panic!("{e}"),
+            }
+        };
+        let running = || window(&[]).1;
+        let (mut laptop, _) = window(&["mine", "both"]);
+        until(&mut laptop, &|m| matches!(m, Msg::Opened { id } if id == "both"));
+        let (mut other, _) = window(&["theirs", "both"]);
+        until(&mut other, &|m| matches!(m, Msg::Opened { id } if id == "both"));
+
+        // A window back after its tasks closed prunes: not what the other shows.
+        proto::write_msg(&mut laptop, &Msg::Prune { keep: vec!["both".into()] }).unwrap();
+        proto::write_msg(&mut laptop, &Msg::Ping).unwrap();
+        until(&mut laptop, &|m| matches!(m, Msg::Pong));
+        assert_eq!(running(), ["both", "theirs"].map(String::from), "pruned only its own");
+
+        proto::write_msg(&mut laptop, &Msg::Open { id: "mine".into(), spec: Spec { cwd: dir.clone(), env: Vec::new(), input: None, program: vec!["sleep".into(), "60".into()] }, size: Size { cols: 80, rows: 24, cell_w: 8, cell_h: 16 } }).unwrap();
+        until(&mut laptop, &|m| matches!(m, Msg::Opened { id } if id == "mine"));
+        // Exit: the daemon stays for the other window, which sees its sessions go on.
+        proto::write_msg(&mut laptop, &Msg::Shutdown).unwrap();
+        until(&mut laptop, &|m| matches!(m, Msg::Stays));
+        assert_eq!(running(), ["both", "theirs"].map(String::from), "ended only what it alone showed");
+        proto::write_msg(&mut other, &Msg::Ping).unwrap();
+        until(&mut other, &|m| matches!(m, Msg::Pong));
+
+        // A window of another machine (it pings) opens a session and its link drops: the
+        // desk's prune leaves it (its owner is another window), and that window's Exit
+        // when it is back ends it and not the daemon (the desk's agents may be here).
+        let far = |owner: &str| {
+            let (mut w, _) = window(&[]);
+            proto::write_msg(&mut w, &Msg::Owner { owner: owner.into() }).unwrap();
+            proto::write_msg(&mut w, &Msg::Ping).unwrap();
+            until(&mut w, &|m| matches!(m, Msg::Pong));
+            w
+        };
+        let mut laptop = far("laptop");
+        proto::write_msg(&mut laptop, &Msg::Open { id: "far".into(), spec: Spec { cwd: dir.clone(), env: Vec::new(), input: None, program: vec!["sleep".into(), "60".into()] }, size: Size { cols: 80, rows: 24, cell_w: 8, cell_h: 16 } }).unwrap();
+        until(&mut laptop, &|m| matches!(m, Msg::Opened { id } if id == "far"));
+        drop(laptop);
+        let (mut desk, _) = window(&[]);
+        proto::write_msg(&mut desk, &Msg::Owner { owner: "desk".into() }).unwrap();
+        proto::write_msg(&mut desk, &Msg::Prune { keep: vec!["both".into(), "theirs".into()] }).unwrap();
+        proto::write_msg(&mut desk, &Msg::Ping).unwrap();
+        until(&mut desk, &|m| matches!(m, Msg::Pong));
+        assert!(running().contains(&"far".to_string()), "another window's, left by the desk's prune");
+        drop(desk);
+        drop(other);
+        let mut laptop = far("laptop");
+        proto::write_msg(&mut laptop, &Msg::Shutdown).unwrap();
+        until(&mut laptop, &|m| matches!(m, Msg::Stays));
+        assert!(!running().contains(&"far".to_string()), "its own, ended by its Exit");
+        assert!(running().contains(&"both".to_string()), "the daemon and the rest go on");
+
+        // A build only asking what this daemon is counts for nothing: the last window at work ends it all.
+        // (Not done here: the daemon of this test runs in the test's process.)
+        let (mut end, _) = window(&[]);
+        for id in ["both", "theirs"] {
+            proto::write_msg(&mut end, &Msg::Kill { id: id.into() }).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two windows on one daemon share its store: what one changes the
+    /// other is told of and fetches; one's change from an old base does not
+    /// take back the other's.
+    #[test]
+    #[ignore]
+    fn two_windows_share_the_store() {
+        use crate::store::Machine;
+        let _one = crate::tests::ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ideae-daemon-store-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // SAFETY: set before anything of this daemon reads it, under the lock the tests that set it share.
+        unsafe { std::env::set_var("IDEAE_STATE", dir.join("state.json")) };
+        struct Unset;
+        impl Drop for Unset {
+            fn drop(&mut self) {
+                // SAFETY: as above.
+                unsafe { std::env::remove_var("IDEAE_STATE") };
+            }
+        }
+        let _unset = Unset;
+        let path = proto::socket_path();
+        std::thread::spawn(|| run(false));
+        let window = || {
+            let mut stream = (0..200)
+                .find_map(|_| {
+                    std::thread::sleep(Duration::from_millis(20));
+                    UnixStream::connect(&path).ok()
+                })
+                .expect("the daemon listens");
+            proto::write_msg(&mut stream, &Msg::Hello { protocol: proto::PROTOCOL, version: crate::build::id() }).unwrap();
+            assert!(matches!(proto::read_frame(&mut stream), Ok(Frame::Msg(Msg::Welcome { .. }))));
+            stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            stream
+        };
+        // A call, its answer's body; what else comes meanwhile kept for a look.
+        let call = |stream: &mut UnixStream, call: proto::Call, body: &[u8], heard: &mut Vec<Msg>| -> Vec<u8> {
+            proto::write_bytes(stream, proto::KIND_CALL, "c", &proto::pack(&call, body)).unwrap();
+            loop {
+                match proto::read_frame(stream).unwrap() {
+                    Frame::Bytes { kind: proto::KIND_REPLY, bytes, .. } => {
+                        let (reply, body) = proto::unpack::<proto::Reply>(&bytes).unwrap();
+                        assert_eq!(reply.error, None);
+                        return body.to_vec();
+                    }
+                    Frame::Msg(msg) => heard.push(msg),
+                    _ => {}
+                }
+            }
+        };
+        let state = serde_json::json!({ "projects": [{ "path": "/p", "tasks": [
+            { "path": "/p", "branch": "main", "main": true },
+            { "path": "/w/a", "branch": "a", "title": "A", "port_slot": 1 },
+            { "path": "/w/b", "branch": "b", "title": "B", "port_slot": 2 }
+        ] }] });
+        let open = proto::Call::StoreOpen { dir: dir.clone(), state_file: dir.join("state.json"), machine_rev: 0 };
+        let opened = |body: Vec<u8>| -> Machine { serde_json::from_value(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["machine"].clone()).unwrap() };
+        // That machine's state.json, as its own ideae keeps it.
+        std::fs::write(dir.join("state.json"), serde_json::to_vec(&state).unwrap()).unwrap();
+        let (mut one, mut two, mut heard_one, mut heard_two) = (window(), window(), Vec::new(), Vec::new());
+        // One from another machine (over ssh) brings no state: the machine's own is its store.
+        let seen_one = opened(call(&mut one, proto::Call::StoreOpenHere, b"", &mut heard_one));
+        assert_eq!(seen_one.projects[0].tasks.len(), 3, "made of the machine's state.json");
+        // Its desktop's window, with that state.json: the same store.
+        let seen_two = opened(call(&mut two, open.clone(), &serde_json::to_vec(&state).unwrap(), &mut heard_two));
+        assert_eq!(seen_one, seen_two, "the second window gets the store the first made");
+        assert!(dir.join("machine.json").exists());
+        let edit = |base: &Machine, path: &str, set: &dyn Fn(&mut crate::store::Task)| {
+            let mut m = base.clone();
+            set(m.projects[0].tasks.iter_mut().find(|t| t.path == std::path::Path::new(path)).unwrap());
+            m
+        };
+        let sync = |base: &Machine, wanted: &Machine| serde_json::to_vec(&serde_json::json!({ "base": base, "wanted": wanted, "mirrors": true })).unwrap();
+        // One renames a; two, from the same base, stars b.
+        let renamed = edit(&seen_one, "/w/a", &|t| t.title = "A by one".into());
+        call(&mut one, proto::Call::StoreSync, &sync(&seen_one, &renamed), &mut heard_one);
+        let starred = edit(&seen_two, "/w/b", &|t| t.starred = true);
+        call(&mut two, proto::Call::StoreSync, &sync(&seen_two, &starred), &mut heard_two);
+        assert!(heard_two.iter().any(|m| matches!(m, Msg::StoreChanged { .. })), "two was told of one's change: {heard_two:?}");
+        assert!(!heard_one.iter().any(|m| matches!(m, Msg::StoreChanged { .. })), "not yet: one is told of two's on its next frame");
+        let now: Machine = serde_json::from_slice(&call(&mut one, proto::Call::StoreGet, b"", &mut heard_one)).unwrap();
+        assert!(heard_one.iter().any(|m| matches!(m, Msg::StoreChanged { .. })), "one was told of two's change");
+        let task = |m: &Machine, path: &str| m.projects[0].tasks.iter().find(|t| t.path == std::path::Path::new(path)).cloned().unwrap();
+        assert_eq!(task(&now, "/w/a").title, "A by one", "two's sync from the old base did not take one's rename back");
+        assert!(task(&now, "/w/b").starred);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A program that prints without end, into a window that reads nothing:

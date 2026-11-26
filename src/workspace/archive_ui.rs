@@ -790,7 +790,7 @@ impl Workspace {
     /// The agent a project's new tasks run, as a profile.
     fn project_profile(&self, pi: usize) -> Option<agents::Profile> {
         let id = self.project_agent(pi);
-        state::with_settings(|s| s.profile(&id).cloned())
+        agents::profile_of(&self.projects.get(pi)?.path, &id)
     }
 
     /// Deferred tasks whose day came are restored as Restore would, from

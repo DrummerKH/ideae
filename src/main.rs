@@ -39,6 +39,7 @@ mod keys;
 mod layers;
 mod layers_ui;
 mod local_time;
+mod machine;
 mod lsp;
 #[cfg(unix)]
 mod lsp_remote;

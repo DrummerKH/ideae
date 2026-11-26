@@ -32,7 +32,7 @@ cat > "$work/image/Dockerfile" <<'EOF'
 FROM alpine:3.20
 RUN apk add --no-cache openssh bash && ssh-keygen -A \
  && sed -i 's/^AllowTcpForwarding no/AllowTcpForwarding yes/' /etc/ssh/sshd_config \
- && adduser -D -s /bin/bash dev \
+ && adduser -D -s /bin/bash dev && adduser -D other \
  && mkdir -p /home/dev/.ssh && echo 'echo "Welcome to the test box"' > /home/dev/.bashrc \
  && chown -R dev:dev /home/dev && chmod 700 /home/dev/.ssh
 CMD ["/usr/sbin/sshd", "-D", "-e"]
@@ -69,10 +69,12 @@ run() {
   if env "$@" cargo test -q -- --ignored --test-threads=1 a_real_server_gets a_real_server_asks 2>&1 | tee "$work/out" | grep -E -A2 "panicked|^test result"; then :; fi
   grep -q "^test result: ok. 2 passed" "$work/out" || { echo "remote-live: $name failed" >&2; fails=$((fails + 1)); }
 }
+# IDEAE_LIVE_OTHER: a command run there as another user of that machine (a port of yours is not theirs).
 run "direct, $(docker exec "$tag-hub" uname -m)" IDEAE_LIVE_REMOTE="$ssh -i $work/key -p $hub_port dev@127.0.0.1" \
-  IDEAE_LIVE_PASSWORD_REMOTE="$ssh -o PubkeyAuthentication=no -p $hub_port dev@127.0.0.1" IDEAE_LIVE_PASSWORD="$password"
-run "direct, $(docker exec "$tag-beyond" uname -m)" IDEAE_LIVE_REMOTE="$ssh -i $work/key -p $beyond_port dev@127.0.0.1"
-run "through the hub" IDEAE_LIVE_REMOTE="$ssh -i $work/key -p $hub_port dev@127.0.0.1" IDEAE_LIVE_HOP="dev@$tag-beyond"
+  IDEAE_LIVE_PASSWORD_REMOTE="$ssh -o PubkeyAuthentication=no -p $hub_port dev@127.0.0.1" IDEAE_LIVE_PASSWORD="$password" \
+  IDEAE_LIVE_OTHER="docker exec -u other $tag-hub"
+run "direct, $(docker exec "$tag-beyond" uname -m)" IDEAE_LIVE_REMOTE="$ssh -i $work/key -p $beyond_port dev@127.0.0.1" IDEAE_LIVE_OTHER="docker exec -u other $tag-beyond"
+run "through the hub" IDEAE_LIVE_REMOTE="$ssh -i $work/key -p $hub_port dev@127.0.0.1" IDEAE_LIVE_HOP="dev@$tag-beyond" IDEAE_LIVE_OTHER="docker exec -u other $tag-beyond"
 
 # Nothing of a run is left there but the daemon, which an Exit would end.
 for c in "$tag-hub" "$tag-beyond"; do

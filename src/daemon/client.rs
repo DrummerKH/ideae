@@ -203,6 +203,19 @@ pub fn connect(on_hook: impl Fn(Hook) + Send + Sync + 'static) -> Option<(Arc<Da
     Some((daemon, hooks))
 }
 
+/// Which window this is to a daemon, the same across its links and runs:
+/// its machine and its state.json. The sessions it opens are its own.
+pub fn window_id() -> String {
+    let mut name = vec![0u8; 256];
+    // SAFETY: gethostname writes at most `len` bytes into `name`.
+    let host = if unsafe { libc::gethostname(name.as_mut_ptr().cast(), name.len()) } == 0 {
+        String::from_utf8_lossy(&name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())]).into_owned()
+    } else {
+        String::new()
+    };
+    format!("{host}:{}", crate::state::state_path().display())
+}
+
 /// A connection that said hello: the writer, the reader, the kept hooks,
 /// the sessions that run.
 fn dial(upgrade: bool) -> Option<(UnixStream, UnixStream, Vec<Hook>, Vec<String>)> {
@@ -210,6 +223,7 @@ fn dial(upgrade: bool) -> Option<(UnixStream, UnixStream, Vec<Hook>, Vec<String>
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut started = false;
     let mut upgraded = !upgrade;
+    let mut replaced = false;
     loop {
         let stream = match UnixStream::connect(&path) {
             Ok(stream) => stream,
@@ -236,8 +250,11 @@ fn dial(upgrade: bool) -> Option<(UnixStream, UnixStream, Vec<Hook>, Vec<String>
         let welcome = proto::read_frame(&mut reader);
         let _ = reader.set_read_timeout(None);
         match welcome {
-            Ok(Frame::Msg(Msg::Welcome { protocol, version, hooks, sessions, .. })) => {
+            Ok(Frame::Msg(Msg::Welcome { protocol, version, hooks, sessions, owners, .. })) => {
                 if protocol == proto::PROTOCOL && (version == crate::build_watch::build_id() || upgraded) {
+                    if owners {
+                        proto::write_msg(&mut writer, &Msg::Owner { owner: window_id() }).ok()?;
+                    }
                     return Some((writer, reader, hooks, sessions));
                 }
                 upgraded = true;
@@ -252,7 +269,13 @@ fn dial(upgrade: bool) -> Option<(UnixStream, UnixStream, Vec<Hook>, Vec<String>
                 } else {
                     // It speaks other frames and cannot hand over: replace it.
                     // Its agents end and continue their conversations when
-                    // started again.
+                    // started again. Once: one that stays (another window at
+                    // work on it) is not ours to use.
+                    if replaced {
+                        eprintln!("ideae: {}", ideae_core::daemon::bridge::OTHER_VERSION);
+                        return None;
+                    }
+                    replaced = true;
                     let _ = proto::write_msg(&mut writer, &Msg::Shutdown);
                 }
                 // It exits once done; wait for that, then connect again. One
@@ -459,6 +482,11 @@ impl Daemon {
                     let _ = tx.try_send(());
                 }
             }
+            // A machine's store changed by another window: this one's, or that host's.
+            Frame::Msg(Msg::StoreChanged { rev }) => match self.wire {
+                None => crate::machine::changed_elsewhere(rev),
+                Some(_) => crate::machine::changed_remote(self),
+            },
             Frame::Msg(Msg::Pong) => {
                 if let Some(wire) = &self.wire {
                     wire.heard();
@@ -609,6 +637,26 @@ impl Daemon {
             }
             None => {}
         }
+    }
+
+    /// Port `port` of here (a task's Chrome) reached at the same port on
+    /// this daemon's host, for its user's processes alone. Let go of with
+    /// `release_here` once for each time asked, reached or not.
+    pub fn reach_here(&self, port: u16) -> Result<(), String> {
+        let wire = self.wire.as_ref().ok_or("not on another machine")?;
+        let socket = wire.reach_here(port)?;
+        self.relay(port, Some(socket))
+    }
+
+    pub fn release_here(&self, port: u16) {
+        if self.wire.as_ref().is_some_and(|wire| wire.release_here(port)) {
+            let _ = self.relay(port, None);
+        }
+    }
+
+    pub(super) fn relay(&self, port: u16, socket: Option<std::path::PathBuf>) -> Result<(), String> {
+        let (reply, _) = self.call(&proto::Call::Relay { port, socket }, b"").map_err(|e| e.to_string())?;
+        reply.error.map_or(Ok(()), Err)
     }
 
     pub fn prune(&self, keep: Vec<String>) {
