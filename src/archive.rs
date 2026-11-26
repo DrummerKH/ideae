@@ -79,6 +79,10 @@ pub struct Meta {
     /// Its tickets, request and addresses (`TaskState::links`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<crate::state::TaskLink>,
+    /// A review of a colleague's work (`TaskState::review`): restored one,
+    /// its Push still asks first.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reviewing: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -1110,6 +1114,16 @@ mod tests {
         assert_eq!(CommitLine { sha: "0123456789ab".into(), subject: String::new() }.short(), "01234567");
         assert_eq!(prefix("ééééééééé", 8), "éééééééé");
         assert_eq!(prefix("abc", 8), "abc");
+    }
+
+    /// A review is archived a review: its Push asks first once restored.
+    /// Others write nothing of it, as before.
+    #[test]
+    fn a_review_is_archived_a_review() {
+        let review = Meta { reviewing: true, ..meta_with(&[]) };
+        let written = serde_json::to_string(&review).unwrap();
+        assert!(serde_json::from_str::<Meta>(&written).unwrap().reviewing);
+        assert!(!serde_json::to_string(&meta_with(&[])).unwrap().contains("reviewing"));
     }
 
     fn meta_with(sessions: &[(&str, Option<&str>)]) -> Meta {

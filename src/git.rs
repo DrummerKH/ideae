@@ -2121,6 +2121,38 @@ pub fn restore(root: &Path, snap: &FileSnapshot) -> Result<String, String> {
     Ok(format!("Restored {path}"))
 }
 
+/// The branch's upstream fetched alone, quietly: what was pushed to it
+/// since, for the branch bar to tell. None to fetch: nothing done. Asks for
+/// no password and gives up after a minute, as the polls' fetches do.
+pub fn fetch_upstream(root: &Path) -> Result<(), String> {
+    let upstream = git(root, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]).map(|u| u.trim().to_string()).unwrap_or_default();
+    let Some((remote, branch)) = upstream.split_once('/') else { return Ok(()) };
+    let refspec = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
+    let args = ["fetch", "--quiet", "--no-auto-maintenance", remote, &refspec];
+    if crate::hosts::is_remote(root) { git_status(root, &args).map(|_| ()) } else { fetch_quietly(root, &args) }
+}
+
+/// The branch under review brought to what its upstream has now: as Pull
+/// does, but after a force-push (its commits amended or dropped) moved onto
+/// the upstream's where it has nothing of its own, HEAD having been the
+/// upstream once; a rebase would bring the old commits back. What HEAD was
+/// and is, short.
+pub fn follow_upstream(root: &Path) -> Result<(String, String), String> {
+    let at = |rev: &str| run(root, "git", &["rev-parse", rev]).map(|h| h.trim().to_string());
+    let short = |rev: &str| run(root, "git", &["rev-parse", "--short", rev]).map(|h| h.trim().to_string());
+    let old = short("HEAD")?;
+    fetch_upstream(root)?;
+    let ahead = run(root, "git", &["rev-list", "--count", "@{u}..HEAD"])?.trim().parse::<u32>().unwrap_or(0);
+    let head = at("HEAD")?;
+    let was_theirs = ahead > 0 && git(root, &["log", "-g", "--format=%H", "@{u}"]).is_some_and(|log| log.lines().any(|line| line.trim() == head));
+    if was_theirs {
+        run(root, "git", &["reset", "--keep", "@{u}"])?;
+    } else {
+        pull_safe(root)?;
+    }
+    Ok((old, short("HEAD")?))
+}
+
 pub fn fetch(root: &Path) -> Result<String, String> {
     run(root, "git", &["fetch", "--prune"]).map(|out| if out.is_empty() { "Fetched".into() } else { out })
 }
@@ -2470,6 +2502,63 @@ mod pull_tests {
         super::git_status(&plain, &["worktree", "add", "-q", "-b", "t", &task.to_string_lossy(), "HEAD"]).unwrap();
         assert!(task.join("dump.sql").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A review's branch is fetched alone, for what a colleague pushed
+    /// since to show as behind; a branch following nothing is left alone.
+    #[test]
+    fn a_branch_s_upstream_is_fetched_alone() {
+        let base = setup("fetch-upstream");
+        let b = base.join("b");
+        sh(&b, "cd ../a; git checkout -q -b DEV-1; echo x > x.txt; git add x.txt; git commit -qm one; git push -q origin DEV-1 2>/dev/null
+            cd ../b; git fetch -q; git checkout -q --track origin/DEV-1
+            cd ../a; echo y > y.txt; git add y.txt; git commit -qm two; git push -q origin DEV-1 2>/dev/null");
+        let behind = || super::git(&b, &["rev-list", "--count", "HEAD..@{u}"]).map(|n| n.trim().to_string());
+        assert_eq!(behind().as_deref(), Some("0"));
+        super::fetch_upstream(&b).unwrap();
+        assert_eq!(behind().as_deref(), Some("1"), "the colleague's new commit");
+        sh(&b, "git checkout -q -b local");
+        assert!(super::fetch_upstream(&b).is_ok(), "nothing to fetch");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A review brought up to its branch after the colleague amended and
+    /// force-pushed, or dropped a commit: on their commits as they are now,
+    /// none of the old ones back. Commits of your own are rebased as Pull does.
+    #[test]
+    fn a_review_follows_a_force_push() {
+        let base = setup("follow-upstream");
+        let b = base.join("b");
+        let at = |rev: &str| super::git(&b, &["rev-parse", rev]).map(|h| h.trim().to_string());
+        sh(&b, "cd ../a; git checkout -q -b DEV-2; echo x > x.txt; echo d > dbg.txt; git add .; git commit -qm one; git push -q origin DEV-2 2>/dev/null
+            cd ../b; git fetch -q; git checkout -q --track origin/DEV-2
+            cd ../a; echo y > x.txt; git rm -q dbg.txt; git commit -q --amend -am amended; git push -q -f origin DEV-2 2>/dev/null");
+        let (old, new) = super::follow_upstream(&b).unwrap();
+        assert_ne!(old, new);
+        assert_eq!(at("HEAD"), at("@{u}"), "on the amended commit");
+        assert!(!b.join("dbg.txt").exists() && std::fs::read_to_string(b.join("x.txt")).unwrap() == "y\n", "nothing of the old one back");
+        // Yours on top: rebased onto what came, kept.
+        sh(&b, "echo n > note.txt; git add note.txt; git commit -qm mine
+            cd ../a; echo z > z.txt; git add z.txt; git commit -qm more; git push -q origin DEV-2 2>/dev/null");
+        super::follow_upstream(&b).unwrap();
+        assert!(b.join("note.txt").is_file() && b.join("z.txt").is_file(), "yours rebased onto theirs");
+        assert_eq!(super::git(&b, &["rev-list", "--count", "@{u}..HEAD"]).map(|n| n.trim().to_string()).as_deref(), Some("1"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A review is of a branch there is: one gone from origin (merged and
+    /// deleted since it was listed) makes no empty branch of its name.
+    #[test]
+    fn a_review_of_a_branch_gone_is_refused() {
+        let base = setup("review-gone");
+        let b = base.join("b");
+        let refused = super::review_worktree(&b, "DEV-3_gone", false).unwrap_err();
+        assert!(refused.contains("not on origin"), "{refused}");
+        assert!(!super::branch_exists(&b, "DEV-3_gone"), "no branch made");
+        sh(&b, "cd ../a; git checkout -q -b DEV-4; git push -q origin DEV-4 2>/dev/null");
+        let (dir, told) = super::review_worktree(&b, "DEV-4", false).unwrap();
+        assert!(dir.is_dir() && told.is_none(), "on origin's, as a review is: nothing to tell");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A new task whose branch origin has starts from it, not from the base:
@@ -3037,8 +3126,12 @@ pub fn request_worktree(repo: &Path, kind: crate::integrations::Kind, number: u6
         crate::integrations::Kind::GitLab => format!("refs/merge-requests/{number}/head"),
         _ => format!("refs/pull/{number}/head"),
     };
-    git_status(repo, &["fetch", "--quiet", remote, &refspec])?;
-    let tip = git(repo, &["rev-parse", "FETCH_HEAD"]).map(|h| h.trim().to_string()).filter(|h| !h.is_empty()).ok_or("the request's head was not fetched")?;
+    // Into a ref of its own: FETCH_HEAD is any fetch's, one running beside this too.
+    let fetched = format!("refs/ideae/request-{number}");
+    git_status(repo, &["fetch", "--quiet", remote, &format!("+{refspec}:{fetched}")])?;
+    let tip = git(repo, &["rev-parse", "--verify", "-q", &fetched]).map(|h| h.trim().to_string()).filter(|h| !h.is_empty());
+    let _ = git_status(repo, &["update-ref", "-d", &fetched]);
+    let tip = tip.ok_or("the request's head was not fetched")?;
     let has = |name: &str| git(repo, &["rev-parse", "--verify", "-q", &format!("refs/heads/{name}")]).is_some_and(|h| !h.trim().is_empty());
     // A branch here only behind the request's head is moved on to it; one of
     // other commits (an older copy, someone else's of that name) is left alone.
@@ -3366,6 +3459,18 @@ pub fn create_task_worktree(repo: &Path, branch: &str, base: &str, copy_env: boo
 /// `create_task_worktree`, with nothing to tell; what it did instead comes
 /// back with the worktree.
 pub fn new_task_worktree(repo: &Path, branch: &str, base: &str, copy_env: bool) -> Result<(PathBuf, Option<String>), String> {
+    task_worktree_on(repo, branch, Some(base), copy_env)
+}
+
+/// A review's worktree: on origin's branch of that name, or one here; never
+/// a new branch, which would have nothing to review. Nothing to tell when it
+/// is on origin's, as a review is.
+pub fn review_worktree(repo: &Path, branch: &str, copy_env: bool) -> Result<(PathBuf, Option<String>), String> {
+    task_worktree_on(repo, branch, None, copy_env)
+}
+
+/// `new_task_worktree`, or with no `base` a review's.
+fn task_worktree_on(repo: &Path, branch: &str, base: Option<&str>, copy_env: bool) -> Result<(PathBuf, Option<String>), String> {
     let theirs = format!("origin/{branch}");
     let on_origin = match git_status_within(repo, &["ls-remote", "--heads", "origin", &format!("refs/heads/{branch}")], ORIGIN_ASKED_FOR) {
         Ok(listed) => !listed.trim().is_empty(),
@@ -3374,6 +3479,7 @@ pub fn new_task_worktree(repo: &Path, branch: &str, base: &str, copy_env: bool) 
     };
     let here = branch_exists(repo, branch);
     if !on_origin && !here {
+        let Some(base) = base else { return Err(format!("{branch} is not on origin any more, nor here: nothing to review")) };
         return create_task_worktree(repo, branch, base, copy_env).map(|dir| (dir, None));
     }
     if on_origin {
@@ -3386,7 +3492,7 @@ pub fn new_task_worktree(repo: &Path, branch: &str, base: &str, copy_env: bool) 
     if !here {
         let dir = worktree_at(repo, branch, &theirs, copy_env)?;
         let told = if follow(&dir) { "the task starts from its commits and follows it" } else { "the task starts from its commits" };
-        return Ok((dir, Some(format!("{branch} is on origin already: {told}."))));
+        return Ok((dir, base.map(|_| format!("{branch} is on origin already: {told}."))));
     }
     let dir = add_worktree(repo, branch, &[], branch, copy_env)?;
     if !on_origin {

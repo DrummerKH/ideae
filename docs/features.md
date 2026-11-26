@@ -11,11 +11,32 @@ yours from another machine) is the task's start instead: its commits, the
 local branch following it, as `git checkout` does; a second branch of its
 name beside it could be pushed only over it. New task says so under the
 title, in a line of its own, with who made its last commit and when, and
-names origin's other branches of the title's key. A branch of the name here
-with no task is taken as it is; a task already on it keeps it, and the new
-one is refused. A project's [settings](services.md) can install
+names origin's other branches of the title's key; **Review instead…** there
+opens Review… on it, for a colleague's work. A branch of the name here with
+no task is taken as it is; a task already on it keeps it, and the new one is
+refused. A project's [settings](services.md) can install
 what it needs there, check the agent's work after each turn and clean up
 when the task goes.
+
+**Review…** (a project's menu, and File) makes a task to review a
+colleague's work: the requests open now (GitHub's pull requests, GitLab's
+merge requests), those asking your review first and yours last, then the
+branches of origin no request is of, narrowed as you type. The task is on
+its branch, following origin's (a request's head is fetched, a fork's too),
+named after it and marked a review in the list; a branch gone from origin
+since it was listed makes none. Its prompt is shown to change before it
+goes: the review asked, the ticket its branch or title names (one a tracker
+set up owns), "Do not push."; choosing another row changes what choosing
+wrote, not what you wrote, and a prompt that names another request is said
+so. It is sent as it stands. What has a task (a request by its link) is
+switched to instead. Push in a review, and Create PR, ask first: the branch
+is someone else's. What is pushed to a branch following origin's is fetched
+with the request's state, and the branch bar offers **Review again ↓N**: the
+new commits brought in (after a force-push, the branch moved onto them, the
+old ones not brought back) and a review of what they change (`git diff
+old..new`) put in the agent's input, to send as it is or edit. Its request
+merged or closed offers to archive it; archived and restored, it is a review
+still.
 
 A prompt written with the title waits in the agent's input for you to finish
 and send; Settings → Tasks → "Send the prompt at once" sends it once the agent

@@ -566,6 +566,9 @@ pub struct TaskView {
     pub pr: Option<crate::pr::Pr>,
     /// Its tickets, request and addresses: told to what runs in it.
     pub links: Vec<crate::state::TaskLink>,
+    /// A review of a colleague's request or branch: Push asks first, and
+    /// what origin brings is offered as a review again.
+    pub review: bool,
     /// The key its commit box starts with: its ticket's, where the
     /// project's commits carry keys.
     pub commit_key: Option<String>,
@@ -1020,6 +1023,7 @@ impl TaskView {
             recent: Vec::new(),
             pr: None,
             links,
+            review: false,
             commit_key: None,
             viewed: BTreeMap::new(),
             bookmarks: BTreeMap::new(),
@@ -3479,4 +3483,70 @@ pub fn ticket_env(links: &[crate::state::TaskLink]) -> Vec<(String, String)> {
         env.push(("IDEAE_PR_URL".to_string(), pr.url.clone()));
     }
     env
+}
+
+// They script repositories with bash, which Windows lacks or has as WSL's.
+#[cfg(all(test, unix))]
+mod review_push_tests {
+    use super::TaskView;
+    use crate::state::{ProjectState, State};
+    use crate::workspace::Workspace;
+    use gpui_kit::test::TestWindowExt as _;
+    use gpui_kit::{AppContext as _, Bounds, Entity, Point, TestAppContext, WindowBounds, WindowOptions, px, size};
+
+    /// A push from a review asks first: the branch is a colleague's.
+    /// Cancel pushes nothing.
+    #[gpui_kit::test]
+    fn a_push_from_a_review_asks_first(cx: &mut TestAppContext) {
+        let _one = crate::workspace::variants::tests::ONE_WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+        cx.executor().allow_parking();
+        let dir = std::env::temp_dir().join(format!("ideae-review-push-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sh = |script: &str| assert!(std::process::Command::new("bash").arg("-ec").arg(script).current_dir(&dir).status().unwrap().success(), "{script}");
+        sh("git init -q --bare -b main remote.git
+            git clone -q remote.git repo 2>/dev/null; cd repo; git config user.email t@t; git config user.name t
+            echo one > f.txt; git add f.txt; git commit -qm base; git push -q origin main 2>/dev/null; echo two >> f.txt; git commit -qam mine");
+        let repo = dir.join("repo").canonicalize().unwrap();
+        // SAFETY: set before anything of the app reads them, one window at a time.
+        unsafe {
+            std::env::set_var("IDEAE_STATE", dir.join("state.json"));
+            std::env::set_var("IDEAE_NO_DAEMON", "1");
+        }
+        let saved = State { projects: vec![ProjectState { path: repo.clone(), ..Default::default() }], ..Default::default() };
+        std::fs::write(dir.join("state.json"), serde_json::to_string(&saved).unwrap()).unwrap();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            gpui_cn::init(cx);
+            crate::theme::init(cx);
+        });
+        let (handle, workspace) = cx.update(|cx| {
+            let bounds = Bounds { origin: Point::default(), size: size(px(1000.), px(700.)) };
+            let options = WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() };
+            gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| Workspace::new(Vec::new(), Some(None), None, window, cx))).expect("a test window")
+        });
+        cx.update_window(handle.into(), |_, window, cx| workspace.update(cx, |w, cx| w.open_main(0, window, cx))).unwrap();
+        cx.run_until_parked();
+        let task: Entity<TaskView> = workspace.update(cx, |w, _| w.active_view().expect("the checkout in view"));
+        let origin_main = || String::from_utf8(std::process::Command::new("git").args(["rev-parse", "main"]).current_dir(dir.join("remote.git")).output().unwrap().stdout).unwrap();
+        let before = origin_main();
+        cx.update_window(handle.into(), |_, window, cx| {
+            task.update(cx, |t, cx| {
+                t.review = true;
+                t.push(window, cx);
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("review-push").is_some(), "asked first");
+            window.click("review-push-cancel", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("review-push").is_none());
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(origin_main(), before, "nothing pushed");
+        assert!(task.read_with(cx, |t, _| t.busy.is_none()));
+        task.update(cx, |t, cx| t.shut_down(cx));
+        cx.update_window(handle.into(), |_, window, _| window.remove_window()).ok();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
