@@ -2509,6 +2509,11 @@ mod pull_tests {
         assert_eq!(super::git(&left, &["branch", "--show-current"]).map(|b| b.trim().to_string()).as_deref(), Some("DEV-11"));
         assert!(told.is_some_and(|t| t.contains("with no task")));
         assert!(super::new_task_worktree(&b, "DEV-11", "", false).is_err_and(|why| why.contains("already exists")), "its worktree is there");
+        // An origin that does not answer: given up, as last fetched.
+        let started = std::time::Instant::now();
+        let silent = super::git_status_within(&b, &["-c", "protocol.ext.allow=always", "ls-remote", "ext::sleep 3"], std::time::Duration::from_millis(300));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "given up in time");
+        assert!(silent.as_ref().is_err_and(|e| e.contains("no answer")), "{silent:?}");
         // A clone of one branch fetches no other: origin's is taken all the same.
         sh(&base, "git clone -q --single-branch remote.git c");
         let (single, told) = super::new_task_worktree(&base.join("c"), "DEV-7", "", false).unwrap();
@@ -3362,9 +3367,9 @@ pub fn create_task_worktree(repo: &Path, branch: &str, base: &str, copy_env: boo
 /// back with the worktree.
 pub fn new_task_worktree(repo: &Path, branch: &str, base: &str, copy_env: bool) -> Result<(PathBuf, Option<String>), String> {
     let theirs = format!("origin/{branch}");
-    let on_origin = match git_status(repo, &["ls-remote", "--heads", "origin", &format!("refs/heads/{branch}")]) {
+    let on_origin = match git_status_within(repo, &["ls-remote", "--heads", "origin", &format!("refs/heads/{branch}")], ORIGIN_ASKED_FOR) {
         Ok(listed) => !listed.trim().is_empty(),
-        // Not reached (offline, no origin): as last fetched.
+        // Not reached (offline, no origin, a network that does not answer): as last fetched.
         Err(_) => git_status(repo, &["rev-parse", "--verify", "-q", &format!("refs/remotes/{theirs}")]).is_ok(),
     };
     let here = branch_exists(repo, branch);
@@ -3400,6 +3405,51 @@ pub fn new_task_worktree(repo: &Path, branch: &str, base: &str, copy_env: bool) 
         format!("{branch} was a branch here already: the task is on it, up to date with origin's.")
     };
     Ok((dir, Some(told)))
+}
+
+/// How long a new task waits for origin to say whether it has its branch:
+/// a network that does not answer (a VPN gone, ssh waiting for a passphrase)
+/// would leave it "creating…" for minutes.
+const ORIGIN_ASKED_FOR: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// `git_status`, given up after `within`: an error then, and git ended.
+fn git_status_within(root: &Path, args: &[&str], within: std::time::Duration) -> Result<String, String> {
+    let gave_up = || format!("git {}: no answer in {} s", args.first().copied().unwrap_or_default(), within.as_secs());
+    // On another machine: its daemon runs it there; this side stops waiting.
+    if crate::hosts::is_remote(root) {
+        let (root, args): (PathBuf, Vec<String>) = (root.to_path_buf(), args.iter().map(|a| a.to_string()).collect());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let _ = tx.send(git_status(&root, &args));
+        });
+        return rx.recv_timeout(within).unwrap_or_else(|_| Err(gave_up()));
+    }
+    let mut child = crate::procs::command("git")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("git: {e}"))?;
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(gave_up());
+            }
+        }
+    }
+    // Its output is a line or two: it fits the pipe while git runs.
+    let out = child.wait_with_output().map_err(|e| format!("git: {e}"))?;
+    if out.status.success() { Ok(String::from_utf8_lossy(&out.stdout).into_owned()) } else { Err(String::from_utf8_lossy(&out.stderr).trim().to_string()) }
 }
 
 fn worktree_at(repo: &Path, branch: &str, base: &str, copy_env: bool) -> Result<PathBuf, String> {

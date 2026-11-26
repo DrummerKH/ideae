@@ -2032,7 +2032,9 @@ impl Workspace {
         {
             let (repo, on_origin) = (repo.clone(), on_origin.clone());
             cx.spawn_in(window, async move |_, cx| {
-                let read = cx.background_spawn(crate::procs::on_thread(move || OnOrigin::read(&repo))).await;
+                // On the app's executor: a thread of its own would wake the dialog
+                // from outside it, which a test's scheduler takes for a race.
+                let read = cx.background_spawn(async move { OnOrigin::read(&repo) }).await;
                 *on_origin.borrow_mut() = read;
                 let _ = cx.update(|window, _| window.refresh());
             })
@@ -3828,7 +3830,17 @@ mod in_the_way_tests {
         });
         let path = crate::git::task_worktree_dir(&repo, "DEV-7");
         let rows = |cx: &mut TestAppContext| workspace.update(cx, |w, _| w.projects[0].tasks.iter().filter(|t| !t.main).map(|t| (t.title.clone(), t.busy.is_some())).collect::<Vec<_>>());
-        workspace.update(cx, |w, _| w.projects[0].tasks.push(TaskEntry { path: path.clone(), branch: "DEV-7".into(), title: "DEV-7 paused".into(), ..Default::default() }));
+        // A real worktree: the list keeps no row of a task git has none of.
+        let made = std::process::Command::new("git").arg("-C").arg(&repo).args(["worktree", "add", "-q", "-b", "DEV-7"]).arg(&path).status().unwrap().success();
+        assert!(made);
+        cx.run_until_parked();
+        workspace.update(cx, |w, _| {
+            let tasks = &mut w.projects[0].tasks;
+            match tasks.iter_mut().find(|t| t.path == path) {
+                Some(t) => t.title = "DEV-7 paused".into(),
+                None => tasks.push(TaskEntry { path: path.clone(), branch: "DEV-7".into(), title: "DEV-7 paused".into(), ..Default::default() }),
+            }
+        });
         cx.update_window(handle.into(), |_, window, cx| {
             workspace.update(cx, |w, cx| w.create_worktree_task(0, "DEV-7".into(), String::new(), vec![String::new()], Vec::new(), false, window, cx));
         })
