@@ -148,7 +148,6 @@ fn answer_shown(answer: &str) -> Option<String> {
     Some(if all.len() > 10 || short.len() < whole.len() { format!("{}…", short.trim_end()) } else { short })
 }
 
-/// Which of a task's open questions get a row.
 /// Where a task's row is drawn: in its project's list, in Needs you or
 /// Starred above the projects, or under its project's Paused line.
 #[derive(Clone, Copy, PartialEq)]
@@ -158,6 +157,7 @@ enum Place {
     Paused,
 }
 
+/// Which of a task's open questions get a row.
 #[derive(Clone, Copy, PartialEq)]
 enum QuestionRows {
     All,
@@ -1258,7 +1258,7 @@ impl Workspace {
                     div()
                         .id(SharedString::from(format!("host-state-{}", p.path.display())))
                         .flex_shrink_0()
-                        .max_w(px(160.))
+                        .max_w(spx(160.))
                         .truncate()
                         .text_xs()
                         .when(state != HostState::Up && state != HostState::Connecting, |s| s.text_color(cx.theme().warning))
