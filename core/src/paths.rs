@@ -126,7 +126,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn the_sockets_folder_is_the_desktop_s_without_its_variables() {
-        let Some(tmp) = std::env::var_os("TMPDIR") else { return };
+        let Some(tmp) = std::env::var_os(crate::test_tmp::WAS).or_else(|| std::env::var_os("TMPDIR")) else { return };
         let with = std::path::PathBuf::from(tmp).join("x");
         let canon = |p: &std::path::Path| std::fs::canonicalize(p.parent().unwrap()).unwrap();
         assert_eq!(canon(&super::no_runtime_var("x")), canon(&with));

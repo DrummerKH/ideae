@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 /// daemon): it keeps the folder of the run that started it.
 const MARK: &str = "IDEAE_TEST_TMP";
 const PREFIX: &str = "ideae-t";
+/// The TMPDIR the run was given, for a test of what the system's is.
+pub const WAS: &str = "IDEAE_TEST_TMPDIR_WAS";
 
 static mut OWN: Option<PathBuf> = None;
 
@@ -29,6 +31,9 @@ pub unsafe fn own() {
     }
     // SAFETY: before main, one thread (the caller's promise).
     unsafe {
+        if let Some(was) = std::env::var_os("TMPDIR") {
+            std::env::set_var(WAS, was);
+        }
         for var in ["TMPDIR", "TMP", "TEMP"] {
             std::env::set_var(var, &dir);
         }
