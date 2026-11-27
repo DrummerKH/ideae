@@ -17,6 +17,9 @@ for program in google-chrome google-chrome-stable chromium chromium-browser; do
 done
 [ -n "$chrome" ] || echo "no Chrome or Chromium here: the browser's tests are skipped (name one in IDEAE_CHROME)" >&2
 
+# What cargo built before and leaves (docs/building.md): a check is run often enough.
+scripts/sweep-target.py || true
+
 cargo build
 scripts/string-slices.sh
 cargo test

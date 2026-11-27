@@ -79,6 +79,14 @@ mod usage;
 mod workspace;
 mod zoom;
 
+/// The tests' temporary files in a folder of the run's own, gone with it.
+#[cfg(test)]
+#[ctor::ctor(unsafe)]
+fn own_temp_dir() {
+    // SAFETY: before main.
+    unsafe { ideae_core::test_tmp::own() }
+}
+
 use std::path::PathBuf;
 
 use gpui_kit::component::{

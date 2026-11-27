@@ -103,6 +103,7 @@ src/mac_notify.rs  macOS: notifications as the app's own (a click comes back), w
 src/image_diff.rs  a changed image in a diff: its two versions as pictures, read from git or the worktree
 src/local_time.rs  the machine's calendar: weekdays and hours for Defer
 src/crash.rs       what a panic leaves: crashes.log next to the state, told at the next start
+core/src/test_tmp.rs  a test run's temporary files in a folder of its own, gone when it ends
 core/src/awake.rs  the machine kept up while agents work: by the window for its own, by the daemon for every agent it runs
                    (a laptop's too, its own window closed), as its Machine layer says; core/src/battery.rs how full the
                    battery is and whether it is in use
@@ -148,7 +149,7 @@ vendor/            patched gpui-component, gpui-base, gpui-cn, gpui-fast-linux, 
                    cn-pty: gpui-cn's pty, shell setup and process table without a window (gpui-cn re-exports it), for the daemon
 assets/side-icons/ the marks of the side's strip (Lucide's drawings, served by `task::Assets` over the kit's)
 assets/icon/       the app icon: ideae.svg, and the .icns and .ico made from it by scripts/icons.py
-scripts/           Xvfb driver for UI checks, wayland.sh (the same in a headless GNOME Shell), check.sh (the tests to run before a push), remote-live.sh (projects on another machine against real sshd, in Docker), icons.py, macos-app.sh (a .app around a binary)
+scripts/           Xvfb driver for UI checks, wayland.sh (the same in a headless GNOME Shell), check.sh (the tests to run before a push), sweep-target.py (cargo's builds of before out of target/), remote-live.sh (projects on another machine against real sshd, in Docker), icons.py, macos-app.sh (a .app around a binary)
 ```
 
 ## Build and test

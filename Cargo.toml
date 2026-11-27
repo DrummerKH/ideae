@@ -116,8 +116,11 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 # GPUI and libghostty are unusably slow unoptimized; our own crate stays debug for fast rebuilds.
+# No debug info for them: a binary of 0.7 GB, not 2.2, and links quicker; a backtrace
+# still has our own lines.
 [profile.dev.package."*"]
 opt-level = 2
+debug = false
 
 # window_border.rs patched: no 20px client-side shadow inset (see the file).
 # diff/mod.rs patched: Diff::code_font_size, a per-view code size for zoom.
@@ -159,6 +162,7 @@ gpui-fast-macos = { path = "vendor/gpui-fast-macos" }
 mermaid-rs-renderer = { path = "vendor/mermaid-rs-renderer" }
 
 [dev-dependencies]
+ctor = "1"
 gpui-kit = { version = "0.8.1", features = ["test-support"] }
 
 [build-dependencies]

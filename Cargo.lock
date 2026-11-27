@@ -4468,6 +4468,7 @@ dependencies = [
  "boa_engine",
  "cc",
  "cn-pty",
+ "ctor",
  "embed-resource",
  "flate2",
  "gpui-cn",
@@ -4549,6 +4550,7 @@ version = "0.1.0"
 dependencies = [
  "async-channel",
  "cn-pty",
+ "ctor",
  "libc",
  "notify",
  "serde",

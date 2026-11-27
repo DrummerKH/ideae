@@ -22,3 +22,6 @@ async-channel = "2"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 cn-pty = { path = "../vendor/cn-pty" }
+
+[dev-dependencies]
+ctor = "1"

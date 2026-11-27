@@ -18,6 +18,14 @@ Options: `--agent CMD` or `--no-agent`, `--theme auto|light|dark`,
 A debug build is a separate app (`ideae-dev`): its own state, sockets and
 launcher entry, so it can run next to a release build.
 
+Cargo never takes anything out of `target/`: each change of a dependency,
+a flag or rustc builds a crate again under a new name and leaves the old
+one, and the app's own debug binary is 0.7 GB a time.
+`scripts/sweep-target.py` removes the builds that were made again since and
+have not been for a week (`--dry-run` lists them, `IDEAE_SWEEP_DAYS` sets
+the week); `scripts/check.sh` runs it first. The tests keep their temporary
+files in a folder of each run's own, gone when it ends.
+
 ## Portable Linux binary
 
 To run on older glibc, build against glibc 2.31 with

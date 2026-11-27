@@ -18,10 +18,18 @@ pub mod procs;
 pub mod said;
 pub mod status;
 pub mod store;
+#[doc(hidden)]
+pub mod test_tmp;
 pub mod watch;
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[ctor::ctor(unsafe)]
+    fn own_temp_dir() {
+        // SAFETY: before main.
+        unsafe { crate::test_tmp::own() }
+    }
+
     /// Tests that set IDEAE_STATE run one at a time.
     #[cfg_attr(not(unix), allow(dead_code))]
     pub static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
